@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, ClassVar, Literal, overload, override
+from typing import TYPE_CHECKING, Literal, overload, override
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 
@@ -34,7 +34,7 @@ from botocore.exceptions import ClientError, HTTPClientError
 from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
 from langchaint.adapter import (
-    ErrorClassification,
+    RequestFailure,
     retry_after_seconds_from_headers,
 )
 from langchaint.common.exceptions import EmbeddingOutputError
@@ -42,13 +42,7 @@ from langchaint.concurrency.cancellation import (
     await_task_cancellation_safe,
     to_thread_cancellation_safe,
 )
-from langchaint.concurrency.shared_backoff import (
-    DoNotRetry,
-    PauseAll,
-    RetryThisOne,
-    SharedBackoff,
-    Verdict,
-)
+from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.embedding import (
     EmbeddingModel,
     EmbeddingTask,
@@ -66,7 +60,7 @@ if TYPE_CHECKING:
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]
 """Output dimensions accepted by every cataloged Cohere Embed v4 model."""
 
-type CohereEmbedV4ModelName = Literal[
+type CohereEmbedV4ModelId = Literal[
     "cohere.embed-v4:0",
     "global.cohere.embed-v4:0",
     "us.cohere.embed-v4:0",
@@ -74,13 +68,13 @@ type CohereEmbedV4ModelName = Literal[
 ]
 """Cataloged Cohere Embed v4 identifiers for Amazon Bedrock."""
 
-type CohereEmbedV3ModelName = Literal[
+type CohereEmbedV3ModelId = Literal[
     "cohere.embed-english-v3",
     "cohere.embed-multilingual-v3",
 ]
 """Cataloged Cohere Embed v3 identifiers for Amazon Bedrock."""
 
-type _CohereBedrockEmbeddingModelName = CohereEmbedV4ModelName | CohereEmbedV3ModelName
+type _CohereBedrockEmbeddingModelId = CohereEmbedV4ModelId | CohereEmbedV3ModelId
 type _CohereInputType = Literal[
     "search_document",
     "search_query",
@@ -88,17 +82,17 @@ type _CohereInputType = Literal[
     "clustering",
 ]
 
-_COHERE_EMBED_V4_MODELS: frozenset[CohereEmbedV4ModelName] = frozenset({
+_COHERE_EMBED_V4_MODELS: frozenset[CohereEmbedV4ModelId] = frozenset({
     "cohere.embed-v4:0",
     "global.cohere.embed-v4:0",
     "us.cohere.embed-v4:0",
     "eu.cohere.embed-v4:0",
 })
-_COHERE_EMBED_V3_MODELS: frozenset[CohereEmbedV3ModelName] = frozenset({
+_COHERE_EMBED_V3_MODELS: frozenset[CohereEmbedV3ModelId] = frozenset({
     "cohere.embed-english-v3",
     "cohere.embed-multilingual-v3",
 })
-COHERE_BEDROCK_EMBEDDING_MODELS: frozenset[_CohereBedrockEmbeddingModelName] = (
+COHERE_BEDROCK_EMBEDDING_MODELS: frozenset[_CohereBedrockEmbeddingModelId] = (
     _COHERE_EMBED_V4_MODELS | _COHERE_EMBED_V3_MODELS
 )
 """Cohere embedding identifiers accepted by `CohereBedrock`."""
@@ -122,34 +116,38 @@ _FLOAT_EMBEDDINGS: TypeAdapter[_CohereEmbeddings] = TypeAdapter(
 _DIMENSION_UNSET = object()
 
 
-def _parse_cohere_bedrock(failure: Exception) -> Verdict:
-    """Map one Bedrock `ClientError` to its retry verdict.
+def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
+    """Return the `RequestFailure` of one exception a Bedrock request raised.
 
     `botocore==1.43.67` maps Bedrock errors to `ClientError`.
-    Its service model marks `ThrottlingException` as throttling.
+    Its service model marks `ThrottlingException` as throttling, which is transient and pauses the quota.
     It marks `ModelNotReadyException` as transient without throttling.
-    Statuses 408, 500, and 503 also identify transient errors.
+    Statuses 408, 429, and 500 or above are transient without a pause.
+    A botocore connection failure is transient without a pause.
+    Every other exception is `unknown_exception`, including a `ClientError` without response metadata.
     """
-    if not isinstance(failure, ClientError):
-        return DoNotRetry()
-    metadata = failure.response.get("ResponseMetadata")
-    if metadata is None:
-        return DoNotRetry()
-    status_code = metadata["HTTPStatusCode"]
-    error_code = failure.response.get("Error", {}).get("Code")
-    retry_after = retry_after_seconds_from_headers(metadata.get("HTTPHeaders", {}))
-    if error_code == "ThrottlingException":
-        return PauseAll(retry_after=retry_after)
-    if status_code in (408, 429) or status_code >= 500:
-        return RetryThisOne(retry_after=retry_after)
-    return DoNotRetry()
-
-
-def _classify_cohere_bedrock(error: Exception) -> ErrorClassification:
-    """Classify a failure that reached no verdict or a `DoNotRetry` verdict from `_parse_cohere_bedrock`."""
     if isinstance(error, BotocoreConnectionError | HTTPClientError):
-        return "transient"
-    return "unknown_exception"
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+    unknown_exception = RequestFailure(
+        kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+    )
+    if not isinstance(error, ClientError):
+        return unknown_exception
+    metadata = error.response.get("ResponseMetadata")
+    if metadata is None:
+        return unknown_exception
+    status_code = metadata["HTTPStatusCode"]
+    error_code = error.response.get("Error", {}).get("Code")
+    retry_after_seconds = retry_after_seconds_from_headers(metadata.get("HTTPHeaders", {}))
+    if error_code == "ThrottlingException":
+        return RequestFailure(
+            kind="transient", pauses_quota=True, retry_after_seconds=retry_after_seconds
+        )
+    if status_code in (408, 429) or status_code >= 500:
+        return RequestFailure(
+            kind="transient", pauses_quota=False, retry_after_seconds=retry_after_seconds
+        )
+    return unknown_exception
 
 
 def _require_one_sdk_request(client: BedrockRuntimeClient) -> None:
@@ -227,13 +225,11 @@ class _CohereBedrockClientCache:
 class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
     """Map provider-neutral embedding requests to Cohere on Bedrock."""
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (ClientError,)
-
     def __init__(
         self,
         *,
         client_cache: _CohereBedrockClientCache,
-        model: _CohereBedrockEmbeddingModelName,
+        model: _CohereBedrockEmbeddingModelId,
         dimension: int,
     ) -> None:
         """Store one model's validated request configuration."""
@@ -376,14 +372,9 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         return await to_thread_cancellation_safe(lambda: self._invoke(client, inputs, task))
 
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate failure parsing to `_parse_cohere_bedrock`."""
-        return _parse_cohere_bedrock(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Classify a failure that reached no verdict or a `DoNotRetry` verdict."""
-        return _classify_cohere_bedrock(error)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Delegate to `_cohere_bedrock_request_failure`."""
+        return _cohere_bedrock_request_failure(error)
 
 
 class CohereBedrock:
@@ -421,7 +412,7 @@ class CohereBedrock:
     @overload
     def embedding_model(
         self,
-        model: CohereEmbedV4ModelName,
+        model: CohereEmbedV4ModelId,
         *,
         dimension: CohereEmbedV4Dimension = 1536,
         max_requests: int = 3,
@@ -430,14 +421,14 @@ class CohereBedrock:
     @overload
     def embedding_model(
         self,
-        model: CohereEmbedV3ModelName,
+        model: CohereEmbedV3ModelId,
         *,
         max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     def embedding_model(
         self,
-        model: _CohereBedrockEmbeddingModelName,
+        model: _CohereBedrockEmbeddingModelId,
         *,
         dimension: CohereEmbedV4Dimension | object = _DIMENSION_UNSET,
         max_requests: int = 3,
@@ -451,24 +442,19 @@ class CohereBedrock:
             ValueError: `model`, `dimension`, or `max_requests` is invalid.
         """
         if model in _COHERE_EMBED_V4_MODELS:
-            selected_dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
-            if (
-                type(selected_dimension) is not int
-                or selected_dimension not in _COHERE_EMBED_V4_DIMENSIONS
-            ):
-                raise ValueError(
-                    f"dimension is invalid for Cohere Embed v4: {selected_dimension!r}"
-                )
+            dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
+            if type(dimension) is not int or dimension not in _COHERE_EMBED_V4_DIMENSIONS:
+                raise ValueError(f"dimension is invalid for Cohere Embed v4: {dimension!r}")
         elif model in _COHERE_EMBED_V3_MODELS:
             if dimension is not _DIMENSION_UNSET:
                 raise ValueError("Cohere Embed v3 accepts no dimension argument")
-            selected_dimension = 1024
+            dimension = 1024
         else:
             raise ValueError(f"model {model!r} is not in COHERE_BEDROCK_EMBEDDING_MODELS")
         adapter = _CohereBedrockEmbeddingAdapter(
             client_cache=self._client_cache,
             model=model,
-            dimension=selected_dimension,
+            dimension=dimension,
         )
         return EmbeddingModel(
             adapter=adapter,
@@ -480,7 +466,7 @@ class CohereBedrock:
 __all__ = [
     "COHERE_BEDROCK_EMBEDDING_MODELS",
     "CohereBedrock",
-    "CohereEmbedV3ModelName",
+    "CohereEmbedV3ModelId",
     "CohereEmbedV4Dimension",
-    "CohereEmbedV4ModelName",
+    "CohereEmbedV4ModelId",
 ]

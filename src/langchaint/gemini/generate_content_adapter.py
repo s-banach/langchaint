@@ -19,7 +19,7 @@ Source: https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03.
 `Part.thought` marks reasoning, and `Part.thought_signature` contains bytes.
 JSON-mode SDK dumps encode bytes as base64 and validate them back.
 `ReasoningPart.raw` stores that JSON-mode dump.
-SDK models reject unknown keys, so another provider's dump returns `RefusedMessages`.
+SDK models reject unknown keys, so another provider's dump returns `RejectedMessages`.
 SDK enums preserve unknown effort and tier values as synthetic enum values with `UserWarning`.
 `FunctionResponse.response` uses `"output"` and `"error"` for `ToolMessage.content` and `ToolMessage.is_error`.
 
@@ -33,7 +33,7 @@ Replay skips a matching following `AssistantPart` because `ReasoningPart.raw` al
 `generateContent` has no request field for implicit caching.
 Both `automatic_cache_breakpoints` values produce the same request and cache-read billing.
 Gemini never bills a cache write.
-A marked system part raises `ValueError`, and a marked message part returns `RefusedMessages`.
+A system part with `cache_breakpoint=True` raises `ValueError`, and such a message part returns `RejectedMessages`.
 `extra_body={"cachedContent": ...}` selects an explicit cache resource.
 
 Content mappings were verified against google-genai 2.17.0.
@@ -47,7 +47,7 @@ Request and response mappings:
 - `ToolMessage` becomes `function_response` inside user-role `Content`.
 - Consecutive `ToolMessage` values share one `Content`.
 - `FunctionResponse.name` comes from the earlier `ToolCall` matching `tool_call_id`.
-- A missing match returns `RefusedMessages`.
+- A missing match returns `RejectedMessages`.
 - `FunctionCall.id` is optional, while `ToolCall.id` is required.
 - The adapter uses the function name when the provider omits the id.
 - Replay sends the id only when it differs from the function name.
@@ -55,8 +55,8 @@ Request and response mappings:
 - `reasoning_level` sends the exact `thinking_level` string with `include_thoughts=True`.
 - The provider reports unsupported values through its own error.
 - `parallel_tool_calls=False` raises at bind because Gemini has no disabling field.
-- `MAX_TOKENS` maps to `"max_tokens"`, and refusal reasons map to `"refusal"`.
-- `STOP` maps by `ToolCall` presence to `"tool_use"` or `"end_turn"`.
+- `MAX_TOKENS` maps to `"max_completion_tokens"`, and refusal reasons map to `"refusal"`.
+- `STOP` maps by `ToolCall` presence to `"tool_call"` or `"stop"`.
 - Other finish reasons map to `"other"`.
 - Gemini reports terminal conditions through statuses or stream errors instead of a completed 200 failure body.
 - The adapter does not construct `ContextWindowExceeded`, `ProviderFailedTransiently`, or `ProviderFailedTerminally`.
@@ -67,7 +67,7 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, Literal, override
+from typing import Literal, override
 
 import httpx
 from google import genai
@@ -83,11 +83,11 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     EmptyAssistantMessage,
-    ErrorClassification,
     MaxCompletionTokensExceeded,
     ReasoningDelta,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -97,24 +97,24 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedAssistantMessage,
     UsableResponse,
-    _NotSendableError,
+    _RejectedMessagesError,
     _UnusableResponseBase,
     narrowed_request_params,
-    record_parse_fallthrough,
+    record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
-    verdict_from_transient_error,
 )
 from langchaint.billing.pricing import (
     Billing,
     ProviderBilling,
-    category_cost,
+    TokenRates,
+    category_cost_in_usd,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
     require_pricing_key,
 )
 from langchaint.billing.usage import Usage
-from langchaint.common.exceptions import StreamProtocolError, TransientError
+from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -128,7 +128,6 @@ from langchaint.common.messages import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 
 _PAUSE_STATUSES = frozenset({429, 503})
 """429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE pause every request sharing the rate-limit quota."""
@@ -144,8 +143,8 @@ The google-genai 2.19.0 retryable set is `(408, 429, 500, 502, 503, 504)`.
 _DO_NOT_RETRY_STATUSES = frozenset({400, 403, 404})
 """The request-rejection statuses from the troubleshooting page. A resend fails again."""
 
-PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_parse_fallthrough` increments this counter for each status-family default."""
+REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
+"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
 """What a request may ask for: the SDK ServiceTier wire values (google-genai 2.16.0)."""
@@ -185,21 +184,21 @@ All other values produce `UnfinishedAssistantMessage` for a structured binding.
 """
 
 _NO_CACHE_BREAKPOINT_WIRE_FORM = (
-    "cache_breakpoint has no Gemini wire form: generateContent has no request field marking a "
-    "prompt-cache boundary, and dropping the mark would silently misstate the request"
+    "cache_breakpoint has no Gemini wire form: generateContent has no request field for a "
+    "prompt-cache boundary, and dropping the cache breakpoint would silently misstate the request"
 )
 
-_SUPPORTED_PROVIDER_TOOL_FIELDS = frozenset({
+_SUPPORTED_PROVIDER_EXECUTED_TOOL_FIELDS = frozenset({
     "code_execution",
     "file_search",
     "google_maps",
     "google_search",
     "url_context",
 })
-_CHARGED_PROVIDER_TOOL_FIELDS = frozenset({"google_maps", "google_search"})
+_CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS = frozenset({"google_maps", "google_search"})
 
 
-def _populated_provider_tool_fields(tool: types.Tool) -> frozenset[str]:
+def _populated_provider_executed_tool_fields(tool: types.Tool) -> frozenset[str]:
     """Return every populated field after `types.Tool` normalization.
 
     Raises:
@@ -209,7 +208,7 @@ def _populated_provider_tool_fields(tool: types.Tool) -> frozenset[str]:
     populated_fields = frozenset(
         field_name for field_name, field_value in tool if field_value is not None
     )
-    if not populated_fields or not populated_fields <= _SUPPORTED_PROVIDER_TOOL_FIELDS:
+    if not populated_fields or not populated_fields <= _SUPPORTED_PROVIDER_EXECUTED_TOOL_FIELDS:
         raise ValueError("Gemini provider_executed_tools contain an unsupported field")
     google_search = tool.google_search
     if (
@@ -221,21 +220,21 @@ def _populated_provider_tool_fields(tool: types.Tool) -> frozenset[str]:
     return populated_fields
 
 
-def _normalize_provider_tools(
+def _normalize_provider_executed_tools(
     provider_executed_tools: tuple[Mapping[str, object], ...],
 ) -> tuple[tuple[types.Tool, ...], frozenset[str]]:
-    """Normalize every mapping and return every populated provider tool field.
+    """Normalize every mapping and return every populated provider-executed tool field.
 
     Raises:
         pydantic.ValidationError: a mapping fails `types.Tool` validation.
-        ValueError: `_populated_provider_tool_fields` rejects a normalized tool.
+        ValueError: `_populated_provider_executed_tool_fields` rejects a normalized tool.
     """
     normalized_tools: list[types.Tool] = []
     populated_fields: set[str] = set()
-    for provider_tool in provider_executed_tools:
-        normalized_tool = types.Tool.model_validate(provider_tool)
+    for provider_executed_tool in provider_executed_tools:
+        normalized_tool = types.Tool.model_validate(provider_executed_tool)
         normalized_tools.append(normalized_tool)
-        populated_fields.update(_populated_provider_tool_fields(normalized_tool))
+        populated_fields.update(_populated_provider_executed_tool_fields(normalized_tool))
     return tuple(normalized_tools), frozenset(populated_fields)
 
 
@@ -243,23 +242,22 @@ def _normalize_provider_tools(
 class GeminiRates:
     """One rate per category Gemini bills on a request.
 
+    Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
     No cache-write rate: no cache write is ever billed, so none exists to state.
     Pass NaN for an unknown rate.
     A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     """
 
-    input_cache_none_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
+    input_tokens_cache_none: float
+    input_tokens_cache_read: float
+    output_tokens: float
 
     def multiplied(self, multiplier: float) -> "GeminiRates":
         """Return token rates multiplied by one value."""
         return GeminiRates(
-            input_cache_none_usd_per_million_tokens=(
-                self.input_cache_none_usd_per_million_tokens * multiplier
-            ),
-            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens * multiplier,
-            output_usd_per_million_tokens=self.output_usd_per_million_tokens * multiplier,
+            input_tokens_cache_none=self.input_tokens_cache_none * multiplier,
+            input_tokens_cache_read=self.input_tokens_cache_read * multiplier,
+            output_tokens=self.output_tokens * multiplier,
         )
 
 
@@ -267,7 +265,7 @@ _NO_CACHE_WRITE_RATE = float("nan")
 """The cache-write price every Gemini Billing reports.
 
 Gemini bills no cache writes, so no rate exists to state.
-The write counter is always zero, and `category_cost(0, usd_per_million_tokens=float("nan"))` is `0.0`.
+The write counter is always zero, and `category_cost_in_usd(0, usd_per_million_tokens=float("nan"))` is `0.0`.
 """
 
 
@@ -275,41 +273,44 @@ The write counter is always zero, and `category_cost(0, usd_per_million_tokens=f
 class GeminiPricingTable:
     """Store one model's rates for one served tier.
 
-    Above long_prompt_threshold_tokens, long_prompt_rates prices input, cache reads, and output.
-    Models without this pricing leave both long-prompt fields None.
+    `price` compares its `prompt_token_count` with long_context_prompt_token_count_above.
+    Above that threshold, long_context_rates prices input, cache reads, and output.
+    Models without this pricing leave both long-context fields None.
     """
 
     rates: GeminiRates
     google_search_usd_per_query: float | None = None
     google_maps_usd_per_query: float | None = None
-    long_prompt_threshold_tokens: int | None = None
-    long_prompt_rates: GeminiRates | None = None
+    long_context_prompt_token_count_above: int | None = None
+    long_context_rates: GeminiRates | None = None
 
     def __post_init__(self) -> None:
-        """Require the two long-prompt fields together.
+        """Require the two long-context fields together.
 
         Raises:
-            ValueError: Exactly one of long_prompt_threshold_tokens and long_prompt_rates is set.
+            ValueError: Exactly one of long_context_prompt_token_count_above and long_context_rates is set.
         """
-        if (self.long_prompt_threshold_tokens is None) != (self.long_prompt_rates is None):
+        if (self.long_context_prompt_token_count_above is None) != (
+            self.long_context_rates is None
+        ):
             raise ValueError(
-                "long_prompt_threshold_tokens and long_prompt_rates must be set together"
+                "long_context_prompt_token_count_above and long_context_rates must be set together"
             )
 
     def multiplied(self, multiplier: float) -> "GeminiPricingTable":
         """Return the table with every token rate multiplied by one value.
 
-        Per-query tool prices and the long-prompt threshold are unchanged.
+        Per-query tool prices and the long-context threshold are unchanged.
         """
         return GeminiPricingTable(
             rates=self.rates.multiplied(multiplier),
             google_search_usd_per_query=self.google_search_usd_per_query,
             google_maps_usd_per_query=self.google_maps_usd_per_query,
-            long_prompt_threshold_tokens=self.long_prompt_threshold_tokens,
-            long_prompt_rates=(
+            long_context_prompt_token_count_above=self.long_context_prompt_token_count_above,
+            long_context_rates=(
                 None
-                if self.long_prompt_rates is None
-                else self.long_prompt_rates.multiplied(multiplier)
+                if self.long_context_rates is None
+                else self.long_context_rates.multiplied(multiplier)
             ),
         )
 
@@ -325,7 +326,7 @@ class GeminiPricingTable:
         output_tokens_reasoning: int,
         provider_executed_tool_cost_in_usd: float,
     ) -> ProviderBilling:
-        """Price one response's counters, at the long-prompt rates when the prompt crosses the threshold.
+        """Price one response's counters, at the long-context rates when the prompt crosses the threshold.
 
         prompt_token_count excludes the tool-execution input the categories include.
         The zero cache-write counter costs zero despite its NaN price.
@@ -335,11 +336,11 @@ class GeminiPricingTable:
         """
         rates = self.rates
         if (
-            self.long_prompt_threshold_tokens is not None
-            and self.long_prompt_rates is not None
-            and prompt_token_count > self.long_prompt_threshold_tokens
+            self.long_context_prompt_token_count_above is not None
+            and self.long_context_rates is not None
+            and prompt_token_count > self.long_context_prompt_token_count_above
         ):
-            rates = self.long_prompt_rates
+            rates = self.long_context_rates
         return ProviderBilling(
             billing=Billing(
                 usage=Usage(
@@ -348,26 +349,28 @@ class GeminiPricingTable:
                     input_tokens_cache_none=input_tokens_cache_none,
                     output_tokens=output_tokens,
                     output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost(
+                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_read,
-                        usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
+                        usd_per_million_tokens=rates.input_tokens_cache_read,
                     ),
                     input_tokens_cache_write_cost_in_usd=0.0,
-                    input_tokens_cache_none_cost_in_usd=category_cost(
+                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_none,
-                        usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
+                        usd_per_million_tokens=rates.input_tokens_cache_none,
                     ),
-                    output_tokens_cost_in_usd=category_cost(
+                    output_tokens_cost_in_usd=category_cost_in_usd(
                         output_tokens,
-                        usd_per_million_tokens=rates.output_usd_per_million_tokens,
+                        usd_per_million_tokens=rates.output_tokens,
                     ),
                     provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
                 service_tier=service_tier,
-                input_cache_none_usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
-                cache_read_usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
-                cache_write_usd_per_million_tokens=_NO_CACHE_WRITE_RATE,
-                output_usd_per_million_tokens=rates.output_usd_per_million_tokens,
+                usd_per_million_tokens=TokenRates(
+                    input_tokens_cache_read=rates.input_tokens_cache_read,
+                    input_tokens_cache_write=_NO_CACHE_WRITE_RATE,
+                    input_tokens_cache_none=rates.input_tokens_cache_none,
+                    output_tokens=rates.output_tokens,
+                ),
             ),
             usage_raw=usage_raw,
         )
@@ -375,9 +378,9 @@ class GeminiPricingTable:
 
 _UNPRICED = GeminiPricingTable(
     rates=GeminiRates(
-        input_cache_none_usd_per_million_tokens=float("nan"),
-        cache_read_usd_per_million_tokens=float("nan"),
-        output_usd_per_million_tokens=float("nan"),
+        input_tokens_cache_none=float("nan"),
+        input_tokens_cache_read=float("nan"),
+        output_tokens=float("nan"),
     ),
     google_search_usd_per_query=float("nan"),
     google_maps_usd_per_query=float("nan"),
@@ -389,11 +392,11 @@ Every zero counter costs zero.
 """
 
 
-def _require_provider_tool_support(
+def _require_provider_executed_tool_support(
     *,
     model: str,
     pricing: Mapping[str, GeminiPricingTable],
-    provider_tool_fields: frozenset[str],
+    provider_executed_tool_fields: frozenset[str],
 ) -> None:
     """Require Gemini 3 and finite configured rates across supplied pricing tables.
 
@@ -402,15 +405,15 @@ def _require_provider_tool_support(
             Also raised for unavailable, negative, infinite, or NaN configured rates.
     """
     model_id = model.rsplit("/", 1)[-1]
-    if provider_tool_fields and not model_id.startswith("gemini-3"):
+    if provider_executed_tool_fields and not model_id.startswith("gemini-3"):
         raise ValueError("Gemini provider_executed_tools require a Gemini 3 model")
     for pricing_table in pricing.values():
-        if "google_search" in provider_tool_fields:
+        if "google_search" in provider_executed_tool_fields:
             google_search_rate = pricing_table.google_search_usd_per_query
             require_finite_nonnegative_rate(
                 rate_name="google_search_usd_per_query", rate=google_search_rate
             )
-        if "google_maps" in provider_tool_fields:
+        if "google_maps" in provider_executed_tool_fields:
             google_maps_rate = pricing_table.google_maps_usd_per_query
             require_finite_nonnegative_rate(
                 rate_name="google_maps_usd_per_query", rate=google_maps_rate
@@ -509,18 +512,21 @@ def _queries_from_tool_call(tool_call: types.ToolCall, *, maps: bool) -> list[st
 
 
 def _provider_executed_tool_cost_in_usd(
-    provider_tool_parts: Sequence[types.Part],
+    provider_executed_tool_parts: Sequence[types.Part],
     *,
     table: GeminiPricingTable,
-    configured_fields: frozenset[str],
+    provider_executed_tool_fields: frozenset[str],
     billing_complete: bool,
 ) -> float:
     """Price paired Search and Maps calls from one assembled response."""
-    if not billing_complete and configured_fields & _CHARGED_PROVIDER_TOOL_FIELDS:
+    if (
+        not billing_complete
+        and provider_executed_tool_fields & _CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS
+    ):
         return float("nan")
     tool_calls: list[types.ToolCall] = []
     tool_responses: list[types.ToolResponse] = []
-    for part in provider_tool_parts:
+    for part in provider_executed_tool_parts:
         if part.tool_call is not None:
             tool_calls.append(part.tool_call)
         if part.tool_response is not None:
@@ -546,7 +552,7 @@ def _provider_executed_tool_cost_in_usd(
     maps_query_count = 0
     for tool_call, tool_type in typed_tool_calls:
         provider_field = _PROVIDER_FIELD_BY_TOOL_TYPE.get(tool_type)
-        if provider_field is None or provider_field not in configured_fields:
+        if provider_field is None or provider_field not in provider_executed_tool_fields:
             return float("nan")
         if provider_field == "google_search":
             queries = _queries_from_tool_call(tool_call, maps=False)
@@ -559,23 +565,21 @@ def _provider_executed_tool_cost_in_usd(
                 return float("nan")
             maps_query_count += len(queries)
 
-    google_search_rate = table.google_search_usd_per_query
-    google_maps_rate = table.google_maps_usd_per_query
     return invocation_cost_in_usd(
         len(search_queries),
-        usd_per_invocation=google_search_rate,
+        usd_per_invocation=table.google_search_usd_per_query,
     ) + invocation_cost_in_usd(
         maps_query_count,
-        usd_per_invocation=google_maps_rate,
+        usd_per_invocation=table.google_maps_usd_per_query,
     )
 
 
 def _billing_from_provider_evidence(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
-    provider_tool_parts: Sequence[types.Part],
+    provider_executed_tool_parts: Sequence[types.Part],
     pricing: Mapping[str, GeminiPricingTable],
     *,
-    configured_fields: frozenset[str] = frozenset(),
+    provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
 ) -> ProviderBilling:
     """Price token counters and assembled provider-executed tool evidence."""
@@ -587,9 +591,9 @@ def _billing_from_provider_evidence(
         usage_metadata,
         pricing,
         provider_executed_tool_cost_in_usd=_provider_executed_tool_cost_in_usd(
-            provider_tool_parts,
+            provider_executed_tool_parts,
             table=table,
-            configured_fields=configured_fields,
+            provider_executed_tool_fields=provider_executed_tool_fields,
             billing_complete=billing_complete,
         ),
     )
@@ -599,7 +603,7 @@ def _billing_from_response(
     response: types.GenerateContentResponse,
     pricing: Mapping[str, GeminiPricingTable],
     *,
-    configured_fields: frozenset[str] = frozenset(),
+    provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
 ) -> ProviderBilling:
     """Price token counters and provider evidence from every candidate."""
@@ -607,7 +611,7 @@ def _billing_from_response(
         response.usage_metadata,
         _all_candidate_parts(response),
         pricing,
-        configured_fields=configured_fields,
+        provider_executed_tool_fields=provider_executed_tool_fields,
         billing_complete=billing_complete,
     )
 
@@ -659,12 +663,12 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
     """Convert one ToolCall back to its wire form, omitting an id that was synthesized from the name.
 
     Raises:
-        _NotSendableError: args_json does not contain a JSON object.
+        _RejectedMessagesError: args_json does not contain a JSON object.
         json.JSONDecodeError: args_json is not valid JSON.
     """
     args = json.loads(tool_call.args_json)
     if not isinstance(args, dict):
-        raise _NotSendableError(
+        raise _RejectedMessagesError(
             f"a tool call's args_json must hold a JSON object to go on the Gemini wire, "
             f"not {type(args).__name__}"
         )
@@ -682,12 +686,12 @@ def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> type
     `part_description` names the `ReasoningPart` or `RawPart`.
 
     Raises:
-        _NotSendableError: raw does not restore to a Part.
+        _RejectedMessagesError: raw does not restore to a Part.
     """
     try:
         return types.Part.model_validate_json(json.dumps(raw))
     except (TypeError, ValueError) as not_a_part:
-        raise _NotSendableError(
+        raise _RejectedMessagesError(
             f"{part_description} does not restore to a Gemini Part, so it cannot be sent: "
             f"{not_a_part}"
         ) from not_a_part
@@ -728,7 +732,7 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
     A RawPart restores the same way and carries no such pair.
 
     Raises:
-        _NotSendableError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
+        _RejectedMessagesError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     wire_parts: list[types.Part] = []
@@ -744,22 +748,22 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
                 wire_parts.append(types.Part(text=part.text))
             case "tool_call":
                 wire_parts.append(types.Part(function_call=_function_call_from(part)))
-            case "reasoning_part":
+            case "reasoning":
                 replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
                 wire_parts.append(replayed_part)
                 if replayed_part.function_call is not None or (
                     replayed_part.text and not replayed_part.thought
                 ):
                     replayed_part_with_paired_payload = replayed_part
-            case "raw_part":
+            case "raw":
                 wire_parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
     return wire_parts
 
 
-def _cache_breakpoint_reason(
+def _cache_breakpoint_error_text(
     part: ContentPart, *, message_class: type[UserMessage] | type[ToolMessage]
 ) -> str:
-    """Name the marked ContentPart and message_class Gemini cannot send."""
+    """Name the ContentPart with `cache_breakpoint=True` and the message_class that Gemini cannot send."""
     return (
         f"GeminiGenerateContentAdapter cannot send {type(part).__name__} inside "
         f"{message_class.__name__}.content: cache_breakpoint has no Gemini wire form"
@@ -783,14 +787,16 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
     ImageUrlPart uses Part.file_data.
 
     Raises:
-        _NotSendableError: A ContentPart sets cache_breakpoint.
+        _RejectedMessagesError: A ContentPart sets cache_breakpoint.
     """
     if isinstance(content, str):
         return [types.Part(text=content)]
     wire_parts: list[types.Part] = []
     for part in content:
         if part.cache_breakpoint:
-            raise _NotSendableError(_cache_breakpoint_reason(part, message_class=UserMessage))
+            raise _RejectedMessagesError(
+                _cache_breakpoint_error_text(part, message_class=UserMessage)
+            )
         match part.kind:
             case "text":
                 wire_parts.append(types.Part(text=part.text))
@@ -821,13 +827,13 @@ def _function_response_part(
     FunctionResponse.id is omitted when it equals the recovered ToolCall.name.
 
     Raises:
-        _NotSendableError: ToolMessage.tool_call_id matches no earlier ToolCall.id.
+        _RejectedMessagesError: ToolMessage.tool_call_id matches no earlier ToolCall.id.
             FunctionResponse.name cannot be recovered in that case.
             cache_breakpoint on any ContentPart also raises.
     """
     name = tool_call_names.get(tool_message.tool_call_id)
     if name is None:
-        raise _NotSendableError(
+        raise _RejectedMessagesError(
             f"tool_call_id {tool_message.tool_call_id!r} matches no ToolCall in an earlier "
             f"assistant message, so the FunctionResponse name the wire requires cannot be recovered"
         )
@@ -838,7 +844,9 @@ def _function_response_part(
         texts: list[str] = []
         for part in tool_message.content:
             if part.cache_breakpoint:
-                raise _NotSendableError(_cache_breakpoint_reason(part, message_class=ToolMessage))
+                raise _RejectedMessagesError(
+                    _cache_breakpoint_error_text(part, message_class=ToolMessage)
+                )
             match part.kind:
                 case "text":
                     texts.append(part.text)
@@ -877,7 +885,7 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     Assistant messages supply ToolCall names for later FunctionResponse values.
 
     Raises:
-        _NotSendableError: A message is unsendable.
+        _RejectedMessagesError: A message is unsendable.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     contents: list[types.Content] = []
@@ -907,17 +915,19 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     return contents
 
 
-def _request_contents(messages: Sequence[Message]) -> list[types.Content] | RefusedMessages:
+def _request_contents(messages: Sequence[Message]) -> list[types.Content] | RejectedMessages:
     """Convert messages, or report them unsendable.
 
-    An unsendable Sequence[Message] becomes RefusedMessages. This includes unparseable tool_call.args_json.
+    An unsendable Sequence[Message] becomes RejectedMessages. This includes unparseable tool_call.args_json.
     """
     try:
         return _wire_contents(messages)
-    except _NotSendableError as not_sendable:
-        return RefusedMessages(reason=str(not_sendable))
+    except _RejectedMessagesError as rejected:
+        return RejectedMessages(error_text=str(rejected))
     except json.JSONDecodeError as not_json:
-        return RefusedMessages(reason=f"a tool call's args_json is not valid JSON: {not_json}")
+        return RejectedMessages(
+            error_text=f"a tool call's args_json is not valid JSON: {not_json}"
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1098,43 +1108,52 @@ def _retry_after_seconds_from_error(failure: errors.APIError) -> float | None:
     return _retry_after_seconds_from_retry_info(failure.details)
 
 
-def parse_gemini(failure: Exception) -> Verdict:
-    """Classify one failure by the documented status table.
+def gemini_request_failure(error: Exception) -> RequestFailure:
+    """Return the `RequestFailure` of one exception a Gemini request raised, by the documented status table.
 
     Source: https://ai.google.dev/gemini-api/docs/troubleshooting, read 2026-08-03.
-    Statuses 408 and 502 also come from the SDK retryable set.
-    Unlisted statuses of 500 or above return `RetryThisOne`.
-    Other unlisted statuses return `DoNotRetry`.
-    Response headers take precedence over body `RetryInfo` for `retry_after`.
-    `TransientError` uses `verdict_from_transient_error`.
-    Exceptions outside `failure_types` return `DoNotRetry`.
+    google-genai 2.16.0 retry_args retries `httpx.TimeoutException` and `httpx.ConnectError` as transport failures.
+    Both are transient and pause nothing.
+    An `APIError` takes its failure from its status:
+    - `_PAUSE_STATUSES` are transient and pause the quota.
+    - `_RETRY_THIS_ONE_STATUSES` are transient without a pause.
+      Statuses 408 and 502 come from the SDK retryable set.
+    - Unlisted statuses of 500 or above are transient without a pause.
+    - Other statuses are `auth` for `AUTH_STATUSES`, `rejected` for another 4xx, and `unknown_exception` otherwise.
+    Unlisted statuses increment `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and are logged.
+    Response headers take precedence over body `RetryInfo` for a transient failure's `retry_after_seconds`.
+    Other exceptions are `unknown_exception`.
     """
-    if isinstance(failure, TransientError):
-        return verdict_from_transient_error(failure)
-    if not isinstance(failure, errors.APIError):
-        record_parse_fallthrough(
-            PARSE_FALLTHROUGH_COUNTS,
-            parse_name="parse_gemini",
-            status_code=None,
-            error_type=type(failure).__name__,
+    if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+    if not isinstance(error, errors.APIError):
+        return RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
         )
-        return DoNotRetry()
-    retry_after = _retry_after_seconds_from_error(failure)
-    if failure.code in _PAUSE_STATUSES:
-        return PauseAll(retry_after=retry_after)
-    if failure.code in _RETRY_THIS_ONE_STATUSES:
-        return RetryThisOne(retry_after=retry_after)
-    if failure.code in _DO_NOT_RETRY_STATUSES:
-        return DoNotRetry()
-    record_parse_fallthrough(
-        PARSE_FALLTHROUGH_COUNTS,
-        parse_name="parse_gemini",
-        status_code=failure.code,
-        error_type=failure.status,
-    )
-    if failure.code is not None and failure.code >= 500:
-        return RetryThisOne(retry_after=retry_after)
-    return DoNotRetry()
+    if error.code in _PAUSE_STATUSES or error.code in _RETRY_THIS_ONE_STATUSES:
+        return RequestFailure(
+            kind="transient",
+            pauses_quota=error.code in _PAUSE_STATUSES,
+            retry_after_seconds=_retry_after_seconds_from_error(error),
+        )
+    if error.code not in _DO_NOT_RETRY_STATUSES:
+        record_request_failure_fallthrough(
+            REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+            function_name="gemini_request_failure",
+            status_code=error.code,
+            error_type=error.status,
+        )
+        if error.code is not None and error.code >= 500:
+            return RequestFailure(
+                kind="transient",
+                pauses_quota=False,
+                retry_after_seconds=_retry_after_seconds_from_error(error),
+            )
+    if error.code in AUTH_STATUSES:
+        return RequestFailure(kind="auth", pauses_quota=False, retry_after_seconds=None)
+    if error.code is not None and 400 <= error.code < 500:
+        return RequestFailure(kind="rejected", pauses_quota=False, retry_after_seconds=None)
+    return RequestFailure(kind="unknown_exception", pauses_quota=False, retry_after_seconds=None)
 
 
 class GeminiGenerateContentAdapter(Adapter):
@@ -1196,7 +1215,8 @@ class GeminiGenerateContentAdapter(Adapter):
 
         Raises:
             pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
-            ValueError: A marked system part, disabled parallel calls, empty `system_prompt`, or reserved key is used.
+            ValueError: Parallel calls are disabled, `system_prompt` is empty, or a key is reserved.
+                A system part that sets `cache_breakpoint` also raises it.
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A configured charged rate is not finite and nonnegative.
         """
@@ -1213,13 +1233,13 @@ class GeminiGenerateContentAdapter(Adapter):
             )
         if binding.provider_executed_tools and self.provider_name == _VERTEX_PROVIDER_NAME:
             raise ValueError("Gemini provider_executed_tools require the Gemini Developer API")
-        normalized_provider_tools, provider_tool_fields = _normalize_provider_tools(
-            binding.provider_executed_tools
+        normalized_provider_executed_tools, provider_executed_tool_fields = (
+            _normalize_provider_executed_tools(binding.provider_executed_tools)
         )
-        _require_provider_tool_support(
+        _require_provider_executed_tool_support(
             model=self.model,
             pricing=self.pricing,
-            provider_tool_fields=provider_tool_fields,
+            provider_executed_tool_fields=provider_executed_tool_fields,
         )
         system_instruction: str | types.Content | None = None
         if binding.system_prompt is not None:
@@ -1259,7 +1279,7 @@ class GeminiGenerateContentAdapter(Adapter):
         if binding.provider_executed_tools:
             if tools is None:
                 tools = []
-            tools.extend(normalized_provider_tools)
+            tools.extend(normalized_provider_executed_tools)
             tool_config = types.ToolConfig(
                 function_calling_config=(
                     types.FunctionCallingConfig(mode=types.FunctionCallingConfigMode.VALIDATED)
@@ -1303,7 +1323,7 @@ class GeminiGenerateContentAdapter(Adapter):
                     else None,
                 ),
             ),
-            provider_tool_fields,
+            provider_executed_tool_fields,
         )
 
     @override
@@ -1314,9 +1334,13 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.ValidationError: A provider-executed tool is invalid.
             ValueError: `binding` contains unsupported values.
         """
-        config, provider_tool_fields = self._bound_config(binding, response_json_schema=None)
+        config, provider_executed_tool_fields = self._bound_config(
+            binding, response_json_schema=None
+        )
         return _BoundGeminiText(
-            adapter=self, config=config, provider_tool_fields=provider_tool_fields
+            adapter=self,
+            config=config,
+            provider_executed_tool_fields=provider_executed_tool_fields,
         )
 
     @override
@@ -1332,46 +1356,23 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
-        config, provider_tool_fields = self._bound_config(
+        config, provider_executed_tool_fields = self._bound_config(
             binding, response_json_schema=output_type_adapter.json_schema()
         )
         return _BoundGeminiStructured(
             adapter=self,
             config=config,
-            provider_tool_fields=provider_tool_fields,
+            provider_executed_tool_fields=provider_executed_tool_fields,
             output_type_adapter=output_type_adapter,
         )
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (errors.APIError, TransientError)
-    """The exceptions parse_gemini maps to a verdict.
-
-    `ClientError` and `ServerError` subclass `APIError`.
-    A mid-stream error chunk also raises `APIError`.
-    """
-
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate to parse_gemini, whose docstring names the table and the defaults."""
-        return parse_gemini(failure)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Delegate to gemini_request_failure, whose docstring names the table and the defaults.
 
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
-
-        google-genai 2.16.0 retry_args classifies both httpx exceptions as retryable transport failures.
-        A 401 or 403 APIError is an auth error. Any other 4xx APIError is an invalid request.
-        Any other APIError is unknown_exception.
-        Anything else the SDK raises is unknown_exception, which fails this item without a retry.
+        A mid-stream error chunk raises `APIError`, as an error status does.
         """
-        if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
-            return "transient"
-        if not isinstance(error, errors.APIError):
-            return "unknown_exception"
-        if error.code in AUTH_STATUSES:
-            return "auth"
-        if error.code is not None and 400 <= error.code < 500:
-            return "invalid_request"
-        return "unknown_exception"
+        return gemini_request_failure(error)
 
 
 class _ResponseAccumulator:
@@ -1384,7 +1385,7 @@ class _ResponseAccumulator:
 
     def __init__(self) -> None:
         self.parts: list[types.Part] = []
-        self.provider_tool_parts: list[types.Part] = []
+        self.provider_executed_tool_parts: list[types.Part] = []
         self.finish_reason: types.FinishReason | None = None
         self.usage_metadata: types.GenerateContentResponseUsageMetadata | None = None
         self.model_version: str | None = None
@@ -1413,7 +1414,7 @@ class _ResponseAccumulator:
         for streamed_candidate in candidates:
             if streamed_candidate.content is None or streamed_candidate.content.parts is None:
                 continue
-            self.provider_tool_parts.extend(
+            self.provider_executed_tool_parts.extend(
                 part
                 for part in streamed_candidate.content.parts
                 if part.tool_call is not None or part.tool_response is not None
@@ -1513,7 +1514,7 @@ class _GeminiStream(AdapterStream):
         *,
         chunks: AsyncIterator[types.GenerateContentResponse],
         pricing: Mapping[str, GeminiPricingTable],
-        provider_tool_fields: frozenset[str] = frozenset(),
+        provider_executed_tool_fields: frozenset[str] = frozenset(),
         first_chunk: types.GenerateContentResponse | None = None,
     ) -> None:
         """Store the SDK iterator and the chunk open_stream pulled ahead of it.
@@ -1522,7 +1523,7 @@ class _GeminiStream(AdapterStream):
         """
         self._chunks = chunks
         self._pricing = pricing
-        self._provider_tool_fields = provider_tool_fields
+        self._provider_executed_tool_fields = provider_executed_tool_fields
         self._first_chunk = first_chunk
         self._accumulator = _ResponseAccumulator()
         self._billing_complete = False
@@ -1586,17 +1587,19 @@ class _GeminiStream(AdapterStream):
     def billing_reported(self) -> ProviderBilling | None:
         """Return available billing from accumulated stream evidence.
 
-        Missing usage returns None when no charged provider tool was configured.
-        A charged cutoff returns NaN for the provider-tool category.
+        Missing usage returns None when no charged provider-executed tool was configured.
+        A charged cutoff returns NaN for the provider-executed tool category.
         """
-        charged_fields = self._provider_tool_fields & _CHARGED_PROVIDER_TOOL_FIELDS
+        charged_fields = (
+            self._provider_executed_tool_fields & _CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS
+        )
         if self._accumulator.usage_metadata is None and not charged_fields:
             return None
         return _billing_from_provider_evidence(
             self._accumulator.usage_metadata,
-            self._accumulator.provider_tool_parts,
+            self._accumulator.provider_executed_tool_parts,
             self._pricing,
-            configured_fields=self._provider_tool_fields,
+            provider_executed_tool_fields=self._provider_executed_tool_fields,
             billing_complete=self._billing_complete,
         )
 
@@ -1657,14 +1660,14 @@ def _finished_message_or_unusable_response(
         ):
             return Refusal(assistant_message=AssistantMessage(parts=()))
         return UnfinishedAssistantMessage(
-            reason="gemini returned no candidates and no block reason, so there is no assistant message to read",
+            error_text="gemini returned no candidates and no block reason, so there is no assistant message to read",
             assistant_message=AssistantMessage(parts=()),
         )
     candidate = candidates[0]
     assistant_message = _assistant_message_from(candidate.content)
     if candidate.finish_reason is None:
         return UnfinishedAssistantMessage(
-            reason="gemini returned a candidate with no finish_reason, "
+            error_text="gemini returned a candidate with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
         )
@@ -1680,11 +1683,11 @@ def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
     """
     finish_reason = finished_message.finish_reason
     if finish_reason == types.FinishReason.MAX_TOKENS:
-        return "max_tokens"
+        return "max_completion_tokens"
     if finish_reason in _REFUSAL_FINISH_REASONS:
         return "refusal"
     if finish_reason == types.FinishReason.STOP:
-        return "tool_use" if finished_message.assistant_message.tool_calls else "end_turn"
+        return "tool_call" if finished_message.assistant_message.tool_calls else "stop"
     return "other"
 
 
@@ -1706,11 +1709,11 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         *,
         adapter: GeminiGenerateContentAdapter,
         config: types.GenerateContentConfig,
-        provider_tool_fields: frozenset[str],
+        provider_executed_tool_fields: frozenset[str],
     ) -> None:
         self._adapter = adapter
         self._config = config
-        self._provider_tool_fields = provider_tool_fields
+        self._provider_executed_tool_fields = provider_executed_tool_fields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1723,7 +1726,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         return _billing_from_response(
             _as_response(raw),
             self._adapter.pricing,
-            configured_fields=self._provider_tool_fields,
+            provider_executed_tool_fields=self._provider_executed_tool_fields,
         )
 
     @override
@@ -1744,10 +1747,12 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
         """Convert messages under the binding's config."""
         contents = _request_contents(messages)
-        if isinstance(contents, RefusedMessages):
+        if isinstance(contents, RejectedMessages):
             return contents
         return _GeminiRequestParams(
             model=self._adapter.model, config=self._config, contents=contents
@@ -1776,7 +1781,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         return _GeminiStream(
             chunks=chunks,
             pricing=self._adapter.pricing,
-            provider_tool_fields=self._provider_tool_fields,
+            provider_executed_tool_fields=self._provider_executed_tool_fields,
             first_chunk=first_chunk,
         )
 
@@ -1807,10 +1812,14 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         *,
         adapter: GeminiGenerateContentAdapter,
         config: types.GenerateContentConfig,
-        provider_tool_fields: frozenset[str],
+        provider_executed_tool_fields: frozenset[str],
         output_type_adapter: TypeAdapter[ModelT],
     ) -> None:
-        super().__init__(adapter=adapter, config=config, provider_tool_fields=provider_tool_fields)
+        super().__init__(
+            adapter=adapter,
+            config=config,
+            provider_executed_tool_fields=provider_executed_tool_fields,
+        )
         self._output_type_adapter = output_type_adapter
 
     def _parsed_outcome(
@@ -1834,7 +1843,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         assistant_message = finished_message.assistant_message
         if finish_reason not in _FINISHED_FINISH_REASONS:
             return UnfinishedAssistantMessage(
-                reason=f"gemini returned finish_reason {finish_reason.value!r}, "
+                error_text=f"gemini returned finish_reason {finish_reason.value!r}, "
                 f"which langchaint cannot continue",
                 assistant_message=assistant_message,
             )

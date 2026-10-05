@@ -1,6 +1,6 @@
 """Define each agent's identity and limits.
 
-generate_one_timeout_seconds bounds one generate_one call.
+generate_one_timeout_seconds bounds one input.
 A timed-out `generate_one` appends no messages, and the next turn uses the same messages.
 max_turns bounds repeated timeouts.
 """

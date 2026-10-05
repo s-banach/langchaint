@@ -4,33 +4,31 @@ import asyncio
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
-from typing import ClassVar
 
 import numpy as np
 import pytest
 
 from langchaint import EmbeddingModel, EmbeddingOutputError, Float2D
-from langchaint.adapter import ErrorClassification
+from langchaint.adapter import RequestFailure
 from langchaint.common.sequence_not_str import SequenceNotStr
-from langchaint.concurrency.shared_backoff import DoNotRetry, RetryThisOne, SharedBackoff, Verdict
+from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.embedding import EmbeddingTask, _validated_embeddings
 from tests.helpers import run_with_timeout
 
 
 class _ProviderError(Exception):
-    """Identify a parsed provider failure."""
+    """Identify a transient provider failure."""
 
 
 class _TransportError(Exception):
     """Identify a transient transport failure."""
 
 
-def _retry_provider_failure(_failure: Exception) -> Verdict:
-    return RetryThisOne(retry_after=None)
-
-
-def _reject_provider_failure(_failure: Exception) -> Verdict:
-    return DoNotRetry()
+def _place_provider_and_transport_errors(error: Exception) -> RequestFailure:
+    """Place `_ProviderError` and `_TransportError` as transient, and every other exception as unknown_exception."""
+    if isinstance(error, (_ProviderError, _TransportError)):
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+    return RequestFailure(kind="unknown_exception", pauses_quota=False, retry_after_seconds=None)
 
 
 class _StubEmbeddingAdapter:
@@ -38,16 +36,17 @@ class _StubEmbeddingAdapter:
 
     model = "stub-embedding"
     dimension = 2
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (_ProviderError,)
 
     def __init__(
         self,
         requests: Sequence[Float2D | Exception],
         *,
-        parse: Callable[[Exception], Verdict] = _retry_provider_failure,
+        request_failure: Callable[
+            [Exception], RequestFailure
+        ] = _place_provider_and_transport_errors,
     ) -> None:
         self._requests = list(requests)
-        self._parse = parse
+        self._request_failure = request_failure
         self.prepare_calls = 0
         self.partition_calls = 0
         self.embed_calls = 0
@@ -55,8 +54,8 @@ class _StubEmbeddingAdapter:
         self.embed_inputs: list[tuple[str, ...]] = []
         self.embed_tasks: list[EmbeddingTask] = []
 
-    def parse(self, failure: Exception) -> Verdict:
-        return self._parse(failure)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        return self._request_failure(error)
 
     async def prepare(self) -> None:
         self.prepare_calls += 1
@@ -85,18 +84,12 @@ class _StubEmbeddingAdapter:
             raise outcome
         return outcome
 
-    def classify(self, error: Exception) -> ErrorClassification:
-        if isinstance(error, _TransportError):
-            return "transient"
-        return "unknown_exception"
-
 
 class _PartitioningEmbeddingAdapter:
     """Run one request batch per input under explicit completion controls."""
 
     model = "partitioning-embedding"
     dimension = 2
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (_ProviderError,)
 
     def __init__(self, inputs: SequenceNotStr[str], *, fail_once: set[str] | None = None) -> None:
         """Create one start and release event per input."""
@@ -105,9 +98,9 @@ class _PartitioningEmbeddingAdapter:
         self.fail_once = set(fail_once or ())
         self.requests: Counter[str] = Counter()
 
-    def parse(self, failure: Exception) -> Verdict:
-        """Retry every `_ProviderError`."""
-        return _retry_provider_failure(failure)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Retry every `_ProviderError` and `_TransportError`."""
+        return _place_provider_and_transport_errors(error)
 
     async def prepare(self) -> None:
         """Complete preparation without work."""
@@ -139,18 +132,13 @@ class _PartitioningEmbeddingAdapter:
         row = [1.0, 0.0] if input_text == "first" else [0.0, 1.0]
         return np.array([row], dtype=np.float32)
 
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Classify every unparsed exception as unknown."""
-        del error
-        return "unknown_exception"
 
-
-def _shared_backoff(*, longest_wait_seconds: float = 0.001) -> SharedBackoff:
+def _shared_backoff(*, max_wait_seconds: float = 0.001) -> SharedBackoff:
     return SharedBackoff(
         max_concurrent_requests=2,
         max_request_starts_per_second=100_000.0,
-        minimum_wait_ceiling_seconds=0.001,
-        longest_wait_seconds=longest_wait_seconds,
+        min_wait_ceiling_seconds=0.001,
+        max_wait_seconds=max_wait_seconds,
     )
 
 
@@ -158,11 +146,11 @@ def _model(
     adapter: _StubEmbeddingAdapter,
     *,
     max_requests: int = 3,
-    longest_wait_seconds: float = 0.001,
+    max_wait_seconds: float = 0.001,
 ) -> EmbeddingModel:
     return EmbeddingModel(
         adapter=adapter,
-        shared_backoff=_shared_backoff(longest_wait_seconds=longest_wait_seconds),
+        shared_backoff=_shared_backoff(max_wait_seconds=max_wait_seconds),
         max_requests=max_requests,
     )
 
@@ -225,17 +213,10 @@ def test_output_validation_rejects_invalid_matrices(
         _ = _validated_embeddings(values, expected_rows=2, dimension=2)
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [_ProviderError("provider"), _TransportError("transport")],
-)
-def test_transient_failures_retry_and_return_vectors(failure: Exception) -> None:
-    """A RetryThisOne verdict and a transport failure classified transient both retry.
-
-    `classify` calls `_ProviderError` unknown_exception, so only its verdict can make it retry.
-    """
+def test_a_transient_failure_retries_and_returns_vectors() -> None:
+    """A failure the adapter places as transient retries."""
     adapter = _StubEmbeddingAdapter([
-        failure,
+        _ProviderError("provider"),
         np.array([[1.0, 0.0]], dtype=np.float32),
     ])
 
@@ -245,29 +226,28 @@ def test_transient_failures_retry_and_return_vectors(failure: Exception) -> None
     assert adapter.embed_calls == 2
 
 
-def test_a_retry_this_one_retry_after_sets_the_minimum_private_wait() -> None:
-    """The verdict's retry_after reaches `PrivateBackoff.next_wait` as the wait's minimum.
+def test_a_retry_after_sets_the_minimum_private_wait() -> None:
+    """A transient failure's retry_after_seconds reaches `PrivateBackoff.next_wait` as the wait's minimum.
 
     The private ceiling starts at 0.001 seconds, and request starts are 0.00001 seconds apart.
-    So only retry_after can make the retry wait 0.02 seconds.
+    So only retry_after_seconds can make the retry wait 0.02 seconds.
     """
     adapter = _StubEmbeddingAdapter(
         [_ProviderError("slow"), np.array([[1.0, 0.0]], np.float32)],
-        parse=lambda _failure: RetryThisOne(retry_after=0.02),
+        request_failure=lambda _error: RequestFailure(
+            kind="transient", pauses_quota=False, retry_after_seconds=0.02
+        ),
     )
-    model = _model(adapter, longest_wait_seconds=1.0)
+    model = _model(adapter, max_wait_seconds=1.0)
     started_at = time.monotonic()
     _ = run_with_timeout(model.embed(["one"], task="classification"))
     assert time.monotonic() - started_at >= 0.02
     assert adapter.embed_calls == 2
 
 
-def test_a_failure_outside_failure_types_is_decided_by_classify() -> None:
-    """A failure outside the adapter's `failure_types` reaches no verdict.
-
-    `classify` calls it unknown_exception, so the batch fails without a retry.
-    """
-    failure = KeyError("unparsed")
+def test_an_unknown_exception_fails_the_batch_without_a_retry() -> None:
+    """A failure the adapter places as unknown_exception propagates unchanged after one request."""
+    failure = KeyError("unplaced")
     adapter = _StubEmbeddingAdapter([failure, np.array([[1.0, 0.0]], dtype=np.float32)])
     model = _model(adapter)
     with pytest.raises(KeyError) as caught:
@@ -279,7 +259,12 @@ def test_a_failure_outside_failure_types_is_decided_by_classify() -> None:
 def test_terminal_provider_failure_propagates_unchanged() -> None:
     """A terminal provider failure receives no replacement exception."""
     failure = _ProviderError("provider text")
-    adapter = _StubEmbeddingAdapter([failure], parse=_reject_provider_failure)
+    adapter = _StubEmbeddingAdapter(
+        [failure],
+        request_failure=lambda _error: RequestFailure(
+            kind="rejected", pauses_quota=False, retry_after_seconds=None
+        ),
+    )
 
     async def scenario() -> None:
         with pytest.raises(_ProviderError, match="provider text") as caught:

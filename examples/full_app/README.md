@@ -34,7 +34,7 @@ For example, the first specialist uses `root/research_climate/specialist#0`.
 
 `AgentConfig.generate_one_timeout_seconds` becomes `generate_one(timeout_seconds=...)`.
 That deadline includes admission, retries, and provider work.
-`max_turns` bounds repeated `TimedOutErrorRecord` outcomes.
+`max_turns` bounds repeated `timed_out_error` outcomes.
 
 `AgentConfig.max_cost_in_usd` is optional.
 The loop checks `cost_in_usd` before each turn and stops at the configured value.
@@ -49,28 +49,28 @@ The remaining accounting fields are exact:
 | --- | --- |
 | `AgentStarted` | none |
 | `TurnStarted` | `usage_so_far` |
-| `LlmResponse` | `usage`, `usage_so_far` |
+| `GenerationReported` | `usage`, `usage_so_far` |
 | `ToolCalled` | `usage_so_far` |
-| `ToolResponse` | `reported_usage`, `usage_so_far` |
+| `ToolDispatched` | `reported_usage`, `usage_so_far` |
 | `ToolProgress` | none |
-| `LlmCallAbandoned` | `usage_so_far` |
+| `LlmInputTimedOut` | `usage_so_far` |
 | `AgentFinished` | `usage` |
 | `AgentFailed` | `usage` |
 | `AgentCancelled` | `usage` |
 
-`usage` on `LlmResponse` covers that `generate_one` call.
+`usage` on `GenerationReported` covers that input.
 `usage` on terminal events covers that run and its descendants.
 `usage_so_far` covers the emitting run and its descendants.
-`reported_usage` covers spend returned through `ToolOutputExplicit.app_data`.
+`reported_usage` covers spend returned through `ToolReturnExplicit.app_data`.
 
 `ToolProgress` carries no accounting field because it cannot read the current `AgentRun.usage`.
 
 ## Deadlines and cancellation
 
-`generate_one_timeout_seconds` belongs to one `generate_one` call.
-A `TimedOutErrorRecord` carries settled request accounting.
-The loop appends `LlmFailure` before continuing.
-`LlmCallAbandoned` reports that continuation.
+`generate_one_timeout_seconds` belongs to one input.
+A `timed_out_error` record carries settled request accounting.
+The loop appends `GenerationErrorEntry` before continuing.
+`LlmInputTimedOut` reports that continuation.
 
 The whole-app deadline surrounds `App.run()`.
 Its cancellation propagates through the task tree.
@@ -97,7 +97,7 @@ Other sub-agent failures become parent-readable tool errors, so the parent can f
 ## Tracing
 
 `run_live_task_stream.py` passes an `OtelObserver` to `OpenAI`, and `task_stream.py` contains no tracing code.
-Each `generate_one` call and each tool dispatch opens a span.
+Each input and each tool dispatch opens a span.
 A delegated run's generation and tool spans become children of its `delegate` tool span.
 
 `capture_message_content=False` keeps message content off the spans.

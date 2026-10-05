@@ -47,14 +47,14 @@ from langchaint import (
     ToolCall,
     ToolManager,
     ToolMessage,
-    ToolOutputExplicit,
+    ToolReturnExplicit,
     UserMessage,
     to_tables,
 )
 from langchaint.adapter import (
     AdapterStream,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
     RequestParams,
     TransientError,
     UsableResponse,
@@ -93,6 +93,7 @@ from tests.helpers import (
     payload_schema,
     run_with_timeout,
     time_out_when,
+    transient,
 )
 
 _APPLICATION_KEYS = frozenset({
@@ -180,7 +181,7 @@ class _MidFailStream(FakeStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Yield one chunk, then raise a plain exception the classifier maps to transient.
+        """Yield one chunk, then raise a plain exception the adapter places as transient.
 
         Yields:
             One text chunk before the raise.
@@ -324,7 +325,7 @@ class _TerminalCase(NamedTuple):
         ),
         _TerminalCase(
             adapter=lambda: FakeAdapter(
-                invalid_requests=[RefusedMessages(reason="misconfigured")]
+                rejected_messages=[RejectedMessages(error_text="misconfigured")]
             ),
             error_type="rejected_error",
             status_description="misconfigured",
@@ -333,7 +334,7 @@ class _TerminalCase(NamedTuple):
             request_failed_events=0,
         ),
     ],
-    ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "invalid_request"],
+    ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "rejected"],
 )
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attributes(
@@ -539,7 +540,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
     """generate_many_records opens chat spans only for items that send requests."""
 
     async def scenario() -> None:
-        """Persist two samples, reorder them around one new sample, and inspect the span count."""
+        """Persist two inputs, reorder them around one new input, and inspect the span count."""
         adapter = FakeAdapter(echo=True)
         llm, exporter = _traced(adapter)
         bound = llm.bind()
@@ -547,7 +548,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         first = await bound.generate_many_records(
             ["a", "b"],
             resume_path=resume_path,
-            sample_ids=["sample-a", "sample-b"],
+            input_ids=["input-a", "input-b"],
         )
         assert all(record.kind == "without_tool_calls" for record in first)
         assert len(exporter.get_finished_spans()) == 2
@@ -555,7 +556,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         resumed = await bound.generate_many_records(
             ["b", "c", "a"],
             resume_path=resume_path,
-            sample_ids=["sample-b", "sample-c", "sample-a"],
+            input_ids=["input-b", "input-c", "input-a"],
         )
         assert all(record.kind == "without_tool_calls" for record in resumed)
         spans = exporter.get_finished_spans()
@@ -609,7 +610,7 @@ def test_a_stream_block_left_after_its_first_item_reports_the_stream_input_with_
         """Pull one item, leave the block as `block_exit` names, then read the stream span."""
         llm, exporter = _traced(FakeAdapter())
         other_llm = LLM(
-            FakeAdapter(invalid_requests=[RefusedMessages(reason="misconfigured")]),
+            FakeAdapter(rejected_messages=[RejectedMessages(error_text="misconfigured")]),
             shared_backoff=fast_shared_backoff(),
         )
 
@@ -681,7 +682,9 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 
     async def scenario() -> None:
         """Iterate a mid-failing stream and confirm the error span."""
-        llm, exporter = _traced(FakeAdapter(stream=_MidFailStream(), classify_result="transient"))
+        llm, exporter = _traced(
+            FakeAdapter(stream=_MidFailStream(), request_failure=transient(pauses_quota=False))
+        )
         with pytest.raises(GenerationError):
             await _drain(llm)
         (span,) = exporter.get_finished_spans()
@@ -852,7 +855,7 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
     """A custom mapper replaces the default outcome attributes on generate, stream, and batch item spans.
 
     A replacement binding keeps the observer.
-    A mapper key of the same name as an extra wins at completion.
+    A mapper key of the same name as an extra wins when the outcome attributes are set.
     The observer-owned gen_ai.operation.name wins at span start.
     """
 
@@ -958,9 +961,9 @@ def _raising_tool() -> PydanticTool[_EchoToolArgs]:
     )
 
 
-async def _erring_tool_function(args: _EchoToolArgs) -> ToolOutputExplicit[None]:
+async def _erring_tool_function(args: _EchoToolArgs) -> ToolReturnExplicit[None]:
     """Return a function-authored failure: a handled outcome whose ToolMessage carries is_error True."""
-    return ToolOutputExplicit(content=f"cannot process {args.text}", is_error=True)
+    return ToolReturnExplicit(content=f"cannot process {args.text}", is_error=True)
 
 
 def _erring_tool() -> PydanticTool[_EchoToolArgs]:
@@ -1459,7 +1462,7 @@ def _scrub_marker(
     match part.kind:
         case "text":
             return TextPart(text=part.text.replace(_MARKER, "[redacted]"))
-        case "reasoning_part":
+        case "reasoning":
             if part.text is None:
                 return part
             return part.model_copy(update={"text": part.text.replace(_MARKER, "[redacted]")})
@@ -1497,7 +1500,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
                         outcome=UsableResponse(
                             output="answer",
                             assistant_message=scripted_assistant_message,
-                            stop_reason="end_turn",
+                            stop_reason="stop",
                         ),
                         usage=USAGE,
                     )
@@ -1676,10 +1679,10 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
 @pytest.mark.parametrize(
     ("parts", "stop_reason", "expected_parts", "expected_finish_reason"),
     [
-        ((ReasoningPart(raw={"signature": "opaque"}),), "end_turn", [], "stop"),
+        ((ReasoningPart(raw={"signature": "opaque"}),), "stop", [], "stop"),
         (
             (ReasoningPart(raw={"signature": "opaque"}, text=""), TextPart(text="")),
-            "end_turn",
+            "stop",
             [],
             "stop",
         ),
@@ -1688,7 +1691,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
                 ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
                 TextPart(text="answer"),
             ),
-            "end_turn",
+            "stop",
             [
                 {"type": "reasoning", "content": "thought it over"},
                 {"type": "text", "content": "answer"},

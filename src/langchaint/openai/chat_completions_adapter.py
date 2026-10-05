@@ -27,7 +27,7 @@ String extras concatenate across deltas.
 This preserves `reasoning_content` on `ChatCompletionMessage` and `ChoiceDelta`.
 A mid-stream SSE `error` makes the iterator raise `openai.APIError`.
 Only `openai._streaming` constructs that exact type in openai 2.51.0.
-`items()` converts that error to `APIStatusError` on the live response for `parse_openai`.
+`items()` converts that error to `APIStatusError` on the live response for `openai_request_failure`.
 Subclasses of `openai.APIError` propagate unchanged.
 An unclosed stream may produce `Choice.finish_reason=None` despite its required `Literal` type.
 The required `choices` list may be empty.
@@ -41,7 +41,7 @@ Content mappings were verified against openai 2.53.0.
 - `ImagePart` becomes a data URL in `image_url.url`.
 - `ImageUrlPart.url` becomes `image_url.url` unchanged.
 - `AudioPart` accepts `audio/wav` and `audio/mpeg` inside `UserMessage`.
-- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `RefusedMessages`.
+- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `RejectedMessages`.
 - `ChatCompletionMessage.audio` remains available through `Generation.raw`.
 
 Request and response mappings:
@@ -52,8 +52,8 @@ Request and response mappings:
 - DeepSeek requires replayed `reasoning_content` during a tool loop.
 - Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
 - `message.refusal` becomes `TextPart` and sets `stop_reason="refusal"`, including with `finish_reason="stop"`.
-- `finish_reason="stop"` maps by tool calls to `"end_turn"` or `"tool_use"`.
-- `"tool_calls"`, `"length"`, and `"content_filter"` map to `"tool_use"`, `"max_tokens"`, and `"refusal"`.
+- `finish_reason="stop"` maps by tool calls to `"stop"` or `"tool_call"`.
+- `"tool_calls"`, `"length"`, and `"content_filter"` map to `"tool_call"`, `"max_completion_tokens"`, and `"refusal"`.
 - `"function_call"` and unknown values map to `"other"`.
 - Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one complete `ToolCall`.
 - The adapter delays fragments until their call id exists and prepends them to the next emitted fragment.
@@ -104,7 +104,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     ReasoningDelta,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -115,7 +115,7 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedAssistantMessage,
     UsableResponse,
-    _NotSendableError,
+    _RejectedMessagesError,
     _UnusableResponseBase,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
@@ -162,7 +162,7 @@ _AUDIO_FORMAT_BY_MEDIA_TYPE: Mapping[str, Literal["wav", "mp3"]] = {
 
 
 @dataclass(frozen=True, kw_only=True)
-class _ChatCompletionsPrecomputedFields:
+class _OpenAIChatCompletionsPrecomputedFields:
     """The typed request fields one binding precomputes.
 
     Fields set to the SDK's omit sentinel leave the provider default in place.
@@ -210,10 +210,10 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
 
 
 @dataclass(frozen=True, kw_only=True)
-class _ChatCompletionsRequestParams(RequestParams):
+class _OpenAIChatCompletionsRequestParams(RequestParams):
     """One Chat Completions request: the binding's precomputed fields and one input's messages."""
 
-    precomputed: _ChatCompletionsPrecomputedFields
+    precomputed: _OpenAIChatCompletionsPrecomputedFields
     messages: list[ChatCompletionMessageParam]
     """What goes on the wire as messages: the binding's messages_prefix followed by the Sequence[Message]."""
 
@@ -239,9 +239,11 @@ def _reasoning_content_extra(model: BaseModel) -> str | None:
 
 
 def _text_part_param(part: TextPart) -> ChatCompletionContentPartTextParam:
-    """Convert one TextPart to a text content part, marked where the part carries a breakpoint.
+    """Convert one TextPart to a text content part.
 
-    Every mark is sent and no client-side cap applies, the per-request write limits being the API's.
+    The content part carries `prompt_cache_breakpoint` when the part sets `cache_breakpoint`.
+
+    Every cache breakpoint is sent, and no client-side cap applies, because the per-request write limits are the API's.
     """
     wire_text: ChatCompletionContentPartTextParam = {"type": "text", "text": part.text}
     if part.cache_breakpoint:
@@ -261,8 +263,8 @@ def _image_part_param(
     return wire_image
 
 
-def _text_only_tool_message_error(part: ContentPart) -> _NotSendableError:
-    return _NotSendableError(
+def _text_only_tool_message_error(part: ContentPart) -> _RejectedMessagesError:
+    return _RejectedMessagesError(
         f"OpenAIChatCompletionsAdapter cannot send {type(part).__name__} inside "
         "ToolMessage.content: the tool message param's content is text-only"
     )
@@ -274,7 +276,7 @@ def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
     A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part.
 
     Raises:
-        _NotSendableError: AudioPart.media_type has no input_audio.format mapping.
+        _RejectedMessagesError: AudioPart.media_type has no input_audio.format mapping.
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
@@ -296,7 +298,7 @@ def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
             case "audio":
                 audio_format = _AUDIO_FORMAT_BY_MEDIA_TYPE.get(part.media_type)
                 if audio_format is None:
-                    raise _NotSendableError(
+                    raise _RejectedMessagesError(
                         "OpenAIChatCompletionsAdapter cannot send AudioPart inside "
                         f"UserMessage.content: AudioPart.media_type must be 'audio/wav' or "
                         f"'audio/mpeg', not {part.media_type!r}"
@@ -320,7 +322,7 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
     The API has no is_error flag, so the error text in content is the only error signal.
 
     Raises:
-        _NotSendableError: content holds ImagePart, ImageUrlPart, or AudioPart.
+        _RejectedMessagesError: content holds ImagePart, ImageUrlPart, or AudioPart.
     """
     if isinstance(tool_message.content, str):
         return {
@@ -357,14 +359,14 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     This matches openai 2.51.0's ChatCompletionAssistantMessageParam variants.
 
     Raises:
-        _NotSendableError: RawPart.raw matches no supported shape, or repeats function_call.
+        _RejectedMessagesError: RawPart.raw matches no supported shape, or repeats function_call.
     """
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []
     for part in assistant_message.parts:
         match part.kind:
-            case "reasoning_part":
+            case "reasoning":
                 param.update(part.raw)
             case "text":
                 texts.append(part.text)
@@ -374,19 +376,19 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
                     "type": "function",
                     "function": {"name": part.name, "arguments": part.args_json},
                 })
-            case "raw_part":
+            case "raw":
                 if part.raw.get("type") == "custom":
                     # cast: a deliberately-opaque value re-enters the typed API that serialized it.
                     tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", part.raw))
                 elif len(part.raw) == 1 and "function_call" in part.raw:
                     if "function_call" in param:
-                        raise _NotSendableError(
+                        raise _RejectedMessagesError(
                             "an assistant message contains more than one function_call, but Chat "
                             "Completions has one function_call field"
                         )
                     param.update(part.raw)
                 else:
-                    raise _NotSendableError(
+                    raise _RejectedMessagesError(
                         "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
                         "function_call can hold it; rebuild the assistant message without it"
                     )
@@ -402,7 +404,7 @@ def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessagePar
     """Keep the bound system prompt outside messages.
 
     Raises:
-        _NotSendableError: ToolMessage contains ImagePart, ImageUrlPart, or AudioPart.
+        _RejectedMessagesError: ToolMessage contains ImagePart, ImageUrlPart, or AudioPart.
             RawPart.raw may also have no wire form.
     """
     wire: list[ChatCompletionMessageParam] = []
@@ -531,7 +533,7 @@ def _finished_message_or_unfinished(
     """
     if not completion.choices:
         return UnfinishedAssistantMessage(
-            reason="openai returned no choices, so there is no assistant message to read",
+            error_text="openai returned no choices, so there is no assistant message to read",
             assistant_message=AssistantMessage(parts=()),
         )
     choice = completion.choices[0]
@@ -539,7 +541,7 @@ def _finished_message_or_unfinished(
     finish_reason: str | None = choice.finish_reason
     if finish_reason is None:
         return UnfinishedAssistantMessage(
-            reason="openai returned a choice with no finish_reason, "
+            error_text="openai returned a choice with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
         )
@@ -559,11 +561,11 @@ def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
         return "refusal"
     match finished_message.finish_reason:
         case "stop":
-            return "tool_use" if finished_message.assistant_message.tool_calls else "end_turn"
+            return "tool_call" if finished_message.assistant_message.tool_calls else "stop"
         case "tool_calls":
-            return "tool_use"
+            return "tool_call"
         case "length":
-            return "max_tokens"
+            return "max_completion_tokens"
         case "content_filter":
             return "refusal"
         case _:
@@ -580,10 +582,10 @@ def _usable_response[OutputT](
     )
 
 
-def cache_read_tokens_from_usage_openai(usage: CompletionUsage) -> int:
+def input_tokens_cache_read_from_usage_openai(usage: CompletionUsage) -> int:
     """Read the cache-read counter openai reports: prompt_tokens_details.cached_tokens, 0 absent.
 
-    This is the default `OpenAIChatCompletionsAdapter.cache_read_tokens_from_usage`.
+    This is the default `OpenAIChatCompletionsAdapter.input_tokens_cache_read_from_usage`.
     Providers with extra usage fields supply another reader.
     """
     details = usage.prompt_tokens_details
@@ -596,7 +598,7 @@ def _billing_from_chat_completion(
     completion: ChatCompletion,
     *,
     pricing: OpenAIPricingTable,
-    cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
+    input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int],
 ) -> ProviderBilling:
     """Price response counters at the reported `service_tier`.
 
@@ -604,7 +606,7 @@ def _billing_from_chat_completion(
     Source: https://developers.openai.com/api/docs/guides/prompt-caching, read 2026-07-25.
     DeepSeek cache-hit and cache-miss counters also sum to `prompt_tokens`.
     Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
-    `cache_read_tokens_from_usage` supports provider-specific cache-read fields.
+    `input_tokens_cache_read_from_usage` supports provider-specific cache-read fields.
     Missing `prompt_tokens_details` means zero cache-write tokens.
 
     A response without usage bills zero counters.
@@ -613,8 +615,8 @@ def _billing_from_chat_completion(
         pydantic.ValidationError: Cache counters exceed `prompt_tokens`.
     """
     service_tier = _priced_tier(completion.service_tier)
-    usage = completion.usage
-    input_tokens_total = 0 if usage is None else usage.prompt_tokens
+    usage_raw = completion.usage
+    input_tokens_total = 0 if usage_raw is None else usage_raw.prompt_tokens
     rates = pricing.rates_for(
         service_tier=completion.service_tier,
         input_tokens_total=input_tokens_total,
@@ -623,7 +625,7 @@ def _billing_from_chat_completion(
     provider_executed_tool_cost_in_usd = (
         float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
-    if usage is None:
+    if usage_raw is None:
         return rates.price(
             service_tier=service_tier,
             usage_raw=None,
@@ -634,19 +636,21 @@ def _billing_from_chat_completion(
             output_tokens_reasoning=0,
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
-    prompt_details = usage.prompt_tokens_details
-    completion_details = usage.completion_tokens_details
-    cache_read_tokens = cache_read_tokens_from_usage(usage)
-    cache_write_tokens = (
+    prompt_details = usage_raw.prompt_tokens_details
+    completion_details = usage_raw.completion_tokens_details
+    input_tokens_cache_read = input_tokens_cache_read_from_usage(usage_raw)
+    input_tokens_cache_write = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
     return rates.price(
         service_tier=service_tier,
-        usage_raw=usage,
-        input_tokens_cache_read=cache_read_tokens,
-        input_tokens_cache_write=cache_write_tokens,
-        input_tokens_cache_none=usage.prompt_tokens - cache_read_tokens - cache_write_tokens,
-        output_tokens=usage.completion_tokens,
+        usage_raw=usage_raw,
+        input_tokens_cache_read=input_tokens_cache_read,
+        input_tokens_cache_write=input_tokens_cache_write,
+        input_tokens_cache_none=usage_raw.prompt_tokens
+        - input_tokens_cache_read
+        - input_tokens_cache_write,
+        output_tokens=usage_raw.completion_tokens,
         output_tokens_reasoning=(
             completion_details.reasoning_tokens or 0 if completion_details is not None else 0
         ),
@@ -684,9 +688,9 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         pricing: OpenAIPricingTable,
         provider_name: str,
         supports_prompt_cache_options: bool,
-        cache_read_tokens_from_usage: Callable[
+        input_tokens_cache_read_from_usage: Callable[
             [CompletionUsage], int
-        ] = cache_read_tokens_from_usage_openai,
+        ] = input_tokens_cache_read_from_usage_openai,
         service_tier: OpenAIServiceTier | None = None,
     ) -> None:
         """Store request and pricing configuration without sending a request.
@@ -697,7 +701,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
         `supports_prompt_cache_options` identifies gpt-5.6-and-later support documented by openai 2.45.0.
         It sets `Adapter.automatic_cache_breakpoints_default` to the inverse value.
-        `cache_read_tokens_from_usage` reads provider-specific cache-read counters.
+        `input_tokens_cache_read_from_usage` reads provider-specific cache-read counters.
         The default reads `prompt_tokens_details.cached_tokens`.
         `pricing` supplies rates and modifiers.
         `service_tier` requests a tier, while the reported tier selects pricing.
@@ -714,8 +718,8 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         self.client: AsyncOpenAI = client_without_retries(client)
         self.pricing: OpenAIPricingTable = pricing
         self.supports_prompt_cache_options: bool = supports_prompt_cache_options
-        self.cache_read_tokens_from_usage: Callable[[CompletionUsage], int] = (
-            cache_read_tokens_from_usage
+        self.input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int] = (
+            input_tokens_cache_read_from_usage
         )
         self.service_tier: OpenAIServiceTier | None = service_tier
 
@@ -727,7 +731,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             "supports_prompt_cache_options": self.supports_prompt_cache_options,
         }
 
-    def _precompute_fields(self, binding: Binding) -> _ChatCompletionsPrecomputedFields:
+    def _precompute_fields(self, binding: Binding) -> _OpenAIChatCompletionsPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 
         Raises:
@@ -768,7 +772,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             tools = _wire_tools(binding.tool_schemas)
             tool_choice = _wire_tool_choice(binding.tool_choice)
             parallel_tool_calls = binding.parallel_tool_calls
-        return _ChatCompletionsPrecomputedFields(
+        return _OpenAIChatCompletionsPrecomputedFields(
             model=self.model,
             messages_prefix=messages_prefix,
             max_completion_tokens=(
@@ -800,7 +804,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         Raises:
             ValueError: `binding` contains unsupported values.
         """
-        return _BoundChatCompletionsText(
+        return _BoundOpenAIChatCompletionsText(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
         )
 
@@ -815,7 +819,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        return _BoundChatCompletionsStructured(
+        return _BoundOpenAIChatCompletionsStructured(
             adapter=self,
             precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
@@ -833,7 +837,7 @@ def _snapshot_tool_call_id(state: ChatCompletionStreamState, index: int) -> str:
     return tool_calls[index].id
 
 
-class _ChatCompletionsStream(AdapterStream):
+class _OpenAIChatCompletionsStream(AdapterStream):
     """One open Chat Completions stream, assembled by the SDK's ChatCompletionStreamState."""
 
     def __init__(
@@ -841,17 +845,17 @@ class _ChatCompletionsStream(AdapterStream):
         *,
         sdk_stream: AsyncStream[ChatCompletionChunk],
         pricing: OpenAIPricingTable,
-        cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
+        input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
-        self._cache_read_tokens_from_usage = cache_read_tokens_from_usage
+        self._input_tokens_cache_read_from_usage = input_tokens_cache_read_from_usage
         self._state = ChatCompletionStreamState()
         self._last_usage: CompletionUsage | None = None
         self._chunk_received = False
 
     async def _chunks(self) -> AsyncIterator[ChatCompletionChunk]:
-        """Iterate the SDK stream, rewrapping its mid-stream error raise for parse_openai.
+        """Iterate the SDK stream, rewrapping its mid-stream error raise for openai_request_failure.
 
         Yields:
             Every chunk the SDK stream yields.
@@ -918,12 +922,12 @@ class _ChatCompletionsStream(AdapterStream):
                     yield event.delta
                 elif event.type == "tool_calls.function.arguments.delta" and event.arguments_delta:
                     call_id = _snapshot_tool_call_id(self._state, event.index)
-                    held_args = pending_args.pop(event.index, "") + event.arguments_delta
+                    partial_args_json = pending_args.pop(event.index, "") + event.arguments_delta
                     if call_id is None:
-                        pending_args[event.index] = held_args
+                        pending_args[event.index] = partial_args_json
                     else:
                         yield ToolCallDelta(
-                            id=call_id, name=event.name, partial_args_json=held_args
+                            id=call_id, name=event.name, partial_args_json=partial_args_json
                         )
                 elif event.type == "tool_calls.function.arguments.done":
                     yield ToolCall(
@@ -967,7 +971,7 @@ class _ChatCompletionsStream(AdapterStream):
         return _billing_from_chat_completion(
             self._snapshot_with_tracked_usage(),
             pricing=self._pricing,
-            cache_read_tokens_from_usage=self._cache_read_tokens_from_usage,
+            input_tokens_cache_read_from_usage=self._input_tokens_cache_read_from_usage,
         )
 
     @override
@@ -985,14 +989,14 @@ class _ChatCompletionsStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
+class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
     """What both Chat Completions bindings share: the request path, and what a response says about itself."""
 
     def __init__(
         self,
         *,
         adapter: OpenAIChatCompletionsAdapter,
-        precomputed_fields: _ChatCompletionsPrecomputedFields,
+        precomputed_fields: _OpenAIChatCompletionsPrecomputedFields,
     ) -> None:
         self._adapter = adapter
         self._precomputed_fields = precomputed_fields
@@ -1008,7 +1012,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         return _billing_from_chat_completion(
             _as_chat_completion(raw),
             pricing=self._adapter.pricing,
-            cache_read_tokens_from_usage=self._adapter.cache_read_tokens_from_usage,
+            input_tokens_cache_read_from_usage=self._adapter.input_tokens_cache_read_from_usage,
         )
 
     @override
@@ -1028,13 +1032,15 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
         """Convert messages into the wire messages every request for one input sends."""
         try:
             wire_messages = _wire_messages(messages)
-        except _NotSendableError as not_sendable:
-            return RefusedMessages(reason=str(not_sendable))
-        return _ChatCompletionsRequestParams(
+        except _RejectedMessagesError as rejected:
+            return RejectedMessages(error_text=str(rejected))
+        return _OpenAIChatCompletionsRequestParams(
             precomputed=self._precomputed_fields,
             messages=[*self._precomputed_fields.messages_prefix, *wire_messages],
         )
@@ -1047,7 +1053,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request_params(request_params, _ChatCompletionsRequestParams)
+        params = narrowed_request_params(request_params, _OpenAIChatCompletionsRequestParams)
         precomputed = params.precomputed
         sdk_stream = await self._adapter.client.chat.completions.create(
             model=precomputed.model,
@@ -1069,14 +1075,14 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
             stream_options={"include_usage": True},
             extra_body=precomputed.extra_body,
         )
-        return _ChatCompletionsStream(
+        return _OpenAIChatCompletionsStream(
             sdk_stream=sdk_stream,
             pricing=self._adapter.pricing,
-            cache_read_tokens_from_usage=self._adapter.cache_read_tokens_from_usage,
+            input_tokens_cache_read_from_usage=self._adapter.input_tokens_cache_read_from_usage,
         )
 
 
-class _BoundChatCompletionsText(_BoundChatCompletions[str]):
+class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
     """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
@@ -1094,14 +1100,16 @@ class _BoundChatCompletionsText(_BoundChatCompletions[str]):
         return _usable_response(finished_message, finished_message.assistant_message.text)
 
 
-class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[ModelT | None]):
+class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
+    _BoundOpenAIChatCompletions[ModelT | None]
+):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
         *,
         adapter: OpenAIChatCompletionsAdapter,
-        precomputed_fields: _ChatCompletionsPrecomputedFields,
+        precomputed_fields: _OpenAIChatCompletionsPrecomputedFields,
         response_format: type[ModelT],
     ) -> None:
         """Precompute the request's response_format parameter, the JSON-schema format this binding asks for.
@@ -1126,7 +1134,7 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
         A valid instance returns first.
         Otherwise, message.refusal or finish_reason "content_filter" returns Refusal.
         finish_reason "length" returns MaxCompletionTokensExceeded.
-        A tool_use stop with non-empty AssistantMessage.tool_calls returns None.
+        A `tool_call` stop with non-empty AssistantMessage.tool_calls returns None.
         Remaining invalid content returns SchemaViolation.
         Every remaining response returns EmptyAssistantMessage.
         """
@@ -1140,7 +1148,7 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
                 validation_error = rejection
         assistant_message = finished_message.assistant_message
         if (
-            _normalized_stop_reason(finished_message) == "tool_use"
+            _normalized_stop_reason(finished_message) == "tool_call"
             and assistant_message.tool_calls
         ):
             return _usable_response(finished_message, None)

@@ -12,14 +12,14 @@ async def price_at_negotiated_rates() -> GenerationWithoutToolCalls[str]:
         GenerationError: Generation fails.
     """
     negotiated_default_rates = OpenAIRates(
-        input_cache_none_usd_per_million_tokens=1.00,
-        output_usd_per_million_tokens=8.00,
-        cache_read_usd_per_million_tokens=0.10,
-        cache_write_usd_per_million_tokens=0.00,
+        input_tokens_cache_none=1.00,
+        output_tokens=8.00,
+        input_tokens_cache_read=0.10,
+        input_tokens_cache_write=0.00,
     )
     pricing = OpenAIPricingTable(default=negotiated_default_rates)
     openai = OpenAI()
-    bound = openai.model(
+    bound = openai.llm(
         "gpt-5.6",
         pricing=pricing,
         supports_prompt_cache_options=True,

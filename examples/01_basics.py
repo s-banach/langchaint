@@ -24,7 +24,7 @@ async def basics() -> None:
         GenerationError: A `generate_one` call fails.
     """
     openai = OpenAI()
-    llm = openai.model("gpt-5.6-terra")
+    llm = openai.llm("gpt-5.6-terra")
 
     assistant = llm.bind(system_prompt="Be terse.")
     colors = await assistant.generate_one("Name three primary colors.")

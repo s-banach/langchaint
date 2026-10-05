@@ -1,6 +1,6 @@
 """Verify task_stream.py behavior.
 
-Timed-out calls remain in turn_log, and their runs continue.
+Timed-out inputs remain in turn_log, and their runs continue.
 GuiEmitter routes tool progress to the dispatching run's on_event.
 Sync tests use asyncio.run for async behavior.
 """
@@ -27,9 +27,9 @@ from pydantic import BaseModel
 from task_stream import (
     AgentRun,
     App,
-    LlmFailure,
+    DispatchEntry,
+    GenerationErrorEntry,
     ReActAgent,
-    ToolTurn,
     _check_cost_limit,
     _validate_tool_call_ids,
     build_delegate_tool,
@@ -48,9 +48,9 @@ def _discard(event: Event) -> None:
 
 def _timed_out_count(app: App) -> int:
     return sum(
-        isinstance(record, LlmFailure) and record.error.record.kind == "timed_out_error"
+        isinstance(entry, GenerationErrorEntry) and entry.error.record.kind == "timed_out_error"
         for run in app.runs.values()
-        for record in run.turn_log
+        for entry in run.turn_log
     )
 
 
@@ -65,14 +65,14 @@ def _build_app(
     on_event: Callable[[Event], None] = _discard,
     exporter: InMemorySpanExporter | None = None,
     climate_max_tool_calls: int | None = None,
-    second_calls_started: tuple[asyncio.Event, asyncio.Event] | None = None,
+    second_requests_started: tuple[asyncio.Event, asyncio.Event] | None = None,
 ) -> App:
     """Build an app for one scenario under a local TracerProvider."""
     tracer_provider = TracerProvider()
     if exporter is not None:
         tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     configs = build_configs()
-    if scenario == "call_timeout":
+    if scenario == "input_timeout":
         configs["research_climate"] = replace(
             configs["research_climate"], generate_one_timeout_seconds=0.1
         )
@@ -81,29 +81,29 @@ def _build_app(
             configs["research_climate"], max_tool_calls=climate_max_tool_calls
         )
     scripts = build_scripts(scenario, configs)
-    if second_calls_started is not None:
-        climate_started, energy_started = second_calls_started
+    if second_requests_started is not None:
+        climate_started, energy_started = second_requests_started
         scripts[configs["research_climate"].system_prompt][1].started = climate_started
         scripts[configs["research_energy"].system_prompt][1].started = energy_started
     observer = OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
     return App(llm=build_llm(scripts, observer=observer), configs=configs, on_event=on_event)
 
 
-async def _expire_after_second_calls_start(
-    app: App, second_calls_started: tuple[asyncio.Event, asyncio.Event]
+async def _expire_after_second_requests_start(
+    app: App, second_requests_started: tuple[asyncio.Event, asyncio.Event]
 ) -> None:
-    """Expire an asyncio deadline after both researchers enter their delayed second calls."""
+    """Expire an asyncio deadline after both researchers enter their delayed second requests."""
     deadline = asyncio.timeout(5.0)
     app_task: asyncio.Task[None] | None = None
     try:
         async with deadline, asyncio.TaskGroup() as group:
             app_task = group.create_task(app.run())
-            for started in second_calls_started:
+            for started in second_requests_started:
                 await started.wait()
             deadline.reschedule(asyncio.get_running_loop().time())
     except TimeoutError:
         assert deadline.expired()
-        assert all(started.is_set() for started in second_calls_started)
+        assert all(started.is_set() for started in second_requests_started)
         assert app_task is not None
         assert app_task.cancelled()
         raise
@@ -193,9 +193,9 @@ def test_application_span_groups_generation_and_tool_spans() -> None:
     )
 
 
-def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
-    """A timed-out call is recorded before the next turn."""
-    app = _build_app("call_timeout")
+def test_a_timed_out_input_is_recorded_and_the_run_answers_anyway() -> None:
+    """A timed-out input is recorded before the next turn."""
+    app = _build_app("input_timeout")
     run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
     assert _timed_out_count(app) == 1
@@ -203,15 +203,15 @@ def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -
     assert climate.own_usage.cost_in_usd > 0
 
 
-def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> None:
-    """The app deadline preserves settled turns and excludes in-flight calls."""
-    second_calls_started = (asyncio.Event(), asyncio.Event())
-    app = _build_app("app_timeout", second_calls_started=second_calls_started)
+def test_the_app_deadline_leaves_every_settled_entry_readable_in_the_except() -> None:
+    """The app deadline preserves settled entries and excludes in-flight inputs."""
+    second_requests_started = (asyncio.Event(), asyncio.Event())
+    app = _build_app("app_timeout", second_requests_started=second_requests_started)
     at_except: list[tuple[int, float]] = []
 
     async def drive() -> None:
         try:
-            await _expire_after_second_calls_start(app, second_calls_started)
+            await _expire_after_second_requests_start(app, second_requests_started)
         except TimeoutError:
             at_except.append((_timed_out_count(app), _total_cost(app)))
 
@@ -244,12 +244,12 @@ def test_tool_call_budget_uses_call_positions() -> None:
     run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
     assert isinstance(climate, ReActAgent)
-    first_turn_tools = [
-        record
-        for record in climate.turn_log
-        if isinstance(record, ToolTurn) and record.turn_number == 1
+    first_turn_dispatches = [
+        entry
+        for entry in climate.turn_log
+        if isinstance(entry, DispatchEntry) and entry.turn_number == 1
     ]
-    assert [record.tool_message.is_error for record in first_turn_tools] == [False, True]
+    assert [entry.tool_message.is_error for entry in first_turn_dispatches] == [False, True]
     assert climate.tool_calls_made == 1
     assert climate.bound.binding.tool_choice == "none"
 
@@ -288,7 +288,7 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
-        sub_config=AgentConfig(
+        config=AgentConfig(
             name="specialist",
             system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,
@@ -345,12 +345,14 @@ def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
     def collect(event: Event) -> None:
         events_by_path.setdefault(event.agent_path, []).append(event)
 
-    second_calls_started = (asyncio.Event(), asyncio.Event())
-    app = _build_app("app_timeout", on_event=collect, second_calls_started=second_calls_started)
+    second_requests_started = (asyncio.Event(), asyncio.Event())
+    app = _build_app(
+        "app_timeout", on_event=collect, second_requests_started=second_requests_started
+    )
 
     async def drive() -> None:
         try:
-            await _expire_after_second_calls_start(app, second_calls_started)
+            await _expire_after_second_requests_start(app, second_requests_started)
         except TimeoutError:
             pass
 
@@ -368,13 +370,13 @@ def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
         if isinstance(event, AgentCancelled):
             raise TypeError("AgentCancelled callback failed")
 
-    second_calls_started = (asyncio.Event(), asyncio.Event())
+    second_requests_started = (asyncio.Event(), asyncio.Event())
     app = _build_app(
-        "app_timeout", on_event=raise_on_cancelled, second_calls_started=second_calls_started
+        "app_timeout", on_event=raise_on_cancelled, second_requests_started=second_requests_started
     )
 
     with pytest.raises(TimeoutError):
-        run_with_timeout(_expire_after_second_calls_start(app, second_calls_started))
+        run_with_timeout(_expire_after_second_requests_start(app, second_requests_started))
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
@@ -389,7 +391,7 @@ def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers(
         and isinstance(event, AgentFinished | AgentFailed)
     ]
     assert specialist_terminals == [AgentFailed]
-    # One turn and one search cost $0.012 before the failure.
+    # One generation and one search cost $0.012 before the failure.
     assert app.runs["root/research_climate/specialist#0"].usage.cost_in_usd == pytest.approx(0.012)
     assert "root/research_climate" in app.answers
 
@@ -403,7 +405,7 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
-        sub_config=AgentConfig(
+        config=AgentConfig(
             name="specialist",
             system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,

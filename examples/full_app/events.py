@@ -2,7 +2,7 @@
 
 agent_path identifies the emitting run and includes a spawn index for tool-spawned runs.
 usage_so_far and terminal usage include sub-agent spend.
-LlmResponse.usage covers one generate_one call.
+GenerationReported.usage covers one input.
 """
 
 from collections.abc import Callable
@@ -43,11 +43,11 @@ class TurnStarted:
 
 
 @dataclass(frozen=True)
-class LlmResponse:
-    """Report one generate response and updated usage.
+class GenerationReported:
+    """Report one generation and updated usage.
 
     text is empty for an assistant message without text.
-    usage covers this call, and usage_so_far covers the run.
+    usage covers this input, and usage_so_far covers the run.
     """
 
     agent_path: str
@@ -59,10 +59,10 @@ class LlmResponse:
 
 @dataclass(frozen=True)
 class ToolCalled:
-    """Report a tool request before dispatch.
+    """Report a tool call before dispatch.
 
     args_json preserves the model's unvalidated argument text.
-    tool_call_id links the request to its ToolResponse.
+    tool_call_id links the tool call to its ToolDispatched.
     """
 
     agent_path: str
@@ -74,8 +74,8 @@ class ToolCalled:
 
 
 @dataclass(frozen=True)
-class ToolResponse:
-    """Report one settled tool request.
+class ToolDispatched:
+    """Report one dispatched tool call.
 
     tool_call_id links this event to ToolCalled.
     content is the model-facing result.
@@ -103,8 +103,8 @@ class ToolProgress:
 
 
 @dataclass(frozen=True)
-class LlmCallAbandoned:
-    """Report a call that exceeded config.generate_one_timeout_seconds.
+class LlmInputTimedOut:
+    """Report an input that exceeded config.generate_one_timeout_seconds.
 
     usage_so_far includes billing reported before the timeout.
     The next turn reuses the unchanged messages.
@@ -129,7 +129,7 @@ class AgentFailed:
     """Report a run's failure and settled usage."""
 
     agent_path: str
-    error: str
+    error_text: str
     usage: Usage
 
 
@@ -144,11 +144,11 @@ class AgentCancelled:
 type Event = (
     AgentStarted
     | TurnStarted
-    | LlmResponse
+    | GenerationReported
     | ToolCalled
-    | ToolResponse
+    | ToolDispatched
     | ToolProgress
-    | LlmCallAbandoned
+    | LlmInputTimedOut
     | AgentFinished
     | AgentFailed
     | AgentCancelled

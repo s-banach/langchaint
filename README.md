@@ -1,6 +1,6 @@
 # langchaint
 
-langchaint is an opinionated, provider-neutral Python client for LLM applications.
+langchaint is a provider-neutral Python client for LLM applications.
 It provides fully typed, asynchronous APIs for generation, streaming, embeddings, tools, retries, and billing.
 The application owns the agent loop.
 
@@ -9,7 +9,7 @@ Alpha: the API may change without notice.
 ## Why langchaint
 
 - **Consistent API.** Bind request fields once with `LLM.bind()`, then call `generate_one()`, `generate_many()`, or `stream_one()` on the resulting `BoundLLM`.
-- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `GenerationWithoutToolCalls[Answer]`. Binding `tools` adds `GenerationWithToolCalls` to the return type of any binding.
+- **Useful type annotations.** For example, `llm.bind(response_format=Answer)` types `generation.output` as `Answer`.
 - **Outcome variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
 - **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
 - **Complete billing.** `Generation` and `GenerationError` values retain provider-reported usage from every recorded request, including billed retries.
@@ -57,7 +57,7 @@ class Answer(BaseModel):
 async def main() -> None:
     assistant = (
         OpenAI()
-        .model("gpt-5.6-terra")
+        .llm("gpt-5.6-terra")
         .bind(
             system_prompt="Answer clearly and concisely.",
             response_format=Answer,
@@ -88,8 +88,8 @@ openai = OpenAI(
     shared_backoff=SharedBackoff(max_concurrent_requests=8, max_request_starts_per_second=50.0),
 )
 
-fast_model = openai.model("gpt-5.6-luna")
-strong_model = openai.model("gpt-5.6-sol")
+fast_model = openai.llm("gpt-5.6-luna")
+strong_model = openai.llm("gpt-5.6-sol")
 ```
 
 A rate-limit response pauses request starts across the shared quota.
@@ -98,7 +98,7 @@ After a transient failure local to one request, langchaint waits and retries tha
 ## Stream with an explicit lifetime
 
 ```python
-text_assistant = OpenAI().model("gpt-5.6-terra").bind()
+text_assistant = OpenAI().llm("gpt-5.6-terra").bind()
 
 async with text_assistant.stream_one("Explain photosynthesis.") as stream:
     async for item in stream:

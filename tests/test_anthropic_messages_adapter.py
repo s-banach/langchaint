@@ -51,9 +51,9 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     Binding,
-    ErrorClassification,
     ProviderBilling,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -63,16 +63,16 @@ from langchaint.anthropic import (
     BEDROCK_CROSS_REGION_MULTIPLIER,
     Anthropic,
     AnthropicBedrock,
-    AnthropicBedrockModelName,
+    AnthropicBedrockModelId,
     AnthropicMessagesAdapter,
     AnthropicPricingTable,
     AnthropicRates,
 )
 from langchaint.anthropic.messages_adapter import (
-    _NO_ANTHROPIC_PROVIDER_TOOLS,
-    PARSE_FALLTHROUGH_COUNTS,
+    _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS,
+    REQUEST_FAILURE_FALLTHROUGH_COUNTS,
     CacheTTL,
-    _AnthropicProviderTools,
+    _AnthropicProviderExecutedTools,
     _AnthropicRequestParams,
     _AnthropicStream,
     _assistant_content_blocks,
@@ -81,45 +81,37 @@ from langchaint.anthropic.messages_adapter import (
     _extra_body_with_temperature,
     _wire_messages,
     _wire_tool_choice,
-    parse_anthropic,
+    anthropic_request_failure,
 )
 from langchaint.anthropic.messages_adapter import (
     _billing_from_sdk_usage as _provider_billing_from_sdk_usage,
 )
-from langchaint.common.exceptions import TransientError
-from langchaint.concurrency.shared_backoff import (
-    DoNotRetry,
-    PauseAll,
-    PauseAllDoNotRetry,
-    RetryThisOne,
-    Verdict,
-)
 from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
-from tests.helpers import run_with_timeout
+from tests.helpers import run_with_timeout, terminal, transient
 
 
 def _billing_from_sdk_usage(
     usage: at.Usage,
     pricing: AnthropicPricingTable,
     *,
-    provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
+    provider_executed_tools: _AnthropicProviderExecutedTools = _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS,
     billing_complete: bool = True,
 ) -> Billing:
     return _provider_billing_from_sdk_usage(
         usage,
         pricing,
-        provider_tools=provider_tools,
+        provider_executed_tools=provider_executed_tools,
         billing_complete=billing_complete,
     ).billing
 
 
 _STANDARD_RATES = AnthropicRates(
-    input_cache_none_usd_per_million_tokens=3.0,
-    output_usd_per_million_tokens=15.0,
-    cache_read_usd_per_million_tokens=0.3,
-    cache_write_5m_usd_per_million_tokens=3.75,
-    cache_write_1h_usd_per_million_tokens=6.0,
+    input_tokens_cache_none=3.0,
+    output_tokens=15.0,
+    input_tokens_cache_read=0.3,
+    input_tokens_cache_write_5m=3.75,
+    input_tokens_cache_write_1h=6.0,
 )
 
 _PRICING = AnthropicPricingTable(
@@ -129,19 +121,19 @@ _PRICING = AnthropicPricingTable(
 """The standard tier alone, so a response reporting another tier prices NaN."""
 
 _PRIORITY_RATES = AnthropicRates(
-    input_cache_none_usd_per_million_tokens=6.0,
-    output_usd_per_million_tokens=30.0,
-    cache_read_usd_per_million_tokens=0.6,
-    cache_write_5m_usd_per_million_tokens=7.5,
-    cache_write_1h_usd_per_million_tokens=12.0,
+    input_tokens_cache_none=6.0,
+    output_tokens=30.0,
+    input_tokens_cache_read=0.6,
+    input_tokens_cache_write_5m=7.5,
+    input_tokens_cache_write_1h=12.0,
 )
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
 
-_MARK = {"type": "ephemeral"}
-"""The cache_control marker every 5-minute breakpoint writes."""
+_CACHE_CONTROL = {"type": "ephemeral"}
+"""The cache_control value every 5-minute cache breakpoint writes."""
 
-_MARK_1H = {"type": "ephemeral", "ttl": "1h"}
-"""The cache_control marker every 1-hour breakpoint writes."""
+_CACHE_CONTROL_1H = {"type": "ephemeral", "ttl": "1h"}
+"""The cache_control value every 1-hour cache breakpoint writes."""
 
 
 def _content_blocks(message: MessageParam) -> list[ContentBlockParam]:
@@ -160,8 +152,8 @@ def _is_content_block_param(value: object) -> TypeIs[ContentBlockParam]:
     return isinstance(value, dict)
 
 
-def _cache_marks(wire: Sequence[MessageParam]) -> list[list[object]]:
-    """Return each wire block's cache_control marker, None for an unmarked block, grouped by message."""
+def _cache_controls(wire: Sequence[MessageParam]) -> list[list[object]]:
+    """Return each wire block's cache_control, None for a block without one, grouped by message."""
     return [[block.get("cache_control") for block in _content_blocks(message)] for message in wire]
 
 
@@ -260,7 +252,7 @@ _UNSET_BINDING = Binding(
 """A binding that states only `max_completion_tokens`, which Anthropic requires."""
 
 
-def _precomputed_with_provider_tools(*tool_types: str) -> _AnthropicProviderTools:
+def _precomputed_with_provider_executed_tools(*tool_types: str) -> _AnthropicProviderExecutedTools:
     """Validate provider-executed tools of the given types under the default adapter."""
     return (
         _adapter()
@@ -272,7 +264,7 @@ def _precomputed_with_provider_tools(*tool_types: str) -> _AnthropicProviderTool
                 automatic_cache_breakpoints=False,
             )
         )
-        .provider_tools
+        .provider_executed_tools
     )
 
 
@@ -283,10 +275,10 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
     usage = billing.usage
     assert _provider_billing_from_sdk_usage(usage_raw, _PRICING).usage_raw is usage_raw
     assert billing.service_tier == "standard"
-    assert billing.input_cache_none_usd_per_million_tokens == 3.0
-    assert billing.cache_read_usd_per_million_tokens == 0.3
-    assert billing.cache_write_usd_per_million_tokens == pytest.approx(5.25)
-    assert billing.output_usd_per_million_tokens == 15.0
+    assert billing.usd_per_million_tokens.input_tokens_cache_none == 3.0
+    assert billing.usd_per_million_tokens.input_tokens_cache_read == 0.3
+    assert billing.usd_per_million_tokens.input_tokens_cache_write == pytest.approx(5.25)
+    assert billing.usd_per_million_tokens.output_tokens == 15.0
     assert usage.input_tokens_cache_read == 200
     assert usage.input_tokens_cache_write == 30
     assert usage.input_tokens_cache_none == 100
@@ -374,7 +366,9 @@ def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
     usage = _billing_from_sdk_usage(
         usage_raw,
         _PRICING,
-        provider_tools=_precomputed_with_provider_tools(*case.provider_executed_tool_types),
+        provider_executed_tools=_precomputed_with_provider_executed_tools(
+            *case.provider_executed_tool_types
+        ),
         billing_complete=case.billing_complete,
     ).usage
     assert usage.provider_executed_tool_cost_in_usd == pytest.approx(
@@ -430,7 +424,7 @@ def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> N
     """With nothing written there is nothing to blend, so the write price is the default TTL's rate."""
     billing = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
     assert billing.usage.input_tokens_cache_write == 0
-    assert billing.cache_write_usd_per_million_tokens == 3.75
+    assert billing.usd_per_million_tokens.input_tokens_cache_write == 3.75
 
 
 def test_the_reported_tier_selects_the_table() -> None:
@@ -450,13 +444,11 @@ def test_the_reported_tier_selects_the_table() -> None:
     assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
 
 
-def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
-    """Check the system cache marker built through each model factory."""
+def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
+    """Check the system cache breakpoint built through each backend factory."""
     for llm in (
-        Anthropic(client=AsyncAnthropic(api_key="test")).model("claude-sonnet-5", cache_ttl="1h"),
-        AnthropicBedrock(aws_region="us-east-1").model(
-            "anthropic.claude-sonnet-5", cache_ttl="1h"
-        ),
+        Anthropic(client=AsyncAnthropic(api_key="test")).llm("claude-sonnet-5", cache_ttl="1h"),
+        AnthropicBedrock(aws_region="us-east-1").llm("anthropic.claude-sonnet-5", cache_ttl="1h"),
     ):
         bound = llm.adapter.bind_text(
             _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
@@ -464,13 +456,16 @@ def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
         request = bound.build_request_params([UserMessage(content="q")])
         assert isinstance(request, _AnthropicRequestParams)
         assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == (
-            _MARK_1H
+            _CACHE_CONTROL_1H
         )
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
+        ("end_turn", "stop"),
+        ("max_tokens", "max_completion_tokens"),
+        ("refusal", "refusal"),
         ("model_context_window_exceeded", "context_window_exceeded"),
         ("pause_turn", "other"),
         (None, "other"),
@@ -490,7 +485,7 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
 
 
 def test_text_output_concatenates_the_text_blocks() -> None:
-    """The text binding's output joins every text block, and tool_use passes as the stop reason."""
+    """The text binding's output joins every text block, and a tool_use stop maps to the tool_call stop reason."""
     message = _message_with_content([
         at.TextBlock(type="text", text="hello "),
         at.TextBlock(type="text", text="world"),
@@ -502,7 +497,7 @@ def test_text_output_concatenates_the_text_blocks() -> None:
     )
     assert outcome.kind == "usable_response"
     assert outcome.output == "hello world"
-    assert outcome.stop_reason == "tool_use"
+    assert outcome.stop_reason == "tool_call"
 
 
 def _message_with_content(
@@ -622,7 +617,10 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         AssistantMessage(parts=(TextPart(text="done"),)),
     ]
     wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
+        messages,
+        automatic_cache_breakpoints=False,
+        cache_ttl="5m",
+        message_cache_breakpoint_budget=4,
     )
     assert [
         (
@@ -641,17 +639,17 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
     ]
 
 
-class _MarkCase(NamedTuple):
-    """One message sequence, the caching parameters it converts under, and the markers each block gets."""
+class _CacheBreakpointCase(NamedTuple):
+    """One message sequence, the caching parameters it converts under, and each block's cache_control."""
 
     messages: tuple[Message, ...]
-    message_mark_budget: int
-    expected_marks: list[list[object]]
+    message_cache_breakpoint_budget: int
+    expected_cache_controls: list[list[object]]
     automatic_cache_breakpoints: bool = False
     cache_ttl: CacheTTL = "5m"
 
 
-def _marked_texts(count: int) -> tuple[TextPart, ...]:
+def _cache_breakpoint_texts(count: int) -> tuple[TextPart, ...]:
     """Return text parts that each set cache_breakpoint."""
     return tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(count))
 
@@ -660,19 +658,19 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
     "case",
     [
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     ToolMessage(tool_call_id="tu_1", content="r1"),
                     ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
                 ),
                 2,
-                [[None, _MARK]],
+                [[None, _CACHE_CONTROL]],
                 automatic_cache_breakpoints=True,
             ),
-            id="automatic_marker_on_the_last_block_only",
+            id="automatic_cache_breakpoint_on_the_last_block_only",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     AssistantMessage(
                         parts=(
@@ -687,18 +685,18 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
                 [[None, None]],
                 automatic_cache_breakpoints=True,
             ),
-            id="no_automatic_marker_on_a_thinking_last_block",
+            id="no_automatic_cache_breakpoint_on_a_thinking_last_block",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (UserMessage(content="hi"), ToolMessage(tool_call_id="tu_1", content="r1")),
                 4,
                 [[None], [None]],
             ),
-            id="no_automatic_marker_when_disabled",
+            id="no_automatic_cache_breakpoint_when_disabled",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     UserMessage(
                         content=(
@@ -708,12 +706,12 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
                     ),
                 ),
                 4,
-                [[_MARK, None]],
+                [[_CACHE_CONTROL, None]],
             ),
-            id="marked_user_text_part",
+            id="user_text_part_cache_breakpoint",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     UserMessage(
                         content=(
@@ -722,12 +720,12 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
                     ),
                 ),
                 4,
-                [[_MARK]],
+                [[_CACHE_CONTROL]],
             ),
-            id="marked_user_image_part",
+            id="user_image_part_cache_breakpoint",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     ToolMessage(
                         tool_call_id="tu_1",
@@ -735,27 +733,29 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
                     ),
                 ),
                 4,
-                [[_MARK]],
+                [[_CACHE_CONTROL]],
             ),
-            id="marked_last_tool_part_marks_its_tool_result",
+            id="last_tool_part_cache_breakpoint_goes_on_its_tool_result",
         ),
         pytest.param(
-            _MarkCase(
-                (UserMessage(content=_marked_texts(5)),), 4, [[None, _MARK, _MARK, _MARK, _MARK]]
+            _CacheBreakpointCase(
+                (UserMessage(content=_cache_breakpoint_texts(5)),),
+                4,
+                [[None, _CACHE_CONTROL, _CACHE_CONTROL, _CACHE_CONTROL, _CACHE_CONTROL]],
             ),
-            id="budget_keeps_the_latest_marks",
+            id="budget_keeps_the_latest_cache_breakpoints",
         ),
         pytest.param(
-            _MarkCase(
-                (UserMessage(content=_marked_texts(3)), UserMessage(content="question")),
+            _CacheBreakpointCase(
+                (UserMessage(content=_cache_breakpoint_texts(3)), UserMessage(content="question")),
                 2,
-                [[None, _MARK, _MARK], [_MARK]],
+                [[None, _CACHE_CONTROL, _CACHE_CONTROL], [_CACHE_CONTROL]],
                 automatic_cache_breakpoints=True,
             ),
-            id="automatic_marker_beside_the_latest_marks",
+            id="automatic_cache_breakpoint_beside_the_latest_ones",
         ),
         pytest.param(
-            _MarkCase(
+            _CacheBreakpointCase(
                 (
                     UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
                     ToolMessage(
@@ -765,28 +765,28 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
                     UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
                 ),
                 2,
-                [[None], [_MARK], [_MARK]],
+                [[None], [_CACHE_CONTROL], [_CACHE_CONTROL]],
             ),
             id="budget_counts_across_message_kinds",
         ),
         pytest.param(
-            _MarkCase(
-                (UserMessage(content=_marked_texts(1)),),
+            _CacheBreakpointCase(
+                (UserMessage(content=_cache_breakpoint_texts(1)),),
                 2,
-                [[_MARK]],
+                [[_CACHE_CONTROL]],
                 automatic_cache_breakpoints=True,
             ),
-            id="explicit_and_automatic_marks_coincide",
+            id="explicit_and_automatic_cache_breakpoints_coincide",
         ),
         pytest.param(
-            _MarkCase((UserMessage(content=_marked_texts(1)),), 0, [[None]]),
-            id="zero_budget_writes_no_marks",
+            _CacheBreakpointCase((UserMessage(content=_cache_breakpoint_texts(1)),), 0, [[None]]),
+            id="zero_budget_writes_no_cache_control",
         ),
         pytest.param(
-            _MarkCase(
-                (UserMessage(content=_marked_texts(1)), UserMessage(content="question")),
+            _CacheBreakpointCase(
+                (UserMessage(content=_cache_breakpoint_texts(1)), UserMessage(content="question")),
                 2,
-                [[_MARK_1H], [_MARK_1H]],
+                [[_CACHE_CONTROL_1H], [_CACHE_CONTROL_1H]],
                 automatic_cache_breakpoints=True,
                 cache_ttl="1h",
             ),
@@ -794,19 +794,19 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
         ),
     ],
 )
-def test_wire_messages_places_cache_markers(case: _MarkCase) -> None:
-    """The latest explicit marks within message_mark_budget and the automatic marker carry cache_control.
+def test_wire_messages_places_cache_breakpoints(case: _CacheBreakpointCase) -> None:
+    """The automatic and latest explicit cache breakpoints within message_cache_breakpoint_budget carry cache_control.
 
-    A user part marks its own block, and a ToolMessage's marked last part marks its tool_result block.
-    The automatic marker goes on the last block unless that block is thinking, which carries no cache_control.
+    A user part's cache breakpoint goes on its own block, and a ToolMessage last part's on its tool_result block.
+    The automatic cache breakpoint goes on the last block unless that block is thinking, which carries no cache_control.
     """
     wire = _wire_messages(
         case.messages,
         automatic_cache_breakpoints=case.automatic_cache_breakpoints,
         cache_ttl=case.cache_ttl,
-        message_mark_budget=case.message_mark_budget,
+        message_cache_breakpoint_budget=case.message_cache_breakpoint_budget,
     )
-    assert _cache_marks(wire) == case.expected_marks
+    assert _cache_controls(wire) == case.expected_cache_controls
 
 
 def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> None:
@@ -821,7 +821,10 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
         )
     ]
     wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
+        messages,
+        automatic_cache_breakpoints=False,
+        cache_ttl="5m",
+        message_cache_breakpoint_budget=4,
     )
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["type"] == "tool_result"
@@ -852,17 +855,19 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         ],
         automatic_cache_breakpoints=False,
         cache_ttl="5m",
-        message_mark_budget=4,
+        message_cache_breakpoint_budget=4,
     )
-    expected_unmarked_block = {
+    expected_block_without_cache_control = {
         "type": "image",
         "source": {"type": "url", "url": "https://example.com/image.png"},
     }
-    assert _content_blocks(wire[0]) == [{**expected_unmarked_block, "cache_control": _MARK}]
+    assert _content_blocks(wire[0]) == [
+        {**expected_block_without_cache_control, "cache_control": _CACHE_CONTROL}
+    ]
     tool_result = _content_blocks(wire[1])[0]
     assert tool_result["type"] == "tool_result"
-    assert tool_result.get("content") == [expected_unmarked_block]
-    assert tool_result.get("cache_control") == _MARK
+    assert tool_result.get("content") == [expected_block_without_cache_control]
+    assert tool_result.get("cache_control") == _CACHE_CONTROL
 
 
 @pytest.mark.parametrize(
@@ -906,7 +911,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
                 ),
             ),
             "last part",
-            id="marked_non_last_tool_part",
+            id="non_last_tool_part_cache_breakpoint",
         ),
         pytest.param(
             (
@@ -926,17 +931,17 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         ),
     ],
 )
-def test_build_request_reports_an_unsendable_sequence_as_invalid_request(
+def test_build_request_reports_an_unsendable_sequence_as_rejected_messages(
     messages: tuple[Message, ...], reason_fragment: str
 ) -> None:
-    """An unsendable Sequence[Message] reaches build_request_params's caller as the RefusedMessages variant.
+    """An unsendable Sequence[Message] reaches build_request_params's caller as the RejectedMessages variant.
 
     Nothing is sent: the retry loop takes this answer before its first request.
-    A marked non-last ToolMessage part is rejected instead of silently moving the cache boundary.
+    A non-last ToolMessage part with cache_breakpoint=True is rejected, since sending it would move the cache boundary.
     """
     request = _structured_bound().build_request_params(messages)
-    assert isinstance(request, RefusedMessages)
-    assert reason_fragment in request.reason
+    assert isinstance(request, RejectedMessages)
+    assert reason_fragment in request.error_text
 
 
 @pytest.mark.parametrize("parallel_tool_calls", [True, False])
@@ -1059,20 +1064,20 @@ def test_open_stream_sends_the_built_request() -> None:
         )
     )
     request = bound.build_request_params([UserMessage(content="q")])
-    assert not isinstance(request, RefusedMessages)
+    assert not isinstance(request, RejectedMessages)
     with pytest.raises(anthropic.BadRequestError):
         _ = run_with_timeout(bound.open_stream(request))
     assert sent_bodies == [
         {
             "model": "m",
             "max_tokens": 4096,
-            "system": [{"type": "text", "text": "sys", "cache_control": _MARK_1H}],
+            "system": [{"type": "text", "text": "sys", "cache_control": _CACHE_CONTROL_1H}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
             "output_config": {"effort": "high"},
             "thinking": {"type": "adaptive"},
             "service_tier": "standard_only",
             "inference_geo": "us",
-            "cache_control": _MARK_1H,
+            "cache_control": _CACHE_CONTROL_1H,
             "temperature": 0.2,
             "stream": True,
         }
@@ -1119,8 +1124,8 @@ def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
 
 
 def test_provider_executed_tools_follow_function_tools_and_receive_automatic_caching() -> None:
-    """Provider-executed tools keep order and can carry the automatic cache marker."""
-    provider_tool: dict[str, object] = {
+    """Provider-executed tools keep order and can carry the automatic cache breakpoint."""
+    provider_executed_tool: dict[str, object] = {
         "type": "web_search_20250305",
         "name": "web_search",
         "max_uses": 3,
@@ -1129,15 +1134,15 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
         _binding(
             system_prompt=None,
             tool_schemas=_tool_schemas(),
-            provider_executed_tools=(provider_tool,),
+            provider_executed_tools=(provider_executed_tool,),
             automatic_cache_breakpoints=True,
         )
     )
     tools = _block_list(precomputed.tools)
     assert tools[0].get("name") == "get_weather"
     assert tools[1].get("type") == "web_search_20250305"
-    assert tools[1].get("cache_control") == _MARK
-    assert "cache_control" not in provider_tool
+    assert tools[1].get("cache_control") == _CACHE_CONTROL
+    assert "cache_control" not in provider_executed_tool
 
 
 def test_provider_executed_tool_binds_without_function_tools() -> None:
@@ -1173,16 +1178,16 @@ def test_provider_executed_tool_binds_without_function_tools() -> None:
 )
 def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
     """Each reviewed Anthropic provider-executed `type` reaches Messages unchanged."""
-    provider_tool: dict[str, object] = {"type": tool_type}
+    provider_executed_tool: dict[str, object] = {"type": tool_type}
     precomputed = _adapter()._precompute_fields(
         _binding(
             system_prompt="system",
             tool_schemas=(),
-            provider_executed_tools=(provider_tool,),
+            provider_executed_tools=(provider_executed_tool,),
             automatic_cache_breakpoints=False,
         )
     )
-    assert _block_list(precomputed.tools) == [provider_tool]
+    assert _block_list(precomputed.tools) == [provider_executed_tool]
 
 
 @pytest.mark.parametrize(
@@ -1202,12 +1207,14 @@ def test_supported_code_execution_requires_a_qualifying_web_tool(
     code_execution_type: str, web_tool_type: str
 ) -> None:
     """Every reviewed code-execution type is free beside each qualifying web family."""
-    provider_tools = _precomputed_with_provider_tools(web_tool_type, code_execution_type)
-    assert provider_tools.code_execution_exempt
+    provider_executed_tools = _precomputed_with_provider_executed_tools(
+        web_tool_type, code_execution_type
+    )
+    assert provider_executed_tools.code_execution_exempt
 
 
 @pytest.mark.parametrize(
-    "provider_tool",
+    "provider_executed_tool",
     [
         {"type": tool_type}
         for tool_type in (
@@ -1228,7 +1235,7 @@ def test_supported_code_execution_requires_a_qualifying_web_tool(
     + [{}, {"type": 1}],
 )
 def test_every_unlisted_anthropic_provider_type_is_rejected(
-    provider_tool: Mapping[str, object],
+    provider_executed_tool: Mapping[str, object],
 ) -> None:
     """Messages rejects every reviewed client-executed or unaudited `type`, and a missing or non-string one."""
     with pytest.raises(ValueError, match="supported string type"):
@@ -1236,7 +1243,7 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(
             _binding(
                 system_prompt="system",
                 tool_schemas=(),
-                provider_executed_tools=(provider_tool,),
+                provider_executed_tools=(provider_executed_tool,),
                 automatic_cache_breakpoints=False,
             )
         )
@@ -1248,11 +1255,11 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(
 def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: str) -> None:
     """Standalone code execution lacks exact response billing evidence."""
     with pytest.raises(ValueError, match="qualifying web tool"):
-        _ = _precomputed_with_provider_tools(code_execution_type)
+        _ = _precomputed_with_provider_executed_tools(code_execution_type)
 
 
 def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
-    """Anthropic pricing does not establish Bedrock provider-tool billing."""
+    """Anthropic pricing does not establish Bedrock provider-executed tool billing."""
     adapter = _adapter(
         client=AsyncAnthropicBedrock(aws_region="us-east-1"), provider_name="aws.bedrock"
     )
@@ -1267,13 +1274,13 @@ def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
         )
 
 
-def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
-    """Provider-executed cache markers count toward Anthropic's request limit."""
-    provider_tools = tuple(
+def test_provider_executed_tool_cache_breakpoints_reduce_the_message_budget() -> None:
+    """Provider-executed tool cache breakpoints count toward Anthropic's request limit."""
+    provider_executed_tools = tuple(
         {
             "type": "web_search_20250305",
             "name": f"web_search_{index}",
-            "cache_control": _MARK,
+            "cache_control": _CACHE_CONTROL,
         }
         for index in range(2)
     )
@@ -1281,35 +1288,35 @@ def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
         _binding(
             system_prompt=None,
             tool_schemas=(),
-            provider_executed_tools=provider_tools,
+            provider_executed_tools=provider_executed_tools,
             automatic_cache_breakpoints=False,
         )
     )
-    assert precomputed.message_mark_budget == 2
+    assert precomputed.message_cache_breakpoint_budget == 2
 
 
-def test_the_system_block_marker_follows_automatic_cache_breakpoints() -> None:
-    """The automatic system marker is one of the four request markers, as is the automatic message marker."""
+def test_the_system_block_cache_breakpoint_follows_automatic_cache_breakpoints() -> None:
+    """The automatic system and message cache breakpoints are two of the four per request."""
     cached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    assert _block_list(cached.system)[0].get("cache_control") == _MARK
-    assert cached.message_mark_budget == 2
+    assert _block_list(cached.system)[0].get("cache_control") == _CACHE_CONTROL
+    assert cached.message_cache_breakpoint_budget == 2
     uncached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert "cache_control" not in _block_list(uncached.system)[0]
-    assert uncached.message_mark_budget == 4
+    assert uncached.message_cache_breakpoint_budget == 4
 
 
-def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
+def test_request_places_a_cache_breakpoint_on_the_last_tool_only_without_a_system_prompt() -> None:
     """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
     adapter = _adapter(cache_ttl="1h")
     without_system = adapter._precompute_fields(
         _binding(system_prompt=None, tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
-    assert _block_list(without_system.tools)[-1].get("cache_control") == _MARK_1H
+    assert _block_list(without_system.tools)[-1].get("cache_control") == _CACHE_CONTROL_1H
     with_system = adapter._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
@@ -1631,7 +1638,7 @@ def test_automatic_cache_breakpoints_select_final_caching_by_client(
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
-    """Direct and Mantle clients use top-level caching, while legacy Bedrock marks the final block."""
+    """Direct and Mantle clients use top-level caching. Legacy Bedrock places a cache breakpoint on the final block."""
     adapter = _adapter(
         client=client,
         provider_name=("anthropic" if isinstance(client, AsyncAnthropic) else "aws.bedrock"),
@@ -1648,10 +1655,12 @@ def test_automatic_cache_breakpoints_select_final_caching_by_client(
         )
     ])
     assert isinstance(request, _AnthropicRequestParams)
-    final_block_mark = None if uses_top_level_cache_control else _MARK_1H
-    assert _cache_marks(request.messages) == [[None, None, _MARK_1H, _MARK_1H, final_block_mark]]
+    final_block_cache_control = None if uses_top_level_cache_control else _CACHE_CONTROL_1H
+    assert _cache_controls(request.messages) == [
+        [None, None, _CACHE_CONTROL_1H, _CACHE_CONTROL_1H, final_block_cache_control]
+    ]
     if uses_top_level_cache_control:
-        assert request.precomputed.cache_control == _MARK_1H
+        assert request.precomputed.cache_control == _CACHE_CONTROL_1H
     else:
         assert isinstance(request.precomputed.cache_control, anthropic.Omit)
 
@@ -1786,18 +1795,18 @@ def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> N
     """The reason quotes anthropic's own stop reason."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
     assert outcome.kind == "unfinished_assistant_message"
-    assert "pause_turn" in outcome.reason
+    assert "pause_turn" in outcome.error_text
 
 
-def test_parse_anthropic_counts_each_fallthrough_and_no_listed_row() -> None:
-    """An unlisted status lands one tagged count, even when its error type picks the verdict.
+def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -> None:
+    """An unlisted status lands one tagged count, even when its error type picks the `RequestFailure`.
 
     A listed status leaves the counter alone.
     """
-    before = dict(PARSE_FALLTHROUGH_COUNTS)
-    _ = parse_anthropic(_status_error(anthropic.RateLimitError, 429))
-    _ = parse_anthropic(_status_error(anthropic.APIStatusError, 408))
-    assert dict(PARSE_FALLTHROUGH_COUNTS) == before
+    before = dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS)
+    _ = anthropic_request_failure(_status_error(anthropic.RateLimitError, 429))
+    _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 408))
+    assert dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS) == before
     for failure, tag in (
         (_status_error(anthropic.APIStatusError, 599), "status=599 type=None"),
         (
@@ -1805,8 +1814,8 @@ def test_parse_anthropic_counts_each_fallthrough_and_no_listed_row() -> None:
             "status=200 type=api_error",
         ),
     ):
-        _ = parse_anthropic(failure)
-        assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
+        _ = anthropic_request_failure(failure)
+        assert REQUEST_FAILURE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
@@ -1870,32 +1879,32 @@ def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
     ],
 )
 def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
-    model: AnthropicBedrockModelName,
+    model: AnthropicBedrockModelId,
     expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     """Each Bedrock wire model id reaches its API's client class unchanged, retries pinned off."""
-    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
+    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").llm(model))
     assert adapter.model == model
     assert isinstance(adapter.client, expected_client_class)
     assert adapter.client.max_retries == 0
 
 
 def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> None:
-    """A verbatim catalog entry already states its regional rates, so no premium applies.
+    """A verbatim catalog entry already states its regional rates, so no multiplier applies.
 
     The Bedrock catalog remains independent from direct Anthropic pricing.
     """
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
+        AnthropicBedrock(aws_region="us-east-1").llm("us.anthropic.claude-opus-4-6-v1")
     )
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
 
 
 @pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
-def test_prefixed_bedrock_model_applies_its_premium_by_default(prefix: str) -> None:
+def test_prefixed_bedrock_model_applies_its_multiplier_by_default(prefix: str) -> None:
     """Every cross-region prefix multiplies the unprefixed token rates by its multiplier."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1").model(f"{prefix}.anthropic.claude-sonnet-5")
+        AnthropicBedrock(aws_region="us-east-1").llm(f"{prefix}.anthropic.claude-sonnet-5")
     )
     base = ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
     multiplier = BEDROCK_CROSS_REGION_MULTIPLIER[prefix]
@@ -1906,9 +1915,9 @@ def test_prefixed_bedrock_model_applies_its_premium_by_default(prefix: str) -> N
 def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled(
     prefix: str,
 ) -> None:
-    """`apply_cross_region_premium=False` resolves to the unprefixed catalog table itself."""
+    """`apply_cross_region_multiplier=False` resolves to the unprefixed catalog table itself."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1", apply_cross_region_premium=False).model(
+        AnthropicBedrock(aws_region="us-east-1", apply_cross_region_multiplier=False).llm(
             f"{prefix}.anthropic.claude-sonnet-5"
         )
     )
@@ -1932,7 +1941,7 @@ def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> Non
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     """Use a matching supplied client with SDK retries disabled."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).model(
+        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).llm(
             "anthropic.claude-opus-4-8"
         )
     )
@@ -1948,7 +1957,7 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
     """Reject a legacy client for a mantle model."""
     legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
     with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
-        _ = AnthropicBedrock(client=legacy_client).model("anthropic.claude-sonnet-5")
+        _ = AnthropicBedrock(client=legacy_client).llm("anthropic.claude-sonnet-5")
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
 
 
@@ -1956,7 +1965,7 @@ def test_bedrock_model_accepts_custom_pricing_and_a_passed_client() -> None:
     """A passed client serves an uncataloged model with stated pricing."""
     model = "us.anthropic.claude-next"
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1")).model(
+        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1")).llm(
             model,
             pricing=_PRICING,
         )
@@ -1968,7 +1977,7 @@ def test_bedrock_model_accepts_custom_pricing_and_a_passed_client() -> None:
 def test_uncataloged_bedrock_model_requires_a_passed_client() -> None:
     """An uncataloged model cannot select `api`."""
     with pytest.raises(ValueError, match="pass client="):
-        _ = AnthropicBedrock(aws_region="us-east-1").model(
+        _ = AnthropicBedrock(aws_region="us-east-1").llm(
             "us.anthropic.claude-next",
             pricing=_PRICING,
         )
@@ -1978,7 +1987,7 @@ def test_uncataloged_bedrock_model_requires_pricing() -> None:
     """An uncataloged model has no default pricing."""
     bedrock = AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"))
     with pytest.raises(ValueError, match="pass pricing="):
-        _ = bedrock.model("us.anthropic.claude-next")
+        _ = bedrock.llm("us.anthropic.claude-next")
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
@@ -1994,8 +2003,8 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
     assert "temperature" not in rendered["precomputed"]
 
 
-def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
-    """A parts system_prompt is one block per part. Marked parts and the automatic last block carry markers."""
+def test_request_renders_system_part_cache_breakpoints_and_the_automatic_last_block_one() -> None:
+    """A parts system_prompt is one block per part. Its cache breakpoints and the automatic one carry cache_control."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -2007,14 +2016,14 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
         )
     )
     assert precomputed_fields.system == [
-        {"type": "text", "text": "stable instructions", "cache_control": _MARK},
-        {"type": "text", "text": "semi-stable context", "cache_control": _MARK},
+        {"type": "text", "text": "stable instructions", "cache_control": _CACHE_CONTROL},
+        {"type": "text", "text": "semi-stable context", "cache_control": _CACHE_CONTROL},
     ]
-    assert precomputed_fields.message_mark_budget == 1
+    assert precomputed_fields.message_cache_breakpoint_budget == 1
 
 
-def test_request_system_parts_without_automatic_cache_breakpoints_mark_only_marked_parts() -> None:
-    """With `automatic_cache_breakpoints=False`, only `cache_breakpoint` writes a marker."""
+def test_request_system_parts_without_automatic_cache_breakpoints_carry_only_their_own() -> None:
+    """With `automatic_cache_breakpoints=False`, only `cache_breakpoint` writes cache_control."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -2026,14 +2035,14 @@ def test_request_system_parts_without_automatic_cache_breakpoints_mark_only_mark
         )
     )
     assert precomputed_fields.system == [
-        {"type": "text", "text": "stable", "cache_control": _MARK},
+        {"type": "text", "text": "stable", "cache_control": _CACHE_CONTROL},
         {"type": "text", "text": "volatile"},
     ]
-    assert precomputed_fields.message_mark_budget == 3
+    assert precomputed_fields.message_cache_breakpoint_budget == 3
 
 
-def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> None:
-    """Four marked system parts plus the automatic markers cannot fit the 4-marker limit."""
+def test_request_rejects_a_binding_whose_cache_breakpoints_exceed_the_request_limit() -> None:
+    """Four system part cache breakpoints plus the automatic ones exceed the limit of four."""
     with pytest.raises(ValueError, match="limit"):
         _ = _adapter()._precompute_fields(
             _binding(
@@ -2078,7 +2087,7 @@ def _assistant_message_content() -> list[at.ContentBlock]:
     """Build reasoning, server-tool-call, and text blocks.
 
     The reasoning block carries an extra raw field.
-    The final text block receives the automatic cache marker.
+    The final text block receives the automatic cache breakpoint.
     """
     return [
         at.ThinkingBlock.model_construct(
@@ -2166,125 +2175,106 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         return _anthropic_stream([_text_delta_event("he", 0)], _message_snapshot(None))
 
     @override
-    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return Anthropic error classification cases."""
-        return {
-            _connection_error(): "transient",
-            anthropic.APITimeoutError(
-                httpx2.Request("POST", "https://api.anthropic.com")
-            ): "transient",
-            anthropic.RetryableError("middleware said retry"): "transient",
-            _status_error(anthropic.RateLimitError, 429): "invalid_request",
-            _status_error(anthropic.ConflictError, 409): "invalid_request",
-            _status_error(anthropic.BadRequestError, 400): "invalid_request",
-            _status_error(anthropic.AuthenticationError, 401): "auth",
-            _status_error(anthropic.PermissionDeniedError, 403): "auth",
-            _status_error(anthropic.AuthenticationError, 401, {"x-should-retry": "false"}): "auth",
-            _status_error(anthropic.NotFoundError, 404): "invalid_request",
-            _status_error(anthropic.RequestTooLargeError, 413): "invalid_request",
-            _status_error(anthropic.UnprocessableEntityError, 422): "invalid_request",
-            _status_error(anthropic.APIStatusError, 402): "invalid_request",
-            _status_error(anthropic.APIStatusError, 408): "invalid_request",
-            _status_error(
-                anthropic.BadRequestError, 400, {"x-should-retry": "false"}
-            ): "invalid_request",
-            _status_error(
-                anthropic.InternalServerError, 500, {"x-should-retry": "false"}
-            ): "declared_final",
-            _status_error(anthropic.OverloadedError, 529): "unknown_exception",
-            _status_error(anthropic.InternalServerError, 500): "unknown_exception",
-            _status_error(anthropic.InternalServerError, 503): "unknown_exception",
-            _status_error(anthropic.APIStatusError, 302): "unknown_exception",
-            _status_error(
-                anthropic.APIStatusError, 200, error_type="invalid_request_error"
-            ): "declared_final",
-            ValueError("boom"): "unknown_exception",
-        }
+    def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
+        """Return Anthropic `RequestFailure` cases.
 
-    @override
-    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return Anthropic error verdict cases.
-
-        A retry-after header fills retry_after without choosing the verdict.
+        A retry-after header fills `retry_after_seconds` without choosing the kind.
         A rate-limit or overload error type pauses the rate-limit quota at any status.
-        x-should-retry overrides the status tables, but x-should-retry=false keeps a required pause.
+        x-should-retry overrides whether the status tables retry, and x-should-retry=false keeps a required pause.
         A mid-stream error carries status 200, whose retry headers do not apply.
         """
         return {
+            _connection_error(): transient(pauses_quota=False),
+            anthropic.APITimeoutError(
+                httpx2.Request("POST", "https://api.anthropic.com")
+            ): transient(pauses_quota=False),
+            anthropic.RetryableError("middleware said retry"): transient(pauses_quota=False),
             _status_error(
                 anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
-            ): PauseAll(retry_after=7.0),
-            _status_error(anthropic.RateLimitError, 429, {"retry-after-ms": "1500"}): PauseAll(
-                retry_after=1.5
+            ): transient(pauses_quota=True, retry_after_seconds=7.0),
+            _status_error(anthropic.RateLimitError, 429, {"retry-after-ms": "1500"}): transient(
+                pauses_quota=True, retry_after_seconds=1.5
             ),
-            _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"}): DoNotRetry(),
-            _status_error(anthropic.OverloadedError, 529, error_type="overloaded_error"): PauseAll(
-                retry_after=None
-            ),
-            _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error"): PauseAll(
-                retry_after=None
+            _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"}): terminal(
+                "rejected"
             ),
             _status_error(
-                anthropic.InternalServerError, 500, error_type="api_error"
-            ): RetryThisOne(retry_after=None),
+                anthropic.OverloadedError, 529, error_type="overloaded_error"
+            ): transient(pauses_quota=True),
+            _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error"): transient(
+                pauses_quota=True
+            ),
+            _status_error(anthropic.InternalServerError, 500, error_type="api_error"): transient(
+                pauses_quota=False
+            ),
             _status_error(
                 anthropic.InternalServerError, 504, error_type="timeout_error"
-            ): RetryThisOne(retry_after=None),
-            _status_error(anthropic.APIStatusError, 408): RetryThisOne(retry_after=None),
-            _status_error(anthropic.ConflictError, 409): RetryThisOne(retry_after=None),
+            ): transient(pauses_quota=False),
+            _status_error(anthropic.APIStatusError, 408): transient(pauses_quota=False),
+            _status_error(anthropic.ConflictError, 409): transient(pauses_quota=False),
             _status_error(
                 anthropic.BadRequestError, 400, error_type="invalid_request_error"
-            ): DoNotRetry(),
+            ): terminal("rejected"),
             _status_error(
                 anthropic.AuthenticationError, 401, error_type="authentication_error"
-            ): DoNotRetry(),
-            _status_error(anthropic.APIStatusError, 402, error_type="billing_error"): DoNotRetry(),
+            ): terminal("auth"),
+            _status_error(anthropic.APIStatusError, 402, error_type="billing_error"): terminal(
+                "rejected"
+            ),
             _status_error(
                 anthropic.PermissionDeniedError, 403, error_type="permission_error"
-            ): DoNotRetry(),
-            _status_error(
-                anthropic.NotFoundError, 404, error_type="not_found_error"
-            ): DoNotRetry(),
+            ): terminal("auth"),
+            _status_error(anthropic.NotFoundError, 404, error_type="not_found_error"): terminal(
+                "rejected"
+            ),
             _status_error(
                 anthropic.RequestTooLargeError, 413, error_type="request_too_large"
-            ): DoNotRetry(),
-            _status_error(anthropic.UnprocessableEntityError, 422): DoNotRetry(),
-            _status_error(anthropic.InternalServerError, 503): RetryThisOne(retry_after=None),
-            _status_error(anthropic.APIStatusError, 451): DoNotRetry(),
-            _status_error(anthropic.InternalServerError, 502): RetryThisOne(retry_after=None),
-            _status_error(anthropic.APIStatusError, 599): RetryThisOne(retry_after=None),
+            ): terminal("rejected"),
+            _status_error(anthropic.UnprocessableEntityError, 422): terminal("rejected"),
+            _status_error(anthropic.InternalServerError, 503): transient(pauses_quota=False),
+            _status_error(anthropic.APIStatusError, 451): terminal("rejected"),
+            _status_error(anthropic.InternalServerError, 502): transient(pauses_quota=False),
+            _status_error(anthropic.APIStatusError, 599): transient(pauses_quota=False),
+            _status_error(anthropic.APIStatusError, 302): terminal("unknown_exception"),
+            _status_error(
+                anthropic.AuthenticationError, 401, {"x-should-retry": "false"}
+            ): terminal("auth"),
+            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "false"}): terminal(
+                "rejected"
+            ),
             _status_error(
                 anthropic.InternalServerError, 500, {"x-should-retry": "false"}
-            ): DoNotRetry(),
+            ): terminal("provider_failed_terminally"),
             _status_error(
                 anthropic.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
-            ): RetryThisOne(retry_after=3.0),
+            ): transient(pauses_quota=False, retry_after_seconds=3.0),
             _status_error(
                 anthropic.RateLimitError, 429, {"x-should-retry": "true"}, "rate_limit_error"
-            ): PauseAll(retry_after=None),
+            ): transient(pauses_quota=True),
             _status_error(
                 anthropic.RateLimitError,
                 429,
                 {"x-should-retry": "false", "retry-after": "7"},
                 "rate_limit_error",
-            ): PauseAllDoNotRetry(retry_after=7.0),
+            ): RequestFailure(
+                kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
+            ),
             _status_error(
                 anthropic.APIStatusError, 418, {"x-should-retry": "false"}, "overloaded_error"
-            ): PauseAllDoNotRetry(retry_after=None),
+            ): RequestFailure(
+                kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
+            ),
             _status_error(
                 anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
-            ): PauseAll(retry_after=None),
+            ): transient(pauses_quota=True),
             _status_error(
                 anthropic.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_request_error"
-            ): DoNotRetry(),
-            _status_error(anthropic.APIStatusError, 200, error_type="api_error"): RetryThisOne(
-                retry_after=None
+            ): terminal("provider_failed_terminally"),
+            _status_error(anthropic.APIStatusError, 200, error_type="api_error"): transient(
+                pauses_quota=False
             ),
-            _status_error(anthropic.APIStatusError, 200, error_type="timeout_error"): RetryThisOne(
-                retry_after=None
+            _status_error(anthropic.APIStatusError, 200, error_type="timeout_error"): transient(
+                pauses_quota=False
             ),
-            TransientError(
-                "throttled body", retry_after_seconds=3.0, is_rate_limit=True
-            ): PauseAll(retry_after=3.0),
-            TransientError("failed body"): RetryThisOne(retry_after=None),
+            ValueError("boom"): terminal("unknown_exception"),
         }

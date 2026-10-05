@@ -122,28 +122,28 @@ def _decimal(rate: float | None) -> Decimal | None:
 class _AnthropicRateFields(NamedTuple):
     """The five Anthropic token rates of one LiteLLM entry, `None` where the entry lists none."""
 
-    input_cache_none: Decimal | None
-    output: Decimal | None
-    cache_read: Decimal | None
-    cache_write_5m: Decimal | None
-    cache_write_1h: Decimal | None
+    input_tokens_cache_none_usd_per_token: Decimal | None
+    output_tokens_usd_per_token: Decimal | None
+    input_tokens_cache_read_usd_per_token: Decimal | None
+    input_tokens_cache_write_5m_usd_per_token: Decimal | None
+    input_tokens_cache_write_1h_usd_per_token: Decimal | None
 
 
 class _OpenAIRateFields(NamedTuple):
     """The four OpenAI token rates of one service tier, `None` where the entry lists none."""
 
-    input_cache_none: Decimal | None
-    output: Decimal | None
-    cache_read: Decimal | None
-    cache_write: Decimal | None
+    input_tokens_cache_none_usd_per_token: Decimal | None
+    output_tokens_usd_per_token: Decimal | None
+    input_tokens_cache_read_usd_per_token: Decimal | None
+    input_tokens_cache_write_usd_per_token: Decimal | None
 
 
 class _LongContextFields(NamedTuple):
     """The OpenAI long-context threshold and the rates above it."""
 
-    input_tokens_above: int
-    input_cache_none: Decimal
-    output: Decimal
+    input_tokens_total_above: int
+    input_tokens_cache_none_usd_per_token: Decimal
+    output_tokens_usd_per_token: Decimal
 
 
 class _SearchContextCost(BaseModel):
@@ -239,11 +239,15 @@ class _LiteLLMEntry(BaseModel):
     def anthropic_rate_fields(self) -> _AnthropicRateFields:
         """Collect the Anthropic token rates without requiring any of them."""
         return _AnthropicRateFields(
-            input_cache_none=_decimal(self.input_cost_per_token),
-            output=_decimal(self.output_cost_per_token),
-            cache_read=_decimal(self.cache_read_input_token_cost),
-            cache_write_5m=_decimal(self.cache_creation_input_token_cost),
-            cache_write_1h=_decimal(self.cache_creation_input_token_cost_above_1hr),
+            input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token),
+            output_tokens_usd_per_token=_decimal(self.output_cost_per_token),
+            input_tokens_cache_read_usd_per_token=_decimal(self.cache_read_input_token_cost),
+            input_tokens_cache_write_5m_usd_per_token=_decimal(
+                self.cache_creation_input_token_cost
+            ),
+            input_tokens_cache_write_1h_usd_per_token=_decimal(
+                self.cache_creation_input_token_cost_above_1hr
+            ),
         )
 
     def anthropic_batch_rate_fields(self) -> _AnthropicRateFields:
@@ -260,20 +264,25 @@ class _LiteLLMEntry(BaseModel):
                 standard 5-minute cache-write rate is unlisted or zero.
         """
         standard = self.anthropic_rate_fields()
-        batch_cache_write_5m = _decimal(self.cache_creation_input_token_cost_batches)
-        batch_cache_write_1h = (
+        batch_input_tokens_cache_write_5m_usd_per_token = _decimal(
+            self.cache_creation_input_token_cost_batches
+        )
+        batch_input_tokens_cache_write_1h_usd_per_token = (
             None
-            if standard.cache_write_1h is None or batch_cache_write_5m is None
-            else standard.cache_write_1h
-            * batch_cache_write_5m
-            / _positive(standard.cache_write_5m)
+            if standard.input_tokens_cache_write_1h_usd_per_token is None
+            or batch_input_tokens_cache_write_5m_usd_per_token is None
+            else standard.input_tokens_cache_write_1h_usd_per_token
+            * batch_input_tokens_cache_write_5m_usd_per_token
+            / _positive(standard.input_tokens_cache_write_5m_usd_per_token)
         )
         return _AnthropicRateFields(
-            input_cache_none=_decimal(self.input_cost_per_token_batches),
-            output=_decimal(self.output_cost_per_token_batches),
-            cache_read=_decimal(self.cache_read_input_token_cost_batches),
-            cache_write_5m=batch_cache_write_5m,
-            cache_write_1h=batch_cache_write_1h,
+            input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token_batches),
+            output_tokens_usd_per_token=_decimal(self.output_cost_per_token_batches),
+            input_tokens_cache_read_usd_per_token=_decimal(
+                self.cache_read_input_token_cost_batches
+            ),
+            input_tokens_cache_write_5m_usd_per_token=batch_input_tokens_cache_write_5m_usd_per_token,
+            input_tokens_cache_write_1h_usd_per_token=batch_input_tokens_cache_write_1h_usd_per_token,
         )
 
     def regional_processing_multiplier(self) -> float:
@@ -296,31 +305,51 @@ class _LiteLLMEntry(BaseModel):
         match tier:
             case "default":
                 return _OpenAIRateFields(
-                    input_cache_none=_decimal(self.input_cost_per_token),
-                    output=_decimal(self.output_cost_per_token),
-                    cache_read=_decimal(self.cache_read_input_token_cost),
-                    cache_write=_decimal(self.cache_creation_input_token_cost),
+                    input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token),
+                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token),
+                    input_tokens_cache_read_usd_per_token=_decimal(
+                        self.cache_read_input_token_cost
+                    ),
+                    input_tokens_cache_write_usd_per_token=_decimal(
+                        self.cache_creation_input_token_cost
+                    ),
                 )
             case "flex":
                 return _OpenAIRateFields(
-                    input_cache_none=_decimal(self.input_cost_per_token_flex),
-                    output=_decimal(self.output_cost_per_token_flex),
-                    cache_read=_decimal(self.cache_read_input_token_cost_flex),
-                    cache_write=_decimal(self.cache_creation_input_token_cost_flex),
+                    input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token_flex),
+                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_flex),
+                    input_tokens_cache_read_usd_per_token=_decimal(
+                        self.cache_read_input_token_cost_flex
+                    ),
+                    input_tokens_cache_write_usd_per_token=_decimal(
+                        self.cache_creation_input_token_cost_flex
+                    ),
                 )
             case "priority":
                 return _OpenAIRateFields(
-                    input_cache_none=_decimal(self.input_cost_per_token_priority),
-                    output=_decimal(self.output_cost_per_token_priority),
-                    cache_read=_decimal(self.cache_read_input_token_cost_priority),
-                    cache_write=_decimal(self.cache_creation_input_token_cost_priority),
+                    input_tokens_cache_none_usd_per_token=_decimal(
+                        self.input_cost_per_token_priority
+                    ),
+                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_priority),
+                    input_tokens_cache_read_usd_per_token=_decimal(
+                        self.cache_read_input_token_cost_priority
+                    ),
+                    input_tokens_cache_write_usd_per_token=_decimal(
+                        self.cache_creation_input_token_cost_priority
+                    ),
                 )
             case "ultrafast":
                 return _OpenAIRateFields(
-                    input_cache_none=_decimal(self.input_cost_per_token_ultrafast),
-                    output=_decimal(self.output_cost_per_token_ultrafast),
-                    cache_read=_decimal(self.cache_read_input_token_cost_ultrafast),
-                    cache_write=_decimal(self.cache_creation_input_token_cost_ultrafast),
+                    input_tokens_cache_none_usd_per_token=_decimal(
+                        self.input_cost_per_token_ultrafast
+                    ),
+                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_ultrafast),
+                    input_tokens_cache_read_usd_per_token=_decimal(
+                        self.cache_read_input_token_cost_ultrafast
+                    ),
+                    input_tokens_cache_write_usd_per_token=_decimal(
+                        self.cache_creation_input_token_cost_ultrafast
+                    ),
                 )
 
     def long_context_fields(self) -> _LongContextFields:
@@ -341,9 +370,11 @@ class _LiteLLMEntry(BaseModel):
         (match,) = matches
         thousands = match.group(1)
         return _LongContextFields(
-            input_tokens_above=int(thousands) * 1_000,
-            input_cache_none=_decimal(_RATE_ADAPTER.validate_python(extra_fields[match.group(0)])),
-            output=_decimal(
+            input_tokens_total_above=int(thousands) * 1_000,
+            input_tokens_cache_none_usd_per_token=_decimal(
+                _RATE_ADAPTER.validate_python(extra_fields[match.group(0)])
+            ),
+            output_tokens_usd_per_token=_decimal(
                 _RATE_ADAPTER.validate_python(
                     extra_fields.get(f"output_cost_per_token_above_{thousands}k_tokens")
                 )
@@ -377,12 +408,18 @@ class _LiteLLMEntry(BaseModel):
             base = _decimal(_RATE_ADAPTER.validate_python(base_value))
             above = _decimal(_RATE_ADAPTER.validate_python(value))
             default_base, default_above = (
-                (_positive(default.output), long_context.output)
+                (
+                    _positive(default.output_tokens_usd_per_token),
+                    long_context.output_tokens_usd_per_token,
+                )
                 if rate == "output_cost_per_token"
-                else (_positive(default.input_cache_none), long_context.input_cache_none)
+                else (
+                    _positive(default.input_tokens_cache_none_usd_per_token),
+                    long_context.input_tokens_cache_none_usd_per_token,
+                )
             )
             threshold = int(match.group("thousands")) * 1_000
-            if threshold != long_context.input_tokens_above or (
+            if threshold != long_context.input_tokens_total_above or (
                 above * default_base != base * default_above
             ):
                 raise ValueError(
@@ -538,10 +575,10 @@ def _openai_rates(
         return []
     return [
         f"{indent}{field_name}=OpenAIRates(",
-        f"{indent}    input_cache_none_usd_per_million_tokens={_million_rate(fields.input_cache_none)},",
-        f"{indent}    output_usd_per_million_tokens={_million_rate(fields.output)},",
-        f"{indent}    cache_read_usd_per_million_tokens={_million_rate(fields.cache_read)},",
-        f"{indent}    cache_write_usd_per_million_tokens={_million_rate(fields.cache_write)},",
+        f"{indent}    input_tokens_cache_none={_million_rate(fields.input_tokens_cache_none_usd_per_token)},",
+        f"{indent}    output_tokens={_million_rate(fields.output_tokens_usd_per_token)},",
+        f"{indent}    input_tokens_cache_read={_million_rate(fields.input_tokens_cache_read_usd_per_token)},",
+        f"{indent}    input_tokens_cache_write={_million_rate(fields.input_tokens_cache_write_usd_per_token)},",
         f"{indent}),",
     ]
 
@@ -556,11 +593,16 @@ def _long_context(entry: _LiteLLMEntry, *, indent: str) -> list[str]:
     entry.require_shared_long_context()
     fields = entry.long_context_fields()
     default_fields = entry.openai_rate_fields("default")
-    input_multiplier = _decimal_ratio(fields.input_cache_none, default_fields.input_cache_none)
-    output_multiplier = _decimal_ratio(fields.output, default_fields.output)
+    input_multiplier = _decimal_ratio(
+        fields.input_tokens_cache_none_usd_per_token,
+        default_fields.input_tokens_cache_none_usd_per_token,
+    )
+    output_multiplier = _decimal_ratio(
+        fields.output_tokens_usd_per_token, default_fields.output_tokens_usd_per_token
+    )
     return [
         f"{indent}long_context=OpenAILongContextPricing(",
-        f"{indent}    input_tokens_above={fields.input_tokens_above},",
+        f"{indent}    input_tokens_total_above={fields.input_tokens_total_above},",
         f"{indent}    input_multiplier={input_multiplier!r},",
         f"{indent}    output_multiplier={output_multiplier!r},",
         f"{indent}),",
@@ -615,11 +657,11 @@ def _anthropic_rates(
     """
     return [
         f"{indent}{field_name}=AnthropicRates(",
-        f"{indent}    input_cache_none_usd_per_million_tokens={_million_rate(fields.input_cache_none)},",
-        f"{indent}    output_usd_per_million_tokens={_million_rate(fields.output)},",
-        f"{indent}    cache_read_usd_per_million_tokens={_million_rate(fields.cache_read)},",
-        f"{indent}    cache_write_5m_usd_per_million_tokens={_million_rate(fields.cache_write_5m)},",
-        f"{indent}    cache_write_1h_usd_per_million_tokens={_million_rate(fields.cache_write_1h)},",
+        f"{indent}    input_tokens_cache_none={_million_rate(fields.input_tokens_cache_none_usd_per_token)},",
+        f"{indent}    output_tokens={_million_rate(fields.output_tokens_usd_per_token)},",
+        f"{indent}    input_tokens_cache_read={_million_rate(fields.input_tokens_cache_read_usd_per_token)},",
+        f"{indent}    input_tokens_cache_write_5m={_million_rate(fields.input_tokens_cache_write_5m_usd_per_token)},",
+        f"{indent}    input_tokens_cache_write_1h={_million_rate(fields.input_tokens_cache_write_1h_usd_per_token)},",
         f"{indent}),",
     ]
 
@@ -672,7 +714,7 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         KeyError: A required model entry is missing.
         ValueError: Pricing data or provider metadata is invalid.
     """
-    model_names = [*OPENAI_ALIASES, *OPENAI_LITELLM_KEYS]
+    model_ids = [*OPENAI_ALIASES, *OPENAI_LITELLM_KEYS]
     tables = chain.from_iterable(
         [
             *_openai_table(
@@ -697,12 +739,12 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         "    OpenAIRates,",
         ")",
         "",
-        "type OpenAIModelName = Literal[",
-        *[f'    "{model}",' for model in model_names],
+        "type OpenAIModelId = Literal[",
+        *[f'    "{model}",' for model in model_ids],
         "]",
         "",
         *tables,
-        "OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {",
+        "OPENAI_PRICING: dict[OpenAIModelId, OpenAIPricingTable] = {",
         *[
             f'    "{alias}": {_constant_name(canonical)},'
             for alias, canonical in OPENAI_ALIASES.items()
@@ -721,7 +763,7 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         KeyError: A required model entry is missing.
         ValueError: Pricing data or provider metadata is invalid.
     """
-    model_names = [*ANTHROPIC_LITELLM_KEYS, *ANTHROPIC_ALIASES]
+    model_ids = [*ANTHROPIC_LITELLM_KEYS, *ANTHROPIC_ALIASES]
     direct_tables = chain.from_iterable(
         [
             *_anthropic_table(
@@ -759,12 +801,12 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         "    AnthropicRates,",
         ")",
         "",
-        "type AnthropicModelName = Literal[",
-        *[f'    "{model}",' for model in model_names],
+        "type AnthropicModelId = Literal[",
+        *[f'    "{model}",' for model in model_ids],
         "]",
         "",
         *direct_tables,
-        "ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {",
+        "ANTHROPIC_PRICING: dict[AnthropicModelId, AnthropicPricingTable] = {",
         *[f'    "{model}": {_constant_name(model)},' for model in ANTHROPIC_LITELLM_KEYS],
         *[
             f'    "{alias}": {_constant_name(canonical)},'

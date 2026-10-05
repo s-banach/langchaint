@@ -50,12 +50,12 @@ class _PositionItem[OutputT, WithToolCallsOutputT](CheckedCopyModel):
     outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | None
 
 
-class _SampleIdItem[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+class _InputIdItem[OutputT, WithToolCallsOutputT](CheckedCopyModel):
     """Validation reconstructs one identified outcome record and rejects unknown fields."""
 
     model_config = _RESUME_MODEL_CONFIG
 
-    sample_id: str
+    input_id: str
     input_fingerprint: str
     outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | None
 
@@ -66,32 +66,32 @@ class _PositionDocument[OutputT, WithToolCallsOutputT](CheckedCopyModel):
     model_config = _RESUME_MODEL_CONFIG
 
     format_version: Literal[2] = 2
-    binding_fingerprint: str
+    config_fingerprint: str
     identity_mode: Literal["position"] = "position"
     items: tuple[_PositionItem[OutputT, WithToolCallsOutputT], ...]
 
 
-class _SampleIdDocument[OutputT, WithToolCallsOutputT](CheckedCopyModel):
-    """Validation fixes the `sample_id` resume document shape and rejects duplicates."""
+class _InputIdDocument[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+    """Validation fixes the `input_id` resume document shape and rejects duplicates."""
 
     model_config = _RESUME_MODEL_CONFIG
 
     format_version: Literal[2] = 2
-    binding_fingerprint: str
-    identity_mode: Literal["sample_id"] = "sample_id"
-    items: tuple[_SampleIdItem[OutputT, WithToolCallsOutputT], ...]
+    config_fingerprint: str
+    identity_mode: Literal["input_id"] = "input_id"
+    items: tuple[_InputIdItem[OutputT, WithToolCallsOutputT], ...]
 
     @model_validator(mode="after")
-    def _require_unique_sample_ids(self) -> "_SampleIdDocument[OutputT, WithToolCallsOutputT]":
-        sample_ids = tuple(item.sample_id for item in self.items)
-        if len(set(sample_ids)) != len(sample_ids):
-            raise ValueError("resume file sample_id values must be unique")
+    def _require_unique_input_ids(self) -> "_InputIdDocument[OutputT, WithToolCallsOutputT]":
+        input_ids = tuple(item.input_id for item in self.items)
+        if len(set(input_ids)) != len(input_ids):
+            raise ValueError("resume file input_id values must be unique")
         return self
 
 
 type _ResumeDocument[OutputT, WithToolCallsOutputT] = Annotated[
     _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _SampleIdDocument[OutputT, WithToolCallsOutputT],
+    | _InputIdDocument[OutputT, WithToolCallsOutputT],
     Field(discriminator="identity_mode"),
 ]
 
@@ -104,7 +104,7 @@ _BROAD_DOCUMENT_ADAPTER: TypeAdapter[_ResumeDocument[JsonValue, JsonValue]] = Ty
 @dataclass(frozen=True)
 class _LoadedDocument:
     document_json: bytes
-    document: _PositionDocument[JsonValue, JsonValue] | _SampleIdDocument[JsonValue, JsonValue]
+    document: _PositionDocument[JsonValue, JsonValue] | _InputIdDocument[JsonValue, JsonValue]
 
 
 _CLAIMED_RESUME_PATHS: set[Path] = set()
@@ -156,7 +156,7 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
         *,
         resume_path: Path,
         document: _PositionDocument[OutputT, WithToolCallsOutputT]
-        | _SampleIdDocument[OutputT, WithToolCallsOutputT],
+        | _InputIdDocument[OutputT, WithToolCallsOutputT],
         document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
     ) -> None:
         self._resume_path = resume_path
@@ -178,10 +178,10 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
         """Atomically replace one entry and mark its input handled."""
         if index < 0 or index >= len(self._document.items):
             raise IndexError(f"outcome index {index} is outside the generation input sequence")
-        candidate_document = self._document_with_outcome_record(index, outcome_record)
+        document = self._document_with_outcome_record(index, outcome_record)
         validated_document = _write_document(
             resume_path=self._resume_path,
-            document=candidate_document,
+            document=document,
             document_adapter=self._document_adapter,
         )
         self._document = validated_document
@@ -208,7 +208,7 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
         outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT],
     ) -> (
         _PositionDocument[OutputT, WithToolCallsOutputT]
-        | _SampleIdDocument[OutputT, WithToolCallsOutputT]
+        | _InputIdDocument[OutputT, WithToolCallsOutputT]
     ):
         items = list(self._document.items)
         items[index] = items[index].model_copy(update={"outcome_record": outcome_record})
@@ -220,9 +220,9 @@ def prepare_resume_state(
     *,
     resume_path: Path,
     response_format: None,
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-    sample_ids: tuple[str, ...] | None,
+    input_ids: tuple[str, ...] | None,
 ) -> ResumeState[str, str]: ...
 
 
@@ -231,9 +231,9 @@ def prepare_resume_state[OutputT](
     *,
     resume_path: Path,
     response_format: type[OutputT],
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-    sample_ids: tuple[str, ...] | None,
+    input_ids: tuple[str, ...] | None,
 ) -> ResumeState[OutputT, OutputT | None]: ...
 
 
@@ -241,34 +241,34 @@ def prepare_resume_state[OutputT](
     *,
     resume_path: Path,
     response_format: type[OutputT] | None,
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-    sample_ids: tuple[str, ...] | None,
+    input_ids: tuple[str, ...] | None,
 ) -> ResumeState[OutputT, OutputT | None] | ResumeState[str, str]:
     """Validate or replace one resume document before generation starts.
 
     Raises:
-        ValueError: Caller `sample_ids` or existing resume data are invalid.
+        ValueError: Caller `input_ids` or existing resume data are invalid.
     """
-    if sample_ids is not None:
-        if len(sample_ids) != len(input_fingerprints):
-            raise ValueError("sample_ids must contain one value per generation input")
-        if len(set(sample_ids)) != len(sample_ids):
-            raise ValueError("sample_ids must be unique")
+    if input_ids is not None:
+        if len(input_ids) != len(input_fingerprints):
+            raise ValueError("input_ids must contain one value per generation input")
+        if len(set(input_ids)) != len(input_ids):
+            raise ValueError("input_ids must be unique")
     if response_format is None:
         return _prepare_resume_state(
             resume_path=resume_path,
             document_adapter=TypeAdapter(_ResumeDocument[str, str]),
-            binding_fingerprint=binding_fingerprint,
+            config_fingerprint=config_fingerprint,
             input_fingerprints=input_fingerprints,
-            sample_ids=sample_ids,
+            input_ids=input_ids,
         )
     return _prepare_resume_state(
         resume_path=resume_path,
         document_adapter=TypeAdapter(_ResumeDocument[response_format, response_format | None]),
-        binding_fingerprint=binding_fingerprint,
+        config_fingerprint=config_fingerprint,
         input_fingerprints=input_fingerprints,
-        sample_ids=sample_ids,
+        input_ids=input_ids,
     )
 
 
@@ -276,34 +276,34 @@ def _prepare_resume_state[OutputT, WithToolCallsOutputT](
     *,
     resume_path: Path,
     document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-    sample_ids: tuple[str, ...] | None,
+    input_ids: tuple[str, ...] | None,
 ) -> ResumeState[OutputT, WithToolCallsOutputT]:
     loaded_document = _load_document(resume_path)
-    if sample_ids is None:
+    if input_ids is None:
         document = _prepare_position_document(
             loaded_document=loaded_document,
             document_adapter=document_adapter,
-            binding_fingerprint=binding_fingerprint,
+            config_fingerprint=config_fingerprint,
             input_fingerprints=input_fingerprints,
         )
     else:
-        document = _prepare_sample_id_document(
+        document = _prepare_input_id_document(
             loaded_document=loaded_document,
             document_adapter=document_adapter,
-            binding_fingerprint=binding_fingerprint,
+            config_fingerprint=config_fingerprint,
             input_fingerprints=input_fingerprints,
-            sample_ids=sample_ids,
+            input_ids=input_ids,
         )
-    validated_document = _write_document(
+    document = _write_document(
         resume_path=resume_path,
         document=document,
         document_adapter=document_adapter,
     )
     return ResumeState(
         resume_path=resume_path,
-        document=validated_document,
+        document=document,
         document_adapter=document_adapter,
     )
 
@@ -333,13 +333,13 @@ def _prepare_position_document[OutputT, WithToolCallsOutputT](
     *,
     loaded_document: _LoadedDocument | None,
     document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
 ) -> _PositionDocument[OutputT, WithToolCallsOutputT]:
     if (
         loaded_document is not None
         and isinstance(loaded_document.document, _PositionDocument)
-        and loaded_document.document.binding_fingerprint == binding_fingerprint
+        and loaded_document.document.config_fingerprint == config_fingerprint
         and tuple(item.input_fingerprint for item in loaded_document.document.items)
         == input_fingerprints
     ):
@@ -348,7 +348,7 @@ def _prepare_position_document[OutputT, WithToolCallsOutputT](
             raise TypeError("the position discriminator changed during validation")
         return restored
     return _PositionDocument(
-        binding_fingerprint=binding_fingerprint,
+        config_fingerprint=config_fingerprint,
         items=tuple(
             _PositionItem(input_fingerprint=input_fingerprint, outcome_record=None)
             for input_fingerprint in input_fingerprints
@@ -356,41 +356,41 @@ def _prepare_position_document[OutputT, WithToolCallsOutputT](
     )
 
 
-def _prepare_sample_id_document[OutputT, WithToolCallsOutputT](
+def _prepare_input_id_document[OutputT, WithToolCallsOutputT](
     *,
     loaded_document: _LoadedDocument | None,
     document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
-    binding_fingerprint: str,
+    config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-    sample_ids: tuple[str, ...],
-) -> _SampleIdDocument[OutputT, WithToolCallsOutputT]:
-    stored_items: dict[str, _SampleIdItem[OutputT, WithToolCallsOutputT]] = {}
+    input_ids: tuple[str, ...],
+) -> _InputIdDocument[OutputT, WithToolCallsOutputT]:
+    stored_items: dict[str, _InputIdItem[OutputT, WithToolCallsOutputT]] = {}
     if (
         loaded_document is not None
-        and isinstance(loaded_document.document, _SampleIdDocument)
-        and loaded_document.document.binding_fingerprint == binding_fingerprint
+        and isinstance(loaded_document.document, _InputIdDocument)
+        and loaded_document.document.config_fingerprint == config_fingerprint
     ):
         restored = document_adapter.validate_json(loaded_document.document_json)
-        if not isinstance(restored, _SampleIdDocument):
-            raise TypeError("the sample_id discriminator changed during validation")
-        stored_items = {item.sample_id: item for item in restored.items}
-    reconciled_items: list[_SampleIdItem[OutputT, WithToolCallsOutputT]] = []
-    for sample_id, input_fingerprint in zip(sample_ids, input_fingerprints, strict=True):
-        stored_item = stored_items.get(sample_id)
+        if not isinstance(restored, _InputIdDocument):
+            raise TypeError("the input_id discriminator changed during validation")
+        stored_items = {item.input_id: item for item in restored.items}
+    reconciled_items: list[_InputIdItem[OutputT, WithToolCallsOutputT]] = []
+    for input_id, input_fingerprint in zip(input_ids, input_fingerprints, strict=True):
+        stored_item = stored_items.get(input_id)
         outcome_record = (
             stored_item.outcome_record
             if stored_item is not None and stored_item.input_fingerprint == input_fingerprint
             else None
         )
         reconciled_items.append(
-            _SampleIdItem(
-                sample_id=sample_id,
+            _InputIdItem(
+                input_id=input_id,
                 input_fingerprint=input_fingerprint,
                 outcome_record=outcome_record,
             )
         )
-    return _SampleIdDocument(
-        binding_fingerprint=binding_fingerprint,
+    return _InputIdDocument(
+        config_fingerprint=config_fingerprint,
         items=tuple(reconciled_items),
     )
 
@@ -399,11 +399,11 @@ def _write_document[OutputT, WithToolCallsOutputT](
     *,
     resume_path: Path,
     document: _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _SampleIdDocument[OutputT, WithToolCallsOutputT],
+    | _InputIdDocument[OutputT, WithToolCallsOutputT],
     document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
 ) -> (
     _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _SampleIdDocument[OutputT, WithToolCallsOutputT]
+    | _InputIdDocument[OutputT, WithToolCallsOutputT]
 ):
     validated_document = document_adapter.validate_python(document)
     document_json = document_adapter.dump_json(validated_document, indent=2) + b"\n"

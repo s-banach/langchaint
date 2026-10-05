@@ -44,17 +44,16 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClassification,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ResponseOutcome,
     UsableResponse,
 )
 from langchaint.billing.pricing import Billing, ProviderBilling
 from langchaint.common.exceptions import StreamProtocolError
-from langchaint.concurrency.shared_backoff import RetryThisOne, Verdict
 from langchaint.conformance import AdapterConformance
-from langchaint.deepseek import cache_read_tokens_from_usage_deepseek
+from langchaint.deepseek import input_tokens_cache_read_from_usage_deepseek
 from langchaint.openai import (
     OpenAIChatCompletionsAdapter,
     OpenAIPricingTable,
@@ -65,35 +64,35 @@ from langchaint.openai.chat_completions_adapter import (
     _assistant_message_from,
     _assistant_message_param,
     _billing_from_chat_completion,
-    _ChatCompletionsRequestParams,
-    _ChatCompletionsStream,
+    _OpenAIChatCompletionsRequestParams,
+    _OpenAIChatCompletionsStream,
     _wire_messages,
     _wire_tool_choice,
-    cache_read_tokens_from_usage_openai,
+    input_tokens_cache_read_from_usage_openai,
 )
 from langchaint.tools import ToolSchema
 from tests.helpers import (
     connection_error,
-    openai_sdk_errors_and_classifications,
-    openai_sdk_errors_and_verdicts,
+    openai_sdk_errors_and_request_failures,
     run_with_timeout,
+    transient,
 )
 
 _DEFAULT_RATES = OpenAIRates(
-    input_cache_none_usd_per_million_tokens=2.5,
-    output_usd_per_million_tokens=10.0,
-    cache_read_usd_per_million_tokens=1.25,
-    cache_write_usd_per_million_tokens=3.125,
+    input_tokens_cache_none=2.5,
+    output_tokens=10.0,
+    input_tokens_cache_read=1.25,
+    input_tokens_cache_write=3.125,
 )
 
 _PRICING = OpenAIPricingTable(default=_DEFAULT_RATES)
 """The default tier alone, so a response reporting another tier prices NaN."""
 
 _PRIORITY_RATES = OpenAIRates(
-    input_cache_none_usd_per_million_tokens=5.0,
-    output_usd_per_million_tokens=20.0,
-    cache_read_usd_per_million_tokens=2.5,
-    cache_write_usd_per_million_tokens=6.25,
+    input_tokens_cache_none=5.0,
+    output_tokens=20.0,
+    input_tokens_cache_read=2.5,
+    input_tokens_cache_write=6.25,
 )
 """Twice the default rates, so a tier-selection test reads as a doubling."""
 
@@ -222,13 +221,15 @@ def _lenient_completion(finish_reason: str | None) -> ChatCompletion:
 def _provider_billing(
     completion: ChatCompletion,
     pricing: OpenAIPricingTable = _PRICING,
-    cache_read_tokens_from_usage: Callable[
+    input_tokens_cache_read_from_usage: Callable[
         [CompletionUsage], int
-    ] = cache_read_tokens_from_usage_openai,
+    ] = input_tokens_cache_read_from_usage_openai,
 ) -> ProviderBilling:
     """Price one completion, with the openai cache-read reader unless another is given."""
     return _billing_from_chat_completion(
-        completion, pricing=pricing, cache_read_tokens_from_usage=cache_read_tokens_from_usage
+        completion,
+        pricing=pricing,
+        input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage,
     )
 
 
@@ -238,17 +239,17 @@ def _billing(completion: ChatCompletion, pricing: OpenAIPricingTable = _PRICING)
 
 
 @pytest.mark.parametrize(
-    ("usage_raw", "cache_read_tokens_from_usage", "expected_counters"),
+    ("usage_raw", "input_tokens_cache_read_from_usage", "expected_counters"),
     [
-        (_usage_with_cache(), cache_read_tokens_from_usage_openai, (600, 100, 300, 0)),
+        (_usage_with_cache(), input_tokens_cache_read_from_usage_openai, (600, 100, 300, 0)),
         (
             _usage(completion_tokens_details={"reasoning_tokens": 8}),
-            cache_read_tokens_from_usage_openai,
+            input_tokens_cache_read_from_usage_openai,
             (0, 0, 1000, 8),
         ),
-        (_deepseek_usage(), cache_read_tokens_from_usage_openai, (0, 0, 1000, 0)),
-        (_deepseek_usage(), cache_read_tokens_from_usage_deepseek, (600, 0, 400, 0)),
-        (_usage_with_cache(), cache_read_tokens_from_usage_deepseek, (0, 100, 900, 0)),
+        (_deepseek_usage(), input_tokens_cache_read_from_usage_openai, (0, 0, 1000, 0)),
+        (_deepseek_usage(), input_tokens_cache_read_from_usage_deepseek, (600, 0, 400, 0)),
+        (_usage_with_cache(), input_tokens_cache_read_from_usage_deepseek, (0, 100, 900, 0)),
     ],
     ids=[
         "openai_cache_details",
@@ -260,17 +261,18 @@ def _billing(completion: ChatCompletion, pricing: OpenAIPricingTable = _PRICING)
 )
 def test_billing_partitions_prompt_tokens_by_the_cache_read_reader(
     usage_raw: CompletionUsage,
-    cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
+    input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int],
     expected_counters: tuple[int, int, int, int],
 ) -> None:
     """The uncached counter is prompt_tokens minus the cache-read and cache-write counters.
 
-    cache_read_tokens_from_usage prevents treating DeepSeek's cache hits as uncached tokens.
+    input_tokens_cache_read_from_usage prevents treating DeepSeek's cache hits as uncached tokens.
     An absent details object reads as zero.
     expected_counters lists the cache-read, cache-write, and uncached input counters, then reasoning.
     """
     usage = _provider_billing(
-        _completion(usage=usage_raw), cache_read_tokens_from_usage=cache_read_tokens_from_usage
+        _completion(usage=usage_raw),
+        input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage,
     ).billing.usage
     assert (
         usage.input_tokens_cache_read,
@@ -310,7 +312,7 @@ def test_search_annotations_produce_unknown_provider_executed_tool_cost() -> Non
 def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
     """A completion missing usage still stores the rates the tier that served it would have spent."""
     billing = _billing(_completion(usage=None))
-    assert billing.output_usd_per_million_tokens == 10.0
+    assert billing.usd_per_million_tokens.output_tokens == 10.0
     assert billing.service_tier == "default"
 
 
@@ -333,12 +335,12 @@ def test_the_reported_tier_selects_the_table() -> None:
 @pytest.mark.parametrize(
     ("build_completion", "expected", "expected_output"),
     [
-        (lambda: _completion(usage=None), "end_turn", "hey"),
+        (lambda: _completion(usage=None), "stop", "hey"),
         (
             lambda: _completion(
                 usage=None, message={"content": "on it", "tool_calls": [_TOOL_CALL_WIRE]}
             ),
-            "tool_use",
+            "tool_call",
             "on it",
         ),
         (
@@ -347,10 +349,10 @@ def test_the_reported_tier_selects_the_table() -> None:
                 message={"tool_calls": [_TOOL_CALL_WIRE]},
                 finish_reason="tool_calls",
             ),
-            "tool_use",
+            "tool_call",
             "",
         ),
-        (lambda: _completion(usage=None, finish_reason="length"), "max_tokens", "hey"),
+        (lambda: _completion(usage=None, finish_reason="length"), "max_completion_tokens", "hey"),
         (lambda: _completion(usage=None, finish_reason="content_filter"), "refusal", "hey"),
         (
             lambda: _completion(usage=None, message={"refusal": "I can't help with that"}),
@@ -486,12 +488,12 @@ def test_wire_messages_converts_each_message_kind() -> None:
     ]
 
 
-def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
-    """Each content part maps to its wire part, and a marked part carries prompt_cache_breakpoint.
+def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() -> None:
+    """Each content part maps to its wire part, and a cache breakpoint part carries prompt_cache_breakpoint.
 
     AudioPart.media_type "audio/wav" and "audio/mpeg" map to input_audio.format "wav" and "mp3".
     """
-    marked = {"prompt_cache_breakpoint": {"mode": "explicit"}}
+    breakpoint_field = {"prompt_cache_breakpoint": {"mode": "explicit"}}
     wire = _wire_messages([
         UserMessage(
             content=(
@@ -512,21 +514,21 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "shared context", **marked},
+                {"type": "text", "text": "shared context", **breakpoint_field},
                 {
                     "type": "image_url",
                     "image_url": {"url": "data:image/png;base64,cG5n", "detail": "auto"},
-                    **marked,
+                    **breakpoint_field,
                 },
                 {
                     "type": "image_url",
                     "image_url": {"url": "https://example.com/image.png", "detail": "auto"},
-                    **marked,
+                    **breakpoint_field,
                 },
                 {
                     "type": "input_audio",
                     "input_audio": {"data": "d2F2", "format": "wav"},
-                    **marked,
+                    **breakpoint_field,
                 },
                 {"type": "input_audio", "input_audio": {"data": "bXAz", "format": "mp3"}},
                 {"type": "text", "text": "question"},
@@ -536,7 +538,7 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
             "role": "tool",
             "tool_call_id": "c1",
             "content": [
-                {"type": "text", "text": "saw", **marked},
+                {"type": "text", "text": "saw", **breakpoint_field},
                 {"type": "text", "text": "more"},
             ],
         },
@@ -590,17 +592,17 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
         "audio_part_in_tool_message",
     ],
 )
-def test_build_request_reports_unsendable_messages_as_invalid_request(
+def test_build_request_reports_unsendable_messages_as_rejected_messages(
     messages: list[Message], reason_fragments: tuple[str, ...]
 ) -> None:
-    """A message with no Chat Completions wire form returns RefusedMessages before sending.
+    """A message with no Chat Completions wire form returns RejectedMessages before sending.
 
     One assistant message has one function_call field, and the tool message param's content is text-only.
     """
     request = _adapter().bind_text(_binding()).build_request_params(messages)
-    assert isinstance(request, RefusedMessages)
+    assert isinstance(request, RejectedMessages)
     for reason_fragment in reason_fragments:
-        assert reason_fragment in request.reason
+        assert reason_fragment in request.error_text
 
 
 @pytest.mark.parametrize(
@@ -705,8 +707,8 @@ def test_web_search_options_raise_with_the_responses_interface() -> None:
         _ = _adapter().bind_text(_binding(extra_body={"web_search_options": {}}))
 
 
-def test_request_system_parts_become_one_system_message_of_marked_parts() -> None:
-    """A parts system_prompt travels as one system message whose marked parts carry breakpoints."""
+def test_request_system_parts_become_one_system_message_with_their_cache_breakpoints() -> None:
+    """A parts system_prompt travels as one system message, and its cache breakpoints carry prompt_cache_breakpoint."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -1003,12 +1005,12 @@ class _FakeSDKStream(AsyncStream[ChatCompletionChunk]):
 
 def _stream(
     replay: Sequence[ChatCompletionChunk | Exception], headers: dict[str, str] | None = None
-) -> _ChatCompletionsStream:
+) -> _OpenAIChatCompletionsStream:
     """Build an adapter stream over replayed chunks, reading headers off a constructed response."""
-    return _ChatCompletionsStream(
+    return _OpenAIChatCompletionsStream(
         sdk_stream=_FakeSDKStream(replay, headers),
         pricing=_PRICING,
-        cache_read_tokens_from_usage=cache_read_tokens_from_usage_openai,
+        input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage_openai,
     )
 
 
@@ -1184,7 +1186,7 @@ def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> No
 
 
 def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_response() -> None:
-    """The rewrap carries the 200 status and the error's code, so parse_openai verdicts it.
+    """The rewrap carries the 200 status and the error's code, so `openai_request_failure` places it.
 
     server_error is a transient code, so the mid-stream failure retries rather than failing the item.
     """
@@ -1200,7 +1202,7 @@ def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_respo
     assert raised.value.code == "server_error"
     assert "provider mid-stream error" in raised.value.message
     assert raised.value.__cause__ is bare_api_error
-    assert _adapter().parse(raised.value) == RetryThisOne(retry_after=None)
+    assert _adapter().request_failure(raised.value) == transient(pauses_quota=False)
 
 
 @pytest.mark.parametrize(
@@ -1242,7 +1244,7 @@ def _request_body_sent[OutputT](
     )
     bound = bind(_adapter(client=client))
     request = bound.build_request_params([UserMessage(content="q")])
-    assert not isinstance(request, RefusedMessages)
+    assert not isinstance(request, RejectedMessages)
     _ = run_with_timeout(bound.open_stream(request))
     (body,) = bodies
     decoded_body: object = json.loads(body)
@@ -1300,7 +1302,7 @@ def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_fi
         .bind_text(_binding(system_prompt="sys"))
         .build_request_params([UserMessage(content="hi")])
     )
-    assert isinstance(request, _ChatCompletionsRequestParams)
+    assert isinstance(request, _OpenAIChatCompletionsRequestParams)
     rendered = json.loads(request.as_json())
     assert rendered["messages"] == [
         {"role": "system", "content": "sys"},
@@ -1377,7 +1379,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         This wire stores the assistant message in one message param.
         Split ReasoningPart.raw, content, and ToolCall values in AssistantPart order.
         """
-        assert isinstance(request_params, _ChatCompletionsRequestParams)
+        assert isinstance(request_params, _OpenAIChatCompletionsRequestParams)
         (assistant_param,) = request_params.messages[1:]
         payload = dict(assistant_param)
         parts: list[object] = []
@@ -1415,11 +1417,6 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         return _stream([_chunk(delta={"role": "assistant", "content": "he"})])
 
     @override
-    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the shared OpenAI classification table."""
-        return openai_sdk_errors_and_classifications()
-
-    @override
-    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the shared OpenAI verdict table."""
-        return openai_sdk_errors_and_verdicts()
+    def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
+        """Return the shared OpenAI `RequestFailure` table."""
+        return openai_sdk_errors_and_request_failures()

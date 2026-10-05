@@ -27,12 +27,12 @@ async def run_batch_and_handle_what_failed() -> list[
         shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
     )
     openai = OpenAI()
-    summarizer = anthropic.model("claude-sonnet-5").bind(
+    summarizer = anthropic.llm("claude-sonnet-5").bind(
         system_prompt="Summarize in one sentence.",
         max_completion_tokens=256,
         max_requests=5,
     )
-    fallback = openai.model("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
+    fallback = openai.llm("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
 
     scanned_page: list[Message] = [
         UserMessage(
@@ -48,8 +48,8 @@ async def run_batch_and_handle_what_failed() -> list[
         "The new compiler release cuts build times roughly in half.",
     ]
 
-    # Admission waits pause each item's clock.
-    outcomes = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
+    # Admission waits pause each input's clock.
+    outcomes = await summarizer.generate_many(documents, max_working_seconds_per_input=30)
 
     for index, outcome in enumerate(outcomes):
         if not isinstance(outcome, GenerationError):

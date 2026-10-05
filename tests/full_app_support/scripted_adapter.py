@@ -10,7 +10,7 @@ import itertools
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, override
+from typing import override
 
 from pydantic import BaseModel
 
@@ -22,6 +22,7 @@ from langchaint import (
     SharedBackoff,
     StreamItem,
     TextPart,
+    TokenRates,
     ToolCall,
     Usage,
 )
@@ -30,15 +31,11 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    DoNotRetry,
-    ErrorClassification,
     ProviderBilling,
+    RequestFailure,
     RequestParams,
     ResponseIdentity,
-    TransientError,
     UsableResponse,
-    Verdict,
-    verdict_from_transient_error,
 )
 from langchaint.generation.observer import Observer
 
@@ -78,10 +75,12 @@ _TURN_USAGE = Usage(
 _TURN_BILLING = Billing(
     usage=_TURN_USAGE,
     service_tier="scripted",
-    input_cache_none_usd_per_million_tokens=60.00,
-    cache_read_usd_per_million_tokens=6.00,
-    cache_write_usd_per_million_tokens=75.00,
-    output_usd_per_million_tokens=200.00,
+    usd_per_million_tokens=TokenRates(
+        input_tokens_cache_read=6.00,
+        input_tokens_cache_write=75.00,
+        input_tokens_cache_none=60.00,
+        output_tokens=200.00,
+    ),
 )
 """Price the counters in _TURN_USAGE."""
 
@@ -149,19 +148,12 @@ class ScriptedAdapter(Adapter):
         """Reject structured bindings because tools carry structured output."""
         raise NotImplementedError
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (TransientError,)
-
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Map TransientError with verdict_from_transient_error."""
-        if isinstance(failure, TransientError):
-            return verdict_from_transient_error(failure)
-        return DoNotRetry()
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Classify every error as unknown_exception."""
-        return "unknown_exception"
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Place every error as unknown_exception."""
+        return RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -213,13 +205,13 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
             return UsableResponse(
                 output="",
                 assistant_message=AssistantMessage(parts=turn.tool_calls),
-                stop_reason="tool_use",
+                stop_reason="tool_call",
             )
         assert turn.text is not None
         return UsableResponse(
             output=turn.text,
             assistant_message=AssistantMessage(parts=(TextPart(text=turn.text),)),
-            stop_reason="end_turn",
+            stop_reason="stop",
         )
 
     @override
@@ -299,8 +291,8 @@ def build_llm(scripts: dict[str, list[Turn]], *, observer: Observer | None = Non
         shared_backoff=SharedBackoff(
             max_concurrent_requests=16,
             max_request_starts_per_second=10_000.0,
-            minimum_wait_ceiling_seconds=0.001,
-            longest_wait_seconds=0.01,
+            min_wait_ceiling_seconds=0.001,
+            max_wait_seconds=0.01,
         ),
         observer=observer,
     )

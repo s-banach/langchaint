@@ -18,6 +18,7 @@ from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
 from langchaint import SharedBackoff
+from langchaint.adapter import RequestFailure
 from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
 from langchaint.common.exceptions import EmbeddingOutputError
 from tests.helpers import run_with_timeout
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
-    from langchaint.cohere import CohereEmbedV4Dimension, CohereEmbedV4ModelName
+    from langchaint.cohere import CohereEmbedV4Dimension, CohereEmbedV4ModelId
 
 
 _JSON_CONTENT_TYPE = "application/json"
@@ -92,7 +93,7 @@ def _expected_parameters(body: bytes, model: str) -> dict[str, object]:
 )
 @_run_async_test
 async def test_v4_routes_model_and_dimension_verbatim(
-    model: CohereEmbedV4ModelName,
+    model: CohereEmbedV4ModelId,
     dimension: CohereEmbedV4Dimension,
 ) -> None:
     """Every v4 route sends its model and dimension verbatim."""
@@ -240,15 +241,16 @@ def test_embedding_model_default_dimensions() -> None:
 
 
 @pytest.mark.parametrize(
-    ("error_code", "expected_kind"),
+    ("error_code", "pauses_quota"),
     [
-        ("ThrottlingException", "pause_all"),
-        ("ModelNotReadyException", "retry_this_one"),
+        ("ThrottlingException", True),
+        ("ModelNotReadyException", False),
     ],
 )
-def test_429_classification_uses_the_service_model(
+def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
     error_code: str,
-    expected_kind: str,
+    *,
+    pauses_quota: bool,
 ) -> None:
     """Only the service model's throttling error pauses every request."""
     failure = ClientError(
@@ -264,7 +266,9 @@ def test_429_classification_uses_the_service_model(
         },
         "InvokeModel",
     )
-    assert cohere_backend._parse_cohere_bedrock(failure).kind == expected_kind
+    assert cohere_backend._cohere_bedrock_request_failure(failure) == RequestFailure(
+        kind="transient", pauses_quota=pauses_quota, retry_after_seconds=None
+    )
 
 
 @_run_async_test
@@ -615,8 +619,8 @@ async def test_transient_client_error_retries_only_failed_request(
     cohere_bedrock = CohereBedrock(
         aws_region="us-east-1",
         shared_backoff=SharedBackoff(
-            minimum_wait_ceiling_seconds=0.000_001,
-            longest_wait_seconds=0.000_002,
+            min_wait_ceiling_seconds=0.000_001,
+            max_wait_seconds=0.000_002,
             quiet_seconds_per_decay_step=0.000_001,
         ),
     )

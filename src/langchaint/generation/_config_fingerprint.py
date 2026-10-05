@@ -79,7 +79,7 @@ def bound_llm_config_fingerprint(
     return f"sha256:{digest}"
 
 
-def generation_input_fingerprint(messages: Sequence[Message]) -> str:
+def input_fingerprint(messages: Sequence[Message]) -> str:
     """Hash one normalized message sequence."""
     encoded_messages = _Canonicalizer().value(list(messages), path="messages")
     digest = hashlib.sha256(_canonical_json(encoded_messages).encode()).hexdigest()

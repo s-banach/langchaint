@@ -13,45 +13,46 @@ The API filters earlier thinking blocks.
 The API rejects consecutive thinking blocks outside their original order.
 The adapter replays every `ReasoningPart` in `parts` order.
 
-`automatic_cache_breakpoints=True` marks the frozen prefix.
+`automatic_cache_breakpoints=True` places a cache breakpoint at the end of the frozen prefix.
 For `AsyncAnthropic` and `AsyncAnthropicBedrockMantle`, it also sends top-level `cache_control`.
 Top-level `cache_control` selects the final cacheable block.
-For `AsyncAnthropicBedrock`, it instead marks the last message block.
+For `AsyncAnthropicBedrock`, it instead places a cache breakpoint on the last message block.
 The frozen prefix ends at the system prompt or at the last tool when no system prompt exists.
-`automatic_cache_breakpoints=False` adds no automatic marker.
-A marked user part adds `cache_control` to its text or image block.
-A marked final `ToolMessage` part adds `cache_control` to its enclosing `tool_result` block.
-A marked non-final `ToolMessage` part returns `RefusedMessages` because the boundary would move.
-A parts `system_prompt` produces one system block per part and preserves marked boundaries.
+`automatic_cache_breakpoints=False` places no automatic cache breakpoint.
+A user part with `cache_breakpoint=True` adds `cache_control` to its text or image block.
+A final `ToolMessage` part with `cache_breakpoint=True` adds `cache_control` to its enclosing `tool_result` block.
+A non-final `ToolMessage` part with `cache_breakpoint=True` returns `RejectedMessages` because the boundary would move.
+A parts `system_prompt` produces one system block per part and preserves its cache breakpoints.
 
 The API accepts at most four cache breakpoints per request.
 Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-07-25.
-Top-level `cache_control`, system marks, and automatic marks reduce `message_mark_budget`.
-Binding fails with `ValueError` when its marks exceed the limit.
-The adapter marks only the latest message parts that fit `message_mark_budget`.
-Keeping only the latest marks rarely costs a cache hit, because the latest marked prefix includes the earlier ones.
-An older mark matters only when the latest mark finds nothing in the cache.
+Top-level `cache_control` and the binding's cache breakpoints reduce `message_cache_breakpoint_budget`.
+Binding fails with `ValueError` when its cache breakpoints exceed the limit.
+The adapter sends only the latest message cache breakpoints that fit `message_cache_breakpoint_budget`.
+Keeping only the latest cache breakpoints rarely costs a cache hit, because the latest prefix includes the earlier ones.
+An older cache breakpoint matters only when the latest one finds nothing in the cache.
 That happens when this conversation's entries have expired but a shared prefix is still cached.
 
-To find a cache entry from an earlier request, each mark checks its own block and at most 19 blocks before it.
+To find an earlier request's cache entry, each cache breakpoint checks its own block and at most 19 blocks before it.
 On the Claude API, consecutive `tool_use` blocks count as one block, and so do consecutive `tool_result` blocks.
-A request that adds 20 or more blocks misses the previous request's cache unless one of the first 19 is marked.
+A request adding 20 or more blocks misses the previous request's cache unless a cache breakpoint is in its first 19.
 Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-09-24.
 
-Top-level `cache_control` and each marker use `cache_ttl`.
+Top-level `cache_control` and each cache breakpoint use `cache_ttl`.
 The default `"5m"` omits the API-default `ttl` key.
-`"1h"` sends `ttl="1h"` and uses `cache_write_1h_usd_per_million_tokens`.
+`"1h"` sends `ttl="1h"` and uses the `input_tokens_cache_write_1h` rate.
 
 Content mappings were verified against anthropic 0.121.0.
 - `ImagePart` becomes `Base64ImageSourceParam`.
 - `ImageUrlPart` becomes `URLImageSourceParam`.
-- `AudioPart` returns `RefusedMessages` inside `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `RejectedMessages` inside `UserMessage` and `ToolMessage`.
 - `Usage.server_tool_use` reports web-search invocation counts.
 
 Request and response mappings:
 - `ToolMessage` becomes `tool_result` inside a user message.
 - Consecutive `ToolMessage` values share one user message because the API requires alternating roles.
-- `end_turn`, `tool_use`, `max_tokens`, and `refusal` preserve their `stop_reason` values.
+- `stop_reason` `end_turn`, `tool_use`, and `max_tokens` map to `"stop"`, `"tool_call"`, and `"max_completion_tokens"`.
+- `refusal` maps to `"refusal"`, and `model_context_window_exceeded` maps to `"context_window_exceeded"`.
 - Other `stop_reason` values map to `"other"`.
 - `reasoning_level` sends `output_config.effort` with `thinking={"type": "adaptive"}`.
 - The adapter sends neither field alone because effort applies only to adaptive thinking.
@@ -108,11 +109,11 @@ from langchaint.adapter import (
     BoundAdapter,
     ContextWindowExceeded,
     EmptyAssistantMessage,
-    ErrorClassification,
     MaxCompletionTokensExceeded,
     ReasoningDelta,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -123,26 +124,24 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedAssistantMessage,
     UsableResponse,
-    _NotSendableError,
+    _RejectedMessagesError,
     narrowed_request_params,
-    record_parse_fallthrough,
+    record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
+    request_failure_from_response,
     request_params_json,
-    retry_after_seconds_from_headers,
-    terminal_classification_from_response,
     validated_provider_executed_tool_types,
-    verdict_from_transient_error,
-    verdict_under_retry_directive,
 )
 from langchaint.billing.pricing import (
     Billing,
     ProviderBilling,
-    category_cost,
+    TokenRates,
+    category_cost_in_usd,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
 )
 from langchaint.billing.usage import Usage
-from langchaint.common.exceptions import StreamProtocolError, TransientError
+from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -156,7 +155,6 @@ from langchaint.common.messages import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 
 type _ContentBlockParam = (
@@ -200,11 +198,11 @@ _RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})
 _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
 """The statuses that reject this request. A resend fails again."""
 
-PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_parse_fallthrough` increments this counter for each status-family default."""
+REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
+"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
 
-_CACHE_MARKER_REQUEST_LIMIT = 4
-"""The API allows at most 4 cache_control markers per request, the binding's own included."""
+_MAX_CACHE_BREAKPOINTS_PER_REQUEST = 4
+"""The API allows at most 4 cache breakpoints per request, the binding's own included."""
 
 type CacheTTL = Literal["5m", "1h"]
 """Cache TTLs with write rates of 1.25x ("5m") or 2x ("1h") base input."""
@@ -237,15 +235,17 @@ def client_without_retries[ClientT: AnthropicClient](client: ClientT) -> ClientT
 class AnthropicRates:
     """Anthropic token rates for one service tier.
 
+    Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
+    The `_5m` and `_1h` cache-write rates price the five-minute and one-hour shares of `input_tokens_cache_write`.
     Pass NaN for an unknown rate.
     A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     """
 
-    input_cache_none_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    cache_write_5m_usd_per_million_tokens: float
-    cache_write_1h_usd_per_million_tokens: float
+    input_tokens_cache_none: float
+    output_tokens: float
+    input_tokens_cache_read: float
+    input_tokens_cache_write_5m: float
+    input_tokens_cache_write_1h: float
 
     def price(
         self,
@@ -270,13 +270,13 @@ class AnthropicRates:
         Raises:
             pydantic.ValidationError: a counter is negative.
         """
-        cache_write_5m_cost_in_usd = category_cost(
+        cache_write_5m_cost_in_usd = category_cost_in_usd(
             input_tokens_cache_write_5m,
-            usd_per_million_tokens=self.cache_write_5m_usd_per_million_tokens,
+            usd_per_million_tokens=self.input_tokens_cache_write_5m,
         )
-        cache_write_1h_cost_in_usd = category_cost(
+        cache_write_1h_cost_in_usd = category_cost_in_usd(
             input_tokens_cache_write_1h,
-            usd_per_million_tokens=self.cache_write_1h_usd_per_million_tokens,
+            usd_per_million_tokens=self.input_tokens_cache_write_1h,
         )
         input_tokens_cache_write = input_tokens_cache_write_5m + input_tokens_cache_write_1h
         input_tokens_cache_write_cost_in_usd = (
@@ -290,30 +290,32 @@ class AnthropicRates:
                     input_tokens_cache_none=input_tokens_cache_none,
                     output_tokens=output_tokens,
                     output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost(
+                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_read,
-                        usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                        usd_per_million_tokens=self.input_tokens_cache_read,
                     ),
                     input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
-                    input_tokens_cache_none_cost_in_usd=category_cost(
+                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_none,
-                        usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                        usd_per_million_tokens=self.input_tokens_cache_none,
                     ),
-                    output_tokens_cost_in_usd=category_cost(
+                    output_tokens_cost_in_usd=category_cost_in_usd(
                         output_tokens,
-                        usd_per_million_tokens=self.output_usd_per_million_tokens,
+                        usd_per_million_tokens=self.output_tokens,
                     ),
                     provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
                 service_tier=service_tier,
-                input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-                cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
-                cache_write_usd_per_million_tokens=(
-                    input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
-                    if input_tokens_cache_write
-                    else self.cache_write_5m_usd_per_million_tokens
+                usd_per_million_tokens=TokenRates(
+                    input_tokens_cache_read=self.input_tokens_cache_read,
+                    input_tokens_cache_write=(
+                        input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
+                        if input_tokens_cache_write
+                        else self.input_tokens_cache_write_5m
+                    ),
+                    input_tokens_cache_none=self.input_tokens_cache_none,
+                    output_tokens=self.output_tokens,
                 ),
-                output_usd_per_million_tokens=self.output_usd_per_million_tokens,
             ),
             usage_raw=usage_raw,
         )
@@ -321,28 +323,20 @@ class AnthropicRates:
     def multiplied(self, multiplier: float) -> "AnthropicRates":
         """Return token rates multiplied by one value."""
         return AnthropicRates(
-            input_cache_none_usd_per_million_tokens=(
-                self.input_cache_none_usd_per_million_tokens * multiplier
-            ),
-            output_usd_per_million_tokens=self.output_usd_per_million_tokens * multiplier,
-            cache_read_usd_per_million_tokens=(
-                self.cache_read_usd_per_million_tokens * multiplier
-            ),
-            cache_write_5m_usd_per_million_tokens=(
-                self.cache_write_5m_usd_per_million_tokens * multiplier
-            ),
-            cache_write_1h_usd_per_million_tokens=(
-                self.cache_write_1h_usd_per_million_tokens * multiplier
-            ),
+            input_tokens_cache_none=self.input_tokens_cache_none * multiplier,
+            output_tokens=self.output_tokens * multiplier,
+            input_tokens_cache_read=self.input_tokens_cache_read * multiplier,
+            input_tokens_cache_write_5m=self.input_tokens_cache_write_5m * multiplier,
+            input_tokens_cache_write_1h=self.input_tokens_cache_write_1h * multiplier,
         )
 
 
 _UNPRICED_RATES = AnthropicRates(
-    input_cache_none_usd_per_million_tokens=float("nan"),
-    output_usd_per_million_tokens=float("nan"),
-    cache_read_usd_per_million_tokens=float("nan"),
-    cache_write_5m_usd_per_million_tokens=float("nan"),
-    cache_write_1h_usd_per_million_tokens=float("nan"),
+    input_tokens_cache_none=float("nan"),
+    output_tokens=float("nan"),
+    input_tokens_cache_read=float("nan"),
+    input_tokens_cache_write_5m=float("nan"),
+    input_tokens_cache_write_1h=float("nan"),
 )
 
 
@@ -406,7 +400,7 @@ class AnthropicPricingTable:
 
 
 def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
-    """Build one cache_control marker.
+    """Build one cache_control value.
 
     "5m" omits the ttl key because it is the API default.
 
@@ -455,7 +449,7 @@ _SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES = (
 
 
 @dataclass(frozen=True)
-class _AnthropicProviderTools:
+class _AnthropicProviderExecutedTools:
     """Validated provider-executed tool categories needed for billing."""
 
     web_search: bool = False
@@ -464,12 +458,12 @@ class _AnthropicProviderTools:
     code_execution_exempt: bool = False
 
 
-_NO_ANTHROPIC_PROVIDER_TOOLS = _AnthropicProviderTools()
+_NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS = _AnthropicProviderExecutedTools()
 
 
-def _provider_tools(
+def _provider_executed_tools(
     provider_executed_tools: tuple[Mapping[str, object], ...],
-) -> _AnthropicProviderTools:
+) -> _AnthropicProviderExecutedTools:
     """Validate supported `type` values while preserving each mapping by reference.
 
     Raises:
@@ -485,7 +479,7 @@ def _provider_tools(
     code_execution_exempt = bool(tool_types & _CODE_EXECUTION_EXEMPTING_WEB_TOOL_TYPES)
     if code_execution and not code_execution_exempt:
         raise ValueError("Anthropic code execution requires a qualifying web tool")
-    return _AnthropicProviderTools(
+    return _AnthropicProviderExecutedTools(
         web_search=bool(tool_types & _WEB_SEARCH_TOOL_TYPES),
         web_fetch=bool(tool_types & _WEB_FETCH_TOOL_TYPES),
         tool_search=bool(tool_types & _TOOL_SEARCH_TOOL_TYPES),
@@ -514,14 +508,15 @@ class _AnthropicPrecomputedFields:
     cache_control: CacheControlEphemeralParam | Omit
     automatic_message_cache_breakpoint: bool
     cache_ttl: CacheTTL
-    message_mark_budget: int
-    """The remaining per-request part markers under the API's four-marker request limit.
+    message_cache_breakpoint_budget: int
+    """The cache breakpoints left for message parts under the API's limit of four per request.
 
-    System marks, the frozen-prefix marker, and top-level or last-message automatic caching reduce this value.
+    Cache breakpoints in system blocks and tools reduce this value.
+    So does the automatic message cache breakpoint or top-level `cache_control`.
     """
 
     extra_body: Mapping[str, object] | None
-    provider_tools: _AnthropicProviderTools
+    provider_executed_tools: _AnthropicProviderExecutedTools
 
 
 @dataclass(frozen=True)
@@ -600,14 +595,14 @@ def _part_block(
     """Convert one ContentPart to its wire block.
 
     Raises:
-        _NotSendableError: ContentPart has no wire form for message_class.
+        _RejectedMessagesError: ContentPart has no wire form for message_class.
     """
     match part.kind:
         case "text":
             return {"type": "text", "text": part.text}
         case "image":
             if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
-                raise _NotSendableError(
+                raise _RejectedMessagesError(
                     f"AnthropicMessagesAdapter cannot send ImagePart inside "
                     f"{message_class.__name__}.content: the Anthropic API accepts media types "
                     f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
@@ -627,7 +622,7 @@ def _part_block(
                 if message_class is UserMessage
                 else "ToolResultBlockParam.content has no audio variant"
             )
-            raise _NotSendableError(
+            raise _RejectedMessagesError(
                 f"AnthropicMessagesAdapter cannot send AudioPart inside "
                 f"{message_class.__name__}.content: {missing_audio_type}"
             )
@@ -639,22 +634,22 @@ def _user_content_blocks(
     """Convert one UserMessage.content value to wire blocks.
 
     The second element holds the blocks whose part sets cache_breakpoint in content order.
-    The caller applies the request-wide marker budget, so this function writes no marker.
+    The caller applies `message_cache_breakpoint_budget`, so this function writes no `cache_control`.
 
     Raises:
-        _NotSendableError: _part_block rejects one ContentPart.
+        _RejectedMessagesError: _part_block rejects one ContentPart.
     """
     blocks: list[_ContentBlockParam] = []
-    marked: list[TextBlockParam | ImageBlockParam] = []
+    part_cache_breakpoint_blocks: list[TextBlockParam | ImageBlockParam] = []
     if isinstance(user_message.content, str):
         blocks.append({"type": "text", "text": user_message.content})
-        return blocks, marked
+        return blocks, part_cache_breakpoint_blocks
     for part in user_message.content:
         block = _part_block(part, message_class=UserMessage)
         blocks.append(block)
         if part.cache_breakpoint:
-            marked.append(block)
-    return blocks, marked
+            part_cache_breakpoint_blocks.append(block)
+    return blocks, part_cache_breakpoint_blocks
 
 
 def _tool_result_content(
@@ -666,7 +661,7 @@ def _tool_result_content(
     A ContentPart tuple becomes TextBlockParam and ImageBlockParam values.
 
     Raises:
-        _NotSendableError: _part_block rejects one ContentPart.
+        _RejectedMessagesError: _part_block rejects one ContentPart.
     """
     if isinstance(content, str):
         return content
@@ -676,14 +671,14 @@ def _tool_result_content(
 def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     """Copy a stored SDK block without reading or changing its fields.
 
-    The copy prevents cache-marker writes from changing the stored block.
+    The copy prevents `cache_control` writes from changing the stored block.
     A block from another provider passes through when it has a `type` key.
 
     Raises:
-        _NotSendableError: `raw` lacks the `type` key required by anthropic 0.120.2 block parameters.
+        _RejectedMessagesError: `raw` lacks the `type` key required by anthropic 0.120.2 block parameters.
     """
     if "type" not in raw:
-        raise _NotSendableError(
+        raise _RejectedMessagesError(
             "ReasoningPart.raw or RawPart.raw names no type key, "
             "so anthropic has no content block to send it as"
         )
@@ -699,7 +694,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
 
     Raises:
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
-        _NotSendableError: A stored block lacks a `type` key.
+        _RejectedMessagesError: A stored block lacks a `type` key.
     """
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.parts:
@@ -719,23 +714,23 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     return blocks
 
 
-def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
-    """Return whether the last part marks the enclosing `tool_result` block.
+def _tool_message_has_cache_breakpoint(tool_message: ToolMessage) -> bool:
+    """Return whether the last part places a cache breakpoint on the enclosing `tool_result` block.
 
     Raises:
-        _NotSendableError: A non-final part sets `cache_breakpoint` because the API marks the block end.
+        _RejectedMessagesError: A non-final part sets `cache_breakpoint`, because the API caches up to the block end.
     """
     if isinstance(tool_message.content, str):
         return False
-    marked_indexes = [
+    cache_breakpoint_indexes = [
         index for index, part in enumerate(tool_message.content) if part.cache_breakpoint
     ]
-    if not marked_indexes:
+    if not cache_breakpoint_indexes:
         return False
-    if marked_indexes != [len(tool_message.content) - 1]:
-        raise _NotSendableError(
+    if cache_breakpoint_indexes != [len(tool_message.content) - 1]:
+        raise _RejectedMessagesError(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
-            "the marker goes on the enclosing tool_result block, whose span ends at the last part"
+            "the cache breakpoint goes on the enclosing tool_result block, whose span ends at the last part"
         )
     return True
 
@@ -745,21 +740,22 @@ def _wire_messages(
     *,
     automatic_cache_breakpoints: bool,
     cache_ttl: CacheTTL,
-    message_mark_budget: int,
+    message_cache_breakpoint_budget: int,
 ) -> list[MessageParam]:
-    """Convert messages and apply the permitted cache markers.
+    """Convert messages and apply the permitted cache breakpoints.
 
-    `automatic_cache_breakpoints` marks the last block unless it is a thinking block.
-    A user part marks its own block, while a tool part marks its enclosing `tool_result`.
-    The latest marks up to `message_mark_budget` are sent.
+    `automatic_cache_breakpoints` places a cache breakpoint on the last block unless it is a thinking block.
+    A user part's cache breakpoint goes on its own block, and a tool part's on its enclosing `tool_result`.
+    The latest cache breakpoints up to `message_cache_breakpoint_budget` are sent.
 
     Raises:
-        _NotSendableError: A `ContentPart` lacks a wire form, a non-final tool part is marked, or raw lacks `type`.
+        _RejectedMessagesError: A `ContentPart` lacks a wire form, or raw lacks `type`.
+            A non-final tool part that sets `cache_breakpoint` also raises it.
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
     """
     wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []
     pending_tool_results: list[_ContentBlockParam] = []
-    marked_blocks: list[TextBlockParam | ImageBlockParam | ToolResultBlockParam] = []
+    cache_breakpoint_blocks: list[TextBlockParam | ImageBlockParam | ToolResultBlockParam] = []
 
     def flush_tool_results() -> None:
         if pending_tool_results:
@@ -775,20 +771,20 @@ def _wire_messages(
                     "content": _tool_result_content(message.content),
                     "is_error": message.is_error,
                 }
-                if _tool_message_is_marked(message):
-                    marked_blocks.append(tool_result_block)
+                if _tool_message_has_cache_breakpoint(message):
+                    cache_breakpoint_blocks.append(tool_result_block)
                 pending_tool_results.append(tool_result_block)
             case "user":
                 flush_tool_results()
-                blocks, marked = _user_content_blocks(message)
-                marked_blocks.extend(marked)
+                blocks, part_cache_breakpoint_blocks = _user_content_blocks(message)
+                cache_breakpoint_blocks.extend(part_cache_breakpoint_blocks)
                 wire.append(("user", blocks))
             case "assistant":
                 flush_tool_results()
                 wire.append(("assistant", _assistant_content_blocks(message)))
     flush_tool_results()
-    if message_mark_budget > 0:
-        for block in marked_blocks[-message_mark_budget:]:
+    if message_cache_breakpoint_budget > 0:
+        for block in cache_breakpoint_blocks[-message_cache_breakpoint_budget:]:
             block["cache_control"] = _cache_control_param(cache_ttl)
     if automatic_cache_breakpoints and wire:
         last_blocks = wire[-1][1]
@@ -801,10 +797,10 @@ def _wire_messages(
 
 def _request_messages(
     messages: Sequence[Message], precomputed_fields: _AnthropicPrecomputedFields
-) -> list[MessageParam] | RefusedMessages:
+) -> list[MessageParam] | RejectedMessages:
     """Convert messages under the binding's caching parameters, or report them unsendable.
 
-    The one place a Sequence[Message] this adapter will not put on the wire becomes RefusedMessages.
+    The one place a Sequence[Message] this adapter will not put on the wire becomes RejectedMessages.
     The wire block holds parsed `tool_call.args_json`.
     Text that is not JSON has no wire block.
     """
@@ -813,12 +809,14 @@ def _request_messages(
             messages,
             automatic_cache_breakpoints=precomputed_fields.automatic_message_cache_breakpoint,
             cache_ttl=precomputed_fields.cache_ttl,
-            message_mark_budget=precomputed_fields.message_mark_budget,
+            message_cache_breakpoint_budget=precomputed_fields.message_cache_breakpoint_budget,
         )
-    except _NotSendableError as not_sendable:
-        return RefusedMessages(reason=str(not_sendable))
+    except _RejectedMessagesError as rejected:
+        return RejectedMessages(error_text=str(rejected))
     except json.JSONDecodeError as not_json:
-        return RefusedMessages(reason=f"a tool call's args_json is not valid JSON: {not_json}")
+        return RejectedMessages(
+            error_text=f"a tool call's args_json is not valid JSON: {not_json}"
+        )
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
@@ -855,7 +853,7 @@ def _wire_tools(
     """Convert every bound tool to one ordered wire list.
 
     `cache_breakpoint_on_last_tool` puts the frozen-prefix cache breakpoint on the last tool.
-    The last tool carries the marker when no system prompt follows the tools.
+    The last tool carries the cache breakpoint when no system prompt follows the tools.
     """
     tools: list[ToolUnionParam] = [
         {
@@ -877,12 +875,20 @@ def _wire_tools(
     return tools
 
 
+_STOP_REASON_BY_ANTHROPIC_STOP_REASON: Mapping[str, StopReason] = {
+    "end_turn": "stop",
+    "tool_use": "tool_call",
+    "max_tokens": "max_completion_tokens",
+    "refusal": "refusal",
+    "model_context_window_exceeded": "context_window_exceeded",
+}
+"""The langchaint `StopReason` of each Anthropic `stop_reason` with a counterpart."""
+
+
 def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
-    if stop_reason in ("end_turn", "tool_use", "max_tokens", "refusal"):
-        return stop_reason
-    if stop_reason == "model_context_window_exceeded":
-        return "context_window_exceeded"
-    return "other"
+    if stop_reason is None:
+        return "other"
+    return _STOP_REASON_BY_ANTHROPIC_STOP_REASON.get(stop_reason, "other")
 
 
 def _unfinished_message_or_none(
@@ -900,7 +906,7 @@ def _unfinished_message_or_none(
     ):
         return None
     return UnfinishedAssistantMessage(
-        reason=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
+        error_text=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
         assistant_message=assistant_message,
     )
 
@@ -971,10 +977,10 @@ def _priced_tier(
 
 
 def _billing_from_sdk_usage(
-    usage: anthropic.types.Usage,
+    usage_raw: anthropic.types.Usage,
     pricing: AnthropicPricingTable,
     *,
-    provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
+    provider_executed_tools: _AnthropicProviderExecutedTools = _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS,
     billing_complete: bool = True,
 ) -> ProviderBilling:
     """Price SDK counters by the reported service tier.
@@ -989,32 +995,32 @@ def _billing_from_sdk_usage(
         pydantic.ValidationError: A reported token counter is negative.
         ValueError: A provider-executed request counter is boolean or negative.
     """
-    output_tokens_details = usage.output_tokens_details
-    input_tokens_cache_write_5m = usage.cache_creation_input_tokens or 0
+    output_tokens_details = usage_raw.output_tokens_details
+    input_tokens_cache_write_5m = usage_raw.cache_creation_input_tokens or 0
     input_tokens_cache_write_1h = 0
-    if usage.cache_creation is not None:
-        input_tokens_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens
-        input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
-    service_tier = _priced_tier(usage.service_tier)
+    if usage_raw.cache_creation is not None:
+        input_tokens_cache_write_5m = usage_raw.cache_creation.ephemeral_5m_input_tokens
+        input_tokens_cache_write_1h = usage_raw.cache_creation.ephemeral_1h_input_tokens
+    service_tier = _priced_tier(usage_raw.service_tier)
     rates = pricing.rates_for(
-        service_tier=usage.service_tier,
-        inference_geo=usage.inference_geo,
+        service_tier=usage_raw.service_tier,
+        inference_geo=usage_raw.inference_geo,
     )
-    server_tool_use = usage.server_tool_use
+    server_tool_use = usage_raw.server_tool_use
     web_search_requests = 0 if server_tool_use is None else server_tool_use.web_search_requests
     provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
         web_search_requests,
         usd_per_invocation=pricing.web_search_usd_per_invocation,
     )
-    if provider_tools.web_search and not billing_complete:
+    if provider_executed_tools.web_search and not billing_complete:
         provider_executed_tool_cost_in_usd = float("nan")
     if server_tool_use is not None:
         accounted_counters = {"web_search_requests"}
-        if provider_tools.web_fetch:
+        if provider_executed_tools.web_fetch:
             accounted_counters.add("web_fetch_requests")
-        if provider_tools.tool_search:
+        if provider_executed_tools.tool_search:
             accounted_counters.add("tool_search_requests")
-        if provider_tools.code_execution_exempt:
+        if provider_executed_tools.code_execution_exempt:
             accounted_counters.add("code_execution_requests")
         unaccounted_counter_fired = any(
             counter_name.endswith("_requests") and counter
@@ -1025,12 +1031,12 @@ def _billing_from_sdk_usage(
             provider_executed_tool_cost_in_usd = float("nan")
     return rates.price(
         service_tier=service_tier,
-        usage_raw=usage,
-        input_tokens_cache_read=usage.cache_read_input_tokens or 0,
+        usage_raw=usage_raw,
+        input_tokens_cache_read=usage_raw.cache_read_input_tokens or 0,
         input_tokens_cache_write_5m=input_tokens_cache_write_5m,
         input_tokens_cache_write_1h=input_tokens_cache_write_1h,
-        input_tokens_cache_none=usage.input_tokens,
-        output_tokens=usage.output_tokens,
+        input_tokens_cache_none=usage_raw.input_tokens,
+        output_tokens=usage_raw.output_tokens,
         output_tokens_reasoning=(
             output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
         ),
@@ -1049,70 +1055,62 @@ def _usable_response[OutputT](
     )
 
 
-def parse_anthropic(failure: Exception) -> Verdict:
-    """Map one AnthropicMessagesAdapter.failure_types exception to its verdict.
+def anthropic_request_failure(error: Exception) -> RequestFailure:
+    """Return the `RequestFailure` of one exception an Anthropic request raised.
 
-    _verdict_from_anthropic_tables reads the status and the error type.
-    On every status except 200, x-should-retry overrides that verdict.
-    `verdict_under_retry_directive` defines the override.
-    Status 200 identifies a mid-stream error, so its headers do not override the table verdict.
-    A retry-after header only fills a verdict's retry_after.
-    A TransientError takes verdict_from_transient_error's shared mapping.
-    Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
+    `APIConnectionError` and `RetryableError` are transient transport failures that pause nothing.
+    `APITimeoutError` is an `APIConnectionError` subclass.
+    `request_failure_from_response` builds an `APIStatusError`'s failure from `_anthropic_table_answers`.
+    It applies `x-should-retry` on every status except 200, which identifies a mid-stream error.
+    Other exceptions are `unknown_exception`.
     """
-    if isinstance(failure, TransientError):
-        return verdict_from_transient_error(failure)
-    if not isinstance(failure, anthropic.APIStatusError):
-        record_parse_fallthrough(
-            PARSE_FALLTHROUGH_COUNTS,
-            parse_name="parse_anthropic",
-            status_code=None,
-            error_type=type(failure).__name__,
+    if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+    if not isinstance(error, anthropic.APIStatusError):
+        return RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
         )
-        return DoNotRetry()
-    retry_after = retry_after_seconds_from_headers(failure.response.headers)
-    verdict = _verdict_from_anthropic_tables(failure, retry_after)
-    if failure.status_code == 200:
-        return verdict
-    return verdict_under_retry_directive(
-        verdict, headers=failure.response.headers, retry_after=retry_after
+    retries, pauses_quota = _anthropic_table_answers(error)
+    return request_failure_from_response(
+        status_code=error.status_code,
+        headers=error.response.headers,
+        retries=retries,
+        pauses_quota=pauses_quota,
     )
 
 
-def _verdict_from_anthropic_tables(
-    failure: anthropic.APIStatusError, retry_after: float | None
-) -> Verdict:
-    """Classify one `APIStatusError` by status and error type.
+def _anthropic_table_answers(error: anthropic.APIStatusError) -> tuple[bool, bool]:
+    """Return whether one `APIStatusError` retries and whether it pauses the quota, by status and error type.
 
     Source: https://platform.claude.com/docs/en/api/errors, read 2026-08-01.
     Error types override status because stream errors may carry the live response's 200 status.
-    Unlisted 5xx statuses return `RetryThisOne`.
-    Other unlisted statuses return `DoNotRetry`.
+    `_PAUSE_STATUSES` and `_PAUSE_ERROR_TYPES` retry and pause.
+    `_RETRY_THIS_ONE_STATUSES` and `_RETRY_THIS_ONE_ERROR_TYPES` retry without a pause.
+    Unlisted 5xx statuses retry without a pause.
+    Other unlisted statuses neither retry nor pause.
     """
-    for error_types, statuses, verdict_class in (
-        (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, PauseAll),
-        (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, RetryThisOne),
+    for error_types, statuses, pauses_quota in (
+        (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, True),
+        (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, False),
     ):
-        if failure.type in error_types or failure.status_code in statuses:
-            if failure.status_code not in statuses:
-                record_parse_fallthrough(
-                    PARSE_FALLTHROUGH_COUNTS,
-                    parse_name="parse_anthropic",
-                    status_code=failure.status_code,
-                    error_type=failure.type,
+        if error.type in error_types or error.status_code in statuses:
+            if error.status_code not in statuses:
+                record_request_failure_fallthrough(
+                    REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+                    function_name="anthropic_request_failure",
+                    status_code=error.status_code,
+                    error_type=error.type,
                 )
-            return verdict_class(retry_after=retry_after)
-    if failure.status_code in _DO_NOT_RETRY_STATUSES:
-        return DoNotRetry()
-    record_parse_fallthrough(
-        PARSE_FALLTHROUGH_COUNTS,
-        parse_name="parse_anthropic",
-        status_code=failure.status_code,
-        error_type=failure.type,
+            return True, pauses_quota
+    if error.status_code in _DO_NOT_RETRY_STATUSES:
+        return False, False
+    record_request_failure_fallthrough(
+        REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+        function_name="anthropic_request_failure",
+        status_code=error.status_code,
+        error_type=error.type,
     )
-    if failure.status_code >= 500:
-        return RetryThisOne(retry_after=retry_after)
-    return DoNotRetry()
+    return error.status_code >= 500, False
 
 
 class AnthropicMessagesAdapter(Adapter):
@@ -1146,9 +1144,9 @@ class AnthropicMessagesAdapter(Adapter):
 
         `provider_name` is `"anthropic"` for `AsyncAnthropic` and `"aws.bedrock"` for Bedrock clients.
         The stored client disables SDK retries and preserves custom Bedrock transports.
-        `cache_ttl` applies to top-level `cache_control` and every automatic and explicit cache marker.
+        `cache_ttl` applies to top-level `cache_control` and every automatic and explicit cache breakpoint.
         `"5m"` writes bill 1.25 times base input, and `"1h"` writes bill twice base input.
-        Mixed TTLs require one-hour markers before five-minute markers.
+        Mixed TTLs require one-hour cache breakpoints before five-minute ones.
         Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
         `pricing` supplies rates and modifiers.
         `inference_geo` requests an inference geography.
@@ -1183,16 +1181,16 @@ class AnthropicMessagesAdapter(Adapter):
         }
 
     def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
-        """Precompute request fields and the remaining `message_mark_budget`.
+        """Precompute request fields and the remaining `message_cache_breakpoint_budget`.
 
         A string `system_prompt` becomes one system block.
-        A parts `system_prompt` becomes one block per part and preserves marks.
-        `automatic_cache_breakpoints` marks the last system block or the last tool.
-        Binding marks use the four-marker limit before message marks.
+        A parts `system_prompt` becomes one block per part and preserves its cache breakpoints.
+        `automatic_cache_breakpoints` places a cache breakpoint on the last system block or the last tool.
+        Binding cache breakpoints count toward the limit of four before message cache breakpoints.
 
         Raises:
             ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
-            ValueError: Binding marks exceed four, `extra_body` conflicts, or `system_prompt` is empty.
+            ValueError: Binding cache breakpoints exceed four, `extra_body` conflicts, or `system_prompt` is empty.
             ValueError: A provider-executed tool type is unsupported or code execution lacks a qualifying web tool.
             ValueError: Provider-executed tools use another provider or web-search rates are invalid.
             TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
@@ -1204,16 +1202,16 @@ class AnthropicMessagesAdapter(Adapter):
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
-        provider_tools = _provider_tools(binding.provider_executed_tools)
+        provider_executed_tools = _provider_executed_tools(binding.provider_executed_tools)
         if binding.provider_executed_tools and self.provider_name != "anthropic":
             raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
-        if provider_tools.web_search:
+        if provider_executed_tools.web_search:
             require_finite_nonnegative_rate(
                 rate_name="web_search_usd_per_invocation",
                 rate=self.pricing.web_search_usd_per_invocation,
             )
         system: list[TextBlockParam] | Omit = omit
-        bind_marker_count = 0
+        bind_cache_breakpoint_count = 0
         if binding.system_prompt is not None:
             system_blocks: list[TextBlockParam] = []
             if isinstance(binding.system_prompt, str):
@@ -1231,7 +1229,9 @@ class AnthropicMessagesAdapter(Adapter):
                     system_blocks.append(system_block)
             if binding.automatic_cache_breakpoints:
                 system_blocks[-1]["cache_control"] = _cache_control_param(self.cache_ttl)
-            bind_marker_count = sum(1 for block in system_blocks if "cache_control" in block)
+            bind_cache_breakpoint_count = sum(
+                1 for block in system_blocks if "cache_control" in block
+            )
             system = system_blocks
         tools: list[ToolUnionParam] | Omit = omit
         tool_choice: ToolChoiceParam | Omit = omit
@@ -1245,19 +1245,21 @@ class AnthropicMessagesAdapter(Adapter):
                 cache_breakpoint_on_last_tool=cache_breakpoint_on_last_tool,
                 cache_ttl=self.cache_ttl,
             )
-            bind_marker_count += sum(1 for tool in tools if "cache_control" in tool)
+            bind_cache_breakpoint_count += sum(1 for tool in tools if "cache_control" in tool)
             tool_choice = _wire_tool_choice(
                 binding.tool_choice, parallel_tool_calls=binding.parallel_tool_calls
             )
         automatic_cache_breakpoint_count = 1 if binding.automatic_cache_breakpoints else 0
-        message_mark_budget = (
-            _CACHE_MARKER_REQUEST_LIMIT - bind_marker_count - automatic_cache_breakpoint_count
+        message_cache_breakpoint_budget = (
+            _MAX_CACHE_BREAKPOINTS_PER_REQUEST
+            - bind_cache_breakpoint_count
+            - automatic_cache_breakpoint_count
         )
-        if message_mark_budget < 0:
+        if message_cache_breakpoint_budget < 0:
             raise ValueError(
-                f"the binding writes {bind_marker_count + automatic_cache_breakpoint_count} cache markers, "
-                f"over the API's limit of {_CACHE_MARKER_REQUEST_LIMIT} per request; "
-                f"unmark some system parts"
+                f"the binding writes {bind_cache_breakpoint_count + automatic_cache_breakpoint_count} cache breakpoints, "
+                f"over the API's limit of {_MAX_CACHE_BREAKPOINTS_PER_REQUEST} per request; "
+                "set cache_breakpoint=False on some system parts or remove cache_control from provider_executed_tools"
             )
         output_config: OutputConfigParam | Omit = omit
         thinking: ThinkingConfigParam | Omit = omit
@@ -1285,9 +1287,9 @@ class AnthropicMessagesAdapter(Adapter):
                 binding.automatic_cache_breakpoints and not self._uses_top_level_cache_control
             ),
             cache_ttl=self.cache_ttl,
-            message_mark_budget=message_mark_budget,
+            message_cache_breakpoint_budget=message_cache_breakpoint_budget,
             extra_body=binding.extra_body,
-            provider_tools=provider_tools,
+            provider_executed_tools=provider_executed_tools,
         )
 
     @override
@@ -1320,37 +1322,10 @@ class AnthropicMessagesAdapter(Adapter):
             response_format=response_format,
         )
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (
-        anthropic.APIStatusError,
-        TransientError,
-    )
-    """The exceptions parse_anthropic maps to a verdict.
-
-    APIStatusError catches every error status.
-    """
-
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate to parse_anthropic, whose docstring names the table and the defaults."""
-        return parse_anthropic(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
-
-        `APIConnectionError` and `RetryableError` are transient transport failures.
-        `APITimeoutError` is an `APIConnectionError` subclass.
-        `APIStatusError` reaches this function only after `parse` returns `DoNotRetry`.
-        Other exceptions return `unknown_exception`.
-        """
-        if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
-            return "transient"
-        if not isinstance(error, anthropic.APIStatusError):
-            return "unknown_exception"
-        return terminal_classification_from_response(
-            status_code=error.response.status_code,
-            headers=error.response.headers,
-        )
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Delegate to anthropic_request_failure, whose docstring names the tables and the defaults."""
+        return anthropic_request_failure(error)
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:
@@ -1371,11 +1346,11 @@ class _AnthropicStream(AdapterStream):
         *,
         sdk_stream: AsyncMessageStream[Any],
         pricing: AnthropicPricingTable,
-        provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
+        provider_executed_tools: _AnthropicProviderExecutedTools = _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS,
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
-        self._provider_tools = provider_tools
+        self._provider_executed_tools = provider_executed_tools
         self._snapshot_started = False
         self._billing_complete = False
         """Whether an event has been accumulated, which is what makes current_message_snapshot readable."""
@@ -1447,7 +1422,7 @@ class _AnthropicStream(AdapterStream):
         return _billing_from_sdk_usage(
             self._sdk_stream.current_message_snapshot.usage,
             self._pricing,
-            provider_tools=self._provider_tools,
+            provider_executed_tools=self._provider_executed_tools,
             billing_complete=self._billing_complete,
         )
 
@@ -1484,7 +1459,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         return _billing_from_sdk_usage(
             _as_message(raw).usage,
             pricing=self._adapter.pricing,
-            provider_tools=self._precomputed_fields.provider_tools,
+            provider_executed_tools=self._precomputed_fields.provider_executed_tools,
         )
 
     @override
@@ -1502,10 +1477,12 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
         """Convert messages under the binding's precomputed fields."""
         wire_messages = _request_messages(messages, self._precomputed_fields)
-        if isinstance(wire_messages, RefusedMessages):
+        if isinstance(wire_messages, RejectedMessages):
             return wire_messages
         return _AnthropicRequestParams(
             precomputed=self._precomputed_fields, messages=wire_messages
@@ -1538,7 +1515,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         return _AnthropicStream(
             sdk_stream=await manager.__aenter__(),
             pricing=self._adapter.pricing,
-            provider_tools=precomputed.provider_tools,
+            provider_executed_tools=precomputed.provider_executed_tools,
         )
 
 

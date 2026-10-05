@@ -2,7 +2,7 @@
 
 `LLM.bind` freezes a prompt prefix and returns `BoundLLM`.
 Each request runs inside `SharedBackoff.admitted`.
-`PauseAll` pauses shared requests; `RetryThisOne` retries only the current request.
+A failed request's `RequestFailure` decides whether it retries and whether its rate-limit quota pauses.
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from langchaint.adapter import (
     Adapter,
     Binding,
     BoundAdapter,
-    RefusedMessages,
+    RejectedMessages,
     RequestParams,
     ResponseOutcome,
     ToolChoice,
@@ -30,14 +30,14 @@ from langchaint.common.observed_operation import (
     ObservedOperation,
     start_observed_operation,
 )
+from langchaint.common.request_failure import RequestFailure, _request_failure_of
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
-from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff, Verdict
-from langchaint.failure_step import _failure_step, _transient_error_for_step
+from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff
 from langchaint.generation._config_fingerprint import (
     bound_llm_config_fingerprint,
     capture_response_format_fingerprint_data,
-    generation_input_fingerprint,
+    input_fingerprint,
 )
 from langchaint.generation._generate_many_records import (
     _run_resume_io,
@@ -47,9 +47,9 @@ from langchaint.generation._generate_many_records import (
 from langchaint.generation.errors import (
     GenerationError,
     GenerationErrorRecord,
-    RejectedErrorRecord,
-    RetriesExhaustedErrorRecord,
+    SchemaViolationErrorRecord,
     _terminal_generation_error,
+    _transient_error_for,
 )
 from langchaint.generation.observer import GenerationStart, Observer
 from langchaint.generation.request_history import AbandonedStreamRecord, _RequestLedger
@@ -70,7 +70,7 @@ from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
 
 class _StreamObservations(NamedTuple):
-    billing: ProviderBilling | None
+    provider_billing: ProviderBilling | None
     request_id: str | None
     opened: bool
 
@@ -143,7 +143,7 @@ class WallClockDeadline:
 class WorkingTimeDeadline:
     """A deadline that stops while a request waits to be admitted and runs the rest of the time.
 
-    `max_working_seconds_per_item` selects this deadline.
+    `max_working_seconds_per_input` selects this deadline.
     """
 
     def __init__(self, max_working_seconds: float | None) -> None:
@@ -376,7 +376,7 @@ class LLM:
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `None` for text.
                 With `None`, `output` is the kept assistant message's joined text, possibly `""`, for any stop reason.
-                To treat an empty reply as a failure, bind a `response_format` that rejects empty text.
+                To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
                 `AnthropicMessagesAdapter` requires a value because the Messages API requires `max_tokens`.
             reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
@@ -731,7 +731,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         resolved_automatic_cache_breakpoints = _resolved_replacement(
             automatic_cache_breakpoints, self.binding.automatic_cache_breakpoints
         )
-        new_binding = _build_binding(
+        binding = _build_binding(
             system_prompt=_resolved_replacement(system_prompt, self.binding.system_prompt),
             tool_schemas=tool_schemas,
             provider_executed_tools=_resolved_replacement(
@@ -753,16 +753,16 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ),
             extra_body=_resolved_replacement(extra_body, self.binding.extra_body),
         )
-        new_response_format = _resolved_replacement(response_format, self.response_format)
-        new_max_requests = _resolved_replacement(max_requests, self.max_requests)
+        resolved_response_format = _resolved_replacement(response_format, self.response_format)
+        max_requests = _resolved_replacement(max_requests, self.max_requests)
         return BoundLLM(
             adapter=self.adapter,
-            bound_adapter=_bind_adapter(self.adapter, new_binding, new_response_format),
-            response_format=new_response_format,
-            binding=new_binding,
+            bound_adapter=_bind_adapter(self.adapter, binding, resolved_response_format),
+            response_format=resolved_response_format,
+            binding=binding,
             tool_manager=tool_manager,
             shared_backoff=self.shared_backoff,
-            max_requests=new_max_requests,
+            max_requests=max_requests,
             observer=self.observer,
         )
 
@@ -776,38 +776,42 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         exc: Exception,
         *,
-        verdict: Verdict | None,
+        request_failure: RequestFailure | None,
         private_backoff: PrivateBackoff,
         assistant_message: AssistantMessage | None,
         ledger: _RequestLedger,
         request_params: RequestParams,
         observations: _StreamObservations,
     ) -> None:
-        """Record a failed request and wait before the next one, as `_failure_step` decides.
+        """Record a failed request and wait before the next one, as its `RequestFailure` decides.
 
-        The wait happens only while `max_requests` permits another request.
+        `request_failure` is `None` when the adapter's `request_failure` raised `exc`.
+        A transient failure that pauses the quota relies on the next `admitted()` wait.
+        Another transient failure waits for `private_backoff`, only while `max_requests` permits another request.
 
         Raises:
-            GenerationError: `_failure_step` decides the failure is terminal.
+            GenerationError: The failure is not transient.
+            Exception: `exc`, when `request_failure` is `None`.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
-        step = _failure_step(exc, verdict=verdict, classify=self.adapter.classify)
-        if step.kind == "terminal":
+        if request_failure is None:
+            raise exc
+        if request_failure.kind != "transient":
             raise _terminal_generation_error(
-                step,
-                reason=str(exc),
+                request_failure.kind,
+                error_text=str(exc),
                 ledger=ledger,
-                billing=observations.billing,
+                provider_billing=observations.provider_billing,
                 request_params=request_params,
                 stream_opened=observations.opened,
             ) from exc
         ledger.record(
-            error=_transient_error_for_step(exc, str(exc), step),
+            error=_transient_error_for(exc, str(exc), request_failure),
             assistant_message=assistant_message,
-            billing=observations.billing,
+            provider_billing=observations.provider_billing,
         )
-        if step.kind == "retry_after_private_wait" and ledger.request_count < self.max_requests:
-            await asyncio.sleep(private_backoff.next_wait(step.retry_after))
+        if not request_failure.pauses_quota and ledger.request_count < self.max_requests:
+            await asyncio.sleep(private_backoff.next_wait(request_failure.retry_after_seconds))
 
     def _staged_interpretation(
         self, raw: BaseModel, *, request_id: str | None, ledger: _RequestLedger
@@ -815,11 +819,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Stage an arrived response with its billing, then read what it produced.
 
         Raises:
-            Exception: whatever interpret raises, for Adapter.classify to sort.
+            Exception: whatever interpret raises, for `Adapter.request_failure` to place.
         """
         ledger.stage_response(
             raw=raw,
-            billing=self._bound_adapter.billing_from_raw(raw),
+            provider_billing=self._bound_adapter.billing_from_raw(raw),
             identity=self._bound_adapter.identity_from_raw(raw, request_id=request_id),
         )
         return self._bound_adapter.interpret(raw)
@@ -834,9 +838,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Send requests for one input under `deadline` and record each outcome.
 
         Raises:
-            GenerationError: The adapter returns `RefusedMessages`.
+            GenerationError: The adapter returns `RejectedMessages`.
                 The provider declares a terminal failure.
-                The adapter cannot classify an exception.
+                The adapter cannot place an exception.
                 The completed response is not usable and is not retried.
                 Transient failures consume `max_requests`.
                 `deadline` expires.
@@ -852,7 +856,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 raise
             # The ledger retains billing that the interrupted stream reported.
             # A settled request record clears this value to `None`.
-            raise _timed_out_error(ledger, ledger.billing_in_flight) from None
+            raise _timed_out_error(ledger, ledger.provider_billing_in_flight) from None
 
     async def _request_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _RequestLedger, deadline: Deadline
@@ -869,7 +873,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             deadline.suspend_until_admitted()
             admission = self.shared_backoff.admitted()
             assistant_message: AssistantMessage | None = None
-            observations = _StreamObservations(billing=None, request_id=None, opened=False)
+            observations = _StreamObservations(
+                provider_billing=None, request_id=None, opened=False
+            )
+            request_failure: RequestFailure | None = None
             try:
                 async with admission:
                     try:
@@ -886,10 +893,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                             )
                         except BaseException:
                             observations = observations._replace(
-                                billing=adapter_stream.billing_reported(),
+                                provider_billing=adapter_stream.billing_reported(),
                                 request_id=adapter_stream.request_id(),
                             )
-                            ledger.note_billing_in_flight(observations.billing)
+                            ledger.note_provider_billing_in_flight(observations.provider_billing)
                             raise
                         finally:
                             await _close_stream_quietly(
@@ -902,22 +909,23 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                             raw, request_id=observations.request_id, ledger=ledger
                         )
                         if outcome.kind == "provider_failed_transiently":
-                            # Raise inside the try so the failure_types handler records its verdict.
+                            # Raise inside the try so the handler below records its `RequestFailure`.
                             # A billable 200 body can report a transient provider failure.
                             # A rate-limit body pauses the rate-limit quota like a 429 status.
                             assistant_message = outcome.assistant_message
-                            raise TransientError(
-                                outcome.reason, is_rate_limit=outcome.is_rate_limit
+                            raise TransientError(  # noqa: TRY301 (the handler below records it)
+                                outcome.error_text, pauses_quota=outcome.pauses_quota
                             )
-                    except self.adapter.failure_types as error:
-                        admission.record(self.adapter.parse(error))
+                    except Exception as error:
+                        request_failure = admission.record(
+                            _request_failure_of(error, self.adapter.request_failure)
+                        )
                         raise
             except Exception as exc:  # noqa: BLE001 (_settle_failed_request raises every terminal failure)
                 last_failure = exc
-                # The admission holds a verdict only when `exc` is one of `failure_types`.
                 await self._settle_failed_request(
                     exc,
-                    verdict=admission.verdict,
+                    request_failure=request_failure,
                     private_backoff=private_backoff,
                     assistant_message=assistant_message,
                     ledger=ledger,
@@ -937,7 +945,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     raise generation_outcome
                 return generation_outcome
         raise GenerationError(
-            record=RetriesExhaustedErrorRecord(request_history=ledger.freeze()),
+            record=GenerationErrorRecord(
+                kind="retries_exhausted_error", request_history=ledger.freeze()
+            ),
             request_params=request_params,
             request_provider_data=ledger.request_provider_data,
         ) from last_failure
@@ -948,13 +958,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Build the request params for `messages`.
 
         Raises:
-            GenerationError: The adapter returns `RefusedMessages`, so no request is sent.
+            GenerationError: The adapter returns `RejectedMessages`, so no request is sent.
         """
         built = self._bound_adapter.build_request_params(messages)
-        if isinstance(built, RefusedMessages):
+        if isinstance(built, RejectedMessages):
             raise GenerationError(
-                record=RejectedErrorRecord(
-                    error_text=built.reason, request_history=ledger.freeze()
+                record=GenerationErrorRecord(
+                    kind="rejected_error",
+                    error_text=built.error_text,
+                    request_history=ledger.freeze(),
                 ),
                 request_params=None,
                 request_provider_data=ledger.request_provider_data,
@@ -1088,7 +1100,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationWithoutToolCalls[OutputT] | GenerationError]: ...
     @overload
     async def generate_many(
@@ -1096,7 +1108,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcome[str]]: ...
     @overload
     async def generate_many[ModelT: BaseModel](
@@ -1104,7 +1116,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcome[ModelT, ModelT | None]]: ...
     @overload
     async def generate_many(
@@ -1112,7 +1124,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> (
         list[GenerationWithoutToolCalls[OutputT] | GenerationError]
         | list[GenerationOutcome[OutputT, OutputT | None]]
@@ -1122,7 +1134,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
-        max_working_seconds_per_item: float | None = None,
+        max_working_seconds_per_input: float | None = None,
         # `list` is invariant.
         # No single value union is assignable from each overload's list type.
         # A union of list types would restate the overloads without replacing this `Any`.
@@ -1131,12 +1143,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Each `GenerationError` becomes that input's outcome and does not cancel sibling inputs.
         `SharedBackoff.max_concurrent_requests` limits request starts and pending items.
-        `max_working_seconds_per_item` excludes admission and shared-pause waits.
+        `max_working_seconds_per_input` excludes admission and shared-pause waits.
 
         Args:
             generation_inputs: The input-aligned text or message values.
             warm_cache: Whether to finish the first input before starting the remaining inputs.
-            max_working_seconds_per_item: The per-item working-time budget, or `None`.
+            max_working_seconds_per_input: The per-input working-time budget, or `None`.
 
         Raises:
             asyncio.CancelledError: The caller cancels the batch.
@@ -1150,7 +1162,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 BaseException: Generation raises a value other than `GenerationError`.
             """
             return await self._generate_one_or_failure(
-                generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_item)
+                generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_input)
             )
 
         run_ones = tuple(
@@ -1168,19 +1180,23 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
+        input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]: ...
+        max_working_seconds_per_input: float | None = ...,
+    ) -> list[
+        GenerationWithoutToolCallsRecord[OutputT]
+        | GenerationErrorRecord
+        | SchemaViolationErrorRecord
+    ]: ...
     @overload
     async def generate_many_records(
         self: "BoundLLM[str, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
+        input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcomeRecord[str, str]]: ...
     @overload
     async def generate_many_records[ModelT: BaseModel](
@@ -1188,9 +1204,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
+        input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcomeRecord[ModelT, ModelT | None]]: ...
     @overload
     async def generate_many_records(
@@ -1198,11 +1214,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
+        input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
+        max_working_seconds_per_input: float | None = ...,
     ) -> (
-        list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]
+        list[
+            GenerationWithoutToolCallsRecord[OutputT]
+            | GenerationErrorRecord
+            | SchemaViolationErrorRecord
+        ]
         | list[GenerationOutcomeRecord[OutputT, OutputT | None]]
     ): ...
     async def generate_many_records(
@@ -1210,9 +1230,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = None,
+        input_ids: SequenceNotStr[str] | None = None,
         warm_cache: bool = False,
-        max_working_seconds_per_item: float | None = None,
+        max_working_seconds_per_input: float | None = None,
         # `response_format` selects the concrete record output type at runtime.
         # `list` invariance requires `Any` across text and structured bindings.
     ) -> list[Any]:
@@ -1222,16 +1242,16 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         It stores input fingerprints instead of `GenerationInput` values.
         It stores normalized records without live provider SDK objects.
         The returned list follows `generation_inputs` order.
-        When `sample_ids=None`, each input is identified by its position in the complete ordered input list.
+        When `input_ids=None`, each input is identified by its position in the complete ordered input list.
         Any ordered input change then replaces a valid resume file.
-        Providing `sample_ids` identifies inputs by those strings.
-        Both cases use one JSON format whose `identity_mode` records whether `sample_ids` was provided.
-        Adding, deleting, or reordering inputs preserves records for unchanged `sample_ids` entries.
-        Deleting a `sample_ids` entry removes its saved item.
-        Reusing a `sample_ids` entry with a changed input generates that item again.
-        Repeated equal inputs remain separate items by position or by distinct `sample_ids` entries.
-        Changing the binding or switching whether `sample_ids` is provided replaces a valid resume file.
-        The file's `binding_fingerprint` is the value from `config_fingerprint()`.
+        Providing `input_ids` identifies inputs by those strings.
+        Both cases use one JSON format whose `identity_mode` records whether `input_ids` was provided.
+        Adding, deleting, or reordering inputs preserves records for unchanged `input_ids` entries.
+        Deleting an `input_ids` entry removes its saved item.
+        Reusing an `input_ids` entry with a changed input generates that item again.
+        Repeated equal inputs remain separate items by position or by distinct `input_ids` entries.
+        Changing the binding or switching whether `input_ids` is provided replaces a valid resume file.
+        The file's `config_fingerprint` is the value from `config_fingerprint()`.
         Changes excluded by `config_fingerprint()` do not replace the file.
         A malformed file or unsupported format raises before any provider request and remains unchanged.
         A file in the supported format holds the records this langchaint version would write.
@@ -1239,7 +1259,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         That equality assumes the provider answers the same way both times.
         A langchaint version that writes different records for the same binding and inputs uses a new format.
         Missing records generate again.
-        `RetriesExhaustedErrorRecord`, `TimedOutErrorRecord`, and `AuthErrorRecord` values generate again.
+        Error records with kind `retries_exhausted_error`, `timed_out_error`, or `auth_error` generate again.
         The fingerprints exclude the causes of those errors, so the same input can succeed later.
         The new record replaces the saved error record.
         The replacement record excludes the earlier requests and billing for that input.
@@ -1251,12 +1271,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Args:
             generation_inputs: The input-aligned text or message values.
             resume_path: The JSON file whose parent directory already exists.
-            sample_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
+            input_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
             warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
-            max_working_seconds_per_item: The per-item working-time budget, or `None`.
+            max_working_seconds_per_input: The per-input working-time budget, or `None`.
 
         Raises:
-            ValueError: `sample_ids` has the wrong length or contains a duplicate.
+            ValueError: `input_ids` has the wrong length or contains a duplicate.
             ValueError: `resume_path` contains malformed data or an unsupported format.
             ValueError: A generated outcome record cannot be serialized as resume JSON.
             RuntimeError: Another `generate_many_records` call in this process is using `resume_path`.
@@ -1265,33 +1285,32 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             asyncio.CancelledError: The caller cancels the batch after started items settle.
             BaseException: An item raises a non-`Exception` value after started items settle.
         """
-        generation_input_snapshots = tuple(
+        input_snapshots = tuple(
             _snapshot_generation_input(generation_input) for generation_input in generation_inputs
         )
         input_fingerprints = tuple(
-            generation_input_fingerprint(generation_input)
-            for generation_input in generation_input_snapshots
+            input_fingerprint(input_snapshot) for input_snapshot in input_snapshots
         )
-        sample_id_snapshot = None if sample_ids is None else tuple(sample_ids)
-        binding_fingerprint = self.config_fingerprint()
-        resolved_resume_path = await _run_resume_io(resume_path.resolve)
-        with claim_resume_path(resolved_resume_path):
+        input_ids = None if input_ids is None else tuple(input_ids)
+        config_fingerprint = self.config_fingerprint()
+        resume_path = await _run_resume_io(resume_path.resolve)
+        with claim_resume_path(resume_path):
             resume_state = await _run_resume_io(
                 partial(
                     prepare_resume_state,
-                    resume_path=resolved_resume_path,
+                    resume_path=resume_path,
                     response_format=self.response_format,
-                    binding_fingerprint=binding_fingerprint,
+                    config_fingerprint=config_fingerprint,
                     input_fingerprints=input_fingerprints,
-                    sample_ids=sample_id_snapshot,
+                    input_ids=input_ids,
                 )
             )
             pending_indices = resume_state.pending_indices()
 
             async def run_one(outcome_index: int) -> None:
                 generation_outcome = await self._generate_one_or_failure(
-                    generation_input_snapshots[outcome_index],
-                    deadline=WorkingTimeDeadline(max_working_seconds_per_item),
+                    input_snapshots[outcome_index],
+                    deadline=WorkingTimeDeadline(max_working_seconds_per_input),
                 )
                 await _run_resume_io(
                     partial(
@@ -1341,7 +1360,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> StreamHandle[Any, Any]:
         """Build a `StreamHandle` that opens on context-manager entry.
 
-        `timeout_seconds` starts on entry and covers request opening, iteration, and caller work before conclusion.
+        `timeout_seconds` starts on entry and covers request opening, iteration, and caller work.
+        It ends when the stream stores a `GenerationOutcome` or the block exits.
 
         Args:
             generation_input: The text or messages to send.

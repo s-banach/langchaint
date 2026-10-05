@@ -16,12 +16,12 @@ def build_scripts(scenario: str, configs: Mapping[str, AgentConfig]) -> dict[str
 
     Scenarios:
         happy: every agent completes.
-        call_timeout: one turn exceeds config.generate_one_timeout_seconds.
+        input_timeout: one input exceeds config.generate_one_timeout_seconds.
         app_timeout: both researchers stall on their second turn.
         subagent_error: the specialist's second turn raises.
         unapproved_answer: synthesize answers before critique approves a draft.
     """
-    climate_delay = 5.0 if scenario == "call_timeout" else 0.0
+    climate_delay = 5.0 if scenario == "input_timeout" else 0.0
     app_delay = 5.0 if scenario == "app_timeout" else 0.0
     specialist_error = (
         SubAgentError("specialist backend fell over") if scenario == "subagent_error" else None

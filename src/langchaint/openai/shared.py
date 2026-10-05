@@ -18,18 +18,13 @@ from pydantic import BaseModel
 
 from langchaint.adapter import (
     Adapter,
-    ErrorClassification,
-    record_parse_fallthrough,
-    retry_after_seconds_from_headers,
-    terminal_classification_from_response,
-    verdict_from_transient_error,
-    verdict_under_retry_directive,
+    RequestFailure,
+    record_request_failure_fallthrough,
+    request_failure_from_response,
 )
-from langchaint.billing.pricing import Billing, ProviderBilling, category_cost
+from langchaint.billing.pricing import Billing, ProviderBilling, TokenRates, category_cost_in_usd
 from langchaint.billing.usage import Usage
-from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import ImagePart
-from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 
 _PAUSE_STATUSES = frozenset({429, 503})
 """429 rate limits and documented 503 forms throttle the rate-limit quota.
@@ -57,8 +52,8 @@ _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404, 422})
 A resend fails the same way.
 """
 
-PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_parse_fallthrough` increments this counter for each status-family default."""
+REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
+"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
 
 type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 """What a Chat Completions request may ask for (openai 3.1.0)."""
@@ -129,14 +124,15 @@ def _priced_tier(
 class OpenAIRates:
     """OpenAI token rates for one service tier.
 
+    Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
     Pass NaN for an unknown rate.
     A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     """
 
-    input_cache_none_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    cache_write_usd_per_million_tokens: float
+    input_tokens_cache_none: float
+    output_tokens: float
+    input_tokens_cache_read: float
+    input_tokens_cache_write: float
 
     def price(
         self,
@@ -170,29 +166,31 @@ class OpenAIRates:
                     input_tokens_cache_none=input_tokens_cache_none,
                     output_tokens=output_tokens,
                     output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost(
+                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_read,
-                        usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                        usd_per_million_tokens=self.input_tokens_cache_read,
                     ),
-                    input_tokens_cache_write_cost_in_usd=category_cost(
+                    input_tokens_cache_write_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_write,
-                        usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
+                        usd_per_million_tokens=self.input_tokens_cache_write,
                     ),
-                    input_tokens_cache_none_cost_in_usd=category_cost(
+                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
                         input_tokens_cache_none,
-                        usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                        usd_per_million_tokens=self.input_tokens_cache_none,
                     ),
-                    output_tokens_cost_in_usd=category_cost(
+                    output_tokens_cost_in_usd=category_cost_in_usd(
                         output_tokens,
-                        usd_per_million_tokens=self.output_usd_per_million_tokens,
+                        usd_per_million_tokens=self.output_tokens,
                     ),
                     provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
                 service_tier=service_tier,
-                input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-                cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
-                cache_write_usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
-                output_usd_per_million_tokens=self.output_usd_per_million_tokens,
+                usd_per_million_tokens=TokenRates(
+                    input_tokens_cache_read=self.input_tokens_cache_read,
+                    input_tokens_cache_write=self.input_tokens_cache_write,
+                    input_tokens_cache_none=self.input_tokens_cache_none,
+                    output_tokens=self.output_tokens,
+                ),
             ),
             usage_raw=usage_raw,
         )
@@ -200,32 +198,26 @@ class OpenAIRates:
     def multiplied(self, *, input_multiplier: float, output_multiplier: float) -> "OpenAIRates":
         """Return rates multiplied by category."""
         return OpenAIRates(
-            input_cache_none_usd_per_million_tokens=(
-                self.input_cache_none_usd_per_million_tokens * input_multiplier
-            ),
-            output_usd_per_million_tokens=(self.output_usd_per_million_tokens * output_multiplier),
-            cache_read_usd_per_million_tokens=(
-                self.cache_read_usd_per_million_tokens * input_multiplier
-            ),
-            cache_write_usd_per_million_tokens=(
-                self.cache_write_usd_per_million_tokens * input_multiplier
-            ),
+            input_tokens_cache_none=self.input_tokens_cache_none * input_multiplier,
+            output_tokens=self.output_tokens * output_multiplier,
+            input_tokens_cache_read=self.input_tokens_cache_read * input_multiplier,
+            input_tokens_cache_write=self.input_tokens_cache_write * input_multiplier,
         )
 
 
 _UNPRICED_RATES = OpenAIRates(
-    input_cache_none_usd_per_million_tokens=float("nan"),
-    output_usd_per_million_tokens=float("nan"),
-    cache_read_usd_per_million_tokens=float("nan"),
-    cache_write_usd_per_million_tokens=float("nan"),
+    input_tokens_cache_none=float("nan"),
+    output_tokens=float("nan"),
+    input_tokens_cache_read=float("nan"),
+    input_tokens_cache_write=float("nan"),
 )
 
 
 @dataclass(frozen=True, kw_only=True)
 class OpenAILongContextPricing:
-    """OpenAI rate multipliers above one input-token threshold."""
+    """OpenAI rate multipliers for a request whose `input_tokens_total` exceeds `input_tokens_total_above`."""
 
-    input_tokens_above: int
+    input_tokens_total_above: int
     input_multiplier: float
     output_multiplier: float
 
@@ -235,8 +227,8 @@ class OpenAILongContextPricing:
         Raises:
             ValueError: A threshold or multiplier is invalid.
         """
-        if isinstance(self.input_tokens_above, bool) or self.input_tokens_above <= 0:
-            raise ValueError("input_tokens_above must be a positive int")
+        if isinstance(self.input_tokens_total_above, bool) or self.input_tokens_total_above <= 0:
+            raise ValueError("input_tokens_total_above must be a positive int")
         for name, multiplier in (
             ("input_multiplier", self.input_multiplier),
             ("output_multiplier", self.output_multiplier),
@@ -318,7 +310,7 @@ class OpenAIPricingTable:
         if rates is None:
             return _UNPRICED_RATES
         long_context = self.long_context
-        if long_context is not None and input_tokens_total > long_context.input_tokens_above:
+        if long_context is not None and input_tokens_total > long_context.input_tokens_total_above:
             rates = rates.multiplied(
                 input_multiplier=long_context.input_multiplier,
                 output_multiplier=long_context.output_multiplier,
@@ -352,121 +344,85 @@ def require_prompt_cache_options_support(
         )
 
 
-def parse_openai(failure: Exception) -> Verdict:
-    """Map one OPENAI_FAILURE_TYPES exception to its verdict.
+def openai_request_failure(error: Exception) -> RequestFailure:
+    """Return the `RequestFailure` of one exception an OpenAI request raised.
 
-    Status 200 identifies a mid-stream error, so its code selects the verdict.
-    Other statuses use `_verdict_from_openai_status` before `x-should-retry` overrides it.
-    A retry-after header only fills a verdict's retry_after.
-    A TransientError takes verdict_from_transient_error's shared mapping.
-    Never raises: an Exception outside OPENAI_FAILURE_TYPES is DoNotRetry, counted as a fallthrough.
+    `APIConnectionError` is a transient transport failure without a response, and pauses nothing.
+    `APITimeoutError` is an `APIConnectionError` subclass.
+    Status 200 identifies a mid-stream error, so `_openai_error_code_answers` reads its code.
+    `_openai_status_answers` reads every other status.
+    `request_failure_from_response` builds the failure from those answers.
+    Other exceptions are `unknown_exception`.
     """
-    if isinstance(failure, TransientError):
-        return verdict_from_transient_error(failure)
-    if not isinstance(failure, openai.APIStatusError):
-        record_parse_fallthrough(
-            PARSE_FALLTHROUGH_COUNTS,
-            parse_name="parse_openai",
-            status_code=None,
-            error_type=type(failure).__name__,
+    if isinstance(error, openai.APIConnectionError):
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+    if not isinstance(error, openai.APIStatusError):
+        return RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
         )
-        return DoNotRetry()
-    retry_after = retry_after_seconds_from_headers(failure.response.headers)
-    if failure.status_code == 200:
-        return _verdict_from_openai_error_code(failure, retry_after)
-    return verdict_under_retry_directive(
-        _verdict_from_openai_status(failure, retry_after),
-        headers=failure.response.headers,
-        retry_after=retry_after,
+    retries, pauses_quota = (
+        _openai_error_code_answers(error)
+        if error.status_code == 200
+        else _openai_status_answers(error)
+    )
+    return request_failure_from_response(
+        status_code=error.status_code,
+        headers=error.response.headers,
+        retries=retries,
+        pauses_quota=pauses_quota,
     )
 
 
-def _verdict_from_openai_status(
-    failure: openai.APIStatusError, retry_after: float | None
-) -> Verdict:
-    """Return the verdict the status and the error code alone give one error-status failure.
+def _openai_status_answers(error: openai.APIStatusError) -> tuple[bool, bool]:
+    """Return whether one error-status failure retries and whether it pauses the quota, by status and code.
 
     Source: https://developers.openai.com/api/docs/guides/error-codes.
     Read 2026-08-01.
-    `_PAUSE_STATUSES` return `PauseAll` unless `_SPEND_LIMIT_CODES` requires `DoNotRetry`.
+    `_PAUSE_STATUSES` retry and pause unless `_SPEND_LIMIT_CODES` forbids a retry.
     Retrying spend-limit errors cannot restore access.
-    `_RETRY_THIS_ONE_STATUSES` return `RetryThisOne`.
-    `_DO_NOT_RETRY_STATUSES` return `DoNotRetry`.
+    `_RETRY_THIS_ONE_STATUSES` retry without a pause.
+    `_DO_NOT_RETRY_STATUSES` neither retry nor pause.
     Some rows come from the SDK.
     Each table's docstring names the source and reason.
     `error.code` separates spend-limit 429 errors because `error.type` may still be `insufficient_quota`.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    unlisted 5xx statuses return `RetryThisOne`, and other unlisted statuses return `DoNotRetry`.
+    Failures outside the rows take a default, counted in REQUEST_FAILURE_FALLTHROUGH_COUNTS and logged:
+    unlisted 5xx statuses retry without a pause, and other unlisted statuses neither retry nor pause.
     """
-    if failure.status_code in _PAUSE_STATUSES:
-        if failure.code in _SPEND_LIMIT_CODES:
-            return DoNotRetry()
-        return PauseAll(retry_after=retry_after)
-    if failure.status_code in _RETRY_THIS_ONE_STATUSES:
-        return RetryThisOne(retry_after=retry_after)
-    if failure.status_code in _DO_NOT_RETRY_STATUSES:
-        return DoNotRetry()
-    record_parse_fallthrough(
-        PARSE_FALLTHROUGH_COUNTS,
-        parse_name="parse_openai",
-        status_code=failure.status_code,
-        error_type=failure.type,
+    if error.status_code in _PAUSE_STATUSES:
+        if error.code in _SPEND_LIMIT_CODES:
+            return False, False
+        return True, True
+    if error.status_code in _RETRY_THIS_ONE_STATUSES:
+        return True, False
+    if error.status_code in _DO_NOT_RETRY_STATUSES:
+        return False, False
+    record_request_failure_fallthrough(
+        REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+        function_name="openai_request_failure",
+        status_code=error.status_code,
+        error_type=error.type,
     )
-    if failure.status_code >= 500:
-        return RetryThisOne(retry_after=retry_after)
-    return DoNotRetry()
+    return error.status_code >= 500, False
 
 
-def _verdict_from_openai_error_code(
-    failure: openai.APIStatusError, retry_after: float | None
-) -> Verdict:
-    """Return the verdict a status-200 mid-stream error's code gives it.
+def _openai_error_code_answers(error: openai.APIStatusError) -> tuple[bool, bool]:
+    """Return whether a status-200 mid-stream error retries and whether it pauses the quota, by its code.
 
-    `rate_limit_exceeded` returns `PauseAll`.
-    Other transient codes return `RetryThisOne`.
-    Terminal and unknown codes return `DoNotRetry`.
-    Unknown codes increment `PARSE_FALLTHROUGH_COUNTS` and are logged.
+    Transient codes retry, and `rate_limit_exceeded` also pauses the quota.
+    Terminal and unknown codes neither retry nor pause.
+    Unknown codes increment `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and are logged.
     """
-    disposition = None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
-    if disposition == "transient":
-        if failure.code == "rate_limit_exceeded":
-            return PauseAll(retry_after=retry_after)
-        return RetryThisOne(retry_after=retry_after)
+    disposition = None if error.code is None else _DISPOSITION_BY_ERROR_CODE.get(error.code)
     if disposition is None:
-        record_parse_fallthrough(
-            PARSE_FALLTHROUGH_COUNTS,
-            parse_name="parse_openai",
-            status_code=failure.status_code,
-            error_type=failure.code,
+        record_request_failure_fallthrough(
+            REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+            function_name="openai_request_failure",
+            status_code=error.status_code,
+            error_type=error.code,
         )
-    return DoNotRetry()
-
-
-OPENAI_FAILURE_TYPES: tuple[type[Exception], ...] = (openai.APIStatusError, TransientError)
-"""The exceptions parse_openai maps to a verdict.
-
-Both adapters use these exceptions as `failure_types`.
-
-APIStatusError catches every error status.
-"""
-
-
-def classify_openai(error: Exception) -> ErrorClassification:
-    """Sort an exception parse_openai gave no verdict, or name the terminal error for a DoNotRetry.
-
-    `APIConnectionError` is a transient transport failure without a response.
-    `APITimeoutError` is an `APIConnectionError` subclass.
-    `APIStatusError` reaches this function only after `parse_openai` returns `DoNotRetry`.
-    Other exceptions return `unknown_exception`.
-    """
-    if isinstance(error, openai.APIConnectionError):
-        return "transient"
-    if not isinstance(error, openai.APIStatusError):
-        return "unknown_exception"
-    return terminal_classification_from_response(
-        status_code=error.response.status_code,
-        headers=error.response.headers,
-    )
+    if disposition == "transient":
+        return True, error.code == "rate_limit_exceeded"
+    return False, False
 
 
 def request_id_from_openai_error(error: Exception) -> str | None:
@@ -497,15 +453,9 @@ class _OpenAIGenerationAdapterBase(Adapter, ABC):
         PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
     )
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = OPENAI_FAILURE_TYPES
-
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        return parse_openai(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        return classify_openai(error)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        return openai_request_failure(error)
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:

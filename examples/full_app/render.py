@@ -6,11 +6,11 @@ from events import (
     AgentFinished,
     AgentStarted,
     Event,
-    LlmCallAbandoned,
-    LlmResponse,
+    GenerationReported,
+    LlmInputTimedOut,
     ToolCalled,
+    ToolDispatched,
     ToolProgress,
-    ToolResponse,
     TurnStarted,
 )
 
@@ -27,24 +27,24 @@ def _render_body(event: Event) -> str:
             return f"* {path} started"
         case AgentFinished(agent_path=path, usage=usage):
             return f"* {path} done, spent ${usage.cost_in_usd:.4f}"
-        case AgentFailed(agent_path=path, error=error, usage=usage):
-            return f"! {path} FAILED ({error[:40]}), spent ${usage.cost_in_usd:.4f}"
+        case AgentFailed(agent_path=path, error_text=error_text, usage=usage):
+            return f"! {path} FAILED ({error_text[:40]}), spent ${usage.cost_in_usd:.4f}"
         case AgentCancelled(agent_path=path, usage=usage):
             return f"! {path} CANCELLED, settled spend ${usage.cost_in_usd:.4f}"
         case ToolProgress(tool_name=name, message=message):
             return f"  .. {name}: {message}"
         case TurnStarted(turn_number=turn, usage_so_far=usage):
             return f"  turn {turn} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
-        case LlmResponse(turn_number=turn, text=text, usage_so_far=usage):
+        case GenerationReported(turn_number=turn, text=text, usage_so_far=usage):
             shown = text or "(no text)"
             return f"  llm t{turn}: {shown[:40]!r} -> {usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f}"
-        case LlmCallAbandoned(turn_number=turn, usage_so_far=usage):
+        case LlmInputTimedOut(turn_number=turn, usage_so_far=usage):
             return (
-                f"  llm t{turn}: ABANDONED past the per-call deadline -> ${usage.cost_in_usd:.4f}"
+                f"  llm t{turn}: TIMED OUT past the per-input deadline -> ${usage.cost_in_usd:.4f}"
             )
         case ToolCalled(tool_name=name, args_json=args):
             return f"  -> {name}({args})"
-        case ToolResponse(
+        case ToolDispatched(
             tool_name=name,
             content=content,
             is_error=is_error,

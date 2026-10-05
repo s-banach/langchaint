@@ -10,33 +10,16 @@ from pydantic import BaseModel
 
 from langchaint import (
     AssistantPart,
-    AuthErrorRecord,
     ContentPart,
-    ContextWindowExceededErrorRecord,
     DispatchManyItemOutcome,
     DispatchOutcome,
-    EmptyAssistantMessageErrorRecord,
-    EscapedExceptionErrorRecord,
     Generation,
     GenerationErrorRecord,
-    MaxCompletionTokensExceededErrorRecord,
     Message,
-    ProviderDeclaredFinalErrorRecord,
-    ProviderFailedTerminallyErrorRecord,
-    RefusalErrorRecord,
-    RejectedErrorRecord,
-    RetriesExhaustedErrorRecord,
-    RetryUnavailableErrorRecord,
     SchemaViolationErrorRecord,
     StreamItem,
-    TimedOutErrorRecord,
-    UnfinishedAssistantMessageErrorRecord,
-    UnknownExceptionErrorRecord,
 )
-from langchaint.adapter import (
-    ResponseOutcome,
-    Verdict,
-)
+from langchaint.adapter import ResponseOutcome
 
 
 def _by_message_kind(message: Message) -> object:
@@ -75,19 +58,19 @@ def _by_content_part_kind_missing_a_variant(part: ContentPart) -> object:
 
 def _by_assistant_part_kind(part: AssistantPart) -> object:
     match part.kind:
-        case "reasoning_part":
+        case "reasoning":
             return part.text
         case "text":
             return part.cache_breakpoint
         case "tool_call":
             return part.args_json
-        case "raw_part":
+        case "raw":
             return part.raw
 
 
 def _by_assistant_part_kind_missing_a_variant(part: AssistantPart) -> object:
     match part.kind:  # pyrefly: ignore[non-exhaustive-match]
-        case "reasoning_part":
+        case "reasoning":
             return part.raw
 
 
@@ -98,7 +81,7 @@ def _by_dispatch_outcome_kind(outcome: DispatchOutcome) -> object:
         case "invalid_tool_args":
             return outcome.details
         case "unknown_tool":
-            return outcome.called_name
+            return outcome.tool_name
 
 
 def _by_dispatch_outcome_kind_missing_a_variant(outcome: DispatchOutcome) -> object:
@@ -114,7 +97,7 @@ def _by_dispatch_many_outcome_kind(outcome: DispatchManyItemOutcome) -> object:
         case "invalid_tool_args":
             return outcome.details
         case "unknown_tool":
-            return outcome.called_name
+            return outcome.tool_name
         case "precomputed":
             return outcome.tool_message
 
@@ -141,11 +124,11 @@ def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
         case "schema_violation":
             return outcome.validation_error_json
         case "unfinished_assistant_message":
-            return outcome.reason
+            return outcome.error_text
         case "provider_failed_terminally":
-            return outcome.reason
+            return outcome.error_text
         case "provider_failed_transiently":
-            return outcome.is_rate_limit
+            return outcome.pauses_quota
 
 
 def _by_response_outcome_kind_missing_a_variant(outcome: ResponseOutcome[str]) -> object:
@@ -175,56 +158,17 @@ def _by_generation_kind_missing_a_variant(generation: Generation[str]) -> object
             return generation.output
 
 
-def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requires one branch)
-    record: GenerationErrorRecord,
+def _by_generation_error_record_kind(
+    record: GenerationErrorRecord | SchemaViolationErrorRecord,
 ) -> object:
-    """Verify that `kind` narrows every normalized generation error record."""
+    """Verify that `kind` separates `SchemaViolationErrorRecord` from `GenerationErrorRecord`."""
     match record.kind:
-        case "retries_exhausted_error":
-            assert_type(record, RetriesExhaustedErrorRecord)
-            return record.errors_from_requests
-        case "retry_unavailable_error":
-            assert_type(record, RetryUnavailableErrorRecord)
-            return record.error_text
-        case "refusal_error":
-            assert_type(record, RefusalErrorRecord)
-            return record.stop_reason
-        case "max_completion_tokens_exceeded_error":
-            assert_type(record, MaxCompletionTokensExceededErrorRecord)
-            return record.stop_reason
-        case "empty_assistant_message_error":
-            assert_type(record, EmptyAssistantMessageErrorRecord)
-            return record.stop_reason
         case "schema_violation_error":
             assert_type(record, SchemaViolationErrorRecord)
             return record.validation_error_json
-        case "context_window_exceeded_error":
-            assert_type(record, ContextWindowExceededErrorRecord)
-            return record.stop_reason
-        case "unfinished_assistant_message_error":
-            assert_type(record, UnfinishedAssistantMessageErrorRecord)
+        case _:
+            assert_type(record, GenerationErrorRecord)
             return record.error_text
-        case "provider_failed_terminally_error":
-            assert_type(record, ProviderFailedTerminallyErrorRecord)
-            return record.error_text
-        case "auth_error":
-            assert_type(record, AuthErrorRecord)
-            return record.error_text
-        case "rejected_error":
-            assert_type(record, RejectedErrorRecord)
-            return record.error_text
-        case "provider_declared_final_error":
-            assert_type(record, ProviderDeclaredFinalErrorRecord)
-            return record.error_text
-        case "unknown_exception_error":
-            assert_type(record, UnknownExceptionErrorRecord)
-            return record.error_text
-        case "escaped_exception_error":
-            assert_type(record, EscapedExceptionErrorRecord)
-            return record.error_text
-        case "timed_out_error":
-            assert_type(record, TimedOutErrorRecord)
-            return record.request_count
 
 
 def _by_stream_item_kind(item: StreamItem) -> object:
@@ -246,22 +190,3 @@ def _by_stream_item_kind_missing_a_variant(item: StreamItem) -> object:
     match item.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "reasoning_delta":
             return item.text
-
-
-def _by_verdict_kind(verdict: Verdict) -> object:
-    """Cover Verdict, whose DoNotRetry variant is the one carrying no retry_after."""
-    match verdict.kind:
-        case "pause_all":
-            return verdict.retry_after
-        case "pause_all_do_not_retry":
-            return verdict.retry_after
-        case "retry_this_one":
-            return verdict.retry_after
-        case "do_not_retry":
-            return verdict.kind
-
-
-def _by_verdict_kind_missing_a_variant(verdict: Verdict) -> object:
-    match verdict.kind:  # pyrefly: ignore[non-exhaustive-match]
-        case "pause_all":
-            return verdict.retry_after

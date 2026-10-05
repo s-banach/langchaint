@@ -52,16 +52,16 @@ _VALID_AND_INVALID_VALUE_BY_OTEL_TYPE: dict[str, tuple[JsonValue, JsonValue]] = 
 
 
 def _chat_span(attributes: dict[str, JsonValue] | None = None) -> dict[str, JsonValue]:
-    raw_attributes: dict[str, JsonValue] = {"gen_ai.operation.name": "chat"}
+    span_attributes: dict[str, JsonValue] = {"gen_ai.operation.name": "chat"}
     if attributes is not None:
-        raw_attributes.update(attributes)
-    return raw_attributes
+        span_attributes.update(attributes)
+    return span_attributes
 
 
 def _generation_chat_span(
     attributes: dict[str, JsonValue] | None = None,
 ) -> OtelChatSpan:
-    raw_attributes: dict[str, JsonValue] = {
+    span_attributes: dict[str, JsonValue] = {
         "gen_ai.provider.name": "fake",
         "gen_ai.request.model": "fake-model",
         "gen_ai.response.finish_reasons": ["stop"],
@@ -70,8 +70,8 @@ def _generation_chat_span(
         ],
     }
     if attributes is not None:
-        raw_attributes.update(attributes)
-    return parse_otel(_chat_span(raw_attributes))
+        span_attributes.update(attributes)
+    return parse_otel(_chat_span(span_attributes))
 
 
 async def _return_tool_arguments(arguments: dict[str, object]) -> str:
@@ -126,8 +126,8 @@ class _CountingTool:
             args_schema={"type": "object"},
         )
 
-    async def dispatch(self, call: ToolCall) -> DispatchHandled[None]:
-        return DispatchHandled(tool_message=ToolMessage(tool_call_id=call.id, content="done"))
+    async def dispatch(self, tool_call: ToolCall) -> DispatchHandled[None]:
+        return DispatchHandled(tool_message=ToolMessage(tool_call_id=tool_call.id, content="done"))
 
 
 def _assert_scalar_attributes_parse(
@@ -768,7 +768,7 @@ def test_reconstructs_text_generation_with_tool_calls_record_and_synthetic_field
     record = generation_record_from_otel(span)
     assert record.kind == "with_tool_calls"
     assert record.output == "beforeafter"
-    assert record.stop_reason == "end_turn"
+    assert record.stop_reason == "stop"
     assert record.request_history.model == "fake-model"
     assert record.request_history.provider_name == "fake"
     assert record.request_history.elapsed_seconds == 0.0
@@ -782,7 +782,7 @@ def test_reconstructs_text_generation_with_tool_calls_record_and_synthetic_field
     request_record = record.request_records[0]
     assert request_record.started_after_seconds == 0.0
     assert request_record.elapsed_seconds == 0.0
-    assert request_record.seconds_to_first_item is None
+    assert request_record.first_item_after_seconds is None
     assert request_record.error is None
     assert request_record.model_served == "served-model"
     assert request_record.response_id == "response-1"
@@ -790,10 +790,10 @@ def test_reconstructs_text_generation_with_tool_calls_record_and_synthetic_field
     assert request_record.billing is not None
     assert request_record.billing.usage == ZERO_USAGE
     assert request_record.billing.service_tier == "unknown"
-    assert math.isnan(request_record.billing.input_cache_none_usd_per_million_tokens)
-    assert math.isnan(request_record.billing.cache_read_usd_per_million_tokens)
-    assert math.isnan(request_record.billing.cache_write_usd_per_million_tokens)
-    assert math.isnan(request_record.billing.output_usd_per_million_tokens)
+    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_none)
+    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_read)
+    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_write)
+    assert math.isnan(request_record.billing.usd_per_million_tokens.output_tokens)
 
 
 @pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
@@ -977,9 +977,9 @@ def test_generation_record_rejects_error_finish_reason() -> None:
 @pytest.mark.parametrize(
     ("finish_reason", "stop_reason"),
     [
-        ("stop", "end_turn"),
-        ("tool_call", "tool_use"),
-        ("length", "max_tokens"),
+        ("stop", "stop"),
+        ("tool_call", "tool_call"),
+        ("length", "max_completion_tokens"),
         ("content_filter", "refusal"),
         ("context_window_exceeded", "context_window_exceeded"),
         ("provider_defined", "other"),
@@ -1004,7 +1004,7 @@ def test_generation_record_falls_back_to_message_finish_reason() -> None:
             }
         ]
     }).model_copy(update={"response_finish_reasons": None})
-    assert generation_record_from_otel(span).stop_reason == "max_tokens"
+    assert generation_record_from_otel(span).stop_reason == "max_completion_tokens"
 
 
 def test_generation_record_requires_matching_finish_reason_locations() -> None:

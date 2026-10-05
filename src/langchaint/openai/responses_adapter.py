@@ -16,9 +16,9 @@ Older breakpoints remain available for matching.
 `ttl` accepts only `"30m"`.
 `automatic_cache_breakpoints=False` sends explicit mode and requires `prompt_cache_options` support.
 `automatic_cache_breakpoints=True` sends no `prompt_cache_options` and preserves implicit caching.
-Every marked part sends `prompt_cache_breakpoint: {"mode": "explicit"}`.
+Every part with `cache_breakpoint=True` sends `prompt_cache_breakpoint: {"mode": "explicit"}`.
 The adapter sends every breakpoint and lets the API enforce its write limits.
-Marked parts re-enable caching under `automatic_cache_breakpoints=False`.
+Parts with `cache_breakpoint=True` re-enable caching under `automatic_cache_breakpoints=False`.
 
 The API stores responses by default.
 The adapter sends `store=False` because `GenerationInput` contains the complete state.
@@ -30,7 +30,7 @@ The adapter omits unset `reasoning.effort` and `reasoning.summary` keys.
 Content mappings were verified against openai 2.53.0.
 - `ImagePart` becomes a data URL in `image_url`.
 - `ImageUrlPart.url` becomes `image_url` unchanged.
-- `AudioPart` returns `RefusedMessages` inside `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `RejectedMessages` inside `UserMessage` and `ToolMessage`.
 - Web search and file search produce distinct output item types.
 
 Request and response mappings:
@@ -43,9 +43,9 @@ Request and response mappings:
 - The API has no `is_error` field, so `ToolMessage.content` carries the error signal.
 - `ResponseOutputRefusal` becomes `TextPart` and maps to `stop_reason="refusal"`.
 - Anthropic 0.120.0 represents refusals as text with the same `stop_reason`.
-- A `function_call` output item maps to `stop_reason="tool_use"`.
-- Status `"completed"` maps to `"end_turn"`.
-- Status `"incomplete"` maps `"max_output_tokens"` to `"max_tokens"`.
+- A `function_call` output item maps to `stop_reason="tool_call"`.
+- Status `"completed"` maps to `"stop"`.
+- Status `"incomplete"` maps `"max_output_tokens"` to `"max_completion_tokens"`.
   Status `"incomplete"` maps `"content_filter"` to `"refusal"`.
   OpenAI 3.8.0 incomplete reasons `"max_messages"` and `"steered"` map to `"other"`.
 - Other outcomes map to `"other"`.
@@ -103,7 +103,7 @@ from langchaint.adapter import (
     ProviderFailedTransiently,
     ReasoningDelta,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -115,7 +115,7 @@ from langchaint.adapter import (
     UnfinishedAssistantMessage,
     UnusableResponse,
     UsableResponse,
-    _NotSendableError,
+    _RejectedMessagesError,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
@@ -196,7 +196,7 @@ def _wire_reasoning(effort: str | None, summary: ReasoningSummary | None) -> Rea
 
 
 @dataclass(frozen=True, kw_only=True)
-class _OpenAIPrecomputedFields:
+class _OpenAIResponsesPrecomputedFields:
     """The typed request fields one binding precomputes.
 
     The SDK `omit` sentinel preserves provider defaults.
@@ -222,7 +222,7 @@ class _OpenAIPrecomputedFields:
     """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
 
     extra_body: Mapping[str, object] | None
-    charged_provider_tools: bool
+    charged_provider_executed_tools: bool
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
@@ -245,10 +245,10 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
 
 
 @dataclass(frozen=True, kw_only=True)
-class _OpenAIRequestParams(RequestParams):
+class _OpenAIResponsesRequestParams(RequestParams):
     """One responses request: the binding's precomputed fields and one input's converted input."""
 
-    precomputed: _OpenAIPrecomputedFields
+    precomputed: _OpenAIResponsesPrecomputedFields
     input: list[ResponseInputItemParam]
     """What goes on the wire as input: the binding's input_prefix followed by the Sequence[Message]."""
 
@@ -283,10 +283,10 @@ def _tool_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInpu
 def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
     """Convert one UserMessage to a user message item.
 
-    Marked parts send `prompt_cache_breakpoint`.
+    Parts with `cache_breakpoint=True` send `prompt_cache_breakpoint`.
 
     Raises:
-        _NotSendableError: content holds AudioPart.
+        _RejectedMessagesError: content holds AudioPart.
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
@@ -309,7 +309,7 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
                     _user_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
                 )
             case "audio":
-                raise _NotSendableError(
+                raise _RejectedMessagesError(
                     "OpenAIResponsesAdapter cannot send AudioPart inside UserMessage.content: "
                     "ResponseInputContentParam has no audio variant"
                 )
@@ -331,7 +331,7 @@ def _function_call_output(
     The latest-N server rule in `_user_item` also applies here.
 
     Raises:
-        _NotSendableError: content holds AudioPart.
+        _RejectedMessagesError: content holds AudioPart.
     """
     if isinstance(content, str):
         return content
@@ -357,7 +357,7 @@ def _function_call_output(
                     _tool_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
                 )
             case "audio":
-                raise _NotSendableError(
+                raise _RejectedMessagesError(
                     "OpenAIResponsesAdapter cannot send AudioPart inside ToolMessage.content: "
                     "ResponseFunctionCallOutputItemListParam has no audio variant"
                 )
@@ -417,7 +417,7 @@ def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
     The system prompt is separate.
 
     Raises:
-        _NotSendableError: A ContentPart has no Responses wire form.
+        _RejectedMessagesError: A ContentPart has no Responses wire form.
     """
     wire: list[ResponseInputItemParam] = []
     for message in messages:
@@ -483,23 +483,23 @@ def _provider_failure(
     """Return the failure variant selected by `response.error.code`.
 
     Both variants carry emitted fragments in `assistant_message`.
-    `reason` preserves `response.error.message` verbatim.
+    `error_text` preserves `response.error.message` verbatim.
     Missing errors and unknown codes produce terminal failures.
-    `rate_limit_exceeded` produces a rate-limit transient failure without a server-stated wait.
+    `rate_limit_exceeded` produces a transient failure that pauses the rate-limit quota, without a server-stated wait.
     """
     error = response.error
     if error is None:
         return ProviderFailedTerminally(
-            reason="openai reported status 'failed' and no error object",
+            error_text="openai reported status 'failed' and no error object",
             assistant_message=assistant_message,
         )
     if _DISPOSITION_BY_ERROR_CODE.get(error.code) == "transient":
         return ProviderFailedTransiently(
-            reason=error.message,
-            is_rate_limit=error.code == "rate_limit_exceeded",
+            error_text=error.message,
+            pauses_quota=error.code == "rate_limit_exceeded",
             assistant_message=assistant_message,
         )
-    return ProviderFailedTerminally(reason=error.message, assistant_message=assistant_message)
+    return ProviderFailedTerminally(error_text=error.message, assistant_message=assistant_message)
 
 
 def _has_refusal(response: OpenAIResponse) -> bool:
@@ -540,7 +540,7 @@ def _first_output_text(response: OpenAIResponse) -> str | None:
 
 
 _STOP_REASON_BY_INCOMPLETE_REASON: dict[str, StopReason] = {
-    "max_output_tokens": "max_tokens",
+    "max_output_tokens": "max_completion_tokens",
     "content_filter": "refusal",
     "max_messages": "other",
     "steered": "other",
@@ -557,9 +557,9 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
     if _has_refusal(response):
         return "refusal"
     if any(item.type == "function_call" for item in response.output):
-        return "tool_use"
+        return "tool_call"
     if response.status == "completed":
-        return "end_turn"
+        return "stop"
     if response.status != "incomplete" or response.incomplete_details is None:
         return "other"
     reason = response.incomplete_details.reason
@@ -629,8 +629,8 @@ def _billing_from_response(
         pydantic.ValidationError: Cache counters exceed `input_tokens`.
     """
     service_tier = _priced_tier(response.service_tier)
-    usage = response.usage
-    input_tokens_total = 0 if usage is None else usage.input_tokens
+    usage_raw = response.usage
+    input_tokens_total = 0 if usage_raw is None else usage_raw.input_tokens
     rates = pricing.rates_for(
         service_tier=response.service_tier,
         input_tokens_total=input_tokens_total,
@@ -651,7 +651,7 @@ def _billing_from_response(
     )
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = float("nan")
-    if usage is None:
+    if usage_raw is None:
         return rates.price(
             service_tier=service_tier,
             usage_raw=None,
@@ -662,17 +662,17 @@ def _billing_from_response(
             output_tokens_reasoning=0,
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
-    details = usage.input_tokens_details
+    details = usage_raw.input_tokens_details
     return rates.price(
         service_tier=service_tier,
-        usage_raw=usage,
+        usage_raw=usage_raw,
         input_tokens_cache_read=details.cached_tokens,
         input_tokens_cache_write=details.cache_write_tokens,
         input_tokens_cache_none=(
-            usage.input_tokens - details.cached_tokens - details.cache_write_tokens
+            usage_raw.input_tokens - details.cached_tokens - details.cache_write_tokens
         ),
-        output_tokens=usage.output_tokens,
-        output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
+        output_tokens=usage_raw.output_tokens,
+        output_tokens_reasoning=usage_raw.output_tokens_details.reasoning_tokens,
         provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
     )
 
@@ -719,9 +719,9 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
         `supports_prompt_cache_options` identifies gpt-5.6-and-later support in openai 2.45.0.
         `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
-        `OpenAI.model` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
+        `OpenAI.llm` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
         It requires the parameter for uncataloged identifiers.
-        `OpenAIBedrock.model` always requires it because Bedrock ids have no catalog.
+        `OpenAIBedrock.llm` always requires it because Bedrock ids have no catalog.
         `pricing` supplies rates and modifiers.
         `regional_processing=False` uses the standard `1.0` token-price multiplier.
         `regional_processing=True` applies the regional token-price multiplier.
@@ -752,7 +752,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             "supports_prompt_cache_options": self.supports_prompt_cache_options,
         }
 
-    def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:
+    def _precompute_fields(self, binding: Binding) -> _OpenAIResponsesPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 
         Raises:
@@ -807,7 +807,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             tools = _wire_tools(binding.tool_schemas, binding.provider_executed_tools)
             tool_choice = _wire_tool_choice(binding.tool_choice)
             parallel_tool_calls = binding.parallel_tool_calls
-        return _OpenAIPrecomputedFields(
+        return _OpenAIResponsesPrecomputedFields(
             model=self.model,
             instructions=instructions,
             input_prefix=input_prefix,
@@ -830,7 +830,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             include=["reasoning.encrypted_content"],
             text=omit,
             extra_body=binding.extra_body,
-            charged_provider_tools=bool(provider_executed_tool_types),
+            charged_provider_executed_tools=bool(provider_executed_tool_types),
         )
 
     @override
@@ -840,7 +840,9 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         Raises:
             ValueError: `binding` contains unsupported values.
         """
-        return _BoundOpenAIText(adapter=self, precomputed_fields=self._precompute_fields(binding))
+        return _BoundOpenAIResponsesText(
+            adapter=self, precomputed_fields=self._precompute_fields(binding)
+        )
 
     @override
     def bind_structured[ModelT: BaseModel](
@@ -853,14 +855,14 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        return _BoundOpenAIStructured(
+        return _BoundOpenAIResponsesStructured(
             adapter=self,
             precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
         )
 
 
-class _OpenAIStream(AdapterStream):
+class _OpenAIResponsesStream(AdapterStream):
     """One open Responses stream, backed by the SDK's stream helper."""
 
     def __init__(
@@ -869,12 +871,12 @@ class _OpenAIStream(AdapterStream):
         sdk_stream: AsyncResponseStream[Any],
         pricing: OpenAIPricingTable,
         regional_processing: bool,
-        charged_provider_tools: bool,
+        charged_provider_executed_tools: bool,
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
         self._regional_processing = regional_processing
-        self._charged_provider_tools = charged_provider_tools
+        self._charged_provider_executed_tools = charged_provider_executed_tools
         self._terminal_response: OpenAIResponse | None = None
 
     @override
@@ -985,7 +987,7 @@ class _OpenAIStream(AdapterStream):
 
     @override
     def billing_reported(self) -> ProviderBilling | None:
-        """Return terminal billing or NaN for incomplete charged provider tools.
+        """Return terminal billing or NaN for incomplete charged provider-executed tools.
 
         OpenAI 2.45.0 stream state accumulates output items without counters.
         `ResponseUsage` arrives only with the terminal response.
@@ -996,7 +998,7 @@ class _OpenAIStream(AdapterStream):
                 self._pricing,
                 regional_processing=self._regional_processing,
             )
-        if not self._charged_provider_tools:
+        if not self._charged_provider_executed_tools:
             return None
         rates = self._pricing.rates_for(
             service_tier=_DEFAULT_TIER,
@@ -1030,11 +1032,14 @@ class _OpenAIStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
+class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
     """What both openai bindings share: the request path, and what a response says about itself."""
 
     def __init__(
-        self, *, adapter: OpenAIResponsesAdapter, precomputed_fields: _OpenAIPrecomputedFields
+        self,
+        *,
+        adapter: OpenAIResponsesAdapter,
+        precomputed_fields: _OpenAIResponsesPrecomputedFields,
     ) -> None:
         self._adapter = adapter
         self._precomputed_fields = precomputed_fields
@@ -1068,13 +1073,15 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
         """Convert messages into the input items every request for one input sends."""
         try:
             wire_input = _wire_input(messages)
-        except _NotSendableError as not_sendable:
-            return RefusedMessages(reason=str(not_sendable))
-        return _OpenAIRequestParams(
+        except _RejectedMessagesError as rejected:
+            return RejectedMessages(error_text=str(rejected))
+        return _OpenAIResponsesRequestParams(
             precomputed=self._precomputed_fields,
             input=[*self._precomputed_fields.input_prefix, *wire_input],
         )
@@ -1087,7 +1094,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request_params(request_params, _OpenAIRequestParams)
+        params = narrowed_request_params(request_params, _OpenAIResponsesRequestParams)
         precomputed = params.precomputed
         manager = self._adapter.client.responses.stream(
             model=precomputed.model,
@@ -1107,15 +1114,15 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             input=params.input,
             extra_body=precomputed.extra_body,
         )
-        return _OpenAIStream(
+        return _OpenAIResponsesStream(
             sdk_stream=await manager.__aenter__(),
             pricing=self._adapter.pricing,
             regional_processing=self._adapter.regional_processing,
-            charged_provider_tools=precomputed.charged_provider_tools,
+            charged_provider_executed_tools=precomputed.charged_provider_executed_tools,
         )
 
 
-class _BoundOpenAIText(_BoundOpenAI[str]):
+class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
     """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
@@ -1136,14 +1143,14 @@ class _BoundOpenAIText(_BoundOpenAI[str]):
         return _usable_response(response, assistant_message.text, assistant_message)
 
 
-class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
+class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[ModelT | None]):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
         *,
         adapter: OpenAIResponsesAdapter,
-        precomputed_fields: _OpenAIPrecomputedFields,
+        precomputed_fields: _OpenAIResponsesPrecomputedFields,
         response_format: type[ModelT],
     ) -> None:
         """Precompute the request's text parameter, the JSON-schema format this binding asks for.
@@ -1192,7 +1199,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
                 )
             return EmptyAssistantMessage(assistant_message=assistant_message)
         return UnfinishedAssistantMessage(
-            reason=f"openai returned status {response.status!r}",
+            error_text=f"openai returned status {response.status!r}",
             assistant_message=assistant_message,
         )
 
@@ -1214,7 +1221,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
                 return _usable_response(response, output, assistant_message)
             except ValidationError as rejection:
                 validation_error = rejection
-        if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
+        if response.status == "completed" and _normalized_stop_reason(response) == "tool_call":
             return _usable_response(response, None, assistant_message)
         return self._no_instance(response, validation_error, assistant_message)
 

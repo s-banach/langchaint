@@ -27,7 +27,7 @@ A stream span is never current, because the application's code runs between stre
 A filter that raises or returns a part of another kind is logged, and every attribute in the same build is omitted.
 Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
 `extra_attributes` sets constant attributes when each span starts.
-Request and completion attributes replace matching `extra_attributes` keys.
+Request and outcome attributes replace matching `extra_attributes` keys.
 Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
@@ -37,7 +37,7 @@ They report `gen_ai.output.type` for every input.
 With capture enabled, they report system instructions, tool definitions, input messages, and output messages.
 Stream spans also report `gen_ai.request.stream=True`.
 A stream span reports `gen_ai.response.time_to_first_chunk` once an item arrives, including for a stream left early.
-A stream span whose block exits before the conclusion reports its usage and cost.
+A stream span whose block exits before the stream stores a `GenerationOutcome` reports its usage and cost.
 Its status stays unset, because handling the input did not fail.
 Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
@@ -231,12 +231,11 @@ class _SpanConfig:
 
 
 _CONVENTION_FINISH_REASONS: Mapping[StopReason, str] = {
-    "end_turn": "stop",
-    "tool_use": "tool_call",
-    "max_tokens": "length",
+    "max_completion_tokens": "length",
 }
-"""The StopReason values with an exact counterpart in the convention's finish-reason vocabulary.
+"""The StopReason values whose counterpart in the convention's finish-reason vocabulary has another name.
 
+stop and tool_call are the convention's own values.
 refusal, context_window_exceeded, and other are absent deliberately and pass through unmapped:
 the convention's content_filter means a provider filter blocked content.
 No convention value corresponds to a context-window overflow or to other.
@@ -281,7 +280,7 @@ def gen_ai_attributes[OutputT](
     No cache_none counter is emitted because it is derived.
     gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
     gen_ai.response.model is the last request's model_served and is omitted when unavailable.
-    gen_ai.response.time_to_first_chunk is the last request's seconds_to_first_item, settled or cut off.
+    gen_ai.response.time_to_first_chunk is the last request's first_item_after_seconds, settled or cut off.
     That value runs from sending the request to the first stream item, so only a stream has it.
     The usage and cost attributes are the input's paid totals across every request.
     `outcome.usage` has that scope.
@@ -306,8 +305,8 @@ def gen_ai_attributes[OutputT](
     }
     if final_settled_record is not None and final_settled_record.model_served is not None:
         attributes["gen_ai.response.model"] = final_settled_record.model_served
-    if final_record is not None and final_record.seconds_to_first_item is not None:
-        attributes["gen_ai.response.time_to_first_chunk"] = final_record.seconds_to_first_item
+    if final_record is not None and final_record.first_item_after_seconds is not None:
+        attributes["gen_ai.response.time_to_first_chunk"] = final_record.first_item_after_seconds
     if outcome.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(outcome.stop_reason)]
     return attributes
@@ -381,7 +380,7 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
     A RawPart renders as None because it has no text.
     """
     match part.kind:
-        case "reasoning_part":
+        case "reasoning":
             return {"type": "reasoning", "content": part.text} if part.text else None
         case "text":
             return {"type": "text", "content": part.text} if part.text else None
@@ -392,7 +391,7 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
                 "name": part.name,
                 "arguments": _tool_call_arguments(part.args_json),
             }
-        case "raw_part":
+        case "raw":
             return None
 
 
@@ -627,10 +626,10 @@ def _record_tool_exception(span: Span, exc: Exception) -> None:
 
 
 def _tool_call_arguments_attribute(
-    call: ToolCall, content_filter: ContentFilter
+    tool_call: ToolCall, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
-    """Build gen_ai.tool.call.arguments from the call, empty when the filter omits the call."""
-    filtered = _filtered_part(content_filter, "gen_ai.tool.call.arguments", call)
+    """Build gen_ai.tool.call.arguments from `tool_call`, empty when the filter omits it."""
+    filtered = _filtered_part(content_filter, "gen_ai.tool.call.arguments", tool_call)
     if filtered is None:
         return {}
     return {"gen_ai.tool.call.arguments": json.dumps(_tool_call_arguments(filtered.args_json))}
@@ -771,12 +770,12 @@ class OtelObserver:
             def drop_binary(name: str, part: ContentPart | AssistantPart) -> ContentPart | AssistantPart | None:
                 return None if part.kind in ("image", "audio") else part
 
-        `attribute_mapper` sets the completion attributes of each chat span.
+        `attribute_mapper` sets the outcome attributes of each chat span.
         It defaults to `gen_ai_attributes`.
         `extra_attributes` applies at the start of every span.
         `extra_attributes=None` supplies no extra attributes.
         Request and dispatch identity attributes replace matching `extra_attributes` keys at span start.
-        A key the mapper also emits resolves to the mapper's value, set at completion.
+        A key the mapper also emits resolves to the mapper's value, set with the outcome attributes.
         `tracer_provider` decides where spans go, and `tracer_provider=None` uses the global tracer provider.
         Either way, the tracer is named `langchaint.tracing` with the package version.
         That name is every span's instrumentation scope, which identifies langchaint as the span's source.
@@ -815,19 +814,21 @@ class OtelObserver:
         )
         return _GenerationSpan(span, span_config)
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
+    def dispatch_started(
+        self, tool_call: ToolCall
+    ) -> ObservedOperation[DispatchOutcome | Exception]:
         """Open the INTERNAL execute_tool span and set its identity attributes.
 
-        The span name is "execute_tool {call.name}".
+        The span name is "execute_tool {tool_call.name}".
         The identity attributes gen_ai.operation.name, gen_ai.tool.name, and gen_ai.tool.call.id are set at span start.
         With capture on, gen_ai.tool.call.arguments is set at span start.
         `content_filter` sees the `ToolCall` under gen_ai.tool.call.arguments.
-        It sees each result part under gen_ai.tool.call.result.
+        It sees each `ToolMessage` content part under gen_ai.tool.call.result.
         gen_ai.tool.call.arguments uses best-effort JSON deserialization.
         Unparseable text is preserved as a quoted JSON string.
         The outcome selects the span status and error.type:
 
-        | dispatch result                     | status | error.type              |
+        | dispatch outcome                    | status | error.type              |
         | ----------------------------------- | ------ | ----------------------- |
         | DispatchHandled, is_error False     | OK     | absent                  |
         | DispatchHandled, is_error True      | ERROR  | tool_error              |
@@ -839,21 +840,21 @@ class OtelObserver:
         """
         span_config = self._span_config
         span = span_config.tracer.start_span(
-            f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
+            f"{_EXECUTE_TOOL_OPERATION} {tool_call.name}", kind=SpanKind.INTERNAL
         )
         _set_span_attributes(span, span_config.extra_attributes)
         _set_span_attributes(
             span,
             {
                 "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
-                "gen_ai.tool.name": call.name,
-                "gen_ai.tool.call.id": call.id,
+                "gen_ai.tool.name": tool_call.name,
+                "gen_ai.tool.call.id": tool_call.id,
             },
         )
         _apply_content_attributes(
             span,
             span_config,
-            lambda content_filter: _tool_call_arguments_attribute(call, content_filter),
+            lambda content_filter: _tool_call_arguments_attribute(tool_call, content_filter),
         )
         return _DispatchSpan(span, span_config)
 

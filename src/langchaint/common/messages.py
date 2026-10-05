@@ -190,7 +190,7 @@ class ReasoningPart(CheckedCopyModel):
 
     raw: dict[str, JsonValue]
     text: str | None = None
-    kind: Literal["reasoning_part"] = "reasoning_part"
+    kind: Literal["reasoning"] = "reasoning"
 
 
 class RawPart(CheckedCopyModel):
@@ -199,14 +199,14 @@ class RawPart(CheckedCopyModel):
     `AssistantMessage.parts` preserves `RawPart` response order.
     `raw` is the producing SDK `model_dump` fragment required for replay.
     The consuming adapter sends `raw` unchanged in its original wire position.
-    Another adapter returns `RefusedMessages` or leaves validation to its provider.
+    Another adapter returns `RejectedMessages` or leaves validation to its provider.
     Applications inspect `Generation.raw` for the complete SDK response.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     raw: dict[str, JsonValue]
-    kind: Literal["raw_part"] = "raw_part"
+    kind: Literal["raw"] = "raw"
 
 
 type AssistantPart = Annotated[
@@ -249,7 +249,7 @@ class AssistantMessage(CheckedCopyModel):
             raise ValueError(
                 "cache_breakpoint is not supported on assistant message text. "
                 "openai has no breakpoint on assistant replay text. "
-                "Mark the following user or tool message instead"
+                "Set cache_breakpoint on a part of the following user or tool message instead"
             )
         return self
 
@@ -329,7 +329,7 @@ def messages_from_json(messages_json: str) -> list[Message]:
 
 
 type StopReason = Literal[
-    "end_turn", "tool_use", "max_tokens", "refusal", "context_window_exceeded", "other"
+    "stop", "tool_call", "max_completion_tokens", "refusal", "context_window_exceeded", "other"
 ]
 """Provider stop reasons normalized to one vocabulary.
 

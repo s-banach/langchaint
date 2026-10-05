@@ -8,22 +8,23 @@ class TransientError(Exception):
     Retry loops raise `TransientError` inside `SharedBackoff.admitted()`.
     `SettledRequestRecord.error` preserves normalized failure data.
     `SettledRequestRecord.billing` preserves billing from the same request.
+    `pauses_quota` is true when the failure pauses every request on the rate-limit quota.
     """
 
     retry_after_seconds: float | None
-    is_rate_limit: bool
+    pauses_quota: bool
 
     def __init__(
         self,
-        message: str,
+        error_text: str,
         *,
         retry_after_seconds: float | None = None,
-        is_rate_limit: bool = False,
+        pauses_quota: bool = False,
     ) -> None:
-        """Store the server-stated wait and rate-limit classification."""
-        super().__init__(message)
+        """Store the server-stated wait and whether the failure pauses the rate-limit quota."""
+        super().__init__(error_text)
         self.retry_after_seconds = retry_after_seconds
-        self.is_rate_limit = is_rate_limit
+        self.pauses_quota = pauses_quota
 
 
 class EmbeddingOutputError(RuntimeError):

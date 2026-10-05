@@ -13,7 +13,7 @@ class ObservedOperation[OutcomeT](Protocol):
 
     The observer creates the handle when the operation starts.
     langchaint calls `conclude` at most once, then `end` exactly once.
-    An operation cancelled before its conclusion receives `end` without `conclude`.
+    An operation cancelled before its outcome receives `end` without `conclude`.
     A stream instead concludes with its `abandoned` record.
     langchaint logs an exception raised by any method and continues, so a failing observer loses only its own record.
     """

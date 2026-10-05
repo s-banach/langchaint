@@ -29,7 +29,7 @@ from langchaint.common.sequence_not_str import SequenceNotStr
 
 
 @dataclass(frozen=True, kw_only=True)
-class ToolOutputExplicit[AppDataT = None]:
+class ToolReturnExplicit[AppDataT = None]:
     """Model-facing `content`, its error status, and application-only `app_data`.
 
     `dispatch` copies `is_error` to `ToolMessage.is_error` and returns `app_data` unchanged.
@@ -41,7 +41,7 @@ class ToolOutputExplicit[AppDataT = None]:
     app_data: AppDataT | None = None
 
 
-type ToolOutput[AppDataT = None] = MessageContent | ToolOutputExplicit[AppDataT]
+type ToolReturn[AppDataT = None] = MessageContent | ToolReturnExplicit[AppDataT]
 """The model-facing content and optional application data returned by a tool function."""
 
 
@@ -63,11 +63,11 @@ class InvalidToolArgsDetail:
 
     `path` contains object keys and list indexes.
     An empty `path` refers to the complete arguments object.
-    `message` preserves the validator's text.
+    `error_text` preserves the validator's text.
     """
 
     path: tuple[str | int, ...]
-    message: str
+    error_text: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -84,13 +84,13 @@ class DispatchInvalidToolArgs:
 
 @dataclass(frozen=True, kw_only=True)
 class DispatchUnknownTool:
-    """A tool call whose `called_name` is absent from `ToolManager`.
+    """A tool call whose `tool_name` is absent from `ToolManager`.
 
     `tool_message` lists the available tool names for the model.
     """
 
     tool_message: ToolMessage
-    called_name: str
+    tool_name: str
     kind: Literal["unknown_tool"] = "unknown_tool"
 
 
@@ -142,8 +142,8 @@ class InvalidToolArgsError(Exception):
 class DispatchExceptionGroup(ExceptionGroup[Exception]):
     """Tool function exceptions from `ToolManager.dispatch_many`.
 
-    `completed_outcomes` preserves settled outcomes in input order.
-    The grouped exceptions preserve input order and their tracebacks.
+    `completed_outcomes` preserves settled outcomes in `tool_calls` order.
+    The grouped exceptions preserve `tool_calls` order and their tracebacks.
     Cancellation propagates separately with this group as its cause when both occur.
     """
 
@@ -197,7 +197,7 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     name: str
     description: str
     args_model: type[ArgsT]
-    function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]]
+    function: Callable[[ArgsT], Awaitable[ToolReturn[AppDataT]]]
 
     def schema(self) -> ToolSchema:
         """Convert to the provider-neutral schema."""
@@ -218,7 +218,7 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         except ValidationError as exc:
             raise InvalidToolArgsError(exc) from exc
 
-    async def validate_and_run(self, args_json: str) -> ToolOutput[AppDataT]:
+    async def validate_and_run(self, args_json: str) -> ToolReturn[AppDataT]:
         """Validate `args_json` with `args_model`, then run `function`.
 
         Args:
@@ -231,28 +231,28 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         return await self.function(self._validated_args(args_json))
 
     async def dispatch(
-        self, call: ToolCall
+        self, tool_call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
         """Return a handled call or its argument-validation failure.
 
-        The caller must match `call.name` before calling this method.
+        The caller must match `tool_call.name` before calling this method.
 
         Args:
-            call: The tool call to dispatch.
+            tool_call: The tool call to dispatch.
 
         Raises:
             BaseException: `function` raises it.
         """
         try:
-            args = self._validated_args(call.args_json)
+            args = self._validated_args(tool_call.args_json)
         except InvalidToolArgsError as error:
-            return _invalid_args_outcome(call, _details_from_pydantic(error.validation_error))
-        return _handled_outcome(call, await self.function(args))
+            return _invalid_args_outcome(tool_call, _details_from_pydantic(error.validation_error))
+        return _handled_outcome(tool_call, await self.function(args))
 
 
 def _is_matching_args_model[ArgsT: BaseModel, AppDataT](
     annotation: object,
-    _function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]],
+    _function: Callable[[ArgsT], Awaitable[ToolReturn[AppDataT]]],
 ) -> TypeIs[type[ArgsT]]:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
@@ -264,7 +264,7 @@ class _ToolDecorator:
 
     def __call__[ArgsT: BaseModel, AppDataT = None](
         self,
-        function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]],
+        function: Callable[[ArgsT], Awaitable[ToolReturn[AppDataT]]],
     ) -> PydanticTool[ArgsT, AppDataT]:
         """Resolve `args_model` from the parameter.
 
@@ -326,7 +326,7 @@ class DispatchCaptured[CapturedT: BaseModel]:
 class CaptureTool[CapturedT: BaseModel]:
     """Validate model-generated arguments. Return them without calling a function.
 
-    `acknowledgement` becomes the model-facing tool result.
+    `acknowledgement` becomes the model-facing `ToolMessage` content.
     `capture` preserves `CapturedT`.
     """
 
@@ -344,33 +344,33 @@ class CaptureTool[CapturedT: BaseModel]:
         )
 
     async def capture(
-        self, call: ToolCall
+        self, tool_call: ToolCall
     ) -> DispatchCaptured[CapturedT] | DispatchInvalidToolArgs:
-        """Validate `call.args_json` and return its capture or failure.
+        """Validate `tool_call.args_json` and return its capture or failure.
 
-        The caller must match `call.name` before calling this method.
+        The caller must match `tool_call.name` before calling this method.
 
         Args:
-            call: The tool call to validate.
+            tool_call: The tool call to validate.
         """
         try:
-            captured = self.args_model.model_validate_json(call.args_json)
+            captured = self.args_model.model_validate_json(tool_call.args_json)
         except ValidationError as error:
-            return _invalid_args_outcome(call, _details_from_pydantic(error))
+            return _invalid_args_outcome(tool_call, _details_from_pydantic(error))
         return DispatchCaptured(
-            tool_message=ToolMessage(tool_call_id=call.id, content=self.acknowledgement),
+            tool_message=ToolMessage(tool_call_id=tool_call.id, content=self.acknowledgement),
             captured=captured,
         )
 
     async def dispatch(
-        self, call: ToolCall
+        self, tool_call: ToolCall
     ) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
         """Return `capture` as `DispatchHandled.app_data` after validation.
 
         Args:
-            call: The tool call to dispatch.
+            tool_call: The tool call to dispatch.
         """
-        outcome = await self.capture(call)
+        outcome = await self.capture(tool_call)
         match outcome.kind:
             case "captured":
                 return DispatchHandled(
@@ -393,7 +393,7 @@ class JSONSchemaTool[AppDataT = None]:
     name: str
     description: str
     args_schema: Mapping[str, object]
-    function: Callable[[dict[str, object]], Awaitable[ToolOutput[AppDataT]]]
+    function: Callable[[dict[str, object]], Awaitable[ToolReturn[AppDataT]]]
 
     @cached_property
     def _validator(self) -> jsonschema.protocols.Validator:
@@ -406,30 +406,29 @@ class JSONSchemaTool[AppDataT = None]:
         )
 
     async def dispatch(
-        self, call: ToolCall
+        self, tool_call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Validate `call.args_json`, then run `function`.
+        """Validate `tool_call.args_json`, then run `function`.
 
         Validation failures skip `function`.
 
         Args:
-            call: The tool call to dispatch.
+            tool_call: The tool call to dispatch.
 
         Raises:
             BaseException: `function` raises it.
         """
         try:
-            args = _ARGS_OBJECT.validate_json(call.args_json)
+            args = _ARGS_OBJECT.validate_json(tool_call.args_json)
         except ValidationError as error:
-            return _invalid_args_outcome(call, _details_from_pydantic(error))
+            return _invalid_args_outcome(tool_call, _details_from_pydantic(error))
         # Parsing preserves the JSON types required by `iter_errors`.
         # `object` cannot prove those types to the checker.
         # pyrefly: ignore[bad-argument-type]
         details = _details_from_jsonschema(self._validator.iter_errors(args))
         if details:
-            return _invalid_args_outcome(call, details)
-        result = await self.function(args)
-        return _handled_outcome(call, result)
+            return _invalid_args_outcome(tool_call, details)
+        return _handled_outcome(tool_call, await self.function(args))
 
 
 class Tool[AppDataT](Protocol):
@@ -445,12 +444,12 @@ class Tool[AppDataT](Protocol):
         ...
 
     async def dispatch(
-        self, call: ToolCall
+        self, tool_call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Run this tool on `call` and wrap the outcome.
+        """Run this tool on `tool_call` and wrap the outcome.
 
         Args:
-            call: The tool call to dispatch.
+            tool_call: The tool call to dispatch.
 
         Raises:
             BaseException: The tool implementation raises it.
@@ -464,8 +463,10 @@ type ToolSequence = Sequence[Tool[BaseModel | Mapping[str, object] | None]]
 class DispatchObserver(Protocol):
     """Follows each tool dispatch of a `ToolManager`."""
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
-        """Start following one dispatch of `call`.
+    def dispatch_started(
+        self, tool_call: ToolCall
+    ) -> ObservedOperation[DispatchOutcome | Exception]:
+        """Start following one dispatch of `tool_call`.
 
         The returned handle receives the `DispatchOutcome`, or the exception the tool function raised.
         langchaint logs an exception this method raises and dispatches the call unobserved.
@@ -491,24 +492,24 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
         joined_path = (
             ".".join(str(segment) for segment in detail.path) if detail.path else "(root)"
         )
-        lines.append(f"  {joined_path}: {detail.message}")
+        lines.append(f"  {joined_path}: {detail.error_text}")
     return "\n".join(lines)
 
 
-def render_unknown_tool(called_name: str, held_names: SequenceNotStr[str]) -> str:
+def render_unknown_tool(tool_name: str, held_names: SequenceNotStr[str]) -> str:
     """Name an unknown tool and list the available tool names.
 
     Args:
-        called_name: The unknown tool name.
+        tool_name: The unknown tool name.
         held_names: The available tool names.
     """
     held = ", ".join(held_names) if held_names else "(none)"
-    return f"unknown tool {called_name!r}; available tools: {held}"
+    return f"unknown tool {tool_name!r}; available tools: {held}"
 
 
 def _details_from_pydantic(validation_error: ValidationError) -> tuple[InvalidToolArgsDetail, ...]:
     return tuple(
-        InvalidToolArgsDetail(path=tuple(error["loc"]), message=error["msg"])
+        InvalidToolArgsDetail(path=tuple(error["loc"]), error_text=error["msg"])
         for error in validation_error.errors(
             include_url=False, include_context=False, include_input=False
         )
@@ -519,16 +520,16 @@ def _details_from_jsonschema(
     errors: Iterable[jsonschema.exceptions.ValidationError],
 ) -> tuple[InvalidToolArgsDetail, ...]:
     return tuple(
-        InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
+        InvalidToolArgsDetail(path=tuple(error.absolute_path), error_text=error.message)
         for error in errors
     )
 
 
 def _invalid_args_outcome(
-    call: ToolCall, details: tuple[InvalidToolArgsDetail, ...]
+    tool_call: ToolCall, details: tuple[InvalidToolArgsDetail, ...]
 ) -> DispatchInvalidToolArgs:
     tool_message = ToolMessage.error(
-        call, render_invalid_tool_args(tool_name=call.name, details=details)
+        tool_call, render_invalid_tool_args(tool_name=tool_call.name, details=details)
     )
     return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
@@ -545,28 +546,28 @@ def _split_precomputed(
     answered: dict[int, DispatchPrecomputed] = {}
     to_dispatch: list[tuple[int, ToolCall]] = []
     for index, tool_call in enumerate(tool_calls):
-        supplied = precomputed(tool_call) if precomputed is not None else None
-        if supplied is None:
+        tool_message = precomputed(tool_call) if precomputed is not None else None
+        if tool_message is None:
             to_dispatch.append((index, tool_call))
-        elif supplied.tool_call_id != tool_call.id:
+        elif tool_message.tool_call_id != tool_call.id:
             raise ValueError(
                 f"precomputed answered the call with id {tool_call.id!r} with a ToolMessage "
-                f"whose tool_call_id is {supplied.tool_call_id!r}"
+                f"whose tool_call_id is {tool_message.tool_call_id!r}"
             )
         else:
-            answered[index] = DispatchPrecomputed(tool_message=supplied)
+            answered[index] = DispatchPrecomputed(tool_message=tool_message)
     return answered, to_dispatch
 
 
 def _handled_outcome[AppDataT](
-    call: ToolCall, result: ToolOutput[AppDataT]
+    tool_call: ToolCall, tool_return: ToolReturn[AppDataT]
 ) -> DispatchHandled[AppDataT]:
-    if isinstance(result, ToolOutputExplicit):
+    if isinstance(tool_return, ToolReturnExplicit):
         tool_message = ToolMessage(
-            tool_call_id=call.id, content=result.content, is_error=result.is_error
+            tool_call_id=tool_call.id, content=tool_return.content, is_error=tool_return.is_error
         )
-        return DispatchHandled[AppDataT](tool_message=tool_message, app_data=result.app_data)
-    tool_message = ToolMessage(tool_call_id=call.id, content=result)
+        return DispatchHandled[AppDataT](tool_message=tool_message, app_data=tool_return.app_data)
+    tool_message = ToolMessage(tool_call_id=tool_call.id, content=tool_return)
     return DispatchHandled[AppDataT](tool_message=tool_message)
 
 
@@ -597,14 +598,14 @@ class ToolManager:
         """Convert every indexed tool to its provider-neutral schema."""
         return tuple(tool.schema() for tool in self._tools.values())
 
-    async def dispatch(self, call: ToolCall) -> DispatchOutcome:
-        """Dispatch `call` or return `DispatchUnknownTool`.
+    async def dispatch(self, tool_call: ToolCall) -> DispatchOutcome:
+        """Dispatch `tool_call` or return `DispatchUnknownTool`.
 
         The observer follows the dispatch and is current while the tool function runs.
         An observer failure is logged and never reaches the caller.
 
         Args:
-            call: The tool call to dispatch.
+            tool_call: The tool call to dispatch.
 
         Raises:
             BaseException: The matched tool raises it.
@@ -612,11 +613,11 @@ class ToolManager:
         operation = (
             UNOBSERVED_OPERATION
             if self._observer is None
-            else start_observed_operation(partial(self._observer.dispatch_started, call))
+            else start_observed_operation(partial(self._observer.dispatch_started, tool_call))
         )
         try:
             with operation.current():
-                outcome = await self._dispatch_unobserved(call)
+                outcome = await self._dispatch_unobserved(tool_call)
         except Exception as exc:
             operation.conclude(exc)
             raise
@@ -626,19 +627,20 @@ class ToolManager:
         finally:
             operation.end()
 
-    async def _dispatch_unobserved(self, call: ToolCall) -> DispatchOutcome:
+    async def _dispatch_unobserved(self, tool_call: ToolCall) -> DispatchOutcome:
         """Run the matched tool, or return `DispatchUnknownTool`.
 
         Raises:
             BaseException: The matched tool raises it.
         """
-        tool = self._tools.get(call.name)
+        tool = self._tools.get(tool_call.name)
         if tool is None:
             tool_message = ToolMessage.error(
-                call, render_unknown_tool(called_name=call.name, held_names=tuple(self._tools))
+                tool_call,
+                render_unknown_tool(tool_name=tool_call.name, held_names=tuple(self._tools)),
             )
-            return DispatchUnknownTool(tool_message=tool_message, called_name=call.name)
-        return await tool.dispatch(call)
+            return DispatchUnknownTool(tool_message=tool_message, tool_name=tool_call.name)
+        return await tool.dispatch(tool_call)
 
     async def dispatch_many(
         self,
@@ -653,7 +655,7 @@ class ToolManager:
 
         Args:
             tool_calls: The tool calls to dispatch.
-            precomputed: The optional function that supplies a result without dispatch.
+            precomputed: The optional function that supplies a `ToolMessage` without dispatch.
 
         Raises:
             ValueError: `precomputed` returns a `ToolMessage` for another `tool_call_id`.
@@ -666,7 +668,7 @@ class ToolManager:
         settled: dict[int, DispatchManyItemOutcome | BaseException] = dict(answered)
         tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for _, tool_call in to_dispatch]
         try:
-            results: list[DispatchOutcome | BaseException] = await asyncio.gather(
+            gathered: list[DispatchOutcome | BaseException] = await asyncio.gather(
                 *tasks, return_exceptions=True
             )
         except asyncio.CancelledError:
@@ -675,19 +677,19 @@ class ToolManager:
                 _ = task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        for (index, _), result in zip(to_dispatch, results, strict=True):
-            settled[index] = result
+        for (index, _), outcome_or_exception in zip(to_dispatch, gathered, strict=True):
+            settled[index] = outcome_or_exception
         completed_outcomes: list[DispatchManyItemOutcome] = []
         raised_exceptions: list[Exception] = []
         base_exceptions: list[BaseException] = []
         for index in range(len(tool_calls)):
-            result = settled[index]
-            if isinstance(result, Exception):
-                raised_exceptions.append(result)
-            elif isinstance(result, BaseException):
-                base_exceptions.append(result)
+            outcome_or_exception = settled[index]
+            if isinstance(outcome_or_exception, Exception):
+                raised_exceptions.append(outcome_or_exception)
+            elif isinstance(outcome_or_exception, BaseException):
+                base_exceptions.append(outcome_or_exception)
             else:
-                completed_outcomes.append(result)
+                completed_outcomes.append(outcome_or_exception)
         if raised_exceptions:
             group = DispatchExceptionGroup(
                 f"{len(raised_exceptions)} of {len(tool_calls)} tool calls raised during dispatch_many",

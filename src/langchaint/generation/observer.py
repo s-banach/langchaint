@@ -44,8 +44,9 @@ class Observer(DispatchObserver, Protocol):
         `generate_one` and each generated `generate_many` or `generate_many_records` item start one input.
         Their handle receives the `Generation` or `GenerationError`, and is current during the retry loop.
         `stream_one` starts one input when its handle is entered.
-        Its handle receives the conclusion, or the `GenerationError` of an expired `timeout_seconds`.
-        A block left before the conclusion gives the handle the stream's `abandoned` record.
+        Its handle receives the stream's `GenerationOutcome`.
+        An expired `timeout_seconds` gives the handle that expiry's `GenerationError`.
+        A block left before the stream stores a `GenerationOutcome` gives the handle the stream's `abandoned` record.
         langchaint logs an exception this method raises and handles the input unobserved.
         """
         ...

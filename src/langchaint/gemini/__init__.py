@@ -1,8 +1,8 @@
 """Construct Gemini `LLM` values with cataloged pricing.
 
 Importing this subpackage requires `google-genai`.
-`Gemini.model` sends the stated model identifier verbatim.
-`Gemini.model` reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
+`Gemini.llm` sends the stated model identifier verbatim.
+`Gemini.llm` reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
 Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
 Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
 
@@ -18,7 +18,7 @@ Maps source: https://ai.google.dev/gemini-api/docs/maps-grounding.
 Recheck the sources before relying on a table.
 `GEMINI_PRICING` carries text, image, and video rates.
 Catalog tool rates estimate post-quota list prices.
-`Gemini.model(pricing=...)` replaces cataloged estimates.
+`Gemini.llm(pricing=...)` replaces cataloged estimates.
 langchaint sends no audio.
 Explicit cache-resource storage charges have no request `Usage` field.
 """
@@ -47,7 +47,7 @@ from langchaint.gemini.generate_content_adapter import (
 from langchaint.generation.llm import LLM
 from langchaint.generation.observer import Observer
 
-type GeminiModelName = Literal[
+type GeminiModelId = Literal[
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
@@ -56,21 +56,21 @@ type GeminiModelName = Literal[
 ]
 """Model identifiers with public prices in GEMINI_PRICING."""
 
-GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
+GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
     "gemini-3.6-flash": GeminiPricingTable(
         rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=1.50,
-            cache_read_usd_per_million_tokens=0.15,
-            output_usd_per_million_tokens=7.50,
+            input_tokens_cache_none=1.50,
+            input_tokens_cache_read=0.15,
+            output_tokens=7.50,
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.5-flash": GeminiPricingTable(
         rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=1.50,
-            cache_read_usd_per_million_tokens=0.15,
-            output_usd_per_million_tokens=9.00,
+            input_tokens_cache_none=1.50,
+            input_tokens_cache_read=0.15,
+            output_tokens=9.00,
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
@@ -78,39 +78,39 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
     # The pricing page lists no cache-read price for gemini-3.5-flash-lite, so the rate is NaN.
     "gemini-3.5-flash-lite": GeminiPricingTable(
         rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=0.30,
-            cache_read_usd_per_million_tokens=float("nan"),
-            output_usd_per_million_tokens=2.50,
+            input_tokens_cache_none=0.30,
+            input_tokens_cache_read=float("nan"),
+            output_tokens=2.50,
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-flash-lite": GeminiPricingTable(
         rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=0.25,
-            cache_read_usd_per_million_tokens=0.025,
-            output_usd_per_million_tokens=1.50,
+            input_tokens_cache_none=0.25,
+            input_tokens_cache_read=0.025,
+            output_tokens=1.50,
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-pro-preview": GeminiPricingTable(
         rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=2.00,
-            cache_read_usd_per_million_tokens=0.20,
-            output_usd_per_million_tokens=12.00,
+            input_tokens_cache_none=2.00,
+            input_tokens_cache_read=0.20,
+            output_tokens=12.00,
         ),
-        long_prompt_threshold_tokens=200_000,
-        long_prompt_rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=4.00,
-            cache_read_usd_per_million_tokens=0.40,
-            output_usd_per_million_tokens=18.00,
+        long_context_prompt_token_count_above=200_000,
+        long_context_rates=GeminiRates(
+            input_tokens_cache_none=4.00,
+            input_tokens_cache_read=0.40,
+            output_tokens=18.00,
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     ),
 }
-"""Public on-demand prices that `Gemini.model` uses by default."""
+"""Public on-demand prices that `Gemini.llm` uses by default."""
 
 _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 """`GEMINI_PRICING` with `str` keys for runtime model lookup."""
@@ -143,16 +143,16 @@ class Gemini:
         self.client: genai.Client = client if client is not None else genai.Client(vertexai=False)
 
     @overload
-    def model(
+    def llm(
         self,
-        model: GeminiModelName,
+        model: GeminiModelId,
         *,
         pricing: Mapping[str, GeminiPricingTable] | None = ...,
         service_tier: GeminiServiceTier | None = ...,
     ) -> LLM: ...
 
     @overload
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -160,7 +160,7 @@ class Gemini:
         service_tier: GeminiServiceTier | None = ...,
     ) -> LLM: ...
 
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -202,7 +202,7 @@ __all__ = [
     "GEMINI_PRICING",
     "Gemini",
     "GeminiGenerateContentAdapter",
-    "GeminiModelName",
+    "GeminiModelId",
     "GeminiPricedServiceTier",
     "GeminiPricingTable",
     "GeminiRates",

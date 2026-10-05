@@ -14,19 +14,13 @@ from pydantic import BaseModel
 
 from langchaint.billing.pricing import (
     ProviderBilling,
-    category_cost,
+    category_cost_in_usd,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
-from langchaint.concurrency.shared_backoff import (
-    DoNotRetry,
-    PauseAll,
-    PauseAllDoNotRetry,
-    RetryThisOne,
-    Verdict,
-)
+from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.tools import ToolSchema
 
 _logger = logging.getLogger(__name__)
@@ -40,17 +34,6 @@ class ResponseIdentity(NamedTuple):
     request_id: str | None
 
 
-type ErrorClassification = Literal[
-    "transient", "auth", "invalid_request", "declared_final", "unknown_exception"
-]
-"""The retry loop's action for an unparsed failure or `DoNotRetry`.
-
-`transient` retries this request.
-`auth`, `invalid_request`, `declared_final`, and `unknown_exception` fail this request with distinct errors.
-`auth` names a provider rejection of the client's credentials or permissions.
-`BoundLLM.config_fingerprint()` excludes credentials, so the same request can succeed after the caller repairs them.
-"""
-
 AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
 """The HTTP statuses for failed authentication and denied permission."""
 
@@ -61,7 +44,7 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
     `retry-after-ms` contains milliseconds.
     `retry-after` contains seconds or a GMT HTTP date.
     Return `None` when neither header contains a positive delay.
-    Never raises, so a parse function can call it on any provider headers.
+    Never raises, so a `request_failure` method can call it on any provider headers.
 
     Args:
         headers: The provider response headers.
@@ -108,26 +91,6 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
     return None
 
 
-def terminal_classification_from_response(
-    *, status_code: int, headers: Mapping[str, str]
-) -> Literal["auth", "invalid_request", "declared_final", "unknown_exception"]:
-    """Name one terminal error using its status and retry directive.
-
-    Args:
-        status_code: The response status code.
-        headers: The provider response headers.
-    """
-    if status_code == 200:
-        return "declared_final"
-    if status_code in AUTH_STATUSES:
-        return "auth"
-    if 400 <= status_code < 500:
-        return "invalid_request"
-    if should_retry_from_headers(headers) is False:
-        return "declared_final"
-    return "unknown_exception"
-
-
 def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     """Read the provider's own retry directive from response headers.
 
@@ -144,60 +107,84 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     return None
 
 
-def verdict_under_retry_directive(
-    verdict: Verdict, *, headers: Mapping[str, str], retry_after: float | None
-) -> Verdict:
-    """Apply the provider's `x-should-retry` directive to `verdict`.
+def request_failure_from_response(
+    *, status_code: int, headers: Mapping[str, str], retries: bool, pauses_quota: bool
+) -> RequestFailure:
+    """Build the `RequestFailure` of one error response from what the provider's tables give its status.
 
+    `retries` and `pauses_quota` are the table answers.
+    Status 200 identifies a mid-stream error event, and the table answers stand.
+    On every other status, the provider's `x-should-retry` directive decides whether the request retries.
     Both SDK clients read `x-should-retry` before status rules.
     Anthropic 0.120.2 and OpenAI 2.51.0 verify this behavior.
-    The directive decides whether this request retries.
-    The status decides whether `SharedBackoff` pauses the rate-limit quota.
-    Callers exclude status-200 mid-stream error events.
+    `pauses_quota` stands whatever the directive says.
+    A failure that pauses the quota and does not retry is `provider_failed_terminally`.
+    Another failure that does not retry takes the first kind that applies:
+    - `provider_failed_terminally` for status 200.
+    - `auth` for `AUTH_STATUSES`.
+    - `rejected` for another 4xx status.
+    - `provider_failed_terminally` when the directive forbids a retry.
+    - `unknown_exception` otherwise.
+    `retry_after_seconds` comes from the headers when the failure retries or pauses the quota.
 
     Args:
-        verdict: The status-based verdict.
+        status_code: The response status code.
         headers: The provider response headers.
-        retry_after: The normalized retry delay for a forced retry.
+        retries: Whether the tables retry this status.
+        pauses_quota: Whether the tables pause the rate-limit quota for this status.
     """
-    directive = should_retry_from_headers(headers)
+    retry_after_seconds = retry_after_seconds_from_headers(headers)
+    directive = None if status_code == 200 else should_retry_from_headers(headers)
+    if directive is True or (directive is None and retries):
+        return RequestFailure(
+            kind="transient", pauses_quota=pauses_quota, retry_after_seconds=retry_after_seconds
+        )
+    if pauses_quota:
+        return RequestFailure(
+            kind="provider_failed_terminally",
+            pauses_quota=True,
+            retry_after_seconds=retry_after_seconds,
+        )
+    return RequestFailure(
+        kind=_terminal_kind(status_code=status_code, directive=directive),
+        pauses_quota=False,
+        retry_after_seconds=None,
+    )
+
+
+def _terminal_kind(*, status_code: int, directive: bool | None) -> _TerminalRequestFailureKind:
+    if status_code == 200:
+        return "provider_failed_terminally"
+    if status_code in AUTH_STATUSES:
+        return "auth"
+    if 400 <= status_code < 500:
+        return "rejected"
     if directive is False:
-        if verdict.kind in ("pause_all", "pause_all_do_not_retry"):
-            return PauseAllDoNotRetry(retry_after=verdict.retry_after)
-        return DoNotRetry()
-    if directive is True and verdict.kind == "do_not_retry":
-        return RetryThisOne(retry_after=retry_after)
-    return verdict
+        return "provider_failed_terminally"
+    return "unknown_exception"
 
 
-def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
-    """Map one `TransientError` to its `Verdict`.
-
-    Args:
-        error: The transient failure to map.
-    """
-    if error.is_rate_limit:
-        return PauseAll(retry_after=error.retry_after_seconds)
-    return RetryThisOne(retry_after=error.retry_after_seconds)
-
-
-def record_parse_fallthrough(
-    fallthrough_counts: Counter[str], *, parse_name: str, status_code: object, error_type: object
+def record_request_failure_fallthrough(
+    fallthrough_counts: Counter[str],
+    *,
+    function_name: str,
+    status_code: object,
+    error_type: object,
 ) -> None:
-    """Count and log one parse fallthrough to a status-family default.
+    """Count and log one request failure that fell through to a status-family default.
 
-    A provider parse function calls this when no listed row matched the failure.
+    A provider's `request_failure` function calls this when no listed row matched the failure.
     The count and the warning make a new provider status or error type visible.
 
     Args:
         fallthrough_counts: The counter to increment by failure description.
-        parse_name: The provider parse function name used in the warning.
+        function_name: The provider function name used in the warning.
         status_code: The status code used in the failure description.
         error_type: The provider error type used in the failure description.
     """
     tag = f"status={status_code} type={error_type}"
     fallthrough_counts[tag] += 1
-    _logger.warning("%s fell through to a status-family default for %s", parse_name, tag)
+    _logger.warning("%s fell through to a status-family default for %s", function_name, tag)
 
 
 REASONING_PART_SEPARATOR = "\n\n"
@@ -458,15 +445,14 @@ class ProviderFailedTransiently(_UnusableResponseBase):
     """A billable response reporting a transient provider failure.
 
     Generation records the request and retries.
-    `reason` becomes the request's `TransientError` text.
-    `is_rate_limit=True` produces `PauseAll` during generation.
-    `PauseAll` pauses the rate-limit quota.
+    `error_text` becomes the request's `TransientError` text.
+    `pauses_quota=True` pauses the rate-limit quota.
     Streaming records the request and raises `GenerationError`.
     Streaming cannot retry because the response stream already ended.
     """
 
-    reason: str
-    is_rate_limit: bool
+    error_text: str
+    pauses_quota: bool
     kind: Literal["provider_failed_transiently"] = "provider_failed_transiently"
 
 
@@ -474,10 +460,10 @@ class ProviderFailedTransiently(_UnusableResponseBase):
 class ProviderFailedTerminally(_UnusableResponseBase):
     """A billable response containing a terminal provider failure.
 
-    `reason` preserves the provider's description.
+    `error_text` preserves the provider's description.
     """
 
-    reason: str
+    error_text: str
     kind: Literal["provider_failed_terminally"] = "provider_failed_terminally"
 
 
@@ -507,27 +493,27 @@ class ContextWindowExceeded(_UnusableResponseBase):
 class UnfinishedAssistantMessage(_UnusableResponseBase):
     """A response whose partial content is not a finished answer.
 
-    `reason` preserves the provider's description.
+    `error_text` preserves the provider's description.
     """
 
-    reason: str
+    error_text: str
     kind: Literal["unfinished_assistant_message"] = "unfinished_assistant_message"
 
 
 @dataclass(frozen=True, kw_only=True)
-class RefusedMessages:
+class RejectedMessages:
     """A `Sequence[Message]` the adapter will not put on the wire.
 
-    The retry loop sends no request and raises `GenerationError` whose `error_text` is `reason`.
+    The retry loop sends no request and raises `GenerationError` with this `error_text`.
     Nothing was sent or billed.
     """
 
-    reason: str
-    kind: Literal["invalid_request"] = "invalid_request"
+    error_text: str
+    kind: Literal["rejected"] = "rejected"
 
 
-class _NotSendableError(Exception):
-    """Carry `RefusedMessages.reason` through nested request conversion functions."""
+class _RejectedMessagesError(Exception):
+    """Carry `RejectedMessages.error_text` through nested request conversion functions."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -669,11 +655,13 @@ class BoundAdapter[OutputT](ABC):
     """One adapter bound to a frozen prefix."""
 
     @abstractmethod
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
         """Convert messages and the binding into the request params every request for this input sends.
 
         Called once before the first request.
-        Returns `RefusedMessages` before any request or retry budget use.
+        Returns `RejectedMessages` before any request or retry budget use.
         Performs no I/O.
 
         Args:
@@ -846,35 +834,19 @@ class Adapter(ABC):
         """
         ...
 
-    failure_types: ClassVar[tuple[type[Exception], ...]]
-    """The exception types `parse` maps to a `Verdict` for `Admission.record`.
-
-    `parse` handles SDK status errors and `TransientError`.
-    `classify` handles other transport failures.
-    Every entry must be a strict subclass of `Exception`.
-    """
-
     @abstractmethod
-    def parse(self, failure: Exception) -> Verdict:
-        """Map one `failure_types` exception to its `Verdict` for `Admission.record`.
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Return what one failed request means for its retry loop and its rate-limit quota.
 
-        A retry-after header sets only `retry_after`.
-        Return a verdict for every input without raising.
-        Each provider's `parse` documents defaults for unknown statuses and error types.
+        The retry loops pass every `Exception` a request raises, except two they map themselves.
+        A `TransientError` is transient and pauses the quota when its `pauses_quota` is true.
+        A `StreamProtocolError` is transient and pauses nothing.
+        Return `kind="unknown_exception"` for an exception the adapter cannot place.
+        Never raise, because a raise escapes the retry loop as an adapter defect.
+        Each provider's function documents its tables and defaults for unknown statuses and error types.
 
         Args:
-            failure: The exception to parse.
-        """
-        ...
-
-    @abstractmethod
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Classify an unparsed exception or name a terminal `DoNotRetry` error.
-
-        Return `unknown_exception` for an unrecognized exception.
-
-        Args:
-            error: The exception to classify.
+            error: The exception the failed request raised.
         """
         ...
 
@@ -899,22 +871,18 @@ __all__ = [
     "Binding",
     "BoundAdapter",
     "ContextWindowExceeded",
-    "DoNotRetry",
     "EmptyAssistantMessage",
-    "ErrorClassification",
     "MaxCompletionTokensExceeded",
-    "PauseAll",
-    "PauseAllDoNotRetry",
     "ProviderBilling",
     "ProviderFailedTerminally",
     "ProviderFailedTransiently",
     "ReasoningDelta",
     "Refusal",
-    "RefusedMessages",
+    "RejectedMessages",
+    "RequestFailure",
     "RequestParams",
     "ResponseIdentity",
     "ResponseOutcome",
-    "RetryThisOne",
     "SchemaViolation",
     "SpecificToolChoice",
     "StreamItem",
@@ -925,18 +893,15 @@ __all__ = [
     "UnfinishedAssistantMessage",
     "UnusableResponse",
     "UsableResponse",
-    "Verdict",
-    "category_cost",
+    "category_cost_in_usd",
     "invocation_cost_in_usd",
     "narrowed_request_params",
-    "record_parse_fallthrough",
+    "record_request_failure_fallthrough",
     "reject_extra_body_keys_the_adapter_populates",
+    "request_failure_from_response",
     "request_params_json",
     "require_finite_nonnegative_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
-    "terminal_classification_from_response",
     "validated_provider_executed_tool_types",
-    "verdict_from_transient_error",
-    "verdict_under_retry_directive",
 ]

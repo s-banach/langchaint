@@ -6,7 +6,7 @@ search_tool returns its Usage through app_data for inclusion in the run total.
 from events import current_gui_emitter
 from pydantic import BaseModel
 
-from langchaint import PydanticTool, ToolOutputExplicit, Usage, tool
+from langchaint import PydanticTool, ToolReturnExplicit, Usage, tool
 
 SEARCH_USAGE: Usage = Usage(
     input_tokens_cache_read=0,
@@ -42,7 +42,7 @@ class DelegateArgs(BaseModel):
 
 
 @tool(description="Search the corpus for a query.", name="search")
-async def search_tool(args: SearchArgs) -> ToolOutputExplicit[Usage]:
+async def search_tool(args: SearchArgs) -> ToolReturnExplicit[Usage]:
     """Return a fixed local result and its Usage through app_data.
 
     current_gui_emitter() routes progress to the dispatching run's on_event callback.
@@ -53,7 +53,7 @@ async def search_tool(args: SearchArgs) -> ToolOutputExplicit[Usage]:
     current_gui_emitter().emit_tool_progress(
         tool_name="search", message=f"searching the corpus for {args.query!r}"
     )
-    return ToolOutputExplicit(
+    return ToolReturnExplicit(
         content=f"Top result for {args.query!r}: a paragraph of findings.",
         app_data=SEARCH_USAGE,
     )
@@ -74,12 +74,12 @@ def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
     pending_rejections = [_FIRST_VERDICT]
 
     @tool(description="Critique a draft; return approval or a revision instruction.")
-    async def critique(_args: CritiqueArgs) -> ToolOutputExplicit[CritiqueVerdict]:
+    async def critique(_args: CritiqueArgs) -> ToolReturnExplicit[CritiqueVerdict]:
         """Return the next verdict through app_data."""
         if pending_rejections:
-            return ToolOutputExplicit(
+            return ToolReturnExplicit(
                 content=pending_rejections.pop(0), app_data=CritiqueVerdict(approved=False)
             )
-        return ToolOutputExplicit(content="approved", app_data=CritiqueVerdict(approved=True))
+        return ToolReturnExplicit(content="approved", app_data=CritiqueVerdict(approved=True))
 
     return critique

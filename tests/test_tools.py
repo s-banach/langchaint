@@ -26,7 +26,7 @@ from langchaint import (
     ToolCall,
     ToolManager,
     ToolMessage,
-    ToolOutputExplicit,
+    ToolReturnExplicit,
     tool,
 )
 from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
@@ -69,9 +69,9 @@ class _EchoRecord(BaseModel):
 @tool(description="Echo the text and build a later-defined record.")
 async def _decorated_later_return(
     args: _EchoArgs,
-) -> "ToolOutputExplicit[_LaterEchoRecord]":
+) -> "ToolReturnExplicit[_LaterEchoRecord]":
     """Return application data whose class follows this function."""
-    return ToolOutputExplicit(content=args.text, app_data=_LaterEchoRecord(text=args.text))
+    return ToolReturnExplicit(content=args.text, app_data=_LaterEchoRecord(text=args.text))
 
 
 class _LaterEchoRecord(BaseModel):
@@ -81,9 +81,9 @@ class _LaterEchoRecord(BaseModel):
 
 
 @tool(description="Echo the text and record it.", name="record_echo")
-async def _decorated_record_echo(args: _EchoArgs) -> ToolOutputExplicit[_EchoRecord]:
+async def _decorated_record_echo(args: _EchoArgs) -> ToolReturnExplicit[_EchoRecord]:
     """Return model content and application data."""
-    return ToolOutputExplicit(content=args.text, app_data=_EchoRecord(text=args.text))
+    return ToolReturnExplicit(content=args.text, app_data=_EchoRecord(text=args.text))
 
 
 async def _validation_error_function(args: _EchoArgs) -> str:
@@ -218,15 +218,15 @@ def test_details_from_pydantic_preserve_paths_and_messages() -> None:
         ("subject",),
     )
     for detail, error in zip(details, validation_error.errors(), strict=True):
-        assert detail.message == error["msg"]
+        assert detail.error_text == error["msg"]
 
 
 def test_render_invalid_tool_args_formats_neutral_details() -> None:
     """render_invalid_tool_args preserves detail order and paths."""
     details = [
-        InvalidToolArgsDetail(path=(), message="'name' is a required property"),
-        InvalidToolArgsDetail(path=("items", 0, "id"), message="'x' is not of type 'integer'"),
-        InvalidToolArgsDetail(path=("mode",), message="'fast' is not one of ['safe', 'slow']"),
+        InvalidToolArgsDetail(path=(), error_text="'name' is a required property"),
+        InvalidToolArgsDetail(path=("items", 0, "id"), error_text="'x' is not of type 'integer'"),
+        InvalidToolArgsDetail(path=("mode",), error_text="'fast' is not one of ['safe', 'slow']"),
     ]
     assert render_invalid_tool_args("search", details) == (
         "invalid arguments for search:\n"
@@ -294,7 +294,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
                 == "invalid arguments for echo:\n  text: Field required"
             )
             assert result.details == (
-                InvalidToolArgsDetail(path=("text",), message="Field required"),
+                InvalidToolArgsDetail(path=("text",), error_text="Field required"),
             )
         case DispatchHandled() | DispatchUnknownTool():
             pytest.fail("invalid args must return DispatchInvalidToolArgs")
@@ -305,7 +305,7 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     assert result.kind == "unknown_tool"
-    assert result.called_name == "missing"
+    assert result.tool_name == "missing"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.is_error is True
     assert result.tool_message.content == "unknown tool 'missing'; available tools: echo"
@@ -313,10 +313,10 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
 
 def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
     """render_unknown_tool names the off-list tool and held_names, rendering (none) for an empty set."""
-    assert render_unknown_tool(called_name="x", held_names=("a", "b")) == (
+    assert render_unknown_tool(tool_name="x", held_names=("a", "b")) == (
         "unknown tool 'x'; available tools: a, b"
     )
-    assert render_unknown_tool(called_name="x", held_names=()) == (
+    assert render_unknown_tool(tool_name="x", held_names=()) == (
         "unknown tool 'x'; available tools: (none)"
     )
 
@@ -335,11 +335,11 @@ def test_function_validation_error_propagates_as_a_defect() -> None:
 
 
 def test_dispatch_carries_a_returned_is_error_result() -> None:
-    """A function returning ToolOutputExplicit(is_error=True) becomes an is_error ToolMessage."""
+    """A function returning ToolReturnExplicit(is_error=True) becomes an is_error ToolMessage."""
 
-    async def _returned_error_function(args: _EchoArgs) -> ToolOutputExplicit:
+    async def _returned_error_function(args: _EchoArgs) -> ToolReturnExplicit:
         """Report a model-visible failure by returning, not raising."""
-        return ToolOutputExplicit(
+        return ToolReturnExplicit(
             content=f"cannot echo {args.text!r}: try a shorter value", is_error=True
         )
 
@@ -374,9 +374,9 @@ def test_dispatch_preserves_mapping_app_data_identity() -> None:
     """Mapping app_data passes through ToolManager unchanged."""
     mapping = {"citations": ["doc-1"]}
 
-    async def _mapping_function(args: _EchoArgs) -> ToolOutputExplicit[Mapping[str, object]]:
+    async def _mapping_function(args: _EchoArgs) -> ToolReturnExplicit[Mapping[str, object]]:
         """Return content plus mapping app_data."""
-        return ToolOutputExplicit(content=f"declined {args.text}", is_error=True, app_data=mapping)
+        return ToolReturnExplicit(content=f"declined {args.text}", is_error=True, app_data=mapping)
 
     mapping_tool = PydanticTool(
         name="mapping",
@@ -488,9 +488,9 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     assert result.kind == "invalid_tool_args"
     assert result.tool_message.is_error is True
     assert result.details == (
-        InvalidToolArgsDetail(path=(), message="'city' is a required property"),
+        InvalidToolArgsDetail(path=(), error_text="'city' is a required property"),
         InvalidToolArgsDetail(
-            path=(), message="Additional properties are not allowed ('town' was unexpected)"
+            path=(), error_text="Additional properties are not allowed ('town' was unexpected)"
         ),
     )
     assert result.tool_message.content == (
@@ -565,18 +565,18 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
-    """JSONSchemaTool.dispatch preserves ToolOutputExplicit app_data type."""
+    """JSONSchemaTool.dispatch preserves ToolReturnExplicit app_data type."""
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
     async def _mcp_function(
         args: Mapping[str, object],
-    ) -> ToolOutputExplicit[Mapping[str, object]]:
+    ) -> ToolReturnExplicit[Mapping[str, object]]:
         """Return model-visible content plus the raw MCP result the model never sees.
 
         Contravariance lets Mapping[str, object] satisfy the dict[str, object] parameter.
         The annotation keeps that wider type checked.
         """
-        return ToolOutputExplicit(content=f"weather for {args['city']}", app_data=raw_result)
+        return ToolReturnExplicit(content=f"weather for {args['city']}", app_data=raw_result)
 
     tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
         name="weather",
@@ -805,11 +805,11 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
     """DispatchExceptionGroup preserves settled sibling outcomes and app_data."""
     receipt = _Receipt(record_id="rec-7")
 
-    async def _spender_function(args: _EchoArgs) -> ToolOutputExplicit[_Receipt]:
+    async def _spender_function(args: _EchoArgs) -> ToolReturnExplicit[_Receipt]:
         """Yield twice so the sibling defect fires first, then return content plus the receipt."""
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        return ToolOutputExplicit(content=f"charged {args.text}", app_data=receipt)
+        return ToolReturnExplicit(content=f"charged {args.text}", app_data=receipt)
 
     spender = PydanticTool(
         name="spender",
@@ -1036,7 +1036,9 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
         outcome.tool_message.content
         == "invalid arguments for final_response:\n  answer: Field required"
     )
-    assert outcome.details == (InvalidToolArgsDetail(path=("answer",), message="Field required"),)
+    assert outcome.details == (
+        InvalidToolArgsDetail(path=("answer",), error_text="Field required"),
+    )
 
 
 def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant() -> None:

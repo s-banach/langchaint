@@ -30,7 +30,7 @@ async def main() -> None:
     """
     openai = OpenAI(observer=OtelObserver(capture_message_content=False))
     app = App(
-        llm=openai.model(MODEL),
+        llm=openai.llm(MODEL),
         configs=build_configs(),
         on_event=print_event,
     )

@@ -1,14 +1,14 @@
 """Construct Anthropic and Bedrock `LLM` values with cataloged pricing.
 
 Importing this subpackage requires `anthropic`.
-`Anthropic.model` sends the stated model identifier verbatim.
-`AnthropicBedrock.model` sends the stated Bedrock identifier verbatim.
-`ANTHROPIC_BEDROCK` lists preferred identifiers and their `BedrockRouting` values.
+`Anthropic.llm` sends the stated model identifier verbatim.
+`AnthropicBedrock.llm` sends the stated Bedrock identifier verbatim.
+`ANTHROPIC_BEDROCK_ROUTING` lists preferred identifiers and their `BedrockRouting` values.
 
 Cataloged Anthropic models receive `ANTHROPIC_PRICING`.
 Cataloged Bedrock models receive `ANTHROPIC_BEDROCK_PRICING`.
 A Bedrock identifier with a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix resolves through the unprefixed identifier.
-`AnthropicBedrock` multiplies those token rates by the prefix multiplier unless `apply_cross_region_premium=False`.
+`AnthropicBedrock` multiplies those token rates by the prefix multiplier unless `apply_cross_region_multiplier=False`.
 Uncataloged Anthropic models require `pricing`.
 Uncataloged Bedrock models also require a passed `client`.
 Missing optional rates produce NaN token costs.
@@ -24,8 +24,8 @@ Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
 `ANTHROPIC_PRICING` web-search rates are public list-price estimates.
 A cataloged model without a web-search rate requires `pricing` to bind the web search tool.
-`Anthropic.model(pricing=...)` replaces cataloged estimates.
-`AnthropicBedrock.model(pricing=...)` accepts caller rates.
+`Anthropic.llm(pricing=...)` replaces cataloged estimates.
+`AnthropicBedrock.llm(pricing=...)` accepts caller rates.
 """
 
 from dataclasses import dataclass
@@ -46,7 +46,7 @@ from langchaint.anthropic._generated_pricing import (
     ANTHROPIC_BEDROCK_PRICING,
     ANTHROPIC_PRICING,
     BEDROCK_CROSS_REGION_MULTIPLIER,
-    AnthropicModelName,
+    AnthropicModelId,
 )
 from langchaint.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
@@ -64,7 +64,7 @@ _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items(
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""
 
 
-type AnthropicBedrockModelName = (
+type AnthropicBedrockModelId = (
     Literal[
         "anthropic.claude-fable-5-1",
         "anthropic.claude-fable-5",
@@ -80,7 +80,7 @@ type AnthropicBedrockModelName = (
     ]
     | str
 )
-"""Bedrock identifiers accepted by `AnthropicBedrock.model`.
+"""Bedrock identifiers accepted by `AnthropicBedrock.llm`.
 
 Each identifier is sent verbatim.
 The literal values offer preferred endpoint-specific identifiers.
@@ -104,11 +104,13 @@ def _resolve_catalog_id(model: str) -> _CatalogResolution:
     """
     if model in ANTHROPIC_BEDROCK_PRICING:
         return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
-    prefix, _, unprefixed = model.partition(".")
-    multiplier = BEDROCK_CROSS_REGION_MULTIPLIER.get(prefix)
-    if multiplier is None:
+    prefix, _, catalog_id = model.partition(".")
+    cross_region_multiplier = BEDROCK_CROSS_REGION_MULTIPLIER.get(prefix)
+    if cross_region_multiplier is None:
         return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
-    return _CatalogResolution(catalog_id=unprefixed, cross_region_multiplier=multiplier)
+    return _CatalogResolution(
+        catalog_id=catalog_id, cross_region_multiplier=cross_region_multiplier
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -118,7 +120,7 @@ class BedrockRouting:
     api: Literal["mantle", "legacy"]
 
 
-ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
+ANTHROPIC_BEDROCK_ROUTING: dict[AnthropicBedrockModelId, BedrockRouting] = {
     "anthropic.claude-fable-5-1": BedrockRouting(api="mantle"),
     "anthropic.claude-fable-5": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-5-5": BedrockRouting(api="mantle"),
@@ -131,7 +133,7 @@ ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
     "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy"),
     "us.anthropic.claude-sonnet-4-6": BedrockRouting(api="legacy"),
 }
-"""`BedrockRouting` for each preferred `AnthropicBedrockModelName` value."""
+"""`BedrockRouting` for each preferred `AnthropicBedrockModelId` value."""
 
 _BEDROCK_CLIENT_CLASS: dict[
     Literal["mantle", "legacy"], type[AsyncAnthropicBedrockMantle | AsyncAnthropicBedrock]
@@ -167,9 +169,9 @@ class Anthropic:
         )
 
     @overload
-    def model(
+    def llm(
         self,
-        model: AnthropicModelName,
+        model: AnthropicModelId,
         *,
         pricing: AnthropicPricingTable | None = ...,
         cache_ttl: CacheTTL = ...,
@@ -178,7 +180,7 @@ class Anthropic:
     ) -> LLM: ...
 
     @overload
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -188,7 +190,7 @@ class Anthropic:
         inference_geo: str | None = ...,
     ) -> LLM: ...
 
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -203,7 +205,7 @@ class Anthropic:
         Cataloged models receive `ANTHROPIC_PRICING`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
-        `cache_ttl` applies to automatic `cache_control` and every cache marker.
+        `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         `service_tier` sets the requested Anthropic service tier.
         `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
@@ -238,7 +240,7 @@ class AnthropicBedrock:
         aws_region: str | None = None,
         client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
         http_client: httpx2.AsyncClient | None = None,
-        apply_cross_region_premium: bool = True,
+        apply_cross_region_multiplier: bool = True,
         shared_backoff: SharedBackoff | None = None,
         observer: Observer | None = None,
     ) -> None:
@@ -246,7 +248,7 @@ class AnthropicBedrock:
 
         `aws_region` selects the region for SDK clients created by `AnthropicBedrock`.
         `http_client` applies to SDK clients created by `AnthropicBedrock`.
-        `apply_cross_region_premium=False` leaves a prefixed identifier's catalog rates unmultiplied.
+        `apply_cross_region_multiplier=False` leaves a prefixed identifier's catalog rates unmultiplied.
         `shared_backoff` admits every request of the created `LLM` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.
         `observer` follows every input and every tool dispatch of the created `LLM` values.
@@ -263,15 +265,15 @@ class AnthropicBedrock:
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.aws_region: str | None = aws_region
         self.http_client: httpx2.AsyncClient | None = http_client
-        self.apply_cross_region_premium: bool = apply_cross_region_premium
+        self.apply_cross_region_multiplier: bool = apply_cross_region_multiplier
         self._passed_client = client_without_retries(client) if client is not None else None
         self._clients_by_api: dict[
             Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
         ] = {}
 
-    def model(
+    def llm(
         self,
-        model: AnthropicBedrockModelName,
+        model: AnthropicBedrockModelId,
         *,
         pricing: AnthropicPricingTable | None = None,
         cache_ttl: CacheTTL = "5m",
@@ -285,7 +287,7 @@ class AnthropicBedrock:
         Other known identifiers select `AsyncAnthropicBedrock`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing` and a passed `client`.
-        `cache_ttl` applies to automatic `cache_control` and every cache marker.
+        `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
         Raises:
@@ -294,7 +296,7 @@ class AnthropicBedrock:
                 Also raised when a passed SDK client cannot serve `model`.
         """
         resolution = _resolve_catalog_id(model)
-        routing = ANTHROPIC_BEDROCK.get(resolution.catalog_id)
+        routing = ANTHROPIC_BEDROCK_ROUTING.get(resolution.catalog_id)
         client = self._client_for(routing, model)
         adapter = AnthropicMessagesAdapter(
             client=client,
@@ -355,7 +357,7 @@ class AnthropicBedrock:
     ) -> AnthropicPricingTable:
         """Return the catalog table for `resolution`.
 
-        `apply_cross_region_premium` multiplies the table by the prefix multiplier of `resolution`.
+        `apply_cross_region_multiplier` multiplies the table by the prefix multiplier of `resolution`.
 
         Raises:
             ValueError: The catalog identifier is not in `ANTHROPIC_BEDROCK_PRICING`.
@@ -365,21 +367,21 @@ class AnthropicBedrock:
             raise ValueError(
                 f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
             )
-        if resolution.cross_region_multiplier is None or not self.apply_cross_region_premium:
+        if resolution.cross_region_multiplier is None or not self.apply_cross_region_multiplier:
             return catalog_table
         return catalog_table.multiplied(resolution.cross_region_multiplier)
 
 
 __all__ = [
-    "ANTHROPIC_BEDROCK",
     "ANTHROPIC_BEDROCK_PRICING",
+    "ANTHROPIC_BEDROCK_ROUTING",
     "ANTHROPIC_PRICING",
     "BEDROCK_CROSS_REGION_MULTIPLIER",
     "Anthropic",
     "AnthropicBedrock",
-    "AnthropicBedrockModelName",
+    "AnthropicBedrockModelId",
     "AnthropicMessagesAdapter",
-    "AnthropicModelName",
+    "AnthropicModelId",
     "AnthropicPricingTable",
     "AnthropicRates",
     "AnthropicServiceTier",

@@ -40,14 +40,12 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClassification,
     ProviderBilling,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ToolChoice,
 )
-from langchaint.common.exceptions import TransientError
-from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.conformance import AdapterConformance
 from langchaint.gemini import (
     GeminiGenerateContentAdapter,
@@ -67,7 +65,7 @@ from langchaint.gemini.generate_content_adapter import (
     _GeminiStream,
 )
 from langchaint.tools import ToolSchema
-from tests.helpers import run_with_timeout
+from tests.helpers import run_with_timeout, terminal, transient
 
 
 def _billing_from_usage(
@@ -87,21 +85,21 @@ def _billing_from_response(
     response: types.GenerateContentResponse,
     pricing: Mapping[str, GeminiPricingTable],
     *,
-    configured_fields: frozenset[str] = frozenset(),
+    provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
 ) -> Billing:
     return _provider_billing_from_response(
         response,
         pricing,
-        configured_fields=configured_fields,
+        provider_executed_tool_fields=provider_executed_tool_fields,
         billing_complete=billing_complete,
     ).billing
 
 
 _ON_DEMAND_RATES = GeminiRates(
-    input_cache_none_usd_per_million_tokens=1.0,
-    cache_read_usd_per_million_tokens=0.1,
-    output_usd_per_million_tokens=10.0,
+    input_tokens_cache_none=1.0,
+    input_tokens_cache_read=0.1,
+    output_tokens=10.0,
 )
 
 _PRICING: dict[str, GeminiPricingTable] = {
@@ -117,11 +115,11 @@ _LONG_PROMPT_TABLE = GeminiPricingTable(
     rates=_ON_DEMAND_RATES,
     google_search_usd_per_query=0.014,
     google_maps_usd_per_query=0.014,
-    long_prompt_threshold_tokens=200,
-    long_prompt_rates=GeminiRates(
-        input_cache_none_usd_per_million_tokens=2.0,
-        cache_read_usd_per_million_tokens=0.2,
-        output_usd_per_million_tokens=20.0,
+    long_context_prompt_token_count_above=200,
+    long_context_rates=GeminiRates(
+        input_tokens_cache_none=2.0,
+        input_tokens_cache_read=0.2,
+        output_tokens=20.0,
     ),
 )
 """Every long rate is twice its base rate, so a test tells the two tiers apart by one factor."""
@@ -366,7 +364,7 @@ _ECHO_DECLARATION = types.FunctionDeclaration(
     parameters_json_schema={"type": "object", "properties": {"city": {"type": "string"}}},
 )
 
-_SUPPORTED_PROVIDER_TOOLS: tuple[Mapping[str, object], ...] = (
+_SUPPORTED_PROVIDER_EXECUTED_TOOLS: tuple[Mapping[str, object], ...] = (
     {"code_execution": {}},
     {"file_search": {"file_search_store_names": ["fileSearchStores/one"]}},
     {"google_maps": {}},
@@ -438,7 +436,7 @@ _CONFIG_CASES = [
     ),
     # Function declarations precede provider-executed tools, and mode VALIDATED keeps both usable.
     _ConfigCase(
-        "function_declarations_precede_provider_tools",
+        "function_declarations_precede_provider_executed_tools",
         _binding(tool_schemas=(_echo_schema(),), provider_executed_tools=({"google_search": {}},)),
         types.GenerateContentConfig(
             tools=[
@@ -456,15 +454,15 @@ _CONFIG_CASES = [
     ),
     *(
         _ConfigCase(
-            f"provider_tool_{'_'.join(provider_tool)}",
-            _binding(provider_executed_tools=(provider_tool,)),
+            f"provider_executed_tool_{'_'.join(provider_executed_tool)}",
+            _binding(provider_executed_tools=(provider_executed_tool,)),
             types.GenerateContentConfig(
-                tools=[types.Tool.model_validate(provider_tool)],
+                tools=[types.Tool.model_validate(provider_executed_tool)],
                 tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
                 http_options=_NO_SDK_RETRIES,
             ),
         )
-        for provider_tool in _SUPPORTED_PROVIDER_TOOLS
+        for provider_executed_tool in _SUPPORTED_PROVIDER_EXECUTED_TOOLS
     ),
 ]
 
@@ -546,7 +544,7 @@ def _pricing_with_query_rate(
     }
 
 
-_UNSUPPORTED_PROVIDER_TOOLS: tuple[Mapping[str, object], ...] = (
+_UNSUPPORTED_PROVIDER_EXECUTED_TOOLS: tuple[Mapping[str, object], ...] = (
     {},
     {"computer_use": {}},
     {"enterprise_web_search": {}},
@@ -605,12 +603,12 @@ _BIND_DEFECTS = [
     ),
     # Gemini ToolConfig cannot select or restrict provider-executed tools.
     _BindDefect(
-        "provider_tools_with_required_choice",
+        "provider_executed_tools_with_required_choice",
         _binding(provider_executed_tools=({"google_search": {}},), tool_choice="required"),
         "tool_choice='auto'",
     ),
     _BindDefect(
-        "provider_tools_with_allowed_tools_choice",
+        "provider_executed_tools_with_allowed_tools_choice",
         _binding(
             tool_schemas=(_echo_schema(),),
             provider_executed_tools=({"google_search": {}},),
@@ -629,21 +627,21 @@ _BIND_DEFECTS = [
     # Every installed `types.Tool` field outside the reviewed set is rejected.
     *(
         _BindDefect(
-            f"unsupported_provider_tool_{'_'.join(provider_tool) or 'empty'}",
-            _binding(provider_executed_tools=(provider_tool,)),
+            f"unsupported_provider_executed_tool_{'_'.join(provider_executed_tool) or 'empty'}",
+            _binding(provider_executed_tools=(provider_executed_tool,)),
             "unsupported|validation",
         )
-        for provider_tool in _UNSUPPORTED_PROVIDER_TOOLS
+        for provider_executed_tool in _UNSUPPORTED_PROVIDER_EXECUTED_TOOLS
     ),
     # Deprecated Gemini 2.5 models have no provider-executed tool path.
     _BindDefect(
-        "provider_tools_on_gemini_2_5",
+        "provider_executed_tools_on_gemini_2_5",
         _binding(provider_executed_tools=({"google_search": {}},)),
         "Gemini 3",
         _adapter(model="gemini-2.5-flash"),
     ),
     _BindDefect(
-        "provider_tools_on_vertex_ai",
+        "provider_executed_tools_on_vertex_ai",
         _binding(provider_executed_tools=({"google_search": {}},)),
         "Gemini Developer API",
         _adapter(
@@ -836,10 +834,10 @@ def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
     ]
 
 
-def _marked_part_messages(
+def _cache_breakpoint_part_messages(
     part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
 ) -> tuple[Message, ...]:
-    """Carry one marked ContentPart in a message of message_class."""
+    """Carry one ContentPart with cache_breakpoint=True in a message of message_class."""
     if message_class is UserMessage:
         return (UserMessage(content=(part,)),)
     return (
@@ -890,7 +888,7 @@ _INVALID_MESSAGES = [
     *(
         _InvalidMessages(
             f"{type(part).__name__}_cache_breakpoint_in_{message_class.__name__}",
-            _marked_part_messages(part, message_class),
+            _cache_breakpoint_part_messages(part, message_class),
             ("cache_breakpoint", type(part).__name__, message_class.__name__),
         )
         for part, message_class in (
@@ -906,12 +904,12 @@ _INVALID_MESSAGES = [
 @pytest.mark.parametrize(
     "case", _INVALID_MESSAGES, ids=[case.case_id for case in _INVALID_MESSAGES]
 )
-def test_unsendable_messages_build_an_invalid_request(case: _InvalidMessages) -> None:
-    """Messages without a Gemini wire form become RefusedMessages naming what cannot be sent."""
+def test_unsendable_messages_build_rejected_messages(case: _InvalidMessages) -> None:
+    """Messages without a Gemini wire form become RejectedMessages naming what cannot be sent."""
     invalid = _adapter().bind_text(_binding()).build_request_params(case.messages)
-    assert isinstance(invalid, RefusedMessages)
+    assert isinstance(invalid, RejectedMessages)
     for fragment in case.reason_fragments:
-        assert fragment in invalid.reason
+        assert fragment in invalid.error_text
 
 
 # --- the thought-signature pairing ---
@@ -1019,21 +1017,21 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 
 
 def test_text_binding_reads_stop_reasons() -> None:
-    """STOP is end_turn or tool_use by the assistant message's tool calls. MAX_TOKENS and SAFETY name themselves."""
+    """STOP is stop or tool_call by the assistant message's tool calls. MAX_TOKENS and SAFETY name themselves."""
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
     assert ended.kind == "usable_response"
-    assert (ended.output, ended.stop_reason) == ("hi", "end_turn")
+    assert (ended.output, ended.stop_reason) == ("hi", "stop")
     called = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
     assert called.kind == "usable_response"
-    assert called.stop_reason == "tool_use"
+    assert called.stop_reason == "tool_call"
     truncated = bound.interpret(
         _response([types.Part(text="par")], finish_reason=types.FinishReason.MAX_TOKENS)
     )
     assert truncated.kind == "usable_response"
-    assert (truncated.output, truncated.stop_reason) == ("par", "max_tokens")
+    assert (truncated.output, truncated.stop_reason) == ("par", "max_completion_tokens")
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
     assert refused.kind == "usable_response"
     assert (refused.output, refused.stop_reason) == ("", "refusal")
@@ -1077,7 +1075,7 @@ def test_structured_binding_outcomes() -> None:
     )
     assert tool_call_outcome.kind == "usable_response"
     assert tool_call_outcome.output is None
-    assert tool_call_outcome.stop_reason == "tool_use"
+    assert tool_call_outcome.stop_reason == "tool_call"
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
     assert refused.kind == "refusal"
     truncated = bound.interpret(
@@ -1093,7 +1091,7 @@ def test_structured_binding_outcomes() -> None:
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
     assert unfinished.kind == "unfinished_assistant_message"
-    assert "LANGUAGE" in unfinished.reason
+    assert "LANGUAGE" in unfinished.error_text
 
 
 def test_a_structured_binding_ignores_thought_text_when_validating() -> None:
@@ -1153,7 +1151,7 @@ def _search_call(queries: object) -> list[types.Part]:
 class _ToolCost(NamedTuple):
     case_id: str
     response: types.GenerateContentResponse
-    configured_fields: frozenset[str]
+    provider_executed_tool_fields: frozenset[str]
     cost_in_usd: float
     pricing: Mapping[str, GeminiPricingTable] = _PRICING
     billing_complete: bool = True
@@ -1193,7 +1191,7 @@ _TOOL_COSTS = [
     ),
     # Code execution, URL context, and file search add no separate fee.
     _ToolCost(
-        "free_provider_tools",
+        "free_provider_executed_tools",
         _response(
             [
                 types.Part(
@@ -1280,13 +1278,13 @@ def test_provider_executed_tool_cost(case: _ToolCost) -> None:
     usage = _billing_from_response(
         case.response,
         case.pricing,
-        configured_fields=case.configured_fields,
+        provider_executed_tool_fields=case.provider_executed_tool_fields,
         billing_complete=case.billing_complete,
     ).usage
     assert usage.provider_executed_tool_cost_in_usd == pytest.approx(case.cost_in_usd, nan_ok=True)
 
 
-def test_the_long_prompt_threshold_reprices_every_category() -> None:
+def test_the_long_context_threshold_reprices_every_category() -> None:
     """Above the threshold the long rates price. At or below it the base rates do."""
     short = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
@@ -1298,7 +1296,7 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         output_tokens_reasoning=0,
         provider_executed_tool_cost_in_usd=0.0,
     ).billing
-    assert short.input_cache_none_usd_per_million_tokens == 1.0
+    assert short.usd_per_million_tokens.input_tokens_cache_none == 1.0
     long = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
         usage_raw=None,
@@ -1309,12 +1307,12 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         output_tokens_reasoning=0,
         provider_executed_tool_cost_in_usd=0.0,
     ).billing
-    assert long.input_cache_none_usd_per_million_tokens == 2.0
-    assert long.cache_read_usd_per_million_tokens == 0.2
-    assert long.output_usd_per_million_tokens == 20.0
+    assert long.usd_per_million_tokens.input_tokens_cache_none == 2.0
+    assert long.usd_per_million_tokens.input_tokens_cache_read == 0.2
+    assert long.usd_per_million_tokens.output_tokens == 20.0
 
 
-def test_tool_execution_input_does_not_cross_the_long_prompt_threshold() -> None:
+def test_tool_execution_input_does_not_cross_the_long_context_threshold() -> None:
     """The threshold reads prompt_token_count, which excludes the tool-execution input priced beside it."""
     billing = _billing_from_usage(
         _usage_metadata(prompt_token_count=200, tool_use_prompt_token_count=50),
@@ -1322,43 +1320,43 @@ def test_tool_execution_input_does_not_cross_the_long_prompt_threshold() -> None
         provider_executed_tool_cost_in_usd=0.0,
     )
     assert billing.usage.input_tokens_cache_none == 210
-    assert billing.input_cache_none_usd_per_million_tokens == 1.0
+    assert billing.usd_per_million_tokens.input_tokens_cache_none == 1.0
 
 
-def test_the_long_prompt_fields_are_required_together() -> None:
+def test_the_long_context_fields_are_required_together() -> None:
     """A threshold without rates prices nothing, and rates without a threshold never apply."""
     with pytest.raises(ValueError, match="together"):
         _ = GeminiPricingTable(
             rates=_ON_DEMAND_RATES,
             google_search_usd_per_query=0.014,
             google_maps_usd_per_query=0.014,
-            long_prompt_threshold_tokens=200,
+            long_context_prompt_token_count_above=200,
         )
     with pytest.raises(ValueError, match="together"):
         _ = GeminiPricingTable(
             rates=_ON_DEMAND_RATES,
             google_search_usd_per_query=0.014,
             google_maps_usd_per_query=0.014,
-            long_prompt_rates=_ON_DEMAND_RATES,
+            long_context_rates=_ON_DEMAND_RATES,
         )
 
 
 def test_pricing_table_multiplied_scales_both_rate_sets_and_keeps_tool_prices() -> None:
-    """`multiplied` scales base and long-prompt token rates and preserves the threshold and tool prices."""
+    """`multiplied` scales base and long-context token rates and preserves the threshold and tool prices."""
     doubled_on_demand_rates = GeminiRates(
-        input_cache_none_usd_per_million_tokens=2.0,
-        cache_read_usd_per_million_tokens=0.2,
-        output_usd_per_million_tokens=20.0,
+        input_tokens_cache_none=2.0,
+        input_tokens_cache_read=0.2,
+        output_tokens=20.0,
     )
     assert _LONG_PROMPT_TABLE.multiplied(2.0) == GeminiPricingTable(
         rates=doubled_on_demand_rates,
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
-        long_prompt_threshold_tokens=200,
-        long_prompt_rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=4.0,
-            cache_read_usd_per_million_tokens=0.4,
-            output_usd_per_million_tokens=40.0,
+        long_context_prompt_token_count_above=200,
+        long_context_rates=GeminiRates(
+            input_tokens_cache_none=4.0,
+            input_tokens_cache_read=0.4,
+            output_tokens=40.0,
         ),
     )
     assert _PRICING["ON_DEMAND"].multiplied(2.0) == GeminiPricingTable(
@@ -1371,9 +1369,9 @@ def test_pricing_table_multiplied_scales_both_rate_sets_and_keeps_tool_prices() 
 def test_traffic_type_selects_the_table() -> None:
     """A reported tier prices at its own table. UNSPECIFIED and None price at ON_DEMAND."""
     flex_rates = GeminiRates(
-        input_cache_none_usd_per_million_tokens=0.5,
-        cache_read_usd_per_million_tokens=0.05,
-        output_usd_per_million_tokens=5.0,
+        input_tokens_cache_none=0.5,
+        input_tokens_cache_read=0.05,
+        output_tokens=5.0,
     )
     pricing = {
         **_PRICING,
@@ -1389,14 +1387,14 @@ def test_traffic_type_selects_the_table() -> None:
         provider_executed_tool_cost_in_usd=0.0,
     )
     assert flexed.service_tier == "ON_DEMAND_FLEX"
-    assert flexed.input_cache_none_usd_per_million_tokens == 0.5
+    assert flexed.usd_per_million_tokens.input_tokens_cache_none == 0.5
     unspecified = _billing_from_usage(
         _usage_metadata(traffic_type=types.TrafficType.TRAFFIC_TYPE_UNSPECIFIED),
         pricing,
         provider_executed_tool_cost_in_usd=0.0,
     )
     assert unspecified.service_tier == "ON_DEMAND"
-    assert unspecified.input_cache_none_usd_per_million_tokens == 1.0
+    assert unspecified.usd_per_million_tokens.input_tokens_cache_none == 1.0
 
 
 # --- streaming ---
@@ -1519,7 +1517,7 @@ def test_billing_reported_follows_usage_arrival() -> None:
     assert after.billing.service_tier == "ON_DEMAND"
 
 
-def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
+def test_cutoff_gemini_provider_executed_tool_billing_is_nan() -> None:
     """A charged query cannot report zero before terminal usage arrives."""
 
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
@@ -1531,7 +1529,7 @@ def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
         stream = _GeminiStream(
             chunks=chunks(),
             pricing=_PRICING,
-            provider_tool_fields=frozenset({"google_search"}),
+            provider_executed_tool_fields=frozenset({"google_search"}),
             first_chunk=_response(
                 [*_search_call(["query"]), types.Part(text="partial")], finish_reason=None
             ),
@@ -1557,7 +1555,7 @@ def test_stream_billing_collects_every_candidate_provider_query() -> None:
         stream = _GeminiStream(
             chunks=chunks(),
             pricing=_PRICING,
-            provider_tool_fields=frozenset({"google_search"}),
+            provider_executed_tool_fields=frozenset({"google_search"}),
         )
         _ = [item async for item in stream.items()]
         return stream.billing_reported()
@@ -1753,39 +1751,27 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
         return _gemini_stream([_response([types.Part(text="he")], finish_reason=None)])
 
     @override
-    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return Gemini error classification cases."""
+    def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
+        """Return Gemini `RequestFailure` cases."""
         return {
-            httpx.ConnectError("no route"): "transient",
-            httpx.ReadTimeout("slow"): "transient",
-            _api_error(400): "invalid_request",
-            _api_error(401): "auth",
-            _api_error(403): "auth",
-            _api_error(404): "invalid_request",
-            _api_error(429): "invalid_request",
-            _api_error(500): "unknown_exception",
-            _api_error(503): "unknown_exception",
-            ValueError("boom"): "unknown_exception",
-        }
-
-    @override
-    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return Gemini error verdict cases."""
-        return {
-            _api_error(429, headers={"retry-after": "7"}): PauseAll(retry_after=7.0),
-            _api_error(429, retry_delay="32s"): PauseAll(retry_after=32.0),
-            _api_error(503): PauseAll(retry_after=None),
-            _api_error(408): RetryThisOne(retry_after=None),
-            _api_error(500): RetryThisOne(retry_after=None),
-            _api_error(502): RetryThisOne(retry_after=None),
-            _api_error(504): RetryThisOne(retry_after=None),
-            _api_error(400): DoNotRetry(),
-            _api_error(403): DoNotRetry(),
-            _api_error(404): DoNotRetry(),
-            _api_error(418): DoNotRetry(),
-            _api_error(599): RetryThisOne(retry_after=None),
-            TransientError("throttled body", retry_after_seconds=3.0, is_rate_limit=True): (
-                PauseAll(retry_after=3.0)
+            httpx.ConnectError("no route"): transient(pauses_quota=False),
+            httpx.ReadTimeout("slow"): transient(pauses_quota=False),
+            _api_error(429, headers={"retry-after": "7"}): transient(
+                pauses_quota=True, retry_after_seconds=7.0
             ),
-            TransientError("failed body"): RetryThisOne(retry_after=None),
+            _api_error(429, retry_delay="32s"): transient(
+                pauses_quota=True, retry_after_seconds=32.0
+            ),
+            _api_error(503): transient(pauses_quota=True),
+            _api_error(408): transient(pauses_quota=False),
+            _api_error(500): transient(pauses_quota=False),
+            _api_error(502): transient(pauses_quota=False),
+            _api_error(504): transient(pauses_quota=False),
+            _api_error(599): transient(pauses_quota=False),
+            _api_error(400): terminal("rejected"),
+            _api_error(401): terminal("auth"),
+            _api_error(403): terminal("auth"),
+            _api_error(404): terminal("rejected"),
+            _api_error(418): terminal("rejected"),
+            ValueError("boom"): terminal("unknown_exception"),
         }

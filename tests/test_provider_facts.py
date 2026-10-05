@@ -20,24 +20,24 @@ from pydantic import BaseModel
 
 from langchaint.anthropic import messages_adapter
 from langchaint.cohere import _INVOKE_MODEL_MAX_BODY_BYTES
-from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll
 from langchaint.gemini import generate_content_adapter
 from langchaint.openai import responses_adapter as openai_responses
 from langchaint.openai import shared as openai_shared
+from tests.helpers import terminal, transient
 
 _ANTHROPIC_LISTED_STATUSES = (
     messages_adapter._PAUSE_STATUSES
     | messages_adapter._RETRY_THIS_ONE_STATUSES
     | messages_adapter._DO_NOT_RETRY_STATUSES
 )
-"""Every status parse_anthropic's three tables list, whatever verdict each gives it."""
+"""Every status the three tables of `anthropic_request_failure` list, whatever each gives it."""
 
 _OPENAI_LISTED_STATUSES = (
     openai_shared._PAUSE_STATUSES
     | openai_shared._RETRY_THIS_ONE_STATUSES
     | openai_shared._DO_NOT_RETRY_STATUSES
 )
-"""Every status parse_openai's three tables list, whatever verdict each gives it."""
+"""Every status the three tables of `openai_request_failure` list, whatever each gives it."""
 
 type _SupportedClient = (
     AsyncAnthropic
@@ -178,10 +178,10 @@ def _openai_response_with(status_code: int, headers: dict[str, str]) -> httpx2.R
     )
 
 
-def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None:
+def test_anthropic_status_error_reads_the_error_type_request_failure_branches_on() -> None:
     """APIStatusError.type is the body's error.type, and None where the body is not that shape.
 
-    `parse_anthropic()` checks `failure.type` before status.
+    `anthropic_request_failure()` checks `error.type` before status.
     This lets an unlisted `overloaded_error` pause the rate-limit quota.
     """
     client = anthropic.Anthropic(api_key="k")
@@ -190,30 +190,30 @@ def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None
         "boom", body=body, response=_anthropic_response_with(418, {})
     )
     assert isinstance(error, anthropic.APIStatusError)
-    assert messages_adapter.parse_anthropic(error) == PauseAll(retry_after=None)
+    assert messages_adapter.anthropic_request_failure(error) == transient(pauses_quota=True)
     bodyless = client._make_status_error(
         "boom", body=None, response=_anthropic_response_with(418, {})
     )
     assert isinstance(bodyless, anthropic.APIStatusError)
-    assert messages_adapter.parse_anthropic(bodyless) == DoNotRetry()
+    assert messages_adapter.anthropic_request_failure(bodyless) == terminal("rejected")
 
 
-def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
+def test_openai_status_error_reads_the_code_request_failure_branches_on() -> None:
     """APIStatusError.code is the body's code, and None where the body is not a dict.
 
-    `parse_openai()` checks `failure.code` within status 429.
+    `openai_request_failure()` checks `error.code` within status 429.
     This keeps spend-limit responses terminal without pausing the rate-limit quota.
     """
     client = openai.OpenAI(api_key="k")
     body = {"code": "credit_balance_exhausted", "type": "insufficient_quota", "message": "boom"}
     error = client._make_status_error("boom", body=body, response=_openai_response_with(429, {}))
     assert isinstance(error, openai.APIStatusError)
-    assert openai_shared.parse_openai(error) == DoNotRetry()
+    assert openai_shared.openai_request_failure(error) == terminal("rejected")
     bodyless = client._make_status_error(
         "boom", body=None, response=_openai_response_with(429, {})
     )
     assert isinstance(bodyless, openai.APIStatusError)
-    assert openai_shared.parse_openai(bodyless) == PauseAll(retry_after=None)
+    assert openai_shared.openai_request_failure(bodyless) == transient(pauses_quota=True)
 
 
 def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
@@ -235,8 +235,8 @@ def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
     return named
 
 
-def test_every_status_a_supported_client_names_is_in_one_of_the_verdict_tables() -> None:
-    """Verdict tables cover each client-specific status class."""
+def test_every_status_a_supported_client_names_is_in_one_of_the_status_tables() -> None:
+    """The status tables cover each client-specific status class."""
     clients_and_listed_statuses = (
         (AsyncAnthropic(api_key="k"), _ANTHROPIC_LISTED_STATUSES),
         (

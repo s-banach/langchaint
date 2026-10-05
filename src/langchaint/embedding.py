@@ -12,7 +12,7 @@ Every returned row has L2 norm one.
 import asyncio
 from collections.abc import Sequence
 from functools import partial
-from typing import ClassVar, Literal, Protocol
+from typing import Literal, Protocol
 
 try:
     import numpy as np
@@ -23,16 +23,14 @@ except ModuleNotFoundError as exc:
         "langchaint embeddings require the numpy package; install numpy."
     ) from exc
 
-from langchaint.adapter import ErrorClassification
 from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.request_failure import RequestFailure, _request_failure_of
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
-    Verdict,
 )
-from langchaint.failure_step import _failure_step
 
 type EmbeddingTask = Literal[
     "retrieval_document",
@@ -53,10 +51,9 @@ class _EmbeddingAdapter(Protocol):
 
     model: str
     dimension: int
-    failure_types: ClassVar[tuple[type[Exception], ...]]
 
-    def parse(self, failure: Exception) -> Verdict:
-        """Map one `failure_types` exception to its `Verdict` without raising."""
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Return what one failed request means, as `Adapter.request_failure` does, without raising."""
         ...
 
     async def prepare(self) -> None:
@@ -88,10 +85,6 @@ class _EmbeddingAdapter(Protocol):
         Raises:
             Exception: The provider request or response validation failed.
         """
-        ...
-
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Classify a failure that reached no verdict or a `DoNotRetry` verdict."""
         ...
 
 
@@ -170,8 +163,7 @@ class EmbeddingModel:
     ) -> Float2D:
         """Run one request batch through its retry budget.
 
-        `_failure_step` decides whether a failed request is retried.
-        A failure outside the adapter's `failure_types` reaches no verdict, so `classify` decides it.
+        A failed request retries when its `RequestFailure` is transient.
 
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
@@ -181,25 +173,28 @@ class EmbeddingModel:
         request_index = 0
         while True:
             request_index += 1
-            admission = self._shared_backoff.admitted()
+            request_failure: RequestFailure | None = None
             try:
-                async with admission:
+                async with self._shared_backoff.admitted() as admission:
                     try:
                         return await self._adapter.embed_batch(inputs, task=task)
-                    except self._adapter.failure_types as error:
-                        admission.record(self._adapter.parse(error))
+                    except Exception as error:
+                        request_failure = admission.record(
+                            _request_failure_of(error, self._adapter.request_failure)
+                        )
                         raise
-            except Exception as error:
-                # The admission holds a verdict only when `error` is one of `failure_types`.
-                step = _failure_step(
-                    error,
-                    verdict=admission.verdict,
-                    classify=self._adapter.classify,
-                )
-                if step.kind == "terminal" or request_index == self.max_requests:
+            except Exception:
+                # `request_failure` is `None` when the adapter's `request_failure` raised.
+                if (
+                    request_failure is None
+                    or request_failure.kind != "transient"
+                    or request_index == self.max_requests
+                ):
                     raise
-                if step.kind == "retry_after_private_wait":
-                    await asyncio.sleep(private_backoff.next_wait(step.retry_after))
+                if not request_failure.pauses_quota:
+                    await asyncio.sleep(
+                        private_backoff.next_wait(request_failure.retry_after_seconds)
+                    )
 
     async def embed(
         self,

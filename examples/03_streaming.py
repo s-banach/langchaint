@@ -45,7 +45,7 @@ async def stream_tool_call() -> Generation[str]:
         GenerationError: Generation fails.
     """
     openai = OpenAI()
-    bound = openai.model("gpt-5.6-terra", reasoning_summary="auto").bind(
+    bound = openai.llm("gpt-5.6-terra", reasoning_summary="auto").bind(
         tools=[get_weather],
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
     )

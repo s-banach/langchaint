@@ -8,10 +8,10 @@ Source: https://api-docs.deepseek.com/quick_start/pricing, read 2026-08-03.
 Recheck that page before relying on a table.
 `DEEPSEEK_PRICING` contains off-peak list prices.
 DeepSeek charges twice those prices during its documented peak windows.
-Cache hits use `cache_read_usd_per_million_tokens`.
-Cache misses use `input_cache_none_usd_per_million_tokens`.
+Cache hits use the `input_tokens_cache_read` rate.
+Cache misses use the `input_tokens_cache_none` rate.
 Cache writes cost zero.
-`DeepSeek.model(pricing=...)` takes `OpenAIRates` because DeepSeek bills the same categories as OpenAI.
+`DeepSeek.llm(pricing=...)` takes `OpenAIRates` because DeepSeek bills the same categories as OpenAI.
 """
 
 import os
@@ -38,24 +38,24 @@ from langchaint.openai.shared import (
     client_without_retries,
 )
 
-type DeepSeekModelName = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
+type DeepSeekModelId = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
 
-DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIRates] = {
+DEEPSEEK_PRICING: dict[DeepSeekModelId, OpenAIRates] = {
     "deepseek-v4-flash": OpenAIRates(
-        input_cache_none_usd_per_million_tokens=0.14,
-        output_usd_per_million_tokens=0.28,
-        cache_read_usd_per_million_tokens=0.0028,
-        cache_write_usd_per_million_tokens=0.0,
+        input_tokens_cache_none=0.14,
+        output_tokens=0.28,
+        input_tokens_cache_read=0.0028,
+        input_tokens_cache_write=0.0,
     ),
     "deepseek-v4-pro": OpenAIRates(
-        input_cache_none_usd_per_million_tokens=0.435,
-        output_usd_per_million_tokens=0.87,
-        cache_read_usd_per_million_tokens=0.003625,
-        cache_write_usd_per_million_tokens=0.0,
+        input_tokens_cache_none=0.435,
+        output_tokens=0.87,
+        input_tokens_cache_read=0.003625,
+        input_tokens_cache_write=0.0,
     ),
 }
-"""Public off-peak prices that `DeepSeek.model` uses by default."""
+"""Public off-peak prices that `DeepSeek.llm` uses by default."""
 
 _PRICING_BY_MODEL_ID = dict[str, OpenAIRates](DEEPSEEK_PRICING.items())
 """`DEEPSEEK_PRICING` with `str` keys for runtime model lookup."""
@@ -65,7 +65,7 @@ _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _API_KEY_ENVIRONMENT_VARIABLE = "DEEPSEEK_API_KEY"
 
 
-def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
+def input_tokens_cache_read_from_usage_deepseek(usage: CompletionUsage) -> int:
     """Return `prompt_cache_hit_tokens` from `CompletionUsage.model_extra`, or zero when absent.
 
     DeepSeek documents that cache-hit and cache-miss counters sum to `prompt_tokens`.
@@ -119,22 +119,22 @@ class DeepSeek:
         self.client: AsyncOpenAI = client_without_retries(client)
 
     @overload
-    def model(
+    def llm(
         self,
-        model: DeepSeekModelName,
+        model: DeepSeekModelId,
         *,
         pricing: OpenAIRates | None = ...,
     ) -> LLM: ...
 
     @overload
-    def model(
+    def llm(
         self,
         model: str,
         *,
         pricing: OpenAIRates,
     ) -> LLM: ...
 
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -162,7 +162,7 @@ class DeepSeek:
             pricing=OpenAIPricingTable(default=table),
             provider_name="deepseek",
             supports_prompt_cache_options=False,
-            cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
+            input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage_deepseek,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
@@ -170,7 +170,7 @@ class DeepSeek:
 __all__ = [
     "DEEPSEEK_PRICING",
     "DeepSeek",
-    "DeepSeekModelName",
+    "DeepSeekModelId",
     "OpenAIRates",
-    "cache_read_tokens_from_usage_deepseek",
+    "input_tokens_cache_read_from_usage_deepseek",
 ]

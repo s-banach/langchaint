@@ -11,7 +11,7 @@ from langchaint import (
     ToolCall,
     ToolManager,
     ToolMessage,
-    ToolOutputExplicit,
+    ToolReturnExplicit,
     tool,
 )
 
@@ -32,13 +32,13 @@ class TransferReceipt(BaseModel):
 
 
 @tool(description="Transfer funds after application approval.")
-async def transfer_funds(args: TransferArgs) -> ToolOutputExplicit[TransferReceipt]:
+async def transfer_funds(args: TransferArgs) -> ToolReturnExplicit[TransferReceipt]:
     """Record a transfer and return its application receipt."""
     receipt = TransferReceipt(
         transfer_id=args.transfer_id,
         amount_in_usd=args.amount_in_usd,
     )
-    return ToolOutputExplicit(
+    return ToolReturnExplicit(
         content=f"Transferred {args.amount_in_usd} USD to {args.recipient}.",
         app_data=receipt,
     )
@@ -46,7 +46,7 @@ async def transfer_funds(args: TransferArgs) -> ToolOutputExplicit[TransferRecei
 
 async def search_docs(
     arguments: dict[str, object],
-) -> ToolOutputExplicit[Mapping[str, object]]:
+) -> ToolReturnExplicit[Mapping[str, object]]:
     """Return an MCP-style result and its application data.
 
     Raises:
@@ -57,7 +57,7 @@ async def search_docs(
     if query == "raise server defect":
         raise RuntimeError("the MCP server failed")
     raw_result: Mapping[str, object] = {"query": query, "matches": 3}
-    return ToolOutputExplicit(content=f"Found 3 passages for {query!r}.", app_data=raw_result)
+    return ToolReturnExplicit(content=f"Found 3 passages for {query!r}.", app_data=raw_result)
 
 
 search_docs_tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(

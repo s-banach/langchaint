@@ -12,11 +12,10 @@ import tiktoken
 from openai import AsyncOpenAI, omit
 from openai.types import Embedding as OpenAIEmbedding
 
-from langchaint.adapter import ErrorClassification, _require_provider_name
+from langchaint.adapter import RequestFailure, _require_provider_name
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.cancellation import to_thread_cancellation_safe
-from langchaint.concurrency.shared_backoff import Verdict
 from langchaint.embedding import (
     EmbeddingTask,
     Float2D,
@@ -24,10 +23,8 @@ from langchaint.embedding import (
     _validated_embeddings,
 )
 from langchaint.openai.shared import (
-    OPENAI_FAILURE_TYPES,
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
-    classify_openai,
-    parse_openai,
+    openai_request_failure,
 )
 
 if TYPE_CHECKING:
@@ -51,17 +48,17 @@ def _partition_inputs_sync(inputs: SequenceNotStr[str]) -> tuple[tuple[str, ...]
     for input_text in inputs:
         if input_text == "":
             raise ValueError("OpenAI embedding inputs must not be empty strings")
-        input_tokens = len(encoding.encode(input_text, disallowed_special=()))
+        input_text_tokens = len(encoding.encode(input_text, disallowed_special=()))
         batch_is_full = len(current_batch) == _MAX_INPUTS_PER_REQUEST
         token_limit_would_be_exceeded = (
-            bool(current_batch) and current_tokens + input_tokens > _MAX_TOKENS_PER_REQUEST
+            bool(current_batch) and current_tokens + input_text_tokens > _MAX_TOKENS_PER_REQUEST
         )
         if batch_is_full or token_limit_would_be_exceeded:
             batches.append(tuple(current_batch))
             current_batch = []
             current_tokens = 0
         current_batch.append(input_text)
-        current_tokens += input_tokens
+        current_tokens += input_text_tokens
     if current_batch:
         batches.append(tuple(current_batch))
     return tuple(batches)
@@ -69,8 +66,6 @@ def _partition_inputs_sync(inputs: SequenceNotStr[str]) -> tuple[tuple[str, ...]
 
 class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
     """Map provider-neutral embedding operations to OpenAI embeddings requests."""
-
-    failure_types = OPENAI_FAILURE_TYPES
 
     def __init__(self, *, client: AsyncOpenAI, model: str, dimension: int) -> None:
         """Store one client, cataloged model, and validated output dimension.
@@ -149,11 +144,6 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
         )
 
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate failure parsing to `parse_openai`."""
-        return parse_openai(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Delegate failure classification to `classify_openai`."""
-        return classify_openai(error)
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Delegate to `openai_request_failure`."""
+        return openai_request_failure(error)

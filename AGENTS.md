@@ -42,12 +42,14 @@ Document every public parameter and cross-provider difference.
 - Allow one adapter to report different `provider_name` values for direct and Bedrock clients.
 - Use neutral vocabulary when providers disagree, such as `ToolCall` instead of `ToolUse`.
 - Give a keyword and the variable passed to it one name, as in `tool_manager=tool_manager`.
-- Put units and encodings in names, such as `cost_in_usd`, `elapsed_seconds`, and the `_json` suffix.
+- Put units and encodings in public names and in values that cross modules, such as `cost_in_usd`, `elapsed_seconds`, and the `_json` suffix.
+- A holder named for its unit, such as `usd_per_million_tokens`, covers its fields.
+- A rate class whose docstring states the unit, such as `OpenAIRates`, covers its fields.
 - Prefix related fields so sorting and completion group them, as in `input_tokens_*`, `generate_one`, and `generate_many`.
 - Do not repeat the holder in an attribute name: write `tool.name`, not `tool.tool_name`.
 - Use the full name for a cross-object reference, such as `tool_call_id` on `ToolMessage`.
 - Give an interface the plain noun.
-- Use `cache_breakpoint` for a user-placed prompt-cache boundary.
+- Call every prompt-cache boundary a cache breakpoint, whether a part with `cache_breakpoint=True` places it or the adapter places it automatically, as with `automatic_cache_breakpoints`.
 - `cache_breakpoint=True` means the reusable prompt prefix ends at that part.
 - Never write bare `input_tokens` because providers count it differently.
 - Use `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and the derived `input_tokens_total`.
@@ -86,7 +88,7 @@ Document every public parameter and cross-provider difference.
 ## Outcomes and errors
 
 - Validate a structured response against the caller's model while preserving the response and billing.
-- Classify provider failures into the retry loop's neutral actions.
+- Map each failed request to a neutral `RequestFailure`, which decides the retry and the rate-limit quota pause.
 - Retry transient failures in `generate_one`, `generate_many`, and `generate_many_records`, and while `stream_one` opens a stream.
 - Stop handling the input on other provider failures.
 - Return one outcome per `GenerationInput` without letting one non-transient failure cancel a sibling.
@@ -97,7 +99,9 @@ Document every public parameter and cross-provider difference.
 - Put recoverable content in its own field.
 - Create a separate variant only when an outcome has different fields or changes control flow.
 - Require variant-specific data as non-optional fields.
-- Give each variant a defaulted `Literal` `kind` named from the class after dropping words shared by every variant.
+- A variant may cover several outcomes with the same fields, and then validates the data each outcome requires.
+- Give each variant a `Literal` `kind`.
+- When a variant covers one outcome, default its `kind` and name it from the class after dropping words shared by every variant.
 - Match non-exception class variants on the string `.kind` attribute.
 - The `.kind` attribute lets autocomplete provide the discriminator without imports of variant classes.
 - Use `isinstance` for exceptions and builtin types.
@@ -164,8 +168,8 @@ Document every public parameter and cross-provider difference.
 - `embedding.py`: provider-neutral embedding execution and output validation.
 - `concurrency/shared_backoff.py`: request admission for one rate-limit quota.
 - `common/exceptions.py`: basic shared exceptions without langchaint imports.
+- `common/request_failure.py`: what a failed request means, and the mapping that generation and embedding share.
 - `generation/errors.py`: normalized generation error records and live generation failures.
-- `failure_step.py`: the retry decision after a failed request, shared by generation and embedding.
 - `generation/response.py`: live generations, their records, and the outcome unions.
 - `generation/tables.py`: tabular outcome and request views.
 - `generation/request_history.py`: request records, immutable request history, and retry accounting.

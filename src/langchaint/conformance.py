@@ -17,14 +17,14 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClassification,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     _UnusableResponseBase,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.billing.usage import ZERO_USAGE
-from langchaint.common.exceptions import StreamProtocolError, TransientError
+from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
     Message,
@@ -33,7 +33,6 @@ from langchaint.common.messages import (
     messages_from_json,
     messages_to_json,
 )
-from langchaint.concurrency.shared_backoff import Verdict
 from langchaint.generation.request_history import (
     AbandonedStreamRecord,
     RequestHistory,
@@ -204,16 +203,11 @@ class AdapterConformance(ABC):
         ...
 
     @abstractmethod
-    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Every SDK exception this adapter places, against the classification it places it as."""
-        ...
+    def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
+        """Every SDK exception this adapter places, against the exact `RequestFailure` it returns.
 
-    @abstractmethod
-    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Every failure this adapter's parse maps, against the exact verdict it returns.
-
-        Cover each verdict kind that `parse` can return.
-        Include a server-stated `retry_after` and an unlisted status.
+        Cover each kind that `request_failure` can return, with and without `pauses_quota`.
+        Include a server-stated `retry_after_seconds` and an unlisted status.
         """
         ...
 
@@ -229,7 +223,7 @@ class AdapterConformance(ABC):
         The assertion lets callers compare parts without repeating the guard.
         """
         request_params = bound_adapter.build_request_params(messages)
-        assert not isinstance(request_params, RefusedMessages)
+        assert not isinstance(request_params, RejectedMessages)
         return self.assistant_wire_parts(request_params)
 
     def _billings(self) -> list[Billing]:
@@ -274,10 +268,10 @@ class AdapterConformance(ABC):
         billing = (
             self._bound_adapter().billing_from_raw(self.response_at_an_unpriced_tier()).billing
         )
-        assert math.isnan(billing.input_cache_none_usd_per_million_tokens)
-        assert math.isnan(billing.cache_read_usd_per_million_tokens)
-        assert math.isnan(billing.cache_write_usd_per_million_tokens)
-        assert math.isnan(billing.output_usd_per_million_tokens)
+        assert math.isnan(billing.usd_per_million_tokens.input_tokens_cache_none)
+        assert math.isnan(billing.usd_per_million_tokens.input_tokens_cache_read)
+        assert math.isnan(billing.usd_per_million_tokens.input_tokens_cache_write)
+        assert math.isnan(billing.usd_per_million_tokens.output_tokens)
         assert math.isnan(billing.usage.cost_in_usd)
 
     def test_reasoning_round_trips_verbatim_in_position(self) -> None:
@@ -291,7 +285,7 @@ class AdapterConformance(ABC):
         assert outcome.kind == "usable_response"
         parts = outcome.assistant_message.parts
         ((index, reasoning_part),) = [
-            (index, part) for index, part in enumerate(parts) if part.kind == "reasoning_part"
+            (index, part) for index, part in enumerate(parts) if part.kind == "reasoning"
         ]
         wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
@@ -314,13 +308,13 @@ class AdapterConformance(ABC):
         outcome = bound_adapter.interpret(response)
         assert outcome.kind == "usable_response"
         parts = outcome.assistant_message.parts
-        assert any(part.kind == "raw_part" for part in parts)
+        assert any(part.kind == "raw" for part in parts)
         wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
         assert len(wire_parts) == len(parts)
         for index, part in enumerate(parts):
-            if part.kind == "raw_part":
+            if part.kind == "raw":
                 assert wire_parts[index] == part.raw
 
     def test_a_json_round_tripped_assistant_message_builds_the_same_wire_request(self) -> None:
@@ -382,40 +376,17 @@ class AdapterConformance(ABC):
         assert outcome.kind == "schema_violation"
         assert outcome.validation_error_json == _validation_error_json(_WeatherReport, text)
 
-    def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
-        """Every listed exception takes its stated classification, and an unlisted one still gets one.
+    def test_every_sdk_exception_maps_and_an_unknown_one_is_unknown_exception(self) -> None:
+        """Every listed exception takes its stated `RequestFailure`, and a bare `Exception` is `unknown_exception`.
 
-        Each listed exception must use its stated classification.
-        A bare `Exception` must return a classification without raising.
-        An adapter returns `unknown_exception` when it cannot classify an exception.
+        `request_failure` must return without raising for an exception the adapter cannot place.
         """
         adapter = self.make_adapter()
-        for error, classification in self.sdk_errors_and_classifications().items():
-            assert adapter.classify(error) == classification
-        assert adapter.classify(Exception("no adapter has seen this")) == "unknown_exception"
-
-    def test_every_listed_failure_parses_and_an_unknown_one_still_does(self) -> None:
-        """Every listed failure takes its stated verdict, and an unlisted one still gets one.
-
-        `parse` must return a verdict for every input without raising.
-        """
-        adapter = self.make_adapter()
-        for failure, verdict in self.sdk_errors_and_verdicts().items():
-            assert adapter.parse(failure) == verdict
-        _ = adapter.parse(Exception("no adapter has seen this"))
-
-    def test_failure_types_excludes_bare_exception_and_includes_transient_error(
-        self,
-    ) -> None:
-        """Exclude bare Exception and include TransientError in failure_types.
-
-        The retry loop raises `TransientError` inside `admitted()` for a billable transient failure.
-        Including `TransientError` ensures those failures are recorded.
-        """
-        adapter = self.make_adapter()
-        for failure_type in adapter.failure_types:
-            assert failure_type is not Exception
-        assert TransientError in adapter.failure_types
+        for error, request_failure in self.sdk_errors_and_request_failures().items():
+            assert adapter.request_failure(error) == request_failure
+        assert adapter.request_failure(Exception("no adapter has seen this")) == RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+        )
 
     def test_the_stream_assembled_type_reads_the_same_as_the_whole_response(self) -> None:
         """One assistant message read off the type a stream assembles into and off a whole response agree.
@@ -466,13 +437,22 @@ class AdapterConformance(ABC):
                 ),
                 ("input_tokens_cache_none_cost_in_usd", usage.input_tokens_cache_none_cost_in_usd),
                 ("output_tokens_cost_in_usd", usage.output_tokens_cost_in_usd),
-                ("cache_read_usd_per_million_tokens", billing.cache_read_usd_per_million_tokens),
-                ("cache_write_usd_per_million_tokens", billing.cache_write_usd_per_million_tokens),
                 (
-                    "input_cache_none_usd_per_million_tokens",
-                    billing.input_cache_none_usd_per_million_tokens,
+                    "input_tokens_cache_read_usd_per_million_tokens",
+                    billing.usd_per_million_tokens.input_tokens_cache_read,
                 ),
-                ("output_usd_per_million_tokens", billing.output_usd_per_million_tokens),
+                (
+                    "input_tokens_cache_write_usd_per_million_tokens",
+                    billing.usd_per_million_tokens.input_tokens_cache_write,
+                ),
+                (
+                    "input_tokens_cache_none_usd_per_million_tokens",
+                    billing.usd_per_million_tokens.input_tokens_cache_none,
+                ),
+                (
+                    "output_tokens_usd_per_million_tokens",
+                    billing.usd_per_million_tokens.output_tokens,
+                ),
             ):
                 assert _costs_agree(_row_number(row, column), expected)
 
@@ -483,11 +463,11 @@ def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedStreamRecord:
         request_history=RequestHistory(
             model=adapter.model,
             provider_name=adapter.provider_name,
-            request_records=(
+            records=(
                 SettledRequestRecord(
                     started_after_seconds=0.0,
                     elapsed_seconds=1.0,
-                    seconds_to_first_item=None,
+                    first_item_after_seconds=None,
                     error=None,
                     billing=billing,
                     assistant_message=None,

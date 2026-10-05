@@ -32,18 +32,21 @@ def _less_than_or_ulp_close(left: float, right: float) -> bool:
 
 
 class TransientErrorRecord(CheckedCopyModel):
-    """The normalized retry information from one failed request."""
+    """The normalized retry information from one failed request.
+
+    `pauses_quota` is true when the failure paused every request on the rate-limit quota.
+    """
 
     model_config = _RECORD_CONFIG
 
-    message: str
+    error_text: str
     retry_after_seconds: _NonnegativeFiniteFloat | None = None
-    is_rate_limit: bool = False
+    pauses_quota: bool = False
 
     @override
     def __str__(self) -> str:
-        """Return the retry failure message."""
-        return self.message
+        """Return `error_text`."""
+        return self.error_text
 
 
 class RequestRecord(CheckedCopyModel):
@@ -57,7 +60,7 @@ class SettledRequestRecord(RequestRecord):
 
     started_after_seconds: _NonnegativeFiniteFloat
     elapsed_seconds: _NonnegativeFiniteFloat
-    seconds_to_first_item: _NonnegativeFiniteFloat | None
+    first_item_after_seconds: _NonnegativeFiniteFloat | None
     error: TransientErrorRecord | None
     billing: Billing | None
     assistant_message: AssistantMessage | None
@@ -73,22 +76,22 @@ class SettledRequestRecord(RequestRecord):
 
     @model_validator(mode="after")
     def _validate_first_item_timing(self) -> "SettledRequestRecord":
-        if self.seconds_to_first_item is not None and not _less_than_or_ulp_close(
-            self.seconds_to_first_item, self.elapsed_seconds
+        if self.first_item_after_seconds is not None and not _less_than_or_ulp_close(
+            self.first_item_after_seconds, self.elapsed_seconds
         ):
-            raise ValueError("seconds_to_first_item must not exceed elapsed_seconds")
+            raise ValueError("first_item_after_seconds must not exceed elapsed_seconds")
         return self
 
 
 class CutOffRequestRecord(RequestRecord):
     """One request whose ending langchaint did not observe.
 
-    `seconds_to_first_item` is `None` when no streamed item arrived before the cut-off.
+    `first_item_after_seconds` is `None` when no streamed item arrived before the cut-off.
     Its default keeps records saved without it valid.
     """
 
     started_after_seconds: _NonnegativeFiniteFloat
-    seconds_to_first_item: _NonnegativeFiniteFloat | None = None
+    first_item_after_seconds: _NonnegativeFiniteFloat | None = None
     billing: Billing | None
     kind: Literal["cut_off"] = "cut_off"
 
@@ -110,23 +113,23 @@ class RequestHistory(CheckedCopyModel):
 
     model: str
     provider_name: str
-    request_records: tuple[_RequestRecordVariant, ...]
+    records: tuple[_RequestRecordVariant, ...]
     elapsed_seconds: _NonnegativeFiniteFloat
 
     @model_validator(mode="after")
     def _validate_request_timing(self) -> "RequestHistory":
         cut_off_indexes = [
             index
-            for index, request_record in enumerate(self.request_records)
+            for index, request_record in enumerate(self.records)
             if request_record.kind == "cut_off"
         ]
         if len(cut_off_indexes) > 1:
-            raise ValueError("request_records may contain at most one cut-off record")
-        if cut_off_indexes and cut_off_indexes[0] != len(self.request_records) - 1:
+            raise ValueError("records may contain at most one cut-off record")
+        if cut_off_indexes and cut_off_indexes[0] != len(self.records) - 1:
             raise ValueError("a cut-off request record must be final")
 
         previous_end = 0.0
-        for request_record in self.request_records:
+        for request_record in self.records:
             if not _less_than_or_ulp_close(previous_end, request_record.started_after_seconds):
                 raise ValueError("request records must not overlap")
             if not _less_than_or_ulp_close(
@@ -139,6 +142,15 @@ class RequestHistory(CheckedCopyModel):
                     raise ValueError("a settled request end must fall within the request history")
                 previous_end = request_end
         return self
+
+    @property
+    def errors_from_requests(self) -> tuple[TransientErrorRecord, ...]:
+        """Return the transient error of each settled request that has one, in request order."""
+        return tuple(
+            request_record.error
+            for request_record in self.records
+            if request_record.kind == "settled" and request_record.error is not None
+        )
 
 
 class _InputOutcomeRecordBase(CheckedCopyModel):
@@ -154,13 +166,13 @@ class _InputOutcomeRecordBase(CheckedCopyModel):
     @property
     def request_count(self) -> int:
         """Return the observed request count."""
-        return len(self.request_history.request_records)
+        return len(self.request_history.records)
 
     @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
         return Usage.sum_of(
-            request_record.usage for request_record in self.request_history.request_records
+            request_record.usage for request_record in self.request_history.records
         )
 
     @property
@@ -186,12 +198,12 @@ class _InputOutcomeRecordBase(CheckedCopyModel):
         self,
     ) -> tuple[SettledRequestRecord | CutOffRequestRecord, ...]:
         """Return the input's normalized request records."""
-        return self.request_history.request_records
+        return self.request_history.records
 
     @property
     def assistant_message(self) -> AssistantMessage | None:
         """Return the last recorded assistant message."""
-        for request_record in reversed(self.request_history.request_records):
+        for request_record in reversed(self.request_history.records):
             if request_record.kind == "settled" and request_record.assistant_message is not None:
                 return request_record.assistant_message
         return None
@@ -200,12 +212,11 @@ class _InputOutcomeRecordBase(CheckedCopyModel):
 def _require_abandoned_shape(request_history: RequestHistory) -> None:
     settled = tuple(
         request_record
-        for request_record in request_history.request_records
+        for request_record in request_history.records
         if request_record.kind == "settled"
     )
     final_is_cut_off = (
-        bool(request_history.request_records)
-        and request_history.request_records[-1].kind == "cut_off"
+        bool(request_history.records) and request_history.records[-1].kind == "cut_off"
     )
     if final_is_cut_off:
         settled_prefix = settled
@@ -240,15 +251,15 @@ class AbandonedStreamRecord(_InputOutcomeRecordBase):
 def _settled_request_records(request_history: RequestHistory) -> tuple[SettledRequestRecord, ...]:
     settled_request_records = tuple(
         request_record
-        for request_record in request_history.request_records
+        for request_record in request_history.records
         if request_record.kind == "settled"
     )
-    if len(settled_request_records) != len(request_history.request_records):
+    if len(settled_request_records) != len(request_history.records):
         raise ValueError("this record does not permit a cut-off request")
     return settled_request_records
 
 
-def _require_completed_assistant_message(request_history: RequestHistory) -> None:
+def _require_finished_assistant_message(request_history: RequestHistory) -> None:
     settled_request_records = _settled_request_records(request_history)
     if not settled_request_records:
         raise ValueError("request history must contain at least one settled request")
@@ -294,18 +305,18 @@ class _RequestLedger:
         self._request_in_flight = False
         self._first_item_at_monotonic_seconds: float | None = None
         self._noted_request_id: str | None = None
-        self._billing_in_flight: ProviderBilling | None = None
+        self._provider_billing_in_flight: ProviderBilling | None = None
 
     def stage_response(
         self,
         *,
         raw: BaseModel,
-        billing: ProviderBilling,
+        provider_billing: ProviderBilling,
         identity: ResponseIdentity,
     ) -> None:
         """Hold a complete response before interpretation records its outcome."""
         self._staged_response = _StagedResponse(
-            raw=raw, provider_billing=billing, identity=identity
+            raw=raw, provider_billing=provider_billing, identity=identity
         )
 
     def start_request(self) -> None:
@@ -314,7 +325,7 @@ class _RequestLedger:
         self._request_in_flight = True
         self._first_item_at_monotonic_seconds = None
         self._noted_request_id = None
-        self._billing_in_flight = None
+        self._provider_billing_in_flight = None
 
     def stamp_first_item(self) -> None:
         """Record the first streamed item once."""
@@ -325,14 +336,14 @@ class _RequestLedger:
         """Store the current request's request id."""
         self._noted_request_id = request_id
 
-    def note_billing_in_flight(self, billing: ProviderBilling | None) -> None:
+    def note_provider_billing_in_flight(self, provider_billing: ProviderBilling | None) -> None:
         """Store billing reported before an interruption."""
-        self._billing_in_flight = billing
+        self._provider_billing_in_flight = provider_billing
 
     @property
-    def billing_in_flight(self) -> ProviderBilling | None:
+    def provider_billing_in_flight(self) -> ProviderBilling | None:
         """Return billing for the current request, when reported."""
-        return self._billing_in_flight
+        return self._provider_billing_in_flight
 
     @property
     def request_count(self) -> int:
@@ -354,11 +365,14 @@ class _RequestLedger:
         *,
         error: "TransientError | None",
         assistant_message: AssistantMessage | None,
-        billing: ProviderBilling | None = None,
+        provider_billing: ProviderBilling | None = None,
     ) -> None:
         """Close the current request at the current monotonic time."""
         self.record_ending_at(
-            time.monotonic(), error=error, assistant_message=assistant_message, billing=billing
+            time.monotonic(),
+            error=error,
+            assistant_message=assistant_message,
+            provider_billing=provider_billing,
         )
 
     def record_ending_at(
@@ -367,14 +381,14 @@ class _RequestLedger:
         *,
         error: "TransientError | None",
         assistant_message: AssistantMessage | None,
-        billing: ProviderBilling | None = None,
+        provider_billing: ProviderBilling | None = None,
     ) -> None:
         """Close the current request at an existing monotonic timestamp."""
         staged = self._staged_response
         self._staged_response = None
         self._request_in_flight = False
-        self._billing_in_flight = None
-        provider_billing = staged.provider_billing if staged is not None else billing
+        self._provider_billing_in_flight = None
+        provider_billing = staged.provider_billing if staged is not None else provider_billing
         started_after_seconds = (
             self._request_started_at_monotonic_seconds - self._started_at_monotonic_seconds
         )
@@ -383,7 +397,7 @@ class _RequestLedger:
             SettledRequestRecord(
                 started_after_seconds=started_after_seconds,
                 elapsed_seconds=elapsed_seconds,
-                seconds_to_first_item=(
+                first_item_after_seconds=(
                     None
                     if self._first_item_at_monotonic_seconds is None
                     else self._first_item_at_monotonic_seconds
@@ -393,9 +407,9 @@ class _RequestLedger:
                     None
                     if error is None
                     else TransientErrorRecord(
-                        message=str(error),
+                        error_text=str(error),
                         retry_after_seconds=error.retry_after_seconds,
-                        is_rate_limit=error.is_rate_limit,
+                        pauses_quota=error.pauses_quota,
                     )
                 ),
                 billing=None if provider_billing is None else provider_billing.billing,
@@ -425,12 +439,12 @@ class _RequestLedger:
         return RequestHistory(
             model=self._model,
             provider_name=self._provider_name,
-            request_records=tuple(self._request_records),
+            records=tuple(self._request_records),
             elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
         )
 
     def freeze_with_cut_off(
-        self, billing: ProviderBilling | None = None
+        self, provider_billing: ProviderBilling | None = None
     ) -> tuple[RequestHistory, tuple[RequestProviderData, ...]]:
         """Freeze the request history and append one cut-off record for an open request."""
         ended_at_monotonic_seconds = time.monotonic()
@@ -441,11 +455,13 @@ class _RequestLedger:
         request_provider_data = self.request_provider_data
         if not cut_off_in_flight:
             return request_history, request_provider_data
-        provider_billing = billing if billing is not None else self._billing_in_flight
+        provider_billing = (
+            provider_billing if provider_billing is not None else self._provider_billing_in_flight
+        )
         cut_off = CutOffRequestRecord(
             started_after_seconds=request_started_at_monotonic_seconds
             - self._started_at_monotonic_seconds,
-            seconds_to_first_item=(
+            first_item_after_seconds=(
                 None
                 if first_item_at_monotonic_seconds is None
                 else first_item_at_monotonic_seconds - request_started_at_monotonic_seconds
@@ -456,7 +472,7 @@ class _RequestLedger:
             RequestHistory(
                 model=request_history.model,
                 provider_name=request_history.provider_name,
-                request_records=(*request_history.request_records, cut_off),
+                records=(*request_history.records, cut_off),
                 elapsed_seconds=request_history.elapsed_seconds,
             ),
             (

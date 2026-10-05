@@ -12,7 +12,7 @@ import pathlib
 import pkgutil
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from types import ModuleType
-from typing import override
+from typing import Literal, override
 
 import httpx2
 import jsonschema
@@ -29,19 +29,11 @@ from langchaint import (
     RequestHistory,
     RequestRecord,
     SettledRequestRecord,
+    TokenRates,
     TransientErrorRecord,
     Usage,
 )
-from langchaint.adapter import (
-    DoNotRetry,
-    ErrorClassification,
-    PauseAll,
-    PauseAllDoNotRetry,
-    ProviderBilling,
-    RetryThisOne,
-    TransientError,
-    Verdict,
-)
+from langchaint.adapter import ProviderBilling, RequestFailure, TransientError
 from scripts import refresh_semconv_genai
 
 
@@ -52,30 +44,32 @@ class StubRaw(BaseModel):
 def stated_billing(
     usage: Usage,
     *,
-    input_cache_none_usd_per_million_tokens: float = float("nan"),
+    input_tokens_cache_none_usd_per_million_tokens: float = float("nan"),
 ) -> Billing:
     """Build normalized Billing from test-stated Usage and an optional cache rate."""
     return Billing(
         usage=usage,
         service_tier="stub",
-        input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
-        cache_read_usd_per_million_tokens=float("nan"),
-        cache_write_usd_per_million_tokens=float("nan"),
-        output_usd_per_million_tokens=float("nan"),
+        usd_per_million_tokens=TokenRates(
+            input_tokens_cache_read=float("nan"),
+            input_tokens_cache_write=float("nan"),
+            input_tokens_cache_none=input_tokens_cache_none_usd_per_million_tokens,
+            output_tokens=float("nan"),
+        ),
     )
 
 
 def stated_provider_billing(
     usage: Usage,
     *,
-    input_cache_none_usd_per_million_tokens: float = float("nan"),
+    input_tokens_cache_none_usd_per_million_tokens: float = float("nan"),
     usage_raw: BaseModel | None = None,
 ) -> ProviderBilling:
     """Build provider billing from normalized Billing and optional raw usage."""
     return ProviderBilling(
         billing=stated_billing(
             usage,
-            input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
+            input_tokens_cache_none_usd_per_million_tokens=input_tokens_cache_none_usd_per_million_tokens,
         ),
         usage_raw=usage_raw,
     )
@@ -86,10 +80,10 @@ def request_record(
     error: TransientError | TransientErrorRecord | None,
     usage: Usage = ZERO_USAGE,
     reported_billing: bool = True,
-    input_cache_none_usd_per_million_tokens: float = float("nan"),
+    input_tokens_cache_none_usd_per_million_tokens: float = float("nan"),
     started_after_seconds: float = 0.0,
     elapsed_seconds: float = 0.0,
-    seconds_to_first_item: float | None = None,
+    first_item_after_seconds: float | None = None,
     assistant_message: AssistantMessage | None = None,
     model_served: str | None = None,
     response_id: str | None = None,
@@ -98,9 +92,9 @@ def request_record(
     """Build one normalized settled request record."""
     normalized_error = (
         TransientErrorRecord(
-            message=str(error),
+            error_text=str(error),
             retry_after_seconds=error.retry_after_seconds,
-            is_rate_limit=error.is_rate_limit,
+            pauses_quota=error.pauses_quota,
         )
         if isinstance(error, TransientError)
         else error
@@ -108,12 +102,12 @@ def request_record(
     return SettledRequestRecord(
         started_after_seconds=started_after_seconds,
         elapsed_seconds=elapsed_seconds,
-        seconds_to_first_item=seconds_to_first_item,
+        first_item_after_seconds=first_item_after_seconds,
         error=normalized_error,
         billing=(
             stated_billing(
                 usage,
-                input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
+                input_tokens_cache_none_usd_per_million_tokens=input_tokens_cache_none_usd_per_million_tokens,
             )
             if reported_billing
             else None
@@ -125,14 +119,12 @@ def request_record(
     )
 
 
-def call_record(
-    request_records: tuple[RequestRecord, ...], *, elapsed_seconds: float
-) -> RequestHistory:
+def call_record(records: tuple[RequestRecord, ...], *, elapsed_seconds: float) -> RequestHistory:
     """Build a RequestHistory over the records under test. The identity fields are fixed filler."""
     return RequestHistory(
         model="fake-model",
         provider_name="fake",
-        request_records=request_records,
+        records=records,
         elapsed_seconds=elapsed_seconds,
     )
 
@@ -240,58 +232,62 @@ def connection_error() -> openai.APIConnectionError:
     return openai.APIConnectionError(request=httpx2.Request("POST", "https://api.openai.com"))
 
 
-def openai_sdk_errors_and_classifications() -> Mapping[Exception, ErrorClassification]:
-    """Return shared openai error classification cases."""
-    return {
-        connection_error(): "transient",
-        openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): "transient",
-        status_error(openai.RateLimitError, 429): "invalid_request",
-        status_error(openai.ConflictError, 409): "invalid_request",
-        status_error(openai.BadRequestError, 400): "invalid_request",
-        status_error(openai.AuthenticationError, 401): "auth",
-        status_error(openai.PermissionDeniedError, 403): "auth",
-        status_error(openai.AuthenticationError, 401, {"x-should-retry": "false"}): "auth",
-        status_error(openai.NotFoundError, 404): "invalid_request",
-        status_error(openai.UnprocessableEntityError, 422): "invalid_request",
-        status_error(openai.APIStatusError, 413): "invalid_request",
-        status_error(openai.APIStatusError, 408): "invalid_request",
-        status_error(openai.BadRequestError, 400, {"x-should-retry": "false"}): "invalid_request",
-        status_error(
-            openai.InternalServerError, 500, {"x-should-retry": "false"}
-        ): "declared_final",
-        status_error(openai.InternalServerError, 500): "unknown_exception",
-        status_error(openai.InternalServerError, 503): "unknown_exception",
-        status_error(openai.APIStatusError, 302): "unknown_exception",
-        status_error(openai.APIStatusError, 200, error_code="invalid_prompt"): "declared_final",
-        ValueError("boom"): "unknown_exception",
-    }
+def transient(*, pauses_quota: bool, retry_after_seconds: float | None = None) -> RequestFailure:
+    """Return a transient `RequestFailure`."""
+    return RequestFailure(
+        kind="transient", pauses_quota=pauses_quota, retry_after_seconds=retry_after_seconds
+    )
 
 
-def openai_sdk_errors_and_verdicts() -> Mapping[Exception, Verdict]:
-    """Return shared openai error verdict cases."""
+def terminal(
+    kind: Literal["auth", "rejected", "provider_failed_terminally", "unknown_exception"],
+) -> RequestFailure:
+    """Return a terminal `RequestFailure` that pauses nothing and states no wait."""
+    return RequestFailure(kind=kind, pauses_quota=False, retry_after_seconds=None)
+
+
+def openai_sdk_errors_and_request_failures() -> Mapping[Exception, RequestFailure]:
+    """Return shared openai `RequestFailure` cases."""
     return {
-        status_error(openai.RateLimitError, 429, {"retry-after": "7"}): PauseAll(retry_after=7.0),
+        connection_error(): transient(pauses_quota=False),
+        openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): transient(
+            pauses_quota=False
+        ),
+        status_error(openai.RateLimitError, 429, {"retry-after": "7"}): transient(
+            pauses_quota=True, retry_after_seconds=7.0
+        ),
         status_error(
             openai.RateLimitError, 429, error_code="organization_spend_limit_exceeded"
-        ): DoNotRetry(),
-        status_error(openai.InternalServerError, 503): PauseAll(retry_after=None),
-        status_error(openai.InternalServerError, 500): RetryThisOne(retry_after=None),
-        status_error(openai.APIStatusError, 408): RetryThisOne(retry_after=None),
-        status_error(openai.ConflictError, 409): RetryThisOne(retry_after=None),
-        status_error(openai.BadRequestError, 400): DoNotRetry(),
-        status_error(openai.AuthenticationError, 401): DoNotRetry(),
-        status_error(openai.PermissionDeniedError, 403): DoNotRetry(),
-        status_error(openai.NotFoundError, 404): DoNotRetry(),
-        status_error(openai.UnprocessableEntityError, 422): DoNotRetry(),
-        status_error(openai.APIStatusError, 451): DoNotRetry(),
-        status_error(openai.InternalServerError, 599): RetryThisOne(retry_after=None),
-        status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}): PauseAllDoNotRetry(
-            retry_after=None
+        ): terminal("rejected"),
+        status_error(openai.InternalServerError, 503): transient(pauses_quota=True),
+        status_error(openai.InternalServerError, 500): transient(pauses_quota=False),
+        status_error(openai.APIStatusError, 408): transient(pauses_quota=False),
+        status_error(openai.ConflictError, 409): transient(pauses_quota=False),
+        status_error(openai.InternalServerError, 599): transient(pauses_quota=False),
+        status_error(openai.BadRequestError, 400): terminal("rejected"),
+        status_error(openai.AuthenticationError, 401): terminal("auth"),
+        status_error(openai.PermissionDeniedError, 403): terminal("auth"),
+        status_error(openai.AuthenticationError, 401, {"x-should-retry": "false"}): terminal(
+            "auth"
         ),
-        TransientError("throttled body", retry_after_seconds=3.0, is_rate_limit=True): PauseAll(
-            retry_after=3.0
+        status_error(openai.NotFoundError, 404): terminal("rejected"),
+        status_error(openai.UnprocessableEntityError, 422): terminal("rejected"),
+        status_error(openai.APIStatusError, 413): terminal("rejected"),
+        status_error(openai.APIStatusError, 451): terminal("rejected"),
+        status_error(openai.BadRequestError, 400, {"x-should-retry": "false"}): terminal(
+            "rejected"
         ),
-        TransientError("failed body"): RetryThisOne(retry_after=None),
+        status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}): terminal(
+            "provider_failed_terminally"
+        ),
+        status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}): RequestFailure(
+            kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
+        ),
+        status_error(openai.APIStatusError, 302): terminal("unknown_exception"),
+        status_error(openai.APIStatusError, 200, error_code="invalid_prompt"): terminal(
+            "provider_failed_terminally"
+        ),
+        ValueError("boom"): terminal("unknown_exception"),
     }
 
 

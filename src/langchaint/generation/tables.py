@@ -39,10 +39,10 @@ def _output_cell(output: object) -> str | None:
 
 
 def _billing_cells(
-    billing: Billing | None, provider_data: RequestProviderData | None
+    billing: Billing | None, request_provider_data: RequestProviderData | None
 ) -> dict[str, RowValue]:
     usage = None if billing is None else billing.usage
-    usage_raw = None if provider_data is None else provider_data.usage_raw
+    usage_raw = None if request_provider_data is None else request_provider_data.usage_raw
     return {
         "service_tier": None if billing is None else billing.service_tier,
         "usage_raw_json": None if usage_raw is None else usage_raw.model_dump_json(),
@@ -66,18 +66,18 @@ def _billing_cells(
         if usage is None
         else usage.provider_executed_tool_cost_in_usd,
         "cost_in_usd": None if usage is None else usage.cost_in_usd,
-        "input_cache_none_usd_per_million_tokens": None
+        "input_tokens_cache_none_usd_per_million_tokens": None
         if billing is None
-        else billing.input_cache_none_usd_per_million_tokens,
-        "cache_read_usd_per_million_tokens": None
+        else billing.usd_per_million_tokens.input_tokens_cache_none,
+        "input_tokens_cache_read_usd_per_million_tokens": None
         if billing is None
-        else billing.cache_read_usd_per_million_tokens,
-        "cache_write_usd_per_million_tokens": None
+        else billing.usd_per_million_tokens.input_tokens_cache_read,
+        "input_tokens_cache_write_usd_per_million_tokens": None
         if billing is None
-        else billing.cache_write_usd_per_million_tokens,
-        "output_usd_per_million_tokens": None
+        else billing.usd_per_million_tokens.input_tokens_cache_write,
+        "output_tokens_usd_per_million_tokens": None
         if billing is None
-        else billing.output_usd_per_million_tokens,
+        else billing.usd_per_million_tokens.output_tokens,
     }
 
 
@@ -87,9 +87,9 @@ def _request_row(
     request_index: int,
     kept: bool,
     request_record: SettledRequestRecord | CutOffRequestRecord,
-    provider_data: RequestProviderData | None,
+    request_provider_data: RequestProviderData | None,
 ) -> dict[str, RowValue]:
-    common = _billing_cells(request_record.billing, provider_data) | {
+    common = _billing_cells(request_record.billing, request_provider_data) | {
         "outcome_index": outcome_index,
         "request_index": request_index,
         "kept": kept,
@@ -98,7 +98,7 @@ def _request_row(
     if request_record.kind == "cut_off":
         return common | {
             "elapsed_seconds": None,
-            "seconds_to_first_item": request_record.seconds_to_first_item,
+            "first_item_after_seconds": request_record.first_item_after_seconds,
             "model_served": None,
             "response_id": None,
             "request_id": None,
@@ -107,7 +107,7 @@ def _request_row(
         }
     return common | {
         "elapsed_seconds": request_record.elapsed_seconds,
-        "seconds_to_first_item": request_record.seconds_to_first_item,
+        "first_item_after_seconds": request_record.first_item_after_seconds,
         "model_served": request_record.model_served,
         "response_id": request_record.response_id,
         "request_id": request_record.request_id,
@@ -143,10 +143,10 @@ def to_tables[OutputT, WithToolCallsOutputT](
             value, (GenerationWithoutToolCalls, GenerationWithToolCalls, GenerationError)
         ):
             record = value.record
-            request_provider_data = value.request_provider_data
+            live_request_provider_data = value.request_provider_data
         else:
             record = value
-            request_provider_data = ()
+            live_request_provider_data = ()
         live_error = value if isinstance(value, GenerationError) else None
         is_error = isinstance(record, _GenerationErrorRecordBase)
         is_generation = isinstance(record, _GenerationRecordBase)
@@ -171,8 +171,10 @@ def to_tables[OutputT, WithToolCallsOutputT](
                     request_index=request_index,
                     kept=request_index == kept_index,
                     request_record=request_record,
-                    provider_data=(
-                        request_provider_data[request_index] if request_provider_data else None
+                    request_provider_data=(
+                        live_request_provider_data[request_index]
+                        if live_request_provider_data
+                        else None
                     ),
                 )
             )

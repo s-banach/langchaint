@@ -18,7 +18,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from langchaint.billing.pricing import Billing
+from langchaint.billing.pricing import Billing, TokenRates
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.common.messages import (
@@ -55,7 +55,7 @@ OUTPUT_MESSAGES = "gen_ai.output.messages"
 type StrictFiniteFloat = Annotated[FiniteFloat, Field(strict=True)]
 type StringTuple = Annotated[tuple[str, ...], Field(strict=False)]
 
-_RAW_SPAN_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
+_SPAN_ATTRIBUTES_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 _BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
 _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _STRUCTURED_ATTRIBUTE_NAMES_ADAPTER: TypeAdapter[frozenset[str]] = TypeAdapter(frozenset[str])
@@ -406,12 +406,12 @@ class OtelChatSpan(OtelModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _partition_raw_span(cls, input_value: object) -> object:
-        raw_span = _RAW_SPAN_ADAPTER.validate_python(input_value)
+    def _partition_span_attributes(cls, input_value: object) -> object:
+        span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
         parsed_attributes: dict[str, JsonValue] = {}
         prompt_variables: dict[str, JsonValue] = {}
         unused_attributes: dict[str, JsonValue] = {}
-        for name, value in raw_span.items():
+        for name, value in span_attributes.items():
             if name in _OTEL_CHAT_SPAN_FIXED_ALIASES:
                 if value is None:
                     raise ValueError(f"a present OTel attribute cannot be null: {name}")
@@ -434,19 +434,19 @@ class OtelToLangchaintConversionError(ValueError):
     """A valid OTel value has no lossless langchaint representation."""
 
 
-def parse_otel(raw_attributes: dict[str, JsonValue]) -> OtelChatSpan:
+def parse_otel(span_attributes: dict[str, JsonValue]) -> OtelChatSpan:
     """Parse one deserialized OTel chat span attribute dictionary.
 
     `parse_otel` does not parse span metadata.
     Decoded JSON strings preserve values without preserving their original formatting.
 
     Args:
-        raw_attributes: The deserialized chat span attributes.
+        span_attributes: The deserialized chat span attributes.
 
     Raises:
         pydantic.ValidationError: A standard attribute is malformed or the operation is not `chat`.
     """
-    return OtelChatSpan.model_validate(raw_attributes)
+    return OtelChatSpan.model_validate(span_attributes)
 
 
 def _system_prompt_from_parts(
@@ -616,10 +616,10 @@ def generation_record_from_otel(
     Any other output message returns `GenerationWithoutToolCallsRecord`.
     The record contains one synthetic request record.
     `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
-    `seconds_to_first_item`, `error`, and `request_id` are `None`.
+    `first_item_after_seconds`, `error`, and `request_id` are `None`.
     `Billing.usage` is `ZERO_USAGE`.
     `Billing.service_tier` is `"unknown"`.
-    Every `Billing` rate is NaN.
+    Every `Billing.usd_per_million_tokens` rate is NaN.
     Trace usage, cost, retry, request count, timing, and provider service-tier attributes are ignored.
     Failure detection uses `error.type` and the selected finish reason.
     `OtelChatSpan` does not contain OTel span status.
@@ -651,15 +651,17 @@ def generation_record_from_otel(
     billing = Billing(
         usage=ZERO_USAGE,
         service_tier="unknown",
-        input_cache_none_usd_per_million_tokens=float("nan"),
-        cache_read_usd_per_million_tokens=float("nan"),
-        cache_write_usd_per_million_tokens=float("nan"),
-        output_usd_per_million_tokens=float("nan"),
+        usd_per_million_tokens=TokenRates(
+            input_tokens_cache_read=float("nan"),
+            input_tokens_cache_write=float("nan"),
+            input_tokens_cache_none=float("nan"),
+            output_tokens=float("nan"),
+        ),
     )
     request_record = SettledRequestRecord(
         started_after_seconds=0.0,
         elapsed_seconds=0.0,
-        seconds_to_first_item=None,
+        first_item_after_seconds=None,
         error=None,
         billing=billing,
         assistant_message=assistant_message,
@@ -670,7 +672,7 @@ def generation_record_from_otel(
     request_history = RequestHistory(
         model=otel_chat_span.request_model,
         provider_name=otel_chat_span.provider_name,
-        request_records=(request_record,),
+        records=(request_record,),
         elapsed_seconds=0.0,
     )
     if assistant_message.tool_calls:
@@ -819,18 +821,14 @@ def _stop_reason_from_otel(
             raise OtelToLangchaintConversionError(
                 f"finish_reason {selected_finish_reason!r} reports a failed span"
             )
-        case "stop":
-            return "end_turn"
-        case "tool_call":
-            return "tool_use"
         case "length":
-            return "max_tokens"
+            return "max_completion_tokens"
         case "content_filter":
             return "refusal"
         case (
-            "end_turn"
-            | "tool_use"
-            | "max_tokens"
+            "stop"
+            | "tool_call"
+            | "max_completion_tokens"
             | "refusal"
             | "context_window_exceeded"
             | "other"

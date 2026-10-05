@@ -11,18 +11,9 @@ from langchaint.billing.usage import Usage
 from langchaint.common.messages import AssistantMessage, StopReason, ToolCall
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
-    ContextWindowExceededErrorRecord,
-    EmptyAssistantMessageErrorRecord,
-    EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
-    MaxCompletionTokensExceededErrorRecord,
-    ProviderFailedTerminallyErrorRecord,
-    RefusalErrorRecord,
     SchemaViolationErrorRecord,
-    TimedOutErrorRecord,
-    UnfinishedAssistantMessageErrorRecord,
-    _GenerationErrorRecordBase,
 )
 from langchaint.generation.request_history import (
     AbandonedStreamRecord,
@@ -31,7 +22,7 @@ from langchaint.generation.request_history import (
     SettledRequestRecord,
     _InputOutcomeRecordBase,
     _RequestLedger,
-    _require_completed_assistant_message,
+    _require_finished_assistant_message,
     _settled_request_records,
 )
 
@@ -50,7 +41,7 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
 
     @model_validator(mode="after")
     def _validate_generation(self) -> Self:
-        _require_completed_assistant_message(self.request_history)
+        _require_finished_assistant_message(self.request_history)
         return self
 
     @property
@@ -65,7 +56,7 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
     @override
     def assistant_message(self) -> AssistantMessage:
         """Return the kept assistant message, from the final request."""
-        final = self.request_history.request_records[-1]
+        final = self.request_history.records[-1]
         assert final.kind == "settled"
         assert final.assistant_message is not None
         return final.assistant_message
@@ -132,7 +123,7 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
 
     @property
     def assistant_message(self) -> AssistantMessage:
-        """Return the final assistant message."""
+        """Return the kept assistant message."""
         return self.record.assistant_message
 
     @property
@@ -172,7 +163,7 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """Return the final assistant message's tool calls."""
+        """Return the kept assistant message's tool calls."""
         return self.record.tool_calls
 
 
@@ -221,8 +212,8 @@ class GenerationWithToolCalls(
 def _validate_live_generation(
     record: _GenerationRecordBase, request_provider_data: tuple[RequestProviderData, ...]
 ) -> None:
-    if len(request_provider_data) != len(record.request_history.request_records):
-        raise ValueError("request_provider_data must align with request_history.request_records")
+    if len(request_provider_data) != len(record.request_history.records):
+        raise ValueError("request_provider_data must align with request_history.records")
     _ = _final_raw(request_provider_data)
 
 
@@ -256,7 +247,8 @@ type GenerationOutcome[OutputT, WithToolCallsOutputT = OutputT] = (
 type GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] = Annotated[
     SerializeAsAny[GenerationWithoutToolCallsRecord[OutputT]]
     | SerializeAsAny[GenerationWithToolCallsRecord[WithToolCallsOutputT]]
-    | GenerationErrorRecord,
+    | GenerationErrorRecord
+    | SchemaViolationErrorRecord,
     Field(discriminator="kind"),
 ]
 """The normalized record of one `GenerationOutcome`.
@@ -293,10 +285,7 @@ def _generation_outcome_record[OutputT, WithToolCallsOutputT](
         raise TypeError(f"unsupported generation outcome record: {type(record).__name__}")
     if isinstance(generation_outcome, _GenerationRecordBase):
         return generation_outcome
-    if (
-        isinstance(generation_outcome, _GenerationErrorRecordBase)
-        and type(generation_outcome) in _GENERATION_ERROR_RECORD_CLASSES
-    ):
+    if type(generation_outcome) in _GENERATION_ERROR_RECORD_CLASSES:
         return generation_outcome
     raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
 
@@ -310,7 +299,7 @@ def _generation_variant[OutputT](
     stop_reason: StopReason,
 ) -> Generation[OutputT]:
     """Build one live generation and its normalized record."""
-    final = request_history.request_records[-1]
+    final = request_history.records[-1]
     assert final.kind == "settled"
     assert final.assistant_message is not None
     if splits_on_tool_calls and final.assistant_message.tool_calls:
@@ -346,25 +335,35 @@ def _generation_outcome_from_response_outcome[OutputT](
                 stop_reason=outcome.stop_reason,
             )
         case "refusal":
-            record = RefusalErrorRecord(request_history=request_history)
+            record = GenerationErrorRecord(kind="refusal_error", request_history=request_history)
         case "max_completion_tokens_exceeded":
-            record = MaxCompletionTokensExceededErrorRecord(request_history=request_history)
+            record = GenerationErrorRecord(
+                kind="max_completion_tokens_exceeded_error", request_history=request_history
+            )
         case "empty_assistant_message":
-            record = EmptyAssistantMessageErrorRecord(request_history=request_history)
+            record = GenerationErrorRecord(
+                kind="empty_assistant_message_error", request_history=request_history
+            )
         case "schema_violation":
             record = SchemaViolationErrorRecord(
                 validation_error_json=outcome.validation_error_json,
                 request_history=request_history,
             )
         case "context_window_exceeded":
-            record = ContextWindowExceededErrorRecord(request_history=request_history)
+            record = GenerationErrorRecord(
+                kind="context_window_exceeded_error", request_history=request_history
+            )
         case "unfinished_assistant_message":
-            record = UnfinishedAssistantMessageErrorRecord(
-                error_text=outcome.reason, request_history=request_history
+            record = GenerationErrorRecord(
+                kind="unfinished_assistant_message_error",
+                error_text=outcome.error_text,
+                request_history=request_history,
             )
         case "provider_failed_terminally":
-            record = ProviderFailedTerminallyErrorRecord(
-                error_text=outcome.reason, request_history=request_history
+            record = GenerationErrorRecord(
+                kind="provider_failed_terminally_error",
+                error_text=outcome.error_text,
+                request_history=request_history,
             )
         case "provider_failed_transiently":
             raise ValueError("ProviderFailedTransiently requires the caller's retry policy")
@@ -376,12 +375,12 @@ def _generation_outcome_from_response_outcome[OutputT](
 
 
 def _timed_out_error(
-    ledger: _RequestLedger, billing_in_flight: ProviderBilling | None = None
+    ledger: _RequestLedger, provider_billing_in_flight: ProviderBilling | None = None
 ) -> GenerationError:
     """Build the expired deadline's failure with one normalized cut-off request."""
-    request_history, request_provider_data = ledger.freeze_with_cut_off(billing_in_flight)
+    request_history, request_provider_data = ledger.freeze_with_cut_off(provider_billing_in_flight)
     return GenerationError(
-        record=TimedOutErrorRecord(request_history=request_history),
+        record=GenerationErrorRecord(kind="timed_out_error", request_history=request_history),
         request_params=None,
         request_provider_data=request_provider_data,
     )
@@ -395,8 +394,10 @@ def _escaped_error(ledger: _RequestLedger, escaped: Exception) -> GenerationErro
     """
     request_history, request_provider_data = ledger.freeze_with_cut_off()
     return GenerationError(
-        record=EscapedExceptionErrorRecord(
-            error_text=str(escaped), request_history=request_history
+        record=GenerationErrorRecord(
+            kind="unknown_exception_error",
+            error_text=str(escaped),
+            request_history=request_history,
         ),
         request_params=None,
         request_provider_data=request_provider_data,

@@ -32,7 +32,7 @@ def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, mode
         )
 
 
-def category_cost(tokens: int, *, usd_per_million_tokens: float) -> float:
+def category_cost_in_usd(tokens: int, *, usd_per_million_tokens: float) -> float:
     """Price one token category, preserving zero when the rate is unknown.
 
     `0 * NaN` is NaN.
@@ -47,23 +47,23 @@ def category_cost(tokens: int, *, usd_per_million_tokens: float) -> float:
     return tokens * usd_per_million_tokens / 1_000_000
 
 
-def invocation_cost_in_usd(invocations: int, *, usd_per_invocation: float | None) -> float:
+def invocation_cost_in_usd(invocation_count: int, *, usd_per_invocation: float | None) -> float:
     """Price provider invocations, preserving zero when the rate is unavailable.
 
     Args:
-        invocations: The invocation count to price.
+        invocation_count: The invocation count to price.
         usd_per_invocation: The rate in USD per invocation, or `None` when unavailable.
 
     Raises:
-        ValueError: `invocations` is boolean or negative.
+        ValueError: `invocation_count` is boolean or negative.
     """
-    if isinstance(invocations, bool) or invocations < 0:
-        raise ValueError("invocations must be a nonnegative int")
-    if not invocations:
+    if isinstance(invocation_count, bool) or invocation_count < 0:
+        raise ValueError("invocation_count must be a nonnegative int")
+    if not invocation_count:
         return 0.0
     if usd_per_invocation is None:
         return float("nan")
-    return invocations * usd_per_invocation
+    return invocation_count * usd_per_invocation
 
 
 def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> None:
@@ -80,31 +80,43 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
         raise ValueError(f"{rate_name} must be finite and nonnegative")
 
 
-class Billing(CheckedCopyModel):
-    """One request's normalized priced usage, service tier, and applied rates.
+class TokenRates(CheckedCopyModel):
+    """The rates applied to one request's priced `Usage` token counters.
 
-    Stored rates reproduce token costs without the original rate table.
+    Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
     A missing category rate is NaN.
+    Pydantic validates stored rates and serializes NaN as a string, so a stored `Billing` reproduces its token costs.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
 
-    usage: Usage
-    service_tier: str
-    input_cache_none_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    cache_write_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
+    input_tokens_cache_read: float
+    input_tokens_cache_write: float
+    input_tokens_cache_none: float
+    output_tokens: float
 
     @field_serializer(
-        "input_cache_none_usd_per_million_tokens",
-        "cache_read_usd_per_million_tokens",
-        "cache_write_usd_per_million_tokens",
-        "output_usd_per_million_tokens",
+        "input_tokens_cache_read",
+        "input_tokens_cache_write",
+        "input_tokens_cache_none",
+        "output_tokens",
         when_used="json",
     )
     def _serialize_rate(self, rate: float) -> float | str:
         return _serialize_nonfinite_float(rate)
+
+
+class Billing(CheckedCopyModel):
+    """One request's normalized priced usage, service tier, and applied rates.
+
+    `usd_per_million_tokens` stores the applied rates, which reproduce token costs without the original rate table.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    usage: Usage
+    service_tier: str
+    usd_per_million_tokens: TokenRates
 
     @property
     def cache_savings_in_usd(self) -> float:
@@ -113,11 +125,11 @@ class Billing(CheckedCopyModel):
         The counterfactual prices every input token at the uncached rate.
         Output cost cancels because it is identical in both totals.
         The value is negative when write premiums exceed read discounts.
-        It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input was billed.
+        It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input tokens were billed.
         """
-        uncached = category_cost(
+        uncached = category_cost_in_usd(
             self.usage.input_tokens_total,
-            usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+            usd_per_million_tokens=self.usd_per_million_tokens.input_tokens_cache_none,
         )
         billed = (
             self.usage.input_tokens_cache_read_cost_in_usd

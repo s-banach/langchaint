@@ -1,14 +1,14 @@
 """Construct OpenAI and Bedrock `LLM` values and OpenAI `EmbeddingModel` values.
 
 Importing this subpackage requires `openai`.
-`OpenAI.model` uses the Responses API and reports `provider_name="openai"`.
-`OpenAIBedrock.model` uses Responses and reports `provider_name="aws.bedrock"`.
+`OpenAI.llm` uses the Responses API and reports `provider_name="openai"`.
+`OpenAIBedrock.llm` uses Responses and reports `provider_name="aws.bedrock"`.
 Use `OpenAIChatCompletionsAdapter` directly for compatible endpoints.
 Use `OpenAIResponsesAdapter` directly for Azure.
 
 Cataloged models receive `OPENAI_PRICING`.
 Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
-`OpenAIBedrock.model` always requires both parameters.
+`OpenAIBedrock.llm` always requires both parameters.
 Missing optional rates produce NaN token costs.
 
 Token prices use USD per one million tokens.
@@ -20,8 +20,8 @@ Embedding batching parameters come from the OpenAI embeddings guide.
 Source: https://developers.openai.com/api/docs/guides/embeddings.
 Cataloged embedding model dimensions come from the OpenAI model catalog.
 Source: https://developers.openai.com/api/docs/models/all.
-`OpenAI.model(pricing=...)` replaces cataloged estimates.
-`OpenAIBedrock.model(pricing=...)` uses caller rates.
+`OpenAI.llm(pricing=...)` replaces cataloged estimates.
+`OpenAIBedrock.llm(pricing=...)` uses caller rates.
 The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
 """
@@ -42,7 +42,7 @@ except ModuleNotFoundError as exc:
 
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
-from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelName
+from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelId
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
     OpenAIResponsesAdapter,
@@ -61,14 +61,14 @@ if TYPE_CHECKING:
     from langchaint.embedding import EmbeddingModel
     from langchaint.generation.observer import Observer
 
-type OpenAIEmbeddingModelName = Literal[
+type OpenAIEmbeddingModelId = Literal[
     "text-embedding-3-small",
     "text-embedding-3-large",
     "text-embedding-ada-002",
 ]
 """Cataloged OpenAI model identifiers accepted by `embedding_model()`."""
 
-OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelName] = frozenset({
+OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelId] = frozenset({
     "text-embedding-3-small",
     "text-embedding-3-large",
     "text-embedding-ada-002",
@@ -78,7 +78,7 @@ OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelName] = frozenset({
 _PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](OPENAI_PRICING.items())
 """`OPENAI_PRICING` with `str` keys for runtime model lookup."""
 
-PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
+PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelId] = frozenset({
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -88,7 +88,7 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
 
 OpenAI 2.45.0 documents this parameter for gpt-5.6-and-later.
 It carries `automatic_cache_breakpoints=False` to the request.
-`OpenAI.model` derives `supports_prompt_cache_options` from this set.
+`OpenAI.llm` derives `supports_prompt_cache_options` from this set.
 The set stays independent from pricing because parameter availability can change independently.
 """
 
@@ -122,9 +122,9 @@ class OpenAI:
         )
 
     @overload
-    def model(
+    def llm(
         self,
-        model: OpenAIModelName,
+        model: OpenAIModelId,
         *,
         regional_processing: bool = ...,
         pricing: OpenAIPricingTable | None = ...,
@@ -134,7 +134,7 @@ class OpenAI:
     ) -> LLM: ...
 
     @overload
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -145,7 +145,7 @@ class OpenAI:
         service_tier: OpenAIResponsesServiceTier | None = ...,
     ) -> LLM: ...
 
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -232,7 +232,7 @@ class OpenAI:
 
     def embedding_model(
         self,
-        model: OpenAIEmbeddingModelName,
+        model: OpenAIEmbeddingModelId,
         *,
         dimension: int | None = None,
         max_requests: int = 3,
@@ -252,16 +252,14 @@ class OpenAI:
         if model == "text-embedding-ada-002":
             if dimension is not None:
                 raise ValueError("text-embedding-ada-002 accepts no dimension argument")
-            validated_dimension = 1536
+            dimension = 1536
         else:
-            maximum_dimension = 1536 if model == "text-embedding-3-small" else 3072
-            validated_dimension = maximum_dimension if dimension is None else dimension
-            if isinstance(validated_dimension, bool) or not (
-                1 <= validated_dimension <= maximum_dimension
-            ):
+            max_dimension = 1536 if model == "text-embedding-3-small" else 3072
+            dimension = max_dimension if dimension is None else dimension
+            if isinstance(dimension, bool) or not (1 <= dimension <= max_dimension):
                 raise ValueError(
                     f"dimension for {model!r} must be an int from 1 through "
-                    f"{maximum_dimension}, got {validated_dimension!r}"
+                    f"{max_dimension}, got {dimension!r}"
                 )
         try:
             from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
@@ -281,7 +279,7 @@ class OpenAI:
         adapter = _OpenAIEmbeddingAdapter(
             client=self.client,
             model=model,
-            dimension=validated_dimension,
+            dimension=dimension,
         )
         return EmbeddingModel(
             adapter=adapter,
@@ -323,7 +321,7 @@ class OpenAIBedrock:
             else AsyncBedrockOpenAI(aws_region=aws_region, max_retries=0)
         )
 
-    def model(
+    def llm(
         self,
         model: str,
         *,
@@ -360,9 +358,9 @@ __all__ = [
     "OpenAI",
     "OpenAIBedrock",
     "OpenAIChatCompletionsAdapter",
-    "OpenAIEmbeddingModelName",
+    "OpenAIEmbeddingModelId",
     "OpenAILongContextPricing",
-    "OpenAIModelName",
+    "OpenAIModelId",
     "OpenAIPricingTable",
     "OpenAIRates",
     "OpenAIResponsesAdapter",

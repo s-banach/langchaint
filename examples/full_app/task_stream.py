@@ -2,9 +2,9 @@
 
 AgentRun.final installs GuiEmitter, emits terminal events, and drives run.
 on_event executes synchronously inside the run.
-`TimedOutErrorRecord` lets the loop record a timed-out call and continue.
+A `timed_out_error` lets the loop record a timed-out input and continue.
 
-Each run registers at construction and appends settled TurnRecord values to turn_log.
+Each run registers at construction and appends settled TurnLogEntry values to turn_log.
 Usage is derived from the registered runs' turn_log values.
 """
 
@@ -23,11 +23,11 @@ from events import (
     AgentFinished,
     AgentStarted,
     Event,
+    GenerationReported,
     GuiEmitter,
-    LlmCallAbandoned,
-    LlmResponse,
+    LlmInputTimedOut,
     ToolCalled,
-    ToolResponse,
+    ToolDispatched,
     TurnStarted,
     content_text,
     describe_error,
@@ -48,7 +48,7 @@ from langchaint import (
     ToolCall,
     ToolManager,
     ToolMessage,
-    ToolOutputExplicit,
+    ToolReturnExplicit,
     ToolSequence,
     Usage,
     UserMessage,
@@ -57,7 +57,7 @@ from langchaint import (
 
 
 @dataclass(frozen=True)
-class LlmTurn:
+class GenerationEntry:
     """Record one `Generation`."""
 
     turn_number: int
@@ -65,15 +65,15 @@ class LlmTurn:
 
 
 @dataclass(frozen=True)
-class LlmFailure:
-    """Record one failed or timed-out generate call and its billing."""
+class GenerationErrorEntry:
+    """Record one failed or timed-out input and its billing."""
 
     turn_number: int
     error: GenerationError
 
 
 @dataclass(frozen=True)
-class ToolTurn:
+class DispatchEntry:
     """Record one settled tool call and its reported Usage."""
 
     turn_number: int
@@ -82,19 +82,19 @@ class ToolTurn:
     reported_usage: Usage
 
 
-type TurnRecord = LlmTurn | LlmFailure | ToolTurn
+type TurnLogEntry = GenerationEntry | GenerationErrorEntry | DispatchEntry
 """One entry in a run's ordered turn_log."""
 
 
-def _spend_of(record: TurnRecord) -> Usage:
-    """Return one record's reported Usage."""
-    match record:
-        case LlmTurn():
-            return record.generation.usage
-        case LlmFailure():
-            return record.error.usage
-        case ToolTurn():
-            return record.reported_usage
+def _spend_of(entry: TurnLogEntry) -> Usage:
+    """Return one entry's reported Usage."""
+    match entry:
+        case GenerationEntry():
+            return entry.generation.usage
+        case GenerationErrorEntry():
+            return entry.error.usage
+        case DispatchEntry():
+            return entry.reported_usage
 
 
 def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
@@ -115,7 +115,7 @@ def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
 class AgentRun(ABC):
     """Report one agent's execution through on_event.
 
-    Subclasses implement run and append settled calls to turn_log.
+    Subclasses implement run and append settled entries to turn_log.
     final installs GuiEmitter and emits terminal events.
     """
 
@@ -142,7 +142,7 @@ class AgentRun(ABC):
         self.config: AgentConfig = config
         self.registry: dict[str, AgentRun] = registry
         self.on_event: Callable[[Event], None] = on_event
-        self.turn_log: list[TurnRecord] = []
+        self.turn_log: list[TurnLogEntry] = []
         registry[agent_path] = self
 
     @abstractmethod
@@ -156,7 +156,7 @@ class AgentRun(ABC):
     @property
     def own_usage(self) -> Usage:
         """Sum this run's turn_log Usage."""
-        return Usage.sum_of(_spend_of(record) for record in self.turn_log)
+        return Usage.sum_of(_spend_of(entry) for entry in self.turn_log)
 
     @property
     def usage(self) -> Usage:
@@ -188,7 +188,9 @@ class AgentRun(ABC):
             except Exception as error:
                 self.on_event(
                     AgentFailed(
-                        agent_path=self.agent_path, error=describe_error(error), usage=self.usage
+                        agent_path=self.agent_path,
+                        error_text=describe_error(error),
+                        usage=self.usage,
                     )
                 )
                 raise
@@ -229,14 +231,14 @@ class ReActAgent(AgentRun):
 
     @override
     async def run(self) -> str:
-        """Run generate and tool turns until the agent answers.
+        """Run turns of generation and tool dispatch until the agent answers.
 
         config.self_correction_enabled requires critique approval.
-        Each generate_one call uses config.generate_one_timeout_seconds.
+        Each input uses config.generate_one_timeout_seconds.
         Each settled outcome is appended to turn_log.
 
         Raises:
-            GenerationError: Generation fails after its retries, except for `TimedOutErrorRecord`.
+            GenerationError: Generation fails after its retries, except with kind `timed_out_error`.
             RuntimeError: `max_turns` elapses or the configured cost prevents another turn.
             DispatchExceptionGroup: A tool function raises after settled sibling outcomes enter `turn_log`.
             asyncio.CancelledError: An outer deadline cancels the run.
@@ -265,21 +267,25 @@ class ReActAgent(AgentRun):
                     timeout_seconds=self.config.generate_one_timeout_seconds,
                 )
             except GenerationError as error:
-                self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
+                self.turn_log.append(
+                    GenerationErrorEntry(turn_number=self.turn_number, error=error)
+                )
                 if error.record.kind != "timed_out_error":
                     raise
                 # The timed-out `generate_one` leaves self.messages unchanged for the next turn.
                 self.on_event(
-                    LlmCallAbandoned(
+                    LlmInputTimedOut(
                         agent_path=self.agent_path,
                         turn_number=self.turn_number,
                         usage_so_far=self.usage,
                     )
                 )
                 continue
-            self.turn_log.append(LlmTurn(turn_number=self.turn_number, generation=generation))
+            self.turn_log.append(
+                GenerationEntry(turn_number=self.turn_number, generation=generation)
+            )
             self.on_event(
-                LlmResponse(
+                GenerationReported(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
                     text=generation.assistant_message.text,
@@ -356,7 +362,7 @@ class ReActAgent(AgentRun):
     def _settle_outcomes(
         self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
     ) -> None:
-        """Record each outcome and emit ToolResponse.
+        """Record each outcome and emit ToolDispatched.
 
         tool_call_id matches partial outcomes to their calls.
         An outcome with `kind == "handled"` may carry reported Usage or CritiqueVerdict through app_data.
@@ -385,7 +391,7 @@ class ReActAgent(AgentRun):
                 elif isinstance(app_data, CritiqueVerdict) and app_data.approved:
                     self.critique_approved = True
             self.turn_log.append(
-                ToolTurn(
+                DispatchEntry(
                     turn_number=self.turn_number,
                     tool_name=tool_call.name,
                     tool_message=outcome.tool_message,
@@ -393,7 +399,7 @@ class ReActAgent(AgentRun):
                 )
             )
             self.on_event(
-                ToolResponse(
+                ToolDispatched(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
                     tool_call_id=outcome.tool_message.tool_call_id,
@@ -423,7 +429,7 @@ def build_delegate_tool(
     *,
     llm: LLM,
     parent_path: str,
-    sub_config: AgentConfig,
+    config: AgentConfig,
     registry: dict[str, AgentRun],
     on_event: Callable[[Event], None],
 ) -> PydanticTool[DelegateArgs, None]:
@@ -435,22 +441,22 @@ def build_delegate_tool(
     spawn_counter = itertools.count()
 
     @tool(description="Delegate a focused question to the specialist sub-agent.")
-    async def delegate(args: DelegateArgs) -> ToolOutputExplicit[None]:
+    async def delegate(args: DelegateArgs) -> ToolReturnExplicit[None]:
         """Run the specialist and return its answer.
 
         Raises:
             DispatchExceptionGroup: A specialist tool function raises.
         """
         sub_run = ReActAgent(
-            agent_path=f"{parent_path}/{sub_config.name}#{next(spawn_counter)}",
-            config=sub_config,
+            agent_path=f"{parent_path}/{config.name}#{next(spawn_counter)}",
+            config=config,
             registry=registry,
             on_event=on_event,
             bound=llm.bind(
-                system_prompt=sub_config.system_prompt,
-                tools=_tools_for(sub_config, [search_tool]),
-                max_requests=sub_config.max_requests,
-                automatic_cache_breakpoints=sub_config.automatic_cache_breakpoints,
+                system_prompt=config.system_prompt,
+                tools=_tools_for(config, [search_tool]),
+                max_requests=config.max_requests,
+                automatic_cache_breakpoints=config.automatic_cache_breakpoints,
             ),
             prompt=args.question,
         )
@@ -460,12 +466,12 @@ def build_delegate_tool(
             raise
         except Exception as error:
             # Return sub-agent failures to the parent model.
-            return ToolOutputExplicit(
+            return ToolReturnExplicit(
                 content=f"The specialist failed: {describe_error(error)}. Answer without it.",
                 app_data=None,
                 is_error=True,
             )
-        return ToolOutputExplicit(content=answer, app_data=None)
+        return ToolReturnExplicit(content=answer, app_data=None)
 
     return delegate
 
@@ -558,17 +564,15 @@ class App:
             DispatchExceptionGroup: A synthesize tool function raises.
             ExceptionGroup: A concurrent researcher tool function raises.
         """
-        # Use climate_name for the run and the delegate's parent_path.
-        climate_name = "research_climate"
         delegate_tool = build_delegate_tool(
             llm=self._llm,
-            parent_path=top_level_path(climate_name),
-            sub_config=self._configs["specialist"],
+            parent_path=top_level_path("research_climate"),
+            config=self._configs["specialist"],
             registry=self._runs,
             on_event=self._on_event,
         )
         climate = self._build_run(
-            name=climate_name,
+            name="research_climate",
             tools=[search_tool, delegate_tool],
             prompt="Research the climate outlook to 2030.",
         )

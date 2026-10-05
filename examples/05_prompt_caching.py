@@ -11,7 +11,7 @@ async def generate_with_a_warm_cache() -> list[GenerationWithoutToolCalls[str] |
         "Support policy: route refunds to a human. "
         "Never request a password or payment-card number. "
     ) * 300
-    bound = anthropic.model("claude-sonnet-5", cache_ttl="1h").bind(
+    bound = anthropic.llm("claude-sonnet-5", cache_ttl="1h").bind(
         system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
         max_completion_tokens=1024,
         automatic_cache_breakpoints=False,

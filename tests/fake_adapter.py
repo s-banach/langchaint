@@ -5,7 +5,7 @@ The fakes implement the adapter contract without an SDK, so tests drive BoundLLM
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, override
 
@@ -25,21 +25,18 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    DoNotRetry,
-    ErrorClassification,
     MaxCompletionTokensExceeded,
     ProviderBilling,
     Refusal,
-    RefusedMessages,
+    RejectedMessages,
+    RequestFailure,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
     TransientError,
     UsableResponse,
-    Verdict,
-    verdict_from_transient_error,
 )
-from tests.helpers import stated_provider_billing, yield_until
+from tests.helpers import stated_provider_billing, terminal, yield_until
 
 USAGE: Usage = Usage(
     input_tokens_cache_read=0,
@@ -63,17 +60,14 @@ USAGE_STREAM: Usage = USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.00
 """The stream final()'s assembled usage, distinct so a stream cost is visible."""
 
 
-def parse_fake(failure: Exception) -> Verdict:
-    """Map TransientError with verdict_from_transient_error."""
-    if isinstance(failure, TransientError):
-        return verdict_from_transient_error(failure)
-    return DoNotRetry()
+_UNKNOWN_EXCEPTION = terminal("unknown_exception")
+"""The `RequestFailure` a `FakeAdapter` returns unless the test states one."""
 
 
 def fast_shared_backoff(
     *,
     max_concurrent_requests: int | None = 8,
-    longest_wait_seconds: float = 0.002,
+    max_wait_seconds: float = 0.002,
     max_request_starts_per_second: float = 10_000.0,
 ) -> SharedBackoff:
     """Build a fresh near-zero-wait `SharedBackoff`.
@@ -82,8 +76,8 @@ def fast_shared_backoff(
     """
     return SharedBackoff(
         max_concurrent_requests=max_concurrent_requests,
-        minimum_wait_ceiling_seconds=0.001,
-        longest_wait_seconds=longest_wait_seconds,
+        min_wait_ceiling_seconds=0.001,
+        max_wait_seconds=max_wait_seconds,
         max_request_starts_per_second=max_request_starts_per_second,
     )
 
@@ -136,7 +130,7 @@ def usable_text_response(content: str) -> UsableResponse[str]:
     return UsableResponse(
         output=content,
         assistant_message=AssistantMessage(parts=(TextPart(text=content),)),
-        stop_reason="end_turn",
+        stop_reason="stop",
     )
 
 
@@ -264,7 +258,7 @@ class FakeBoundAdapter(BoundAdapter[str]):
         """Copy the adapter's scripts so this binding consumes them independently."""
         self._adapter = adapter
         self._scripted_requests = list(adapter.scripted_requests)
-        self._invalid_requests = list(adapter.invalid_requests)
+        self._rejected_messages = list(adapter.rejected_messages)
         self._scripted_by_raw_id: dict[str, ScriptedResponse] = {}
         self.final_raws: list[FakeRawResponse] = []
         """The raw response of every request stream this binding built, in order."""
@@ -294,10 +288,12 @@ class FakeBoundAdapter(BoundAdapter[str]):
         return self._scripted_by_raw_id[as_fake_raw(raw).id].outcome
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
-        """Report the scripted refusal, else carry messages into the request params."""
-        if self._invalid_requests:
-            return self._invalid_requests.pop(0)
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
+        """Return the next scripted `RejectedMessages`, else carry messages into the request params."""
+        if self._rejected_messages:
+            return self._rejected_messages.pop(0)
         self.build_count += 1
         return FakeRequestParams(messages=tuple(messages))
 
@@ -392,7 +388,7 @@ class RequestIdError(RuntimeError):
 
 
 class TransientRequestIdError(TransientError):
-    """The same id, on the class an adapter raises to retry a request without going through classify."""
+    """The same id, on the class an adapter raises to retry a request without going through `request_failure`."""
 
     def __init__(self, message: str, request_id: str) -> None:
         """Store the message and the request id."""
@@ -410,18 +406,17 @@ class FakeAdapter(Adapter):
         self,
         *,
         scripted_requests: Sequence[ScriptedRequest] = (),
-        invalid_requests: Sequence[RefusedMessages] = (),
+        rejected_messages: Sequence[RejectedMessages] = (),
         echo: bool = False,
         stream: FakeStream | None = None,
-        classify_result: ErrorClassification = "unknown_exception",
-        parse: Callable[[Exception], Verdict] = parse_fake,
+        request_failure: RequestFailure = _UNKNOWN_EXCEPTION,
         open_seconds: float = 0.0,
         hang_from_open: int | None = None,
         open_barrier: asyncio.Barrier | None = None,
         open_barrier_from_call: int = 1,
         automatic_cache_breakpoints_default: bool = False,
     ) -> None:
-        """Store the behavior every bound adapter reads, the classify verdict, and the failure parser.
+        """Store the behavior every bound adapter reads and the `RequestFailure` of every failure the adapter maps.
 
         From call number open_barrier_from_call on, open_stream first waits at open_barrier.
         From call number hang_from_open on, it then suspends until cancelled.
@@ -429,7 +424,7 @@ class FakeAdapter(Adapter):
         With none left, it returns stream.
         Without a stream, it streams a usable response whose output is "ok".
         With echo set and a first message that is a user message with str content, the output is that content.
-        build_request_params returns the next of invalid_requests while any remain.
+        build_request_params returns the next of rejected_messages while any remain.
         """
         # This adapter reaches no SDK, so it passes client=None.
         # The empty provider_name_by_client_class preserves the stated "fake" provider_name.
@@ -440,15 +435,14 @@ class FakeAdapter(Adapter):
             automatic_cache_breakpoints_default=automatic_cache_breakpoints_default,
         )
         self.scripted_requests: Sequence[ScriptedRequest] = scripted_requests
-        self.invalid_requests: Sequence[RefusedMessages] = invalid_requests
+        self.rejected_messages: Sequence[RejectedMessages] = rejected_messages
         self.echo: bool = echo
         self.stream: FakeStream | None = stream
         self.open_seconds: float = open_seconds
         self.hang_from_open: int | None = hang_from_open
         self.open_barrier: asyncio.Barrier | None = open_barrier
         self.open_barrier_from_call: int = open_barrier_from_call
-        self._classify_result = classify_result
-        self._parse = parse
+        self._request_failure = request_failure
         self.bound_adapters: list[FakeBoundAdapter] = []
         self.structured_bind_count: int = 0
 
@@ -472,17 +466,10 @@ class FakeAdapter(Adapter):
         bound: BoundAdapter[ModelT] = FakeStructuredBoundAdapter()
         return bound
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (TransientError,)
-
     @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate to the failure parser passed to the constructor."""
-        return self._parse(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Return the fixed verdict for every exception classify sees."""
-        return self._classify_result
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Return the `RequestFailure` passed to the constructor."""
+        return self._request_failure
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:

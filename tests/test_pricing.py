@@ -5,7 +5,7 @@ import math
 import pytest
 
 from langchaint import ZERO_USAGE, Usage
-from langchaint.billing.pricing import category_cost, invocation_cost_in_usd
+from langchaint.billing.pricing import category_cost_in_usd, invocation_cost_in_usd
 from tests.helpers import stated_billing
 
 
@@ -35,7 +35,7 @@ def _usage(
 
 def test_a_zero_counter_costs_zero_at_an_unknown_rate() -> None:
     """0 * NaN is NaN, so the zero case is special-cased and a total over it stays a number."""
-    assert category_cost(tokens=0, usd_per_million_tokens=float("nan")) == 0.0
+    assert category_cost_in_usd(tokens=0, usd_per_million_tokens=float("nan")) == 0.0
 
 
 def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:
@@ -44,11 +44,11 @@ def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:
     assert math.isnan(invocation_cost_in_usd(1, usd_per_invocation=None))
 
 
-@pytest.mark.parametrize("invocations", [-1, True])
-def test_invocation_cost_rejects_invalid_counts(invocations: int) -> None:
+@pytest.mark.parametrize("invocation_count", [-1, True])
+def test_invocation_cost_rejects_invalid_counts(invocation_count: int) -> None:
     """Negative and boolean counts cannot produce costs."""
     with pytest.raises(ValueError, match="nonnegative int"):
-        _ = invocation_cost_in_usd(invocations, usd_per_invocation=0.01)
+        _ = invocation_cost_in_usd(invocation_count, usd_per_invocation=0.01)
 
 
 def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
@@ -64,7 +64,7 @@ def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
                     input_tokens_cache_write_cost_in_usd=1000 * 3.75 / 1e6,
                     input_tokens_cache_none_cost_in_usd=100 * 3.0 / 1e6,
                 ),
-                input_cache_none_usd_per_million_tokens=3.0,
+                input_tokens_cache_none_usd_per_million_tokens=3.0,
             ),
             -0.00048,
         ),
@@ -74,7 +74,7 @@ def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
                     input_tokens_cache_read=1000,
                     input_tokens_cache_read_cost_in_usd=float("nan"),
                 ),
-                input_cache_none_usd_per_million_tokens=float("nan"),
+                input_tokens_cache_none_usd_per_million_tokens=float("nan"),
             ),
             float("nan"),
         ),

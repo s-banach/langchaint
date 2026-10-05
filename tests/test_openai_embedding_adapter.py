@@ -398,7 +398,7 @@ def test_transport_failure_retries_the_failed_batch(
             raise failure_type("offline transport failure", request=request)
         return _response([[1.0]])
 
-    def zero_wait(_backoff: PrivateBackoff, _retry_after: float | None) -> float:
+    def zero_wait(_backoff: PrivateBackoff, _retry_after_seconds: float | None) -> float:
         return 0.0
 
     monkeypatch.setattr(PrivateBackoff, "next_wait", zero_wait)

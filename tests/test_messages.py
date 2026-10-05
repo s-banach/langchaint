@@ -55,7 +55,7 @@ def test_audio_bytes_round_trip_as_url_safe_base64() -> None:
 
 
 def test_cache_breakpoint_round_trips() -> None:
-    """Preserve marked and unmarked parts through JSON."""
+    """Preserve parts with and without cache_breakpoint through JSON."""
     messages: tuple[Message, ...] = (
         UserMessage(
             content=(
@@ -72,11 +72,11 @@ def test_cache_breakpoint_round_trips() -> None:
     assert restored == messages
 
 
-def test_assistant_message_rejects_a_marked_text_part() -> None:
+def test_assistant_message_rejects_a_text_part_cache_breakpoint() -> None:
     """A TextPart with cache_breakpoint in an assistant message fails validation on every construction path."""
-    marked = TextPart(text="hey", cache_breakpoint=True)
+    breakpoint_part = TextPart(text="hey", cache_breakpoint=True)
     with pytest.raises(ValidationError, match="cache_breakpoint"):
-        _ = AssistantMessage(parts=(marked,))
+        _ = AssistantMessage(parts=(breakpoint_part,))
     with pytest.raises(ValidationError, match="cache_breakpoint"):
         _ = AssistantMessage.model_validate({
             "kind": "assistant",
@@ -142,7 +142,7 @@ def test_messages_json_round_trip_restores_the_list() -> None:
     assert messages_from_json(messages_to_json(messages)) == messages
 
 
-_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"parts":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_part"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
+_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"parts":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
 """One messages_to_json output, pasted rather than computed.
 
 This is the persisted-text format applications hold on disk.

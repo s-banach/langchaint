@@ -779,6 +779,7 @@ def test_generation_record_rejects_unsupported_output_type(output_type: str) -> 
     "parts",
     [
         [{"type": "tool_call", "name": "lookup", "arguments": {}}],
+        [{"type": "tool_call", "id": "call1", "name": "lookup", "arguments": '{"query": '}],
         [{"type": "reasoning", "content": "thinking"}],
         [{"type": "provider_part", "value": 1}],
     ],

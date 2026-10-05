@@ -932,6 +932,10 @@ def _assistant_part_from_otel(part: OtelMessagePart) -> TextPart | ToolCall:
         _require_no_additional_properties(part)
         if part.id is None:
             raise _unsupported(part, "tool call without id")
+        # `OtelObserver` records argument text that is not JSON as a JSON string.
+        # A string therefore records either that text or a JSON string, and determines no `args_json`.
+        if isinstance(part.arguments, str):
+            raise _unsupported(part, "string arguments")
         return ToolCall(
             id=part.id,
             name=part.name,

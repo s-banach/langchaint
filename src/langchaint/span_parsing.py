@@ -1,5 +1,6 @@
 """Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
+import contextlib
 import json
 from importlib.resources import files
 from typing import Annotated, Literal, overload
@@ -677,10 +678,14 @@ def output_messages_from_otel(
 def generation_record_from_otel(
     otel_chat_span: OtelChatSpan,
 ) -> GenerationRecord[JsonValue, JsonValue]:
-    """Convert one parsed OTel chat span of a generation into the record a live `generate_one` returns.
+    """Convert one parsed OTel chat span of a generation into a generation record.
 
     An output message with a tool call returns `GenerationWithToolCallsRecord`.
     Any other output message returns `GenerationWithoutToolCallsRecord`.
+    Under `gen_ai.output.type` `"text"` or absent, the output joins the text of every text part.
+    Under `"json"`, the output is the first non-empty text part validated as JSON.
+    When that part is not valid JSON, the output is the joined text validated as JSON.
+    An output message with a tool call has output `None` when neither is valid JSON.
     The record contains one synthetic request record.
     `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
     `first_item_after_seconds`, `error`, and `request_id` are `None`.
@@ -923,17 +928,21 @@ def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
 
 
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
-    """Return the output a live `generate_one` returns for `assistant_message`.
+    """Return the output `assistant_message` gives under `output_type`.
 
     Under `"text"`, the output is `assistant_message.text`.
-    Under `"json"`, an assistant message with a tool call has output `None` when its text is not valid JSON.
+    Under `"json"`, the output is the first text part validated as JSON, or else the joined text validated as JSON.
+    An assistant message with a tool call has output `None` when neither is valid JSON.
 
     Raises:
         OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
-        OtelToLangchaintConversionError: Under `"json"`, an assistant message without a tool call has invalid JSON text.
+        OtelToLangchaintConversionError: Under `"json"`, a message without tool calls has no valid JSON text.
     """
     if _supported_output_type(output_type) == "text":
         return assistant_message.text
+    first_text = next((part.text for part in assistant_message.parts if part.kind == "text"), "")
+    with contextlib.suppress(ValidationError):
+        return _JSON_VALUE_ADAPTER.validate_json(first_text)
     try:
         return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
     except ValidationError as error:

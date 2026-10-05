@@ -694,31 +694,38 @@ def test_generation_record_fills_the_request_fields_a_span_does_not_record() -> 
     assert math.isnan(request_record.billing.usd_per_million_tokens.output_tokens)
 
 
+def _json_output_span(texts: list[str]) -> OtelChatSpan:
+    """Return a json-output chat span whose assistant message has one text part per entry of `texts`."""
+    return _generation_chat_span({
+        "gen_ai.output.type": "json",
+        "gen_ai.output.messages": [
+            {"role": "assistant", "parts": [{"type": "text", "content": text} for text in texts]}
+        ],
+    })
+
+
 @pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
 def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
     """Declared JSON output accepts JSON scalars, arrays, and objects."""
-    span = _generation_chat_span({
-        "gen_ai.output.type": "json",
-        "gen_ai.output.messages": [
-            {
-                "role": "assistant",
-                "parts": [{"type": "text", "content": json.dumps(output)}],
-            }
-        ],
-    })
-    assert generation_record_from_otel(span).output == output
+    assert generation_record_from_otel(_json_output_span([json.dumps(output)])).output == output
+
+
+@pytest.mark.parametrize(
+    ("texts", "output"),
+    [(["1", "2"], 1), (['{"answer":', " true}"], {"answer": True})],
+    ids=["first_text_part", "joined_text"],
+)
+def test_declared_json_output_is_the_first_text_part_or_else_the_joined_text(
+    texts: list[str], output: JsonValue
+) -> None:
+    """Declared JSON output validates the first text part, and the joined text when the first part is not JSON."""
+    assert generation_record_from_otel(_json_output_span(texts)).output == output
 
 
 def test_rejects_invalid_declared_json_output() -> None:
-    """Declared JSON output rejects text that is not a JSON value."""
-    span = _generation_chat_span({
-        "gen_ai.output.type": "json",
-        "gen_ai.output.messages": [
-            {"role": "assistant", "parts": [{"type": "text", "content": "not json"}]}
-        ],
-    })
+    """Declared JSON output rejects an assistant message whose first text part and joined text are not JSON."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = generation_record_from_otel(span)
+        _ = generation_record_from_otel(_json_output_span(["not json", " either"]))
 
 
 _TOOL_CALL_OUTPUT_PART: JsonValue = {

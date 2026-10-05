@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, override
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from langchaint import (
     AssistantMessage,
@@ -33,6 +33,7 @@ from langchaint.adapter import (
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
+    SchemaViolation,
     TransientError,
     UsableResponse,
 )
@@ -346,36 +347,60 @@ class FakeBoundAdapter(BoundAdapter[str]):
 
 
 class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
-    """A structured bound adapter for response_format replacement tests. It never generates.
+    """A structured bound adapter that sends, bills, and identifies requests as `text_bound_adapter` does.
 
-    The replacement tests check binding identity and the switched content type.
-    open_stream stays unreachable.
+    interpret validates a usable response's assistant message text into `response_format`.
+    Text that fails validation becomes a `SchemaViolation`.
     """
+
+    def __init__(
+        self, text_bound_adapter: FakeBoundAdapter, response_format: type[ModelT]
+    ) -> None:
+        """Store the text bound adapter that handles every request and the model to validate into."""
+        self._text_bound_adapter = text_bound_adapter
+        self._response_format = response_format
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
-        """Unreachable: response_format replacement tests do not generate."""
-        raise NotImplementedError
+        return self._text_bound_adapter.billing_from_raw(raw)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Unreachable: response_format replacement tests do not generate."""
-        raise NotImplementedError
+        return self._text_bound_adapter.identity_from_raw(raw, request_id=request_id)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Unreachable: response_format replacement tests do not generate."""
-        raise NotImplementedError
+        """Validate the assistant message text of a usable response, and return any other outcome unchanged."""
+        outcome = self._text_bound_adapter.interpret(raw)
+        if outcome.kind != "usable_response":
+            return outcome
+        try:
+            output = self._response_format.model_validate_json(outcome.assistant_message.text)
+        except ValidationError as error:
+            return SchemaViolation(
+                assistant_message=outcome.assistant_message,
+                validation_error_json=error.json(include_url=False),
+            )
+        return UsableResponse(
+            output=output,
+            assistant_message=outcome.assistant_message,
+            stop_reason=outcome.stop_reason,
+        )
 
     @override
-    def build_request_params(self, messages: Sequence[Message]) -> RequestParams:
-        """Unreachable: response_format replacement tests do not generate."""
-        raise NotImplementedError
+    def build_request_params(
+        self, messages: Sequence[Message]
+    ) -> RequestParams | RejectedMessages:
+        return self._text_bound_adapter.build_request_params(messages)
 
     @override
     async def open_stream(self, request_params: RequestParams) -> AdapterStream:
-        """Unreachable: response_format replacement tests do not generate."""
-        raise NotImplementedError
+        """Open the request as the text bound adapter does.
+
+        Raises:
+            Exception: whatever FakeBoundAdapter.open_stream raises.
+        """
+        return await self._text_bound_adapter.open_stream(request_params)
 
 
 class RequestIdError(RuntimeError):
@@ -397,7 +422,10 @@ class TransientRequestIdError(TransientError):
 
 
 class FakeAdapter(Adapter):
-    """An adapter whose bind_text hands out fake bound adapters."""
+    """An adapter whose bind_text and bind_structured hand out fake bound adapters.
+
+    `bound_adapters` lists the bound adapter of every text binding.
+    """
 
     _bound_adapter_class: ClassVar[type[FakeBoundAdapter]] = FakeBoundAdapter
     """The class bind_text hands out; a subclass names its own to vary what interpret does."""
@@ -461,10 +489,9 @@ class FakeAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT]:
-        """Build a structured bound adapter and count the call."""
+        """Build a structured bound adapter over a new text bound adapter, and count the call."""
         self.structured_bind_count += 1
-        bound: BoundAdapter[ModelT] = FakeStructuredBoundAdapter()
-        return bound
+        return FakeStructuredBoundAdapter(self._bound_adapter_class(self), response_format)
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:

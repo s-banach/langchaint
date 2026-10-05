@@ -150,11 +150,11 @@ def _traced(
 type _GenerationPath = Literal["generate", "stream"]
 
 
-async def _generate_through[ToolManagerT: ToolManager | None](
+async def _generate_through[OutputT, ToolManagerT: ToolManager | None](
     path: _GenerationPath,
-    bound_llm: BoundLLM[str, ToolManagerT],
+    bound_llm: BoundLLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
-) -> Generation[str]:
+) -> Generation[OutputT, OutputT | None]:
     """Run one input through `generate_one`, or through `stream_one` drained before its `final()`.
 
     Raises:
@@ -712,54 +712,25 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 
 
 class _Answer(BaseModel):
-    """A response_format model for the bind and covariance type checks."""
+    """The response_format of the round-trip test and the mapper covariance check."""
 
     value: int
 
 
-@pytest.mark.parametrize(
-    ("stream", "response_format", "output_type"),
-    [(False, None, "text"), (True, None, "text"), (False, _Answer, "json")],
-)
-def test_request_attributes_record_the_output_type_and_a_stream(
-    *,
-    stream: bool,
-    response_format: type[_Answer] | None,
-    output_type: str,
-) -> None:
-    """gen_ai.output.type names the output form, and gen_ai.request.stream is present only on a stream."""
-
-    async def scenario() -> None:
-        """Run the selected input and inspect its request attributes."""
-        llm, exporter = _traced(FakeAdapter(echo=True))
-        bound = llm.bind(response_format=response_format)
-        if response_format is not None:
-            with pytest.raises(GenerationError):
-                await bound.generate_one("hi")
-        elif stream:
-            async with bound.stream_one("hi") as handle:
-                await handle.final()
-        else:
-            await bound.generate_one("hi")
-
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.output.type"] == output_type
-        assert span.attributes.get("gen_ai.request.stream") == (True if stream else None)
-
-    run_with_timeout(scenario())
-
-
+@pytest.mark.parametrize("response_format", [None, _Answer])
 @pytest.mark.parametrize("stop_reason", get_args(StopReason.__value__))
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
-    path: _GenerationPath, stop_reason: StopReason
+    path: _GenerationPath, stop_reason: StopReason, response_format: type[_Answer] | None
 ) -> None:
     """The span_parsing converters rebuild the binding, input, and generation of a captured chat span.
 
     The input and system prompt use the forms span parsing returns: tuple content and compact `args_json`.
+    Text output has one text part before any tool call and one after.
+    Json output has one text part, the only shape whose output every adapter validates from the same text.
     `parse_otel` reads each key of the span into a field, except the langchaint keys.
-    The usage counters read back unchanged.
+    The usage counters read back unchanged, and `gen_ai.output.type` names the output form.
+    `gen_ai.request.stream` is present only on a stream.
     """
     tool_calls = (
         (ToolCall(id="call2", name="echo", args_json='{"text":"y"}'),)
@@ -768,6 +739,8 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
     )
     assistant_message = AssistantMessage(
         parts=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
+        if response_format is None
+        else (TextPart(text='{"value":1}'), *tool_calls)
     )
     generation_input = (
         _MULTIMODAL_USER_MESSAGE,
@@ -786,7 +759,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             scripted_requests=[
                 ScriptedResponse(
                     outcome=UsableResponse(
-                        output="beforeafter",
+                        output=assistant_message.text,
                         assistant_message=assistant_message,
                         stop_reason=stop_reason,
                     ),
@@ -795,14 +768,20 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             ]
         )
         llm, exporter = _traced(adapter, capture_message_content=True)
-        bound = llm.bind(
+        text_bound = llm.bind(
             system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
             max_completion_tokens=123,
             reasoning_level="high",
             temperature=0.25,
         )
-        generation = await _generate_through(path, bound, generation_input)
+        generation: Generation[str, str | None] | Generation[_Answer, _Answer | None]
+        if response_format is None:
+            bound = text_bound
+            generation = await _generate_through(path, text_bound, generation_input)
+        else:
+            bound = text_bound.bind(response_format=response_format)
+            generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel(_exported_attributes(span))
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
@@ -811,13 +790,21 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert parsed.usage_reasoning_output_tokens == USAGE.output_tokens_reasoning
         assert parsed.usage_cache_read_input_tokens == USAGE.input_tokens_cache_read
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
-        reconstructed = reconstruct_bound_llm(parsed, llm=llm, tools=[_echo_tool()])
+        assert parsed.request_stream == (True if path == "stream" else None)
+        assert parsed.output_type == ("text" if response_format is None else "json")
+        reconstructed = reconstruct_bound_llm(
+            parsed, llm=llm, tools=[_echo_tool()], response_format=response_format
+        )
         assert reconstructed.binding == bound.binding
         assert generation_input_from_otel(parsed) == generation_input
         assert output_messages_from_otel(parsed) == (generation.assistant_message,)
         record = generation_record_from_otel(parsed)
         assert record.kind == generation.kind
-        assert record.output == generation.output
+        assert record.output == (
+            generation.output.model_dump(mode="json")
+            if isinstance(generation.output, BaseModel)
+            else generation.output
+        )
         assert record.stop_reason == generation.stop_reason
         assert record.assistant_message == generation.assistant_message
         assert record.request_history.provider_name == generation.request_history.provider_name

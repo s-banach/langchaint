@@ -19,7 +19,7 @@ import jsonschema
 import openai
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter
 
 import langchaint
 from langchaint import (
@@ -302,18 +302,93 @@ _validate_payload_attributes still validates this attribute when it contains an 
 """
 
 
+_GENERIC_FALLBACK_DEFINITIONS = frozenset({"GenericPart", "GenericToolDefinition"})
+"""The vendored definitions that end a part or tool-definition union and accept any `type`."""
+
+
+class _TypeProperty(BaseModel, extra="allow"):
+    """A definition's `type` property, whose `const` names the one part or tool type the definition accepts."""
+
+    const: str | None = None
+
+
+class _DefinitionProperties(BaseModel, extra="allow"):
+    """A definition's `properties`, keyed by property name."""
+
+    type: _TypeProperty = _TypeProperty()
+
+
+class _Definition(BaseModel, extra="allow"):
+    """One `$defs` entry of a vendored schema."""
+
+    properties: _DefinitionProperties = _DefinitionProperties()
+    additional_properties: JsonValue = Field(default=None, alias="additionalProperties")
+    not_: JsonValue = Field(default=None, alias="not")
+
+
+class _VendoredSchema(BaseModel, extra="allow"):
+    """A vendored payload schema.
+
+    Every model keeps unknown keys, so dumping with `exclude_unset` reproduces the file.
+    """
+
+    defs: dict[str, _Definition] = Field(default_factory=dict, alias="$defs")
+
+
+_LANGCHAINT_EXTENSION_PROPERTIES: Mapping[str, Mapping[str, JsonValue]] = {
+    "tool_call_response": {"is_error": {"type": "boolean"}},
+}
+"""The schemas of the properties langchaint tracing adds to a convention part, keyed by its declared `type`."""
+
+
+def _strict_definition(
+    name: str, definition: _Definition, declared_types: list[str]
+) -> _Definition:
+    """Return `definition` restricted so that a part or tool definition matches only the definition its `type` declares.
+
+    A generic fallback definition rejects every declared `type`.
+    A definition that declares a `type` rejects properties that neither it nor `_LANGCHAINT_EXTENSION_PROPERTIES` lists.
+    """
+    if name in _GENERIC_FALLBACK_DEFINITIONS:
+        return definition.model_copy(
+            update={"not_": {"properties": {"type": {"enum": declared_types}}}}
+        )
+    declared_type = definition.properties.type.const
+    if declared_type is None:
+        return definition
+    properties = definition.properties.model_copy(
+        update=_LANGCHAINT_EXTENSION_PROPERTIES.get(declared_type, {})
+    )
+    return definition.model_copy(update={"properties": properties, "additional_properties": False})
+
+
 @functools.cache
-def payload_schema(file: str) -> Mapping[str, object]:
-    """Load and cache one vendored schema.
+def _payload_schema(file: str) -> Mapping[str, object]:
+    """Load and cache one vendored schema, restricted by `_strict_definition`.
+
+    A declared `type` is the `const` of a definition's `type` property.
+    The vendored schemas let a part with a declared `type` validate as a generic part and carry any property.
+    With the restriction, a part that lacks a required field or misspells any field fails.
+    Dumping with `exclude_unset` keeps every other key of the file.
 
     Raises:
         OSError: the vendored file could not be read.
-        json.JSONDecodeError: the file does not hold JSON.
-        AssertionError: the file contains a non-object JSON value.
+        pydantic.ValidationError: the file is not JSON, or does not hold the `_VendoredSchema` shape.
     """
-    schema = json.loads((SEMCONV_GENAI_DIR / file).read_text())
-    assert isinstance(schema, dict), f"{file} does not hold a JSON object"
-    return schema
+    schema = _VendoredSchema.model_validate_json((SEMCONV_GENAI_DIR / file).read_text())
+    if not schema.defs:
+        return schema.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    declared_types = [
+        definition.properties.type.const
+        for definition in schema.defs.values()
+        if definition.properties.type.const is not None
+    ]
+    strict_defs = {
+        name: _strict_definition(name, definition, declared_types)
+        for name, definition in schema.defs.items()
+    }
+    strict_schema = schema.model_copy(update={"defs": strict_defs})
+    return strict_schema.model_dump(mode="json", by_alias=True, exclude_unset=True)
 
 
 def _validate_payload_attributes(span: ReadableSpan) -> None:
@@ -338,7 +413,7 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
         if key in _UNVALIDATED_PAYLOAD_ATTRIBUTES and not isinstance(payload, dict):
             continue
         try:
-            jsonschema.Draft202012Validator(payload_schema(file)).validate(payload)
+            jsonschema.Draft202012Validator(_payload_schema(file)).validate(payload)
         except jsonschema.ValidationError as error:
             raise AssertionError(
                 f"{span.name}: {key} violates {file}. "

@@ -26,7 +26,7 @@ Document every public parameter and cross-provider difference.
 - input: one `GenerationInput`.
 - request params: what every request for one input sends.
 - assistant message: the `AssistantMessage` in one response.
-- output: what application code reads from a finished assistant message, either its joined text or that text validated into `response_format`. An assistant message gives output when that value exists.
+- output: what application code reads from a finished assistant message, either its joined text or a `response_format` instance validated from its text. An assistant message gives output when that value exists.
 - usable: an assistant message that gives output or has tool calls.
 - kept assistant message: the usable assistant message that ends handling an input.
 - generation: what handling an input produces when it succeeds. `GenerationError` is its failure.

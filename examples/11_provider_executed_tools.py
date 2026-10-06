@@ -1,10 +1,10 @@
 """Use OpenAI `provider_executed_tools` for web search."""
 
-from langchaint import GenerationWithoutToolCalls
+from langchaint import PlainGeneration
 from langchaint.openai import OpenAI
 
 
-async def search_the_web() -> GenerationWithoutToolCalls[str]:
+async def search_the_web() -> PlainGeneration[str]:
     """Run provider web search and print its output and cost.
 
     Raises:

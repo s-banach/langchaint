@@ -57,9 +57,9 @@ from langchaint.generation.response import (
     Generation,
     GenerationOutcome,
     GenerationOutcomeRecord,
-    GenerationWithoutToolCalls,
-    GenerationWithoutToolCallsRecord,
-    GenerationWithToolCalls,
+    PlainGeneration,
+    PlainGenerationRecord,
+    ToolCallGeneration,
     _escaped_error,
     _generation_outcome_from_response_outcome,
     _generation_outcome_record,
@@ -433,8 +433,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """A frozen prompt prefix with generation and streaming methods.
 
     `OutputT` is `str` or the validated `response_format` type.
-    A binding with `ToolManager` returns `GenerationWithToolCalls` when the kept assistant message has tool calls.
-    A text `GenerationWithToolCalls` has `str` output, and a structured one has `OutputT | None` output.
+    A binding with `ToolManager` returns `ToolCallGeneration` when the kept assistant message has tool calls.
+    A text `ToolCallGeneration` has `str` output, and a structured one has `OutputT | None` output.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
@@ -979,7 +979,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> GenerationWithoutToolCalls[OutputT]: ...
+    ) -> PlainGeneration[OutputT]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1101,7 +1101,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[GenerationWithoutToolCalls[OutputT] | GenerationError]: ...
+    ) -> list[PlainGeneration[OutputT] | GenerationError]: ...
     @overload
     async def generate_many(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1126,7 +1126,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
     ) -> (
-        list[GenerationWithoutToolCalls[OutputT] | GenerationError]
+        list[PlainGeneration[OutputT] | GenerationError]
         | list[GenerationOutcome[OutputT, OutputT | None]]
     ): ...
     async def generate_many(
@@ -1183,7 +1183,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]: ...
+    ) -> list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]: ...
     @overload
     async def generate_many_records(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1214,7 +1214,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
     ) -> (
-        list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]
+        list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[OutputT, OutputT | None]]
     ): ...
     async def generate_many_records(
@@ -1332,21 +1332,21 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[str, GenerationWithToolCalls[str]]: ...
+    ) -> StreamHandle[str, ToolCallGeneration[str]]: ...
     @overload
     def stream_one[ModelT: BaseModel](
         self: "BoundLLM[ModelT, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[ModelT, GenerationWithToolCalls[ModelT | None]]: ...
+    ) -> StreamHandle[ModelT, ToolCallGeneration[ModelT | None]]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[OutputT, GenerationWithToolCalls[OutputT | None]]: ...
+    ) -> StreamHandle[OutputT, ToolCallGeneration[OutputT | None]]: ...
     def stream_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> StreamHandle[Any, Any]:

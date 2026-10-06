@@ -42,8 +42,8 @@ from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
 from langchaint.generation.response import (
     GenerationRecord,
-    GenerationWithoutToolCallsRecord,
-    GenerationWithToolCallsRecord,
+    PlainGenerationRecord,
+    ToolCallGenerationRecord,
 )
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
@@ -681,8 +681,8 @@ def generation_record_from_otel(
 ) -> GenerationRecord[JsonValue, JsonValue]:
     """Convert one parsed OTel chat span of a generation into a generation record.
 
-    An output message with a tool call returns `GenerationWithToolCallsRecord`.
-    Any other output message returns `GenerationWithoutToolCallsRecord`.
+    An output message with a tool call returns `ToolCallGenerationRecord`.
+    Any other output message returns `PlainGenerationRecord`.
     Under `gen_ai.output.type` `"text"` or absent, the output joins the text of every text part.
     Under `"json"`, the output is the first non-empty text part validated as JSON.
     When that part is not valid JSON, the output is the joined text validated as JSON.
@@ -749,10 +749,10 @@ def generation_record_from_otel(
         elapsed_seconds=0.0,
     )
     if assistant_message.tool_calls:
-        return GenerationWithToolCallsRecord[JsonValue](
+        return ToolCallGenerationRecord[JsonValue](
             request_history=request_history, output=output, stop_reason=stop_reason
         )
-    return GenerationWithoutToolCallsRecord[JsonValue](
+    return PlainGenerationRecord[JsonValue](
         request_history=request_history, output=output, stop_reason=stop_reason
     )
 

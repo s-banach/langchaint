@@ -41,8 +41,8 @@ from langchaint.generation.errors import (
 from langchaint.generation.request_history import AbandonedStreamRecord, _RequestLedger
 from langchaint.generation.response import (
     GenerationOutcome,
-    GenerationWithoutToolCalls,
-    GenerationWithToolCalls,
+    PlainGeneration,
+    ToolCallGeneration,
     _escaped_error,
     _generation_outcome_from_response_outcome,
     _timed_out_error,
@@ -75,11 +75,11 @@ async def _close_stream_quietly(
         _logger.warning(failure_log_message, exc_info=True)
 
 
-class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[object] = Never]:
+class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Never]:
     """An async context manager and iterator for one streamed input.
 
     Entry opens the request. `final` drains items.
-    `final` returns `GenerationWithoutToolCalls` or `GenerationWithToolCallsT`.
+    `final` returns `PlainGeneration` or `ToolCallGenerationT`.
     `max_requests` applies only before the stream opens.
     An open-stream transient failure raises `GenerationError`.
     """
@@ -135,7 +135,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
         self._state: _State = "unopened"
         self._request_params: RequestParams | None = None
 
-    async def __aenter__(self) -> "StreamHandle[OutputT, GenerationWithToolCallsT]":
+    async def __aenter__(self) -> "StreamHandle[OutputT, ToolCallGenerationT]":
         """Open the request and return self.
 
         Raises:
@@ -351,7 +351,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
                 self._private_backoff.next_wait(request_failure.retry_after_seconds)
             )
 
-    def __aiter__(self) -> "StreamHandle[OutputT, GenerationWithToolCallsT]":
+    def __aiter__(self) -> "StreamHandle[OutputT, ToolCallGenerationT]":
         """Return `self` because the handle is its own iterator."""
         return self
 
@@ -511,10 +511,10 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
     @overload
     async def final(
         self: "StreamHandle[OutputT, Never]",
-    ) -> GenerationWithoutToolCalls[OutputT]: ...
+    ) -> PlainGeneration[OutputT]: ...
     @overload
-    async def final(self) -> "GenerationWithoutToolCalls[OutputT] | GenerationWithToolCallsT": ...
-    async def final(self) -> GenerationWithoutToolCalls[OutputT] | GenerationWithToolCalls[object]:
+    async def final(self) -> "PlainGeneration[OutputT] | ToolCallGenerationT": ...
+    async def final(self) -> PlainGeneration[OutputT] | ToolCallGeneration[object]:
         """Drain remaining items and return the stored generation.
 
         Repeated calls return or raise the same outcome without reading the stream again.
@@ -556,7 +556,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
                 self._outcome = escaped_error
             self._end_operation(self._outcome)
             await self._close_timeout_scope(None)
-        if isinstance(self._outcome, (GenerationWithoutToolCalls, GenerationWithToolCalls)):
+        if isinstance(self._outcome, (PlainGeneration, ToolCallGeneration)):
             return self._outcome
         raise self._outcome
 

@@ -18,7 +18,7 @@ from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
 from langchaint.generation.response import GenerationOutcomeRecord
 
-_RESUME_FORMAT_VERSION = 2
+_RESUME_FORMAT_VERSION = 3
 """The resume file version that this code reads and writes.
 
 Restoring a file of this version gives the records that rerunning its binding and inputs would give.
@@ -41,57 +41,56 @@ async def _run_resume_io[ReturnT](function: Callable[[], ReturnT]) -> ReturnT:
     return await await_task_cancellation_safe(task)
 
 
-class _PositionItem[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+class _PositionItem[OutputT, ToolCallOutputT](CheckedCopyModel):
     """Validation reconstructs one outcome record and rejects unknown fields."""
 
     model_config = _RESUME_MODEL_CONFIG
 
     input_fingerprint: str
-    outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | None
+    outcome_record: GenerationOutcomeRecord[OutputT, ToolCallOutputT] | None
 
 
-class _InputIdItem[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+class _InputIdItem[OutputT, ToolCallOutputT](CheckedCopyModel):
     """Validation reconstructs one identified outcome record and rejects unknown fields."""
 
     model_config = _RESUME_MODEL_CONFIG
 
     input_id: str
     input_fingerprint: str
-    outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | None
+    outcome_record: GenerationOutcomeRecord[OutputT, ToolCallOutputT] | None
 
 
-class _PositionDocument[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+class _PositionDocument[OutputT, ToolCallOutputT](CheckedCopyModel):
     """Validation fixes the position resume document shape."""
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[2] = 2
+    format_version: Literal[3] = 3
     config_fingerprint: str
     identity_mode: Literal["position"] = "position"
-    items: tuple[_PositionItem[OutputT, WithToolCallsOutputT], ...]
+    items: tuple[_PositionItem[OutputT, ToolCallOutputT], ...]
 
 
-class _InputIdDocument[OutputT, WithToolCallsOutputT](CheckedCopyModel):
+class _InputIdDocument[OutputT, ToolCallOutputT](CheckedCopyModel):
     """Validation fixes the `input_id` resume document shape and rejects duplicates."""
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[2] = 2
+    format_version: Literal[3] = 3
     config_fingerprint: str
     identity_mode: Literal["input_id"] = "input_id"
-    items: tuple[_InputIdItem[OutputT, WithToolCallsOutputT], ...]
+    items: tuple[_InputIdItem[OutputT, ToolCallOutputT], ...]
 
     @model_validator(mode="after")
-    def _require_unique_input_ids(self) -> "_InputIdDocument[OutputT, WithToolCallsOutputT]":
+    def _require_unique_input_ids(self) -> "_InputIdDocument[OutputT, ToolCallOutputT]":
         input_ids = tuple(item.input_id for item in self.items)
         if len(set(input_ids)) != len(input_ids):
             raise ValueError("resume file input_id values must be unique")
         return self
 
 
-type _ResumeDocument[OutputT, WithToolCallsOutputT] = Annotated[
-    _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _InputIdDocument[OutputT, WithToolCallsOutputT],
+type _ResumeDocument[OutputT, ToolCallOutputT] = Annotated[
+    _PositionDocument[OutputT, ToolCallOutputT] | _InputIdDocument[OutputT, ToolCallOutputT],
     Field(discriminator="identity_mode"),
 ]
 
@@ -131,8 +130,8 @@ def claim_resume_path(resolved_resume_path: Path) -> Generator[None]:
             _CLAIMED_RESUME_PATHS.remove(resolved_resume_path)
 
 
-def _regenerates[OutputT, WithToolCallsOutputT](
-    outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | None,
+def _regenerates[OutputT, ToolCallOutputT](
+    outcome_record: GenerationOutcomeRecord[OutputT, ToolCallOutputT] | None,
 ) -> bool:
     """Report whether a resumed `generate_many_records` call generates this entry again.
 
@@ -148,16 +147,16 @@ def _regenerates[OutputT, WithToolCallsOutputT](
             return False
 
 
-class ResumeState[OutputT, WithToolCallsOutputT]:
+class ResumeState[OutputT, ToolCallOutputT]:
     """Hold one validated document while generated records replace pending entries."""
 
     def __init__(
         self,
         *,
         resume_path: Path,
-        document: _PositionDocument[OutputT, WithToolCallsOutputT]
-        | _InputIdDocument[OutputT, WithToolCallsOutputT],
-        document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
+        document: _PositionDocument[OutputT, ToolCallOutputT]
+        | _InputIdDocument[OutputT, ToolCallOutputT],
+        document_adapter: TypeAdapter[_ResumeDocument[OutputT, ToolCallOutputT]],
     ) -> None:
         self._resume_path = resume_path
         self._document = document
@@ -173,7 +172,7 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
     def store_outcome_record(
         self,
         index: int,
-        outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT],
+        outcome_record: GenerationOutcomeRecord[OutputT, ToolCallOutputT],
     ) -> None:
         """Atomically replace one entry and mark its input handled."""
         if index < 0 or index >= len(self._document.items):
@@ -187,7 +186,7 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
         self._document = validated_document
         self._pending_index_set.discard(index)
 
-    def outcome_records(self) -> list[GenerationOutcomeRecord[OutputT, WithToolCallsOutputT]]:
+    def outcome_records(self) -> list[GenerationOutcomeRecord[OutputT, ToolCallOutputT]]:
         """Return records in current input order after each pending item settles.
 
         Raises:
@@ -195,7 +194,7 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
         """
         if self._pending_index_set:
             raise RuntimeError("resume state still has pending generation inputs")
-        outcome_records: list[GenerationOutcomeRecord[OutputT, WithToolCallsOutputT]] = []
+        outcome_records: list[GenerationOutcomeRecord[OutputT, ToolCallOutputT]] = []
         for item in self._document.items:
             if item.outcome_record is None:
                 raise RuntimeError("resume state has a missing outcome record")
@@ -205,11 +204,8 @@ class ResumeState[OutputT, WithToolCallsOutputT]:
     def _document_with_outcome_record(
         self,
         index: int,
-        outcome_record: GenerationOutcomeRecord[OutputT, WithToolCallsOutputT],
-    ) -> (
-        _PositionDocument[OutputT, WithToolCallsOutputT]
-        | _InputIdDocument[OutputT, WithToolCallsOutputT]
-    ):
+        outcome_record: GenerationOutcomeRecord[OutputT, ToolCallOutputT],
+    ) -> _PositionDocument[OutputT, ToolCallOutputT] | _InputIdDocument[OutputT, ToolCallOutputT]:
         items = list(self._document.items)
         items[index] = items[index].model_copy(update={"outcome_record": outcome_record})
         return self._document.model_copy(update={"items": tuple(items)})
@@ -272,14 +268,14 @@ def prepare_resume_state[OutputT](
     )
 
 
-def _prepare_resume_state[OutputT, WithToolCallsOutputT](
+def _prepare_resume_state[OutputT, ToolCallOutputT](
     *,
     resume_path: Path,
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, ToolCallOutputT]],
     config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     input_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT, WithToolCallsOutputT]:
+) -> ResumeState[OutputT, ToolCallOutputT]:
     loaded_document = _load_document(resume_path)
     if input_ids is None:
         document = _prepare_position_document(
@@ -329,13 +325,13 @@ def _load_document(resume_path: Path) -> _LoadedDocument | None:
     return _LoadedDocument(document_json=document_json, document=document)
 
 
-def _prepare_position_document[OutputT, WithToolCallsOutputT](
+def _prepare_position_document[OutputT, ToolCallOutputT](
     *,
     loaded_document: _LoadedDocument | None,
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, ToolCallOutputT]],
     config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-) -> _PositionDocument[OutputT, WithToolCallsOutputT]:
+) -> _PositionDocument[OutputT, ToolCallOutputT]:
     if (
         loaded_document is not None
         and isinstance(loaded_document.document, _PositionDocument)
@@ -356,15 +352,15 @@ def _prepare_position_document[OutputT, WithToolCallsOutputT](
     )
 
 
-def _prepare_input_id_document[OutputT, WithToolCallsOutputT](
+def _prepare_input_id_document[OutputT, ToolCallOutputT](
     *,
     loaded_document: _LoadedDocument | None,
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, ToolCallOutputT]],
     config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     input_ids: tuple[str, ...],
-) -> _InputIdDocument[OutputT, WithToolCallsOutputT]:
-    stored_items: dict[str, _InputIdItem[OutputT, WithToolCallsOutputT]] = {}
+) -> _InputIdDocument[OutputT, ToolCallOutputT]:
+    stored_items: dict[str, _InputIdItem[OutputT, ToolCallOutputT]] = {}
     if (
         loaded_document is not None
         and isinstance(loaded_document.document, _InputIdDocument)
@@ -374,7 +370,7 @@ def _prepare_input_id_document[OutputT, WithToolCallsOutputT](
         if not isinstance(restored, _InputIdDocument):
             raise TypeError("the input_id discriminator changed during validation")
         stored_items = {item.input_id: item for item in restored.items}
-    reconciled_items: list[_InputIdItem[OutputT, WithToolCallsOutputT]] = []
+    reconciled_items: list[_InputIdItem[OutputT, ToolCallOutputT]] = []
     for input_id, input_fingerprint in zip(input_ids, input_fingerprints, strict=True):
         stored_item = stored_items.get(input_id)
         outcome_record = (
@@ -395,16 +391,13 @@ def _prepare_input_id_document[OutputT, WithToolCallsOutputT](
     )
 
 
-def _write_document[OutputT, WithToolCallsOutputT](
+def _write_document[OutputT, ToolCallOutputT](
     *,
     resume_path: Path,
-    document: _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _InputIdDocument[OutputT, WithToolCallsOutputT],
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT, WithToolCallsOutputT]],
-) -> (
-    _PositionDocument[OutputT, WithToolCallsOutputT]
-    | _InputIdDocument[OutputT, WithToolCallsOutputT]
-):
+    document: _PositionDocument[OutputT, ToolCallOutputT]
+    | _InputIdDocument[OutputT, ToolCallOutputT],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, ToolCallOutputT]],
+) -> _PositionDocument[OutputT, ToolCallOutputT] | _InputIdDocument[OutputT, ToolCallOutputT]:
     validated_document = document_adapter.validate_python(document)
     document_json = document_adapter.dump_json(validated_document, indent=2) + b"\n"
     validated_document = document_adapter.validate_json(document_json)

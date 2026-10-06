@@ -30,10 +30,9 @@ from langchaint import (
     GenerationErrorRecord,
     GenerationOutcome,
     GenerationOutcomeRecord,
-    GenerationWithoutToolCalls,
-    GenerationWithoutToolCallsRecord,
-    GenerationWithToolCalls,
     Message,
+    PlainGeneration,
+    PlainGenerationRecord,
     PydanticTool,
     SettledRequestRecord,
     SharedBackoff,
@@ -41,6 +40,7 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallGeneration,
     ToolManager,
     ToolSchema,
     TransientErrorRecord,
@@ -112,14 +112,12 @@ def _settled_request_records(
 
 
 def _outputs(
-    outcomes: Sequence[
-        GenerationWithoutToolCalls[str] | GenerationError | GenerationOutcomeRecord[str, str]
-    ],
+    outcomes: Sequence[PlainGeneration[str] | GenerationError | GenerationOutcomeRecord[str, str]],
 ) -> list[str]:
-    """Assert every outcome is a `GenerationWithoutToolCalls` and return each output in order."""
+    """Assert every outcome is a `PlainGeneration` and return each output in order."""
     outputs: list[str] = []
     for outcome in outcomes:
-        assert outcome.kind == "without_tool_calls"
+        assert outcome.kind == "plain"
         outputs.append(outcome.output)
     return outputs
 
@@ -129,7 +127,7 @@ type _GenerationPath = Literal["generate", "stream"]
 
 async def _generate_through(
     path: _GenerationPath, bound_llm: BoundLLM[str]
-) -> GenerationWithoutToolCalls[str]:
+) -> PlainGeneration[str]:
     """Run one input through `generate_one` or through `stream_one` and its `final()`.
 
     Raises:
@@ -1116,11 +1114,11 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
     assert_type(
         await structured_with_tools.generate_one("hi"),
-        GenerationWithoutToolCalls[_Answer] | GenerationWithToolCalls[_Answer | None],
+        PlainGeneration[_Answer] | ToolCallGeneration[_Answer | None],
     )
     assert_type(
         structured_with_tools.stream_one("hi"),
-        StreamHandle[_Answer, GenerationWithToolCalls[_Answer | None]],
+        StreamHandle[_Answer, ToolCallGeneration[_Answer | None]],
     )
     assert_type(
         await structured_with_tools.generate_many(["hi"]),
@@ -1133,22 +1131,22 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         list[GenerationOutcomeRecord[_Answer, _Answer | None]],
     )
     structured = llm.bind(response_format=_Answer)
-    assert_type(await structured.generate_one("hi"), GenerationWithoutToolCalls[_Answer])
+    assert_type(await structured.generate_one("hi"), PlainGeneration[_Answer])
     assert_type(
         await structured.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[GenerationWithoutToolCallsRecord[_Answer] | GenerationErrorRecord],
+        list[PlainGenerationRecord[_Answer] | GenerationErrorRecord],
     )
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(
         await text_with_tools.generate_one("hi"),
-        GenerationWithoutToolCalls[str] | GenerationWithToolCalls[str],
+        PlainGeneration[str] | ToolCallGeneration[str],
     )
     assert_type(await text_with_tools.generate_many(["hi"]), list[GenerationOutcome[str]])
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
         list[GenerationOutcomeRecord[str, str]],
     )
-    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, GenerationWithToolCalls[str]])
+    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration[str]])
 
 
 async def _pin_generic_request_method_return_types[
@@ -1157,12 +1155,12 @@ async def _pin_generic_request_method_return_types[
 ](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
     assert_type(
         await bound_llm.generate_many(["hi"]),
-        list[GenerationWithoutToolCalls[OutputT] | GenerationError]
+        list[PlainGeneration[OutputT] | GenerationError]
         | list[GenerationOutcome[OutputT, OutputT | None]],
     )
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]
+        list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[OutputT, OutputT | None]],
     )
 
@@ -1246,17 +1244,17 @@ def _structured_tool_bound_llm(
 @pytest.mark.parametrize(
     ("outcome", "kind"),
     [
-        (_STRUCTURED_FINAL_RESPONSE, "without_tool_calls"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE, "with_tool_calls"),
+        (_STRUCTURED_FINAL_RESPONSE, "plain"),
+        (_STRUCTURED_TOOL_CALL_RESPONSE, "tool_call"),
     ],
-    ids=["without_tool_calls", "with_tool_calls"],
+    ids=["plain", "tool_call"],
 )
 def test_structured_tool_bound_generate_one_splits_on_tool_calls(
     outcome: UsableResponse[_Answer | None], kind: str
 ) -> None:
-    """An assistant message with tool calls returns GenerationWithToolCalls with output=None.
+    """An assistant message with tool calls returns ToolCallGeneration with output=None.
 
-    Any other assistant message returns GenerationWithoutToolCalls.
+    Any other assistant message returns PlainGeneration.
     """
 
     async def scenario() -> None:
@@ -1270,11 +1268,11 @@ def test_structured_tool_bound_generate_one_splits_on_tool_calls(
 @pytest.mark.parametrize(
     ("outcome", "kind"),
     [
-        (_STRUCTURED_FINAL_RESPONSE, "without_tool_calls"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE, "with_tool_calls"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE_WITH_INSTANCE, "with_tool_calls"),
+        (_STRUCTURED_FINAL_RESPONSE, "plain"),
+        (_STRUCTURED_TOOL_CALL_RESPONSE, "tool_call"),
+        (_STRUCTURED_TOOL_CALL_RESPONSE_WITH_INSTANCE, "tool_call"),
     ],
-    ids=["without_tool_calls", "with_tool_calls", "with_tool_calls_and_instance"],
+    ids=["plain", "tool_call", "tool_call_with_instance"],
 )
 def test_generate_many_records_restores_a_structured_record(
     tmp_path: Path, outcome: UsableResponse[_Answer | None], kind: str
@@ -1294,7 +1292,7 @@ def test_generate_many_records_restores_a_structured_record(
         assert generated_record.kind == kind
         assert restored_record.kind == kind
         # Narrows the type to the variants that have `.output`.
-        assert restored_record.kind in {"without_tool_calls", "with_tool_calls"}
+        assert restored_record.kind in {"plain", "tool_call"}
         assert restored_record.output == outcome.output
         assert structured_adapter.open_count == 1
 
@@ -1335,8 +1333,8 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
     run_with_timeout(scenario())
 
 
-def test_text_tool_bound_generate_one_returns_the_with_tool_calls_variant() -> None:
-    """A text binding with tools returns GenerationWithToolCalls for an assistant message that called tools."""
+def test_text_tool_bound_generate_one_returns_a_tool_call_generation() -> None:
+    """A text binding with tools returns ToolCallGeneration for an assistant message that called tools."""
 
     async def scenario() -> None:
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
@@ -1349,20 +1347,20 @@ def test_text_tool_bound_generate_one_returns_the_with_tool_calls_variant() -> N
         )
         bound_llm._bound_adapter = _ScriptedBoundAdapter(tool_call_response)
         result = await bound_llm.generate_one("hi")
-        assert result.kind == "with_tool_calls"
+        assert result.kind == "tool_call"
         assert result.output == ""
 
     run_with_timeout(scenario())
 
 
-def test_structured_tool_bound_stream_final_returns_the_with_tool_calls_variant() -> None:
-    """The stream path splits the same way: final() returns GenerationWithToolCalls for tool calls."""
+def test_structured_tool_bound_stream_final_returns_a_tool_call_generation() -> None:
+    """The stream path splits the same way: final() returns ToolCallGeneration for tool calls."""
 
     async def scenario() -> None:
         bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_RESPONSE)
         async with bound_llm.stream_one("hi") as handle:
             result = await handle.final()
-        assert result.kind == "with_tool_calls"
+        assert result.kind == "tool_call"
         assert result.tool_calls == (FAKE_TOOL_CALL,)
 
     run_with_timeout(scenario())
@@ -1604,9 +1602,9 @@ def test_generate_many_aligns_a_failure_among_generations() -> None:
         ])
         first, second, third = results
         assert isinstance(first, GenerationError)
-        assert second.kind == "without_tool_calls"
+        assert second.kind == "plain"
         assert second.output == "b"
-        assert third.kind == "without_tool_calls"
+        assert third.kind == "plain"
         assert third.output == "c"
 
     run_with_timeout(scenario())
@@ -2001,9 +1999,9 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
         )
         first, second, third = results
         assert isinstance(first, GenerationError)
-        assert second.kind == "without_tool_calls"
+        assert second.kind == "plain"
         assert second.output == "b"
-        assert third.kind == "without_tool_calls"
+        assert third.kind == "plain"
         assert third.output == "c"
 
     run_with_timeout(scenario())
@@ -2037,7 +2035,7 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
             [UserMessage(content="b")],
         ])
         failures = [result for result in results if isinstance(result, GenerationError)]
-        responses = [result for result in results if result.kind == "without_tool_calls"]
+        responses = [result for result in results if result.kind == "plain"]
         assert len(failures) == 1
         assert len(responses) == 1
         failure = failures[0]
@@ -2307,7 +2305,7 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
 
 
 def test_a_completed_stream_sets_no_abandoned() -> None:
-    """The `GenerationWithoutToolCalls` from final() records the outcome, so leaving the block adds nothing."""
+    """The `PlainGeneration` from final() records the outcome, so leaving the block adds nothing."""
 
     async def scenario() -> None:
         """Consume one stream to final() and leave the block."""
@@ -2717,7 +2715,7 @@ def test_a_stream_reports_one_outcome_and_one_end_despite_later_misuse() -> None
                 pass
         assert observer.calls == [
             "generation_started fake-model",
-            "conclude GenerationWithoutToolCalls",
+            "conclude PlainGeneration",
             "end",
         ]
 
@@ -2840,7 +2838,7 @@ def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
         ).bind()
         assert (await bound_llm.generate_one("hi")).output == "hi"
         results = await bound_llm.generate_many(["a", "b"])
-        assert [result.output for result in results if result.kind == "without_tool_calls"] == [
+        assert [result.output for result in results if result.kind == "plain"] == [
             "a",
             "b",
         ]
@@ -3118,8 +3116,8 @@ def test_stream_final_is_idempotent() -> None:
         """Call final() twice on one drained stream."""
         bound_llm = LLM(FakeAdapter()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            first: GenerationWithoutToolCalls[str] = await handle.final()
-            second: GenerationWithoutToolCalls[str] = await handle.final()
+            first: PlainGeneration[str] = await handle.final()
+            second: PlainGeneration[str] = await handle.final()
         assert first is second
 
     run_with_timeout(scenario())

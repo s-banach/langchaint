@@ -18,10 +18,9 @@ from langchaint import (
     GenerationErrorKind,
     GenerationErrorRecord,
     GenerationOutcomeRecord,
-    GenerationWithoutToolCalls,
-    GenerationWithoutToolCallsRecord,
-    GenerationWithToolCallsRecord,
     PlainErrorRecord,
+    PlainGeneration,
+    PlainGenerationRecord,
     RequestHistory,
     RequestProviderData,
     SchemaViolationErrorRecord,
@@ -29,6 +28,7 @@ from langchaint import (
     TextPart,
     TokenRates,
     ToolCall,
+    ToolCallGenerationRecord,
     TransientErrorRecord,
     Usage,
     to_tables,
@@ -231,14 +231,14 @@ def test_request_history_rejects_overlap_out_of_bounds_and_cut_off_placement() -
 
 
 def test_response_record_round_trips_with_concrete_output_type() -> None:
-    """A concrete caller model reconstructs through `GenerationWithoutToolCallsRecord` JSON."""
-    record = GenerationWithoutToolCallsRecord(
+    """A concrete caller model reconstructs through `PlainGenerationRecord` JSON."""
+    record = PlainGenerationRecord(
         output=Report(value=3),
         request_history=_completed_request_history(),
         stop_reason="stop",
     )
     response_json = record.model_dump_json()
-    restored = GenerationWithoutToolCallsRecord[Report].model_validate_json(response_json)
+    restored = PlainGenerationRecord[Report].model_validate_json(response_json)
     assert restored.model_dump_json() == response_json
     assert isinstance(restored.output, Report)
 
@@ -246,13 +246,13 @@ def test_response_record_round_trips_with_concrete_output_type() -> None:
 def test_generation_record_rejects_invalid_request_shapes() -> None:
     """Reject generation records with missing billing or a cut-off request."""
     with pytest.raises(ValidationError, match="final request must contain billing"):
-        _ = GenerationWithoutToolCallsRecord(
+        _ = PlainGenerationRecord(
             output=1,
             request_history=_request_history(_settled(billing=None)),
             stop_reason="stop",
         )
     with pytest.raises(ValidationError, match="cut-off"):
-        _ = GenerationWithoutToolCallsRecord(
+        _ = PlainGenerationRecord(
             output=1,
             request_history=_request_history(
                 CutOffRequestRecord(started_after_seconds=0.0, billing=None)
@@ -261,36 +261,34 @@ def test_generation_record_rejects_invalid_request_shapes() -> None:
         )
 
 
-def test_generation_with_tool_calls_record_requires_a_tool_call() -> None:
-    """A `GenerationWithToolCallsRecord` requires a tool call in its kept assistant message."""
+def test_tool_call_generation_record_requires_a_tool_call() -> None:
+    """A `ToolCallGenerationRecord` requires a tool call in its kept assistant message."""
     with pytest.raises(ValidationError, match="tool call"):
-        _ = GenerationWithToolCallsRecord(
+        _ = ToolCallGenerationRecord(
             output=None, request_history=_completed_request_history(), stop_reason="tool_call"
         )
-    record = GenerationWithToolCallsRecord(
+    record = ToolCallGenerationRecord(
         output=Report(value=4),
         request_history=_completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE),
         stop_reason="tool_call",
     )
-    restored = GenerationWithToolCallsRecord[Report].model_validate_json(record.model_dump_json())
+    restored = ToolCallGenerationRecord[Report].model_validate_json(record.model_dump_json())
     assert restored.tool_calls == _TOOL_CALL_ASSISTANT_MESSAGE.tool_calls
     assert isinstance(restored.output, Report)
 
 
 def test_live_generation_preserves_provider_data_and_requires_alignment() -> None:
     """Preserve raw provider data and reject misaligned request_provider_data."""
-    record = GenerationWithoutToolCallsRecord(
+    record = PlainGenerationRecord(
         output=Report(value=5),
         request_history=_completed_request_history(),
         stop_reason="stop",
     )
     request_provider_data = _request_provider_data()
-    response = GenerationWithoutToolCalls(
-        record=record, request_provider_data=request_provider_data
-    )
+    response = PlainGeneration(record=record, request_provider_data=request_provider_data)
     assert response.raw is request_provider_data[0].raw
     with pytest.raises(ValueError, match="align"):
-        _ = GenerationWithoutToolCalls(record=record, request_provider_data=())
+        _ = PlainGeneration(record=record, request_provider_data=())
 
 
 def test_live_generation_requires_provider_data_from_the_final_request() -> None:
@@ -302,7 +300,7 @@ def test_live_generation_requires_provider_data_from_the_final_request() -> None
         assistant_message=None,
     )
     successful_request = _settled(started_after_seconds=0.5, elapsed_seconds=0.5)
-    record = GenerationWithoutToolCallsRecord(
+    record = PlainGenerationRecord(
         output=Report(value=5),
         request_history=_request_history(failed_request, successful_request),
         stop_reason="stop",
@@ -312,7 +310,7 @@ def test_live_generation_requires_provider_data_from_the_final_request() -> None
         RequestProviderData(raw=None, usage_raw=None),
     )
     with pytest.raises(ValueError, match="final provider response"):
-        _ = GenerationWithoutToolCalls(record=record, request_provider_data=request_provider_data)
+        _ = PlainGeneration(record=record, request_provider_data=request_provider_data)
 
 
 def test_generation_variant_constructs_one_normalized_record() -> None:
@@ -325,8 +323,8 @@ def test_generation_variant_constructs_one_normalized_record() -> None:
         request_provider_data=_request_provider_data(),
         stop_reason="tool_call",
     )
-    assert generation.kind == "with_tool_calls"
-    assert generation.record.kind == "with_tool_calls"
+    assert generation.kind == "tool_call"
+    assert generation.record.kind == "tool_call"
     assert generation.record.request_history is request_history
 
 
@@ -568,7 +566,7 @@ def test_generation_error_requires_provider_request_alignment() -> None:
 def test_mixed_normalized_outcome_list_round_trips() -> None:
     """A mixed normalized outcome list reconstructs through its concrete output type."""
     records: list[GenerationOutcomeRecord[Report, Report | None]] = [
-        GenerationWithoutToolCallsRecord(
+        PlainGenerationRecord(
             output=Report(value=9),
             request_history=_completed_request_history(),
             stop_reason="stop",
@@ -598,8 +596,8 @@ def test_to_tables_reads_live_only_request_params_and_provider_usage() -> None:
     assert live_tables.requests[0]["usage_raw_json"] == '{"billed_units":17}'
     assert normalized_tables.requests[0]["usage_raw_json"] is None
     assert live_tables.requests[0]["started_after_seconds"] == 0.0
-    response = GenerationWithoutToolCalls(
-        record=GenerationWithoutToolCallsRecord(
+    response = PlainGeneration(
+        record=PlainGenerationRecord(
             output=Report(value=5),
             request_history=_completed_request_history(),
             stop_reason="stop",

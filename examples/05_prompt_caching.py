@@ -1,10 +1,10 @@
 """Warm a reusable prompt prefix before running its batch siblings."""
 
-from langchaint import GenerationError, GenerationWithoutToolCalls, TextPart
+from langchaint import GenerationError, PlainGeneration, TextPart
 from langchaint.anthropic import Anthropic
 
 
-async def generate_with_a_warm_cache() -> list[GenerationWithoutToolCalls[str] | GenerationError]:
+async def generate_with_a_warm_cache() -> list[PlainGeneration[str] | GenerationError]:
     """Warm one prefix and print each outcome's cache usage."""
     anthropic = Anthropic()
     stable_policy = (

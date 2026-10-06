@@ -45,10 +45,10 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
     for _ in range(max_turns):
         generation = await bound.generate_one(messages)
         match generation.kind:
-            case "with_tool_calls":
+            case "tool_call":
                 messages.append(generation.assistant_message)
                 outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
                 messages.extend(outcome.tool_message for outcome in outcomes)
-            case "without_tool_calls":
+            case "plain":
                 return generation.output
     raise RuntimeError(f"model did not finish within {max_turns} turns")

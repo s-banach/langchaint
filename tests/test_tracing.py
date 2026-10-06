@@ -36,10 +36,10 @@ from langchaint import (
     GenerationError,
     GenerationInput,
     GenerationOutcome,
-    GenerationWithoutToolCalls,
     ImagePart,
     ImageUrlPart,
     JSONSchemaTool,
+    PlainGeneration,
     PydanticTool,
     ReasoningPart,
     StreamHandle,
@@ -219,7 +219,7 @@ def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
         llm, exporter = _traced(FakeAdapter(echo=True))
         bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
         result = await bound.generate_one("hi")
-        assert result.kind == "without_tool_calls"
+        assert result.kind == "plain"
         assert result.output == "hi"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
@@ -490,7 +490,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         ])
         first, *rest = results
         assert isinstance(first, GenerationError)
-        assert all(result.kind == "without_tool_calls" for result in rest)
+        assert all(result.kind == "plain" for result in rest)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -515,7 +515,7 @@ def test_generate_many_maps_and_captures_each_item_from_its_own_outcome() -> Non
 
         def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
             """Record the mapped outcome and emit it as an attribute."""
-            output = outcome.output if outcome.kind == "without_tool_calls" else None
+            output = outcome.output if outcome.kind == "plain" else None
             mapped_outputs.append(output)
             return {"custom.mapped_output": str(output)}
 
@@ -526,7 +526,7 @@ def test_generate_many_maps_and_captures_each_item_from_its_own_outcome() -> Non
             max_concurrent_requests=1,
         )
         results = await llm.bind().generate_many(["a", "b"])
-        assert [result.output for result in results if result.kind == "without_tool_calls"] == [
+        assert [result.output for result in results if result.kind == "plain"] == [
             "a",
             "b",
         ]
@@ -565,7 +565,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             input_ids=["input-a", "input-b"],
         )
-        assert all(record.kind == "without_tool_calls" for record in first)
+        assert all(record.kind == "plain" for record in first)
         assert len(exporter.get_finished_spans()) == 2
 
         resumed = await bound.generate_many_records(
@@ -573,7 +573,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             input_ids=["input-b", "input-c", "input-a"],
         )
-        assert all(record.kind == "without_tool_calls" for record in resumed)
+        assert all(record.kind == "plain" for record in resumed)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -871,9 +871,9 @@ def test_raising_mapper_is_caught_and_the_generation_survives(
 
 
 def _covariance_pin(
-    mapper: AttributeMapper, generation: GenerationWithoutToolCalls[_Answer]
+    mapper: AttributeMapper, generation: PlainGeneration[_Answer]
 ) -> SpanAttributes:
-    """Pin that a GenerationWithoutToolCalls[_Answer] satisfies the mapper's GenerationOutcome[object] parameter.
+    """Pin that a PlainGeneration[_Answer] satisfies the mapper's GenerationOutcome[object] parameter.
 
     pyrefly checks the OutputT covariance at the call below.
     """

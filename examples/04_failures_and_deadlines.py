@@ -3,9 +3,9 @@
 from langchaint import (
     GenerationError,
     GenerationInput,
-    GenerationWithoutToolCalls,
     ImagePart,
     Message,
+    PlainGeneration,
     SharedBackoff,
     TextPart,
     UserMessage,
@@ -14,9 +14,7 @@ from langchaint.anthropic import Anthropic
 from langchaint.openai import OpenAI
 
 
-async def run_batch_and_handle_what_failed() -> list[
-    GenerationWithoutToolCalls[str] | GenerationError
-]:
+async def run_batch_and_handle_what_failed() -> list[PlainGeneration[str] | GenerationError]:
     """Run a batch and send failed items to a second provider.
 
     Raises:

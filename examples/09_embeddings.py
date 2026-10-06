@@ -2,11 +2,11 @@
 
 import numpy as np
 
-from langchaint import GenerationWithoutToolCalls
+from langchaint import PlainGeneration
 from langchaint.openai import OpenAI
 
 
-async def retrieve_and_summarize() -> GenerationWithoutToolCalls[str]:
+async def retrieve_and_summarize() -> PlainGeneration[str]:
     """Embed documents, select one, and summarize it.
 
     Raises:

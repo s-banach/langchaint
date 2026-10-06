@@ -145,17 +145,17 @@ class _Answer(BaseModel):
 def _by_generation_kind(generation: Generation[_Answer, _Answer | None]) -> object:
     """Verify that kind narrows a structured Generation.output, the one whose variants differ."""
     match generation.kind:
-        case "without_tool_calls":
+        case "plain":
             assert_type(generation.output, _Answer)
             return generation.output
-        case "with_tool_calls":
+        case "tool_call":
             assert_type(generation.output, _Answer | None)
             return generation.tool_calls
 
 
 def _by_generation_kind_missing_a_variant(generation: Generation[str]) -> object:
     match generation.kind:  # pyrefly: ignore[non-exhaustive-match]
-        case "without_tool_calls":
+        case "plain":
             return generation.output
 
 

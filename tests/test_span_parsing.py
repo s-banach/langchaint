@@ -737,18 +737,18 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
 @pytest.mark.parametrize(
     ("output_type", "parts", "expected"),
     [
-        ("text", [], ("without_tool_calls", "")),
-        ("text", [_TOOL_CALL_OUTPUT_PART], ("with_tool_calls", "")),
+        ("text", [], ("plain", "")),
+        ("text", [_TOOL_CALL_OUTPUT_PART], ("tool_call", "")),
         (
             "text",
             [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART],
-            ("with_tool_calls", ""),
+            ("tool_call", ""),
         ),
-        ("json", [_TOOL_CALL_OUTPUT_PART], ("with_tool_calls", None)),
+        ("json", [_TOOL_CALL_OUTPUT_PART], ("tool_call", None)),
         (
             "json",
             [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART],
-            ("with_tool_calls", None),
+            ("tool_call", None),
         ),
     ],
     ids=[

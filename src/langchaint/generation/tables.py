@@ -14,9 +14,9 @@ from langchaint.generation.request_history import (
 )
 from langchaint.generation.response import (
     GenerationOutcome,
-    GenerationWithoutToolCalls,
-    GenerationWithToolCalls,
     InputOutcomeRecord,
+    PlainGeneration,
+    ToolCallGeneration,
     _GenerationRecordBase,
 )
 
@@ -118,12 +118,11 @@ def _request_row(
     }
 
 
-def to_tables[OutputT, WithToolCallsOutputT](
-    outcomes: GenerationOutcome[OutputT, WithToolCallsOutputT]
-    | InputOutcomeRecord[OutputT, WithToolCallsOutputT]
+def to_tables[OutputT, ToolCallOutputT](
+    outcomes: GenerationOutcome[OutputT, ToolCallOutputT]
+    | InputOutcomeRecord[OutputT, ToolCallOutputT]
     | Iterable[
-        GenerationOutcome[OutputT, WithToolCallsOutputT]
-        | InputOutcomeRecord[OutputT, WithToolCallsOutputT]
+        GenerationOutcome[OutputT, ToolCallOutputT] | InputOutcomeRecord[OutputT, ToolCallOutputT]
     ],
 ) -> Tables:
     """Flatten live outcomes or outcome records into outcome and request tables.
@@ -139,9 +138,7 @@ def to_tables[OutputT, WithToolCallsOutputT](
     outcome_rows: list[dict[str, RowValue]] = []
     request_rows: list[dict[str, RowValue]] = []
     for outcome_index, value in enumerate(values):
-        if isinstance(
-            value, (GenerationWithoutToolCalls, GenerationWithToolCalls, GenerationError)
-        ):
+        if isinstance(value, (PlainGeneration, ToolCallGeneration, GenerationError)):
             record = value.record
             live_request_provider_data = value.request_provider_data
         else:

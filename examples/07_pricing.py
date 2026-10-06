@@ -1,10 +1,10 @@
 """Price an uncataloged model and read the cost of a generation."""
 
-from langchaint import GenerationWithoutToolCalls
+from langchaint import PlainGeneration
 from langchaint.openai import OpenAI, OpenAIPricingTable, OpenAIRates
 
 
-async def price_at_negotiated_rates() -> GenerationWithoutToolCalls[str]:
+async def price_at_negotiated_rates() -> PlainGeneration[str]:
     """Price an uncataloged model at contract rates.
 
     Raises:

@@ -130,14 +130,14 @@ See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `
 
 | Binding | `generate_one` return type |
 | --- | --- |
-| text, without tools | `GenerationWithoutToolCalls[str]` |
-| text, with `ToolManager` | `GenerationWithoutToolCalls[str] \| GenerationWithToolCalls[str]` |
-| structured, without tools | `GenerationWithoutToolCalls[Model]` |
-| structured, with `ToolManager` | `GenerationWithoutToolCalls[Model] \| GenerationWithToolCalls[Model \| None]` |
+| text, without tools | `PlainGeneration[str]` |
+| text, with `ToolManager` | `PlainGeneration[str] \| ToolCallGeneration[str]` |
+| structured, without tools | `PlainGeneration[Model]` |
+| structured, with `ToolManager` | `PlainGeneration[Model] \| ToolCallGeneration[Model \| None]` |
 
 `Generation[str]` and `Generation[Model, Model | None]` name the unions `generate_one` returns.
 `GenerationOutcome` adds `GenerationError` for batch outcomes.
-A binding with `ToolManager` returns `GenerationWithToolCalls` whenever the kept assistant message has tool calls.
+A binding with `ToolManager` returns `ToolCallGeneration` whenever the kept assistant message has tool calls.
 
 ```python
 from pydantic import BaseModel
@@ -153,14 +153,14 @@ generation = await llm.bind(
 ).generate_one("Answer the question")
 
 match generation.kind:
-    case "with_tool_calls":
+    case "tool_call":
         print(generation.tool_calls)
-    case "without_tool_calls":
+    case "plain":
         print(generation.output.text)
 ```
 
 A text binding's `output` is the assistant message's text, which is `""` for an assistant message without text.
-A structured `GenerationWithToolCalls.output` is `None` when the assistant message has no valid `Model`.
+A structured `ToolCallGeneration.output` is `None` when the assistant message has no valid `Model`.
 Append `assistant_message`, never `output`, when continuing a conversation.
 
 See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.
@@ -304,7 +304,7 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | LangChain hook | Application location |
 | --- | --- |
 | `before_model` | before `await bound.generate_one(messages)` |
-| `after_model` | after receiving `GenerationWithoutToolCalls` or `GenerationWithToolCalls` |
+| `after_model` | after receiving `PlainGeneration` or `ToolCallGeneration` |
 | `modify_model_request` | `bound = bound.bind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |

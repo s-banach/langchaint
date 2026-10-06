@@ -295,9 +295,9 @@ class ReActAgent(AgentRun):
             )
             self.messages.append(generation.assistant_message)
             match generation.kind:
-                case "with_tool_calls":
+                case "tool_call":
                     await self._dispatch_all(generation.tool_calls)
-                case "without_tool_calls":
+                case "plain":
                     if self.config.self_correction_enabled and not self.critique_approved:
                         self.messages.append(
                             UserMessage(

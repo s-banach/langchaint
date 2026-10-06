@@ -1492,7 +1492,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
     assert outcome.kind == "refusal"
 
 
-def test_billing_reported_follows_usage_arrival() -> None:
+def test_provider_billing_follows_usage_arrival() -> None:
     """Return Billing only after usage_metadata arrives."""
 
     async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
@@ -1506,9 +1506,9 @@ def test_billing_reported_follows_usage_arrival() -> None:
         ])
         items = stream.items()
         _ = await anext(items)
-        before = stream.billing_reported()
+        before = stream.provider_billing()
         _ = [item async for item in items]
-        return before, stream.billing_reported()
+        return before, stream.provider_billing()
 
     before, after = run_with_timeout(scenario())
     assert before is None
@@ -1536,7 +1536,7 @@ def test_cutoff_gemini_provider_executed_tool_billing_is_nan() -> None:
         )
         items = stream.items()
         assert await anext(items) == "partial"
-        billing = stream.billing_reported()
+        billing = stream.provider_billing()
         await stream.close()
         return billing
 
@@ -1558,7 +1558,7 @@ def test_stream_billing_collects_every_candidate_provider_query() -> None:
             provider_executed_tool_fields=frozenset({"google_search"}),
         )
         _ = [item async for item in stream.items()]
-        return stream.billing_reported()
+        return stream.provider_billing()
 
     billing = run_with_timeout(scenario())
     assert billing is not None

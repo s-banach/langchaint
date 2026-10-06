@@ -492,10 +492,10 @@ class OtelToLangchaintConversionError(ValueError):
     """A valid OTel value has no lossless langchaint representation."""
 
 
-def parse_otel(span_attributes: dict[str, JsonValue]) -> OtelChatSpan:
+def parse_otel_chat(span_attributes: dict[str, JsonValue]) -> OtelChatSpan:
     """Parse one deserialized OTel chat span attribute dictionary.
 
-    `parse_otel` does not parse span metadata.
+    `parse_otel_chat` does not parse span metadata.
     Decoded JSON strings preserve values without preserving their original formatting.
 
     Args:
@@ -758,7 +758,7 @@ def generation_record_from_otel(
 
 
 @overload
-def reconstruct_bound_llm[ModelT: BaseModel](
+def bound_llm_from_otel[ModelT: BaseModel](
     otel_chat_span: OtelChatSpan,
     *,
     llm: LLM,
@@ -768,7 +768,7 @@ def reconstruct_bound_llm[ModelT: BaseModel](
 
 
 @overload
-def reconstruct_bound_llm[ModelT: BaseModel](
+def bound_llm_from_otel[ModelT: BaseModel](
     otel_chat_span: OtelChatSpan,
     *,
     llm: LLM,
@@ -778,7 +778,7 @@ def reconstruct_bound_llm[ModelT: BaseModel](
 
 
 @overload
-def reconstruct_bound_llm(
+def bound_llm_from_otel(
     otel_chat_span: OtelChatSpan,
     *,
     llm: LLM,
@@ -788,7 +788,7 @@ def reconstruct_bound_llm(
 
 
 @overload
-def reconstruct_bound_llm(
+def bound_llm_from_otel(
     otel_chat_span: OtelChatSpan,
     *,
     llm: LLM,
@@ -797,7 +797,7 @@ def reconstruct_bound_llm(
 ) -> BoundLLM[str, None]: ...
 
 
-def reconstruct_bound_llm[ModelT: BaseModel](
+def bound_llm_from_otel[ModelT: BaseModel](
     otel_chat_span: OtelChatSpan,
     *,
     llm: LLM,
@@ -1092,12 +1092,12 @@ __all__ = [
     "OtelToolCallResult",
     "OtelToolDefinition",
     "OtelUriPart",
+    "bound_llm_from_otel",
     "generation_input_from_otel",
     "generation_record_from_otel",
     "output_messages_from_otel",
-    "parse_otel",
+    "parse_otel_chat",
     "parse_otel_execute_tool",
-    "reconstruct_bound_llm",
     "system_prompt_from_otel",
     "tool_schemas_from_otel",
 ]

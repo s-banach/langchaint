@@ -236,7 +236,7 @@ class SpecificToolChoice:
     """Tool choice that forces the model to call the named tool."""
 
     tool_name: str
-    kind: Literal["specific"] = "specific"
+    kind: Literal["specific_tool"] = "specific_tool"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -509,7 +509,7 @@ class RejectedMessages:
     """
 
     error_text: str
-    kind: Literal["rejected"] = "rejected"
+    kind: Literal["rejected_messages"] = "rejected_messages"
 
 
 class _RejectedMessagesError(Exception):
@@ -631,7 +631,7 @@ class AdapterStream(ABC):
         ...
 
     @abstractmethod
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Return currently reported billing, or `None` before the SDK reports any."""
         ...
 

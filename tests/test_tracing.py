@@ -63,12 +63,12 @@ from langchaint.adapter import (
 from langchaint.common.messages import StopReason
 from langchaint.span_parsing import (
     OtelToolCallResponsePart,
+    bound_llm_from_otel,
     generation_input_from_otel,
     generation_record_from_otel,
     output_messages_from_otel,
-    parse_otel,
+    parse_otel_chat,
     parse_otel_execute_tool,
-    reconstruct_bound_llm,
 )
 from langchaint.tracing import (
     AttributeMapper,
@@ -728,7 +728,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
     The input and system prompt use the forms span parsing returns: tuple content and compact `args_json`.
     Text output has one text part before any tool call and one after.
     Json output has one text part, the only shape whose output every adapter validates from the same text.
-    `parse_otel` reads each key of the span into a field, except the langchaint keys.
+    `parse_otel_chat` reads each key of the span into a field, except the langchaint keys.
     The usage counters read back unchanged, and `gen_ai.output.type` names the output form.
     `gen_ai.request.stream` is present only on a stream.
     """
@@ -783,7 +783,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             bound = text_bound.bind(response_format=response_format)
             generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
-        parsed = parse_otel(_exported_attributes(span))
+        parsed = parse_otel_chat(_exported_attributes(span))
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
         assert parsed.usage_input_tokens == USAGE.input_tokens_total
         assert parsed.usage_output_tokens == USAGE.output_tokens
@@ -792,7 +792,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
         assert parsed.request_stream == (True if path == "stream" else None)
         assert parsed.output_type == ("text" if response_format is None else "json")
-        reconstructed = reconstruct_bound_llm(
+        reconstructed = bound_llm_from_otel(
             parsed, llm=llm, tools=[_echo_tool()], response_format=response_format
         )
         assert reconstructed.binding == bound.binding

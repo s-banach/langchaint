@@ -149,7 +149,7 @@ REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
 """What a request may ask for: the SDK ServiceTier wire values (google-genai 2.16.0)."""
 
-type GeminiPricedServiceTier = Literal[
+type GeminiReportedServiceTier = Literal[
     "ON_DEMAND", "ON_DEMAND_PRIORITY", "ON_DEMAND_FLEX", "PROVISIONED_THROUGHPUT"
 ]
 """What a response's usage_metadata.traffic_type reports having been served at (google-genai 2.16.0).
@@ -159,7 +159,7 @@ Its key type is `str` because the SDK's open enum constructs unknown values.
 The request and response tier vocabularies share no value.
 """
 
-_ON_DEMAND_TIER: GeminiPricedServiceTier = "ON_DEMAND"
+_ON_DEMAND_TIER: GeminiReportedServiceTier = "ON_DEMAND"
 
 _VERTEX_PROVIDER_NAME = "gcp.vertex_ai"
 
@@ -1176,7 +1176,7 @@ class GeminiGenerateContentAdapter(Adapter):
         `provider_name` records the provider reached by `client`.
         A Vertex AI client requires `"gcp.vertex_ai"`.
         Per-request options disable retries without copying the client.
-        `pricing` maps each `GeminiPricedServiceTier` to rates.
+        `pricing` maps each `GeminiReportedServiceTier` to rates.
         Missing reported tiers cost NaN.
         Missing `traffic_type` uses `"ON_DEMAND"`.
         `service_tier` requests a tier, while reported `traffic_type` selects pricing.
@@ -1584,7 +1584,7 @@ class _GeminiStream(AdapterStream):
         return self._accumulator.response()
 
     @override
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Return available billing from accumulated stream evidence.
 
         Missing usage returns None when no charged provider-executed tool was configured.

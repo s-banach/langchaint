@@ -960,7 +960,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         return self._snapshot_with_tracked_usage()
 
     @override
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Return what the tracked usage bills at the snapshot's tier, or None before one arrives.
 
         `stream_options` requests usage on the trailing chunk.

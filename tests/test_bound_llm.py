@@ -3050,7 +3050,7 @@ def test_a_terminal_failure_that_pauses_the_quota_pauses_it_and_stops_the_retry(
 
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_a_retry_after_sets_the_minimum_private_wait(path: _GenerationPath) -> None:
-    """A transient failure's retry_after_seconds reaches `PrivateBackoff.next_wait` as the wait's minimum.
+    """A transient failure's retry_after_seconds reaches `PrivateBackoff.next_wait_seconds` as the wait's minimum.
 
     The private ceiling starts at 0.001 seconds, so only retry_after_seconds can make the retry wait 0.02 seconds.
     """

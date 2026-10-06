@@ -146,11 +146,11 @@ class FakeStream(AdapterStream):
         self.closed: bool = False
         self.raw: FakeRawResponse = FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
-        """What billing_reported wraps; None stands for an adapter with no such channel."""
+        """What provider_billing wraps; None stands for an adapter with no such channel."""
         self._outcome = outcome
 
     @override
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Wrap whatever the test set, defaulting to the None an openai stream returns."""
         return (
             None if self._usage_reported is None else stated_provider_billing(self._usage_reported)

@@ -1411,7 +1411,7 @@ class _AnthropicStream(AdapterStream):
         return await self._sdk_stream.get_final_message()
 
     @override
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Return snapshot billing after the first event, or `None` before it.
 
         Anthropic 0.120.0 provides required input tokens from `message_start`.

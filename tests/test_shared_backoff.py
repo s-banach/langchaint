@@ -564,7 +564,7 @@ def test_private_backoff_ceilings_grow_to_the_cap() -> None:
         )
     )
     ceilings_and_waits = [
-        (private_backoff._wait_ceiling, private_backoff.next_wait(None)) for _ in range(4)
+        (private_backoff._wait_ceiling, private_backoff.next_wait_seconds(None)) for _ in range(4)
     ]
     assert [ceiling for ceiling, _ in ceilings_and_waits] == [1.0, 2.0, 4.0, 4.0]
     assert all(0.0 < wait <= ceiling for ceiling, wait in ceilings_and_waits)

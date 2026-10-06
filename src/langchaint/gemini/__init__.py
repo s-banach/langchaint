@@ -38,9 +38,9 @@ except ModuleNotFoundError as exc:
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.gemini.generate_content_adapter import (
     GeminiGenerateContentAdapter,
-    GeminiPricedServiceTier,
     GeminiPricingTable,
     GeminiRates,
+    GeminiReportedServiceTier,
     GeminiServiceTier,
     assembled_response,
 )
@@ -203,9 +203,9 @@ __all__ = [
     "Gemini",
     "GeminiGenerateContentAdapter",
     "GeminiModelId",
-    "GeminiPricedServiceTier",
     "GeminiPricingTable",
     "GeminiRates",
+    "GeminiReportedServiceTier",
     "GeminiServiceTier",
     "assembled_response",
 ]

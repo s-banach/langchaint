@@ -262,7 +262,7 @@ class _ScriptedTurnStream(AdapterStream):
         return self._raw
 
     @override
-    def billing_reported(self) -> None:
+    def provider_billing(self) -> None:
         """Report no billing before final."""
 
     @override

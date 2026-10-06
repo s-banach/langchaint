@@ -1145,15 +1145,15 @@ def test_a_sparse_tool_call_fragment_index_is_a_stream_protocol_error() -> None:
         _ = _collected_items(replay)
 
 
-def test_billing_reported_is_none_until_the_usage_chunk_arrives() -> None:
+def test_provider_billing_is_none_until_the_usage_chunk_arrives() -> None:
     """A stream cut off before the usage-bearing chunk reports None, and the full drain reports it."""
     stream = _stream(_text_stream_chunks())
 
     async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
-        before = stream.billing_reported()
+        before = stream.provider_billing()
         async for _item in stream.items():
             pass
-        return before, stream.billing_reported()
+        return before, stream.provider_billing()
 
     before, after = run_with_timeout(scenario())
     assert before is None

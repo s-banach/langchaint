@@ -1129,10 +1129,10 @@ def _stream(
 
 def test_cutoff_openai_provider_executed_tool_billing_is_nan() -> None:
     """A charged binding cannot report zero before terminal usage arrives."""
-    billing = _stream([], charged_provider_executed_tools=True).billing_reported()
+    billing = _stream([], charged_provider_executed_tools=True).provider_billing()
     assert billing is not None
     assert math.isnan(billing.billing.usage.provider_executed_tool_cost_in_usd)
-    assert _stream([]).billing_reported() is None
+    assert _stream([]).provider_billing() is None
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:

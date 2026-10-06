@@ -507,7 +507,7 @@ class PrivateBackoff:
         self._wait_multiplier = shared_backoff.wait_multiplier
         self._max_wait_seconds = shared_backoff.max_wait_seconds
 
-    def next_wait(self, retry_after_seconds: float | None) -> float:
+    def next_wait_seconds(self, retry_after_seconds: float | None) -> float:
         """Return one failure's wait in seconds, then grow the ceiling one step.
 
         The wait is a positive random draw bounded by `_wait_ceiling`.

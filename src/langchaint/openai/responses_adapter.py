@@ -986,7 +986,7 @@ class _OpenAIResponsesStream(AdapterStream):
         return self._terminal_response
 
     @override
-    def billing_reported(self) -> ProviderBilling | None:
+    def provider_billing(self) -> ProviderBilling | None:
         """Return terminal billing or NaN for incomplete charged provider-executed tools.
 
         OpenAI 2.45.0 stream state accumulates output items without counters.

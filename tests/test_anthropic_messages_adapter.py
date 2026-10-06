@@ -2063,18 +2063,18 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
         )
 
 
-def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
-    """billing_reported returns None before the first event and Billing after it."""
+def test_provider_billing_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
+    """provider_billing returns None before the first event and Billing after it."""
 
     async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
         """Read billing before and after one stream item."""
         adapter_stream = _anthropic_stream(
             [_text_delta_event("he", 0)], _message_snapshot("end_turn")
         )
-        before = adapter_stream.billing_reported()
+        before = adapter_stream.provider_billing()
         items = adapter_stream.items()
         await anext(items)
-        return before, adapter_stream.billing_reported()
+        return before, adapter_stream.provider_billing()
 
     before, after = run_with_timeout(scenario())
     assert before is None

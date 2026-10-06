@@ -193,7 +193,7 @@ class EmbeddingModel:
                     raise
                 if not request_failure.pauses_quota:
                     await asyncio.sleep(
-                        private_backoff.next_wait(request_failure.retry_after_seconds)
+                        private_backoff.next_wait_seconds(request_failure.retry_after_seconds)
                     )
 
     async def embed(

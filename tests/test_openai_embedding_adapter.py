@@ -401,7 +401,7 @@ def test_transport_failure_retries_the_failed_batch(
     def zero_wait(_backoff: PrivateBackoff, _retry_after_seconds: float | None) -> float:
         return 0.0
 
-    monkeypatch.setattr(PrivateBackoff, "next_wait", zero_wait)
+    monkeypatch.setattr(PrivateBackoff, "next_wait_seconds", zero_wait)
     client = _client(handler)
 
     async def scenario() -> None:

@@ -185,7 +185,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
             # Record abandonment here because no other frame sees cancellation during the open.
             self._state = "finished"
             self._exit_admission()
-            provider_billing_in_flight = self._billing_reported()
+            provider_billing_in_flight = self._provider_billing()
             if await self._close_timeout_scope(exc):
                 raise _timed_out_error(self._ledger, provider_billing_in_flight) from None
             if isinstance(exc, asyncio.CancelledError):
@@ -234,7 +234,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
         """
         self._state = "finished"
         # Read before the close, which drops the stream that reports it.
-        provider_billing_in_flight = self._billing_reported()
+        provider_billing_in_flight = self._provider_billing()
         timed_out = await self._close_timeout_scope(exc)
         try:
             await self._close_adapter_stream()
@@ -262,14 +262,14 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
             return True
         return False
 
-    def _billing_reported(self) -> ProviderBilling | None:
+    def _provider_billing(self) -> ProviderBilling | None:
         """Ask the open stream what the provider has reported, or None where it reported nothing.
 
         Call before the connection closes, because closing drops the stream this asks.
         """
         if self._adapter_stream is None:
             return None
-        return self._adapter_stream.billing_reported()
+        return self._adapter_stream.provider_billing()
 
     def _abandon(self, provider_billing_in_flight: ProviderBilling | None) -> None:
         """Set `abandoned` and conclude the operation with it, when the stream stored no `GenerationOutcome`.
@@ -348,7 +348,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
             ) from exc
         if not request_failure.pauses_quota:
             await asyncio.sleep(
-                self._private_backoff.next_wait(request_failure.retry_after_seconds)
+                self._private_backoff.next_wait_seconds(request_failure.retry_after_seconds)
             )
 
     def __aiter__(self) -> "StreamHandle[OutputT, ToolCallGenerationT]":
@@ -477,7 +477,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
         `stage` names the stream step that failed in the transient error text.
         """
         self._state = "finished"
-        stream_provider_billing = self._billing_reported()
+        stream_provider_billing = self._provider_billing()
         self._ledger.note_provider_billing_in_flight(stream_provider_billing)
         request_failure = self._request_failure_exiting_admission(exc)
         if request_failure.kind != "transient":

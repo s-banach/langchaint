@@ -40,7 +40,7 @@ from langchaint.generation.request_history import (
 )
 from langchaint.generation.tables import RowValue, to_tables
 
-_PLAIN_TEXT_BINDING = Binding(
+_PLAIN_BINDING = Binding(
     system_prompt=None,
     tool_schemas=(),
     provider_executed_tools=(),
@@ -51,7 +51,7 @@ _PLAIN_TEXT_BINDING = Binding(
     temperature=None,
     automatic_cache_breakpoints=True,
 )
-"""The binding every invariant here binds under: text output and a completion limit.
+"""The binding every invariant here binds under: no system prompt, no tools, and a completion limit.
 
 The limit is stated because `AnthropicMessagesAdapter` rejects a binding without one.
 """
@@ -213,7 +213,7 @@ class AdapterConformance(ABC):
 
     def _bound_adapter(self) -> BoundAdapter[str]:
         """Bind a fresh adapter for plain text under the one binding these invariants use."""
-        return self.make_adapter().bind_text(_PLAIN_TEXT_BINDING)
+        return self.make_adapter().bind_text(_PLAIN_BINDING)
 
     def _assistant_wire_parts_of(
         self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
@@ -356,7 +356,7 @@ class AdapterConformance(ABC):
         The outcome kind, not the output's class, separates a usable response from an unusable one.
         """
         bound_adapter = self.make_adapter().bind_structured(
-            _PLAIN_TEXT_BINDING, _WeatherReportAlsoUnusableResponseBase
+            _PLAIN_BINDING, _WeatherReportAlsoUnusableResponseBase
         )
         outcome = bound_adapter.interpret(
             self.response_with_text('{"city": "Nairobi", "celsius": 25}')
@@ -371,7 +371,7 @@ class AdapterConformance(ABC):
         It keeps each rejected field and value for the caller.
         """
         text = '{"city": "Nairobi", "celsius": "SENTINEL"}'
-        bound_adapter = self.make_adapter().bind_structured(_PLAIN_TEXT_BINDING, _WeatherReport)
+        bound_adapter = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
         outcome = bound_adapter.interpret(self.response_with_text(text))
         assert outcome.kind == "schema_violation"
         assert outcome.validation_error_json == _validation_error_json(_WeatherReport, text)

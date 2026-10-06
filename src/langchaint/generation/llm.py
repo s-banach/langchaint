@@ -811,7 +811,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             provider_billing=observations.provider_billing,
         )
         if not request_failure.pauses_quota and ledger.request_count < self.max_requests:
-            await asyncio.sleep(private_backoff.next_wait(request_failure.retry_after_seconds))
+            await asyncio.sleep(
+                private_backoff.next_wait_seconds(request_failure.retry_after_seconds)
+            )
 
     def _staged_interpretation(
         self, raw: BaseModel, *, request_id: str | None, ledger: _RequestLedger
@@ -893,7 +895,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                             )
                         except BaseException:
                             observations = observations._replace(
-                                provider_billing=adapter_stream.billing_reported(),
+                                provider_billing=adapter_stream.provider_billing(),
                                 request_id=adapter_stream.request_id(),
                             )
                             ledger.note_provider_billing_in_flight(observations.provider_billing)

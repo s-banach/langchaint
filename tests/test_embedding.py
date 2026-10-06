@@ -227,7 +227,7 @@ def test_a_transient_failure_retries_and_returns_vectors() -> None:
 
 
 def test_a_retry_after_sets_the_minimum_private_wait() -> None:
-    """A transient failure's retry_after_seconds reaches `PrivateBackoff.next_wait` as the wait's minimum.
+    """A transient failure's retry_after_seconds reaches `PrivateBackoff.next_wait_seconds` as the wait's minimum.
 
     The private ceiling starts at 0.001 seconds, and request starts are 0.00001 seconds apart.
     So only retry_after_seconds can make the retry wait 0.02 seconds.

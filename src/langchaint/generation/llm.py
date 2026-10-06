@@ -1089,7 +1089,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Return one batch item as a `Generation` or `GenerationError`.
 
         Raises:
-            BaseException: Generation raises a value other than `GenerationError`.
+            BaseException: A non-`Exception` value interrupts handling the input.
         """
         try:
             return await self._generate_one_any_binding(generation_input, deadline=deadline)
@@ -1161,7 +1161,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             """Run one batch item under a deadline of its own.
 
             Raises:
-                BaseException: Generation raises a value other than `GenerationError`.
+                BaseException: A non-`Exception` value interrupts handling the input.
             """
             return await self._generate_one_or_failure(
                 generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_input)

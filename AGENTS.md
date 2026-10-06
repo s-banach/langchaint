@@ -23,7 +23,7 @@ Document every public parameter and cross-provider difference.
 - adapter: an `Adapter` implementation.
 - request: one send to the provider. Each retry is another request.
 - response: the provider's reply to one request.
-- input: one `GenerationInput`.
+- input: one `GenerationInput`. In token counts and token rates, such as `input_tokens_*`, `input_multiplier`, and "input tokens", "input" means the prompt side of one request.
 - request params: what every request for one input sends.
 - assistant message: the `AssistantMessage` in one response.
 - output: what application code reads from a finished assistant message, either its joined text or a `response_format` instance validated from its text. An assistant message gives output when that value exists.

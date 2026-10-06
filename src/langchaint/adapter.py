@@ -444,11 +444,11 @@ class SchemaViolation(_UnusableResponseBase):
 class ProviderFailedTransiently(_UnusableResponseBase):
     """A billable response reporting a transient provider failure.
 
-    Generation records the request and retries.
+    `generate_one`, `generate_many` and `generate_many_records` record the request and retry.
     `error_text` becomes the request's `TransientError` text.
     `pauses_quota=True` pauses the rate-limit quota.
-    Streaming records the request and raises `GenerationError`.
-    Streaming cannot retry because the response stream already ended.
+    `StreamHandle.final` records the request and raises `GenerationError`.
+    `StreamHandle` cannot retry because the response stream already ended.
     """
 
     error_text: str

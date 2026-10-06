@@ -18,19 +18,12 @@ Document every public parameter and cross-provider difference.
 
 ## Terms
 
-- langchaint: this project.
-- provider: anthropic, openai, or a model-serving platform.
-- adapter: an `Adapter` implementation.
-- request: one send to the provider. Each retry is another request.
-- response: the provider's reply to one request.
-- input: one `GenerationInput`. In token counts and token rates, such as `input_tokens_*`, `input_multiplier`, and "input tokens", "input" means the prompt side of one request.
-- request params: what every request for one input sends.
-- assistant message: the `AssistantMessage` in one response.
+- input: one value the application passes in to be handled: a `GenerationInput`, or one text passed to `EmbeddingModel.embed`.
 - output: what application code reads from a finished assistant message, either its joined text or a `response_format` instance validated from its text. An assistant message gives output when that value exists.
 - usable: an assistant message that gives output or has tool calls.
 - kept assistant message: the usable assistant message that ends handling an input.
-- generation: what handling an input produces when it succeeds. `GenerationError` is its failure.
-- outcome: one way that handling an input, reading one response, or dispatching a tool call ends. An `*Outcome` type is the union of them.
+- generation: what handling a `GenerationInput` produces when it succeeds. `GenerationError` is its failure.
+- outcome: one way that handling a `GenerationInput`, reading one response, or dispatching a tool call ends. An `*Outcome` type is the union of them.
 - Use these terms, and never give one of these concepts a second name.
 
 ## Vocabulary
@@ -156,36 +149,6 @@ Document every public parameter and cross-provider difference.
 - Catch and log telemetry failures without propagating them.
 - Require `capture_message_content` without a default for recording message content.
 - Use OTel convention keys where available and `langchaint.*` otherwise.
-
-## Module map
-
-- `generation/llm.py`: client binding, the generate methods, and shared batch coordination.
-- `generation/_config_fingerprint.py`: deterministic binding and generation-input fingerprints.
-- `generation/_generate_many_records.py`: validated JSON resume state and atomic outcome-record persistence.
-- `adapter.py`: the SDK-free neutral adapter contract and `ResponseIdentity`.
-- `concurrency/cancellation.py`: cancellation-safe synchronous provider work.
-- `conformance.py`: SDK-free adapter invariants that adapter tests inherit.
-- `embedding.py`: provider-neutral embedding execution and output validation.
-- `concurrency/shared_backoff.py`: request admission for one rate-limit quota.
-- `common/exceptions.py`: basic shared exceptions without langchaint imports.
-- `common/request_failure.py`: what a failed request means, and the mapping that generation and embedding share.
-- `generation/errors.py`: normalized generation error records and live generation failures.
-- `generation/response.py`: live generations, their records, and the outcome unions.
-- `generation/tables.py`: tabular outcome and request views.
-- `generation/request_history.py`: request records, immutable request history, and retry accounting.
-- `generation/streaming.py`: the stream handle.
-- `generation/observer.py`: the protocol that follows every input and every tool dispatch.
-- `common/observed_operation.py`: the handle an observer returns for one input or one tool dispatch, and the guard that logs observer failures, without langchaint imports.
-- `tools.py`: tool forms, dispatch, dispatch outcomes, and tool exceptions.
-- `common/messages.py`: provider-neutral messages, content parts, and JSON round trips.
-- `billing/usage.py`: token accounting and per-category costs.
-- `common/checked_copy.py`: the base for langchaint pydantic models.
-- `billing/pricing.py`: SDK-free rate arithmetic and per-request `Billing`.
-- `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: backend subpackages that require their SDKs.
-- `concurrency/run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
-- `common/sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
-- `tracing/`: the optional OTel subpackage and its `OtelObserver`.
-- `span_parsing.py`: OTel chat and execute_tool span parsing, and chat span conversion, without OpenTelemetry dependencies.
 
 ## Checks
 

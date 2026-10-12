@@ -73,7 +73,7 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
 def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None:
     """Return the seconds until a GMT HTTP date, or None for a past or unconvertible date.
 
-    On Python 3.14, `email.utils.mktime_tz` raises `ValueError` for a year outside 1..9999.
+    `email.utils.mktime_tz` raises `ValueError` for a year outside 1..9999.
     It raises `OverflowError` for a year above 2**31 - 1.
     A numeric field with hundreds of digits gives an integer whose difference with `time.time()` raises `OverflowError`.
     """

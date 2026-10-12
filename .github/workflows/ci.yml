@@ -18,7 +18,7 @@ jobs:
         include:
           # Newest resolvable dependencies on the floor and the current Python.
           - { python-version: "3.13", resolution: highest }
-          - { python-version: "3.14", resolution: highest }
+          - { python-version: "3.15", resolution: highest }
           # Floor dependencies (each direct dep at its pyproject lower bound) on the floor Python, the most conservative supported combination.
           - { python-version: "3.13", resolution: lowest-direct }
     steps:

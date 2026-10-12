@@ -43,7 +43,7 @@ def _run(command: list[str], *, working_directory: pathlib.Path = ROOT) -> str:
         command,
         cwd=working_directory,
         check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
     )
     return completed.stdout.strip()
@@ -88,7 +88,7 @@ def _resolved_source_sha() -> str:
     if (SOURCE_CHECKOUT / ".git").is_dir():
         try:
             return _run(
-                ["git", "rev-parse", "--verify", PREPARED_SOURCE_REF],
+                ["git", "rev-parse", "--verify", "--quiet", PREPARED_SOURCE_REF],
                 working_directory=SOURCE_CHECKOUT,
             )
         except subprocess.CalledProcessError:
@@ -154,7 +154,7 @@ License: Apache-2.0.
 The resolved commit SHA is the upstream commit resolved by the last refresh that changed the committed data.
 A refresh that produces identical data leaves this file unchanged.
 
-`{CHAT_SPAN_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+`{CHAT_SPAN_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.client.inference` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
 `{EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
 `src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.

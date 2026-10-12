@@ -1,7 +1,7 @@
 templates:
   - template: json.j2
     filter: >-
-      def normalized_attribute($condition): {
+      def normalized_attribute: {
         name: .key,
         value_type: (
           if (.type | type) == "object" then "string"
@@ -15,7 +15,6 @@ templates:
           end
         ),
         presence_rule: .requirement_level,
-        condition: $condition,
         structured_schema: (.annotations.type.json_schema // null),
         template_prefix: (
           if .type == "template[string]" then (.key + ".")
@@ -23,35 +22,25 @@ templates:
           end
         )
       };
-      def provider_name($id):
-        if $id == "azure.ai.inference.client" then "azure.ai.inference"
-        else ($id | sub("\\.inference\\.client$"; ""))
-        end;
-      (
-          .registry.spans[]
-          | select(.type == "gen_ai.inference.client")
-          | .attributes
-        ) as $base_attributes
+      def span_attributes($type):
+        [.registry.spans[] | select(.type == $type)]
+        | if length == 1 then .[0].attributes
+          else error("the resolved registry has \(length) spans of type \($type), expected 1")
+          end;
+      span_attributes("gen_ai.client.inference") as $base_attributes
       | {
-        span_type: "gen_ai.inference.client",
-        operation_name: "chat",
         attributes: [
           $base_attributes[]
-          | normalized_attribute(null)
+          | normalized_attribute
         ],
         refinements: [
           .refinements.spans[]
           | select(
-              .type == "gen_ai.inference.client"
-              and .id != "gen_ai.inference.client"
+              .type == "gen_ai.client.inference"
+              and .id != "gen_ai.client.inference"
             )
-          | provider_name(.id) as $provider_name
           | {
               id: .id,
-              condition: {
-                attribute: "gen_ai.provider.name",
-                equals: $provider_name
-              },
               attributes: [
                 .attributes[]
                   | select(
@@ -62,13 +51,10 @@ templates:
                           | first
                         ) as $base_attribute
                       | $base_attribute == null
-                        or ($refinement_attribute | normalized_attribute(null))
-                          != ($base_attribute | normalized_attribute(null))
+                        or ($refinement_attribute | normalized_attribute)
+                          != ($base_attribute | normalized_attribute)
                     )
-                  | normalized_attribute({
-                    attribute: "gen_ai.provider.name",
-                    equals: $provider_name
-                  })
+                  | normalized_attribute
               ]
             }
         ]
@@ -77,11 +63,12 @@ templates:
     file_name: chat-span-attributes.json
   - template: json.j2
     filter: >-
-      [
-        .registry.spans[]
-        | select(.type == "gen_ai.execute_tool.internal")
-        | .attributes[].key
-      ]
+      def span_attributes($type):
+        [.registry.spans[] | select(.type == $type)]
+        | if length == 1 then .[0].attributes
+          else error("the resolved registry has \(length) spans of type \($type), expected 1")
+          end;
+      [span_attributes("gen_ai.execute_tool.internal")[].key]
       | sort
     application_mode: single
     file_name: execute-tool-span-attribute-names.json

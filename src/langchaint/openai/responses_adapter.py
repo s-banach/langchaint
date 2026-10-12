@@ -65,6 +65,7 @@ from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
+    FunctionToolParam,
     ResponseErrorEvent,
     ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCallParam,
@@ -451,26 +452,30 @@ def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
     return tool_choice
 
 
-def _wire_tools(
-    tool_schemas: tuple[ToolSchema, ...],
-    provider_executed_tools: tuple[Mapping[str, object], ...],
-) -> list[ToolParam]:
-    """Convert every bound tool to one ordered wire list.
+def _wire_function_tool(tool_schema: ToolSchema) -> FunctionToolParam:
+    """Convert one tool schema. `description=None` omits the description key.
 
     strict is a required key of FunctionToolParam.
     None leaves the provider's non-strict default in place.
     The ToolManager schemas do not satisfy strict mode's restrictions.
     """
-    tools: list[ToolParam] = [
-        {
-            "type": "function",
-            "name": tool_schema.name,
-            "description": tool_schema.description,
-            "parameters": dict(tool_schema.args_schema),
-            "strict": None,
-        }
-        for tool_schema in tool_schemas
-    ]
+    tool: FunctionToolParam = {
+        "type": "function",
+        "name": tool_schema.name,
+        "parameters": dict(tool_schema.args_schema),
+        "strict": None,
+    }
+    if tool_schema.description is not None:
+        tool["description"] = tool_schema.description
+    return tool
+
+
+def _wire_tools(
+    tool_schemas: tuple[ToolSchema, ...],
+    provider_executed_tools: tuple[Mapping[str, object], ...],
+) -> list[ToolParam]:
+    """Convert every bound tool to one ordered wire list."""
+    tools: list[ToolParam] = [_wire_function_tool(tool_schema) for tool_schema in tool_schemas]
     # cast: the neutral Mapping type exceeds the SDK TypedDict union.
     # The adapter validated each mapping's type discriminator.
     tools.extend(cast("ToolParam", tool) for tool in provider_executed_tools)

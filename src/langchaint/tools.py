@@ -183,10 +183,14 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
 
 @dataclass(frozen=True, kw_only=True)
 class ToolSchema:
-    """The provider-neutral description of one tool."""
+    """The provider-neutral description of one tool.
+
+    `description` tells the model what the tool does.
+    None sends the tool without a description.
+    """
 
     name: str
-    description: str
+    description: str | None = None
     args_schema: Mapping[str, object]
 
 
@@ -195,7 +199,7 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     """A callable tool validated by `args_model`."""
 
     name: str
-    description: str
+    description: str | None = None
     args_model: type[ArgsT]
     function: Callable[[ArgsT], Awaitable[ToolReturn[AppDataT]]]
 
@@ -259,7 +263,7 @@ def _is_matching_args_model[ArgsT: BaseModel, AppDataT](
 
 @dataclass(frozen=True, kw_only=True)
 class _ToolDecorator:
-    description: str
+    description: str | None
     name: str | None
 
     def __call__[ArgsT: BaseModel, AppDataT = None](
@@ -303,11 +307,11 @@ class _ToolDecorator:
         )
 
 
-def tool(*, description: str, name: str | None = None) -> _ToolDecorator:
+def tool(*, description: str | None = None, name: str | None = None) -> _ToolDecorator:
     """Decorate one async function as a PydanticTool.
 
     Args:
-        description: Provider-facing purpose.
+        description: ToolSchema.description.
         name: ToolSchema.name. None uses function.__name__.
     """
     return _ToolDecorator(description=description, name=name)
@@ -331,7 +335,7 @@ class CaptureTool[CapturedT: BaseModel]:
     """
 
     name: str
-    description: str
+    description: str | None = None
     args_model: type[CapturedT]
     acknowledgement: str = "Acknowledged"
 
@@ -391,7 +395,7 @@ class JSONSchemaTool[AppDataT = None]:
     """
 
     name: str
-    description: str
+    description: str | None = None
     args_schema: Mapping[str, object]
     function: Callable[[dict[str, object]], Awaitable[ToolReturn[AppDataT]]]
 

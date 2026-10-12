@@ -423,7 +423,7 @@ def test_parses_boolean_draft_07_schema_before_conversion_fails() -> None:
         })
     )
     assert parsed.tool_definitions is not None
-    with pytest.raises(OtelToLangchaintConversionError, match="description and parameters"):
+    with pytest.raises(OtelToLangchaintConversionError, match="not a schema object"):
         _ = tool_schemas_from_otel(parsed)
 
 
@@ -644,6 +644,20 @@ def test_converts_every_output_message_without_span_identity_or_finish_reason() 
     assert output_messages_from_otel(parsed) == (
         AssistantMessage(parts=(TextPart(text="one"),)),
         AssistantMessage(parts=(TextPart(text="two"),)),
+    )
+
+
+def test_function_definition_without_description_converts() -> None:
+    """A function definition without a description converts to `description=None`."""
+    parsed = parse_otel_chat(
+        _chat_span({
+            "gen_ai.tool.definitions": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+            ]
+        })
+    )
+    assert tool_schemas_from_otel(parsed) == (
+        ToolSchema(name="lookup", args_schema={"type": "object"}),
     )
 
 

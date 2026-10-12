@@ -89,6 +89,7 @@ from openai.types.chat import (
 )
 from openai.types.chat.completion_create_params import PromptCacheOptions
 from openai.types.completion_usage import CompletionUsage
+from openai.types.shared_params import FunctionDefinition
 from openai.types.shared_params.response_format_json_schema import (
     JSONSchema,
     ResponseFormatJSONSchema,
@@ -444,16 +445,20 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[ChatCompletionFunc
     The non-strict default accepts the schemas that `ToolManager` generates.
     """
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool_schema.name,
-                "description": tool_schema.description,
-                "parameters": dict(tool_schema.args_schema),
-            },
-        }
+        {"type": "function", "function": _wire_function_definition(tool_schema)}
         for tool_schema in tool_schemas
     ]
+
+
+def _wire_function_definition(tool_schema: ToolSchema) -> FunctionDefinition:
+    """Convert one tool schema. `description=None` omits the description key."""
+    function: FunctionDefinition = {
+        "name": tool_schema.name,
+        "parameters": dict(tool_schema.args_schema),
+    }
+    if tool_schema.description is not None:
+        function["description"] = tool_schema.description
+    return function
 
 
 def _as_chat_completion(raw: BaseModel) -> ChatCompletion:

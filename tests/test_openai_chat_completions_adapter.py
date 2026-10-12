@@ -777,6 +777,16 @@ def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them()
     assert with_tool.parallel_tool_calls is True
 
 
+def test_tool_without_description_omits_the_description_key() -> None:
+    """`description=None` sends the function without a description."""
+    precomputed = _adapter()._precompute_fields(
+        _binding(tool_schemas=(ToolSchema(name="lookup", args_schema={"type": "object"}),))
+    )
+    assert precomputed.tools == [
+        {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    ]
+
+
 def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions() -> None:
     """AllowedToolsChoice changes tool_choice without removing tools."""
     schemas = (

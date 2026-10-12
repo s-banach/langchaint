@@ -929,6 +929,19 @@ def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
         )
 
 
+def test_tool_without_description_omits_the_description_key() -> None:
+    """`description=None` sends the function without a description."""
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            automatic_cache_breakpoints=True,
+            tool_schemas=(ToolSchema(name="lookup", args_schema={"type": "object"}),),
+        )
+    )
+    assert precomputed.tools == [
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}, "strict": None}
+    ]
+
+
 def test_allowed_tools_choice_keeps_complete_responses_tool_definitions() -> None:
     """AllowedToolsChoice restricts function names in order without removing tools.
 

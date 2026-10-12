@@ -608,9 +608,10 @@ def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ..
         if not isinstance(definition, OtelFunctionTool):
             raise _unsupported(definition, "tool definition type")
         _require_no_additional_properties(definition)
-        if definition.description is None or not isinstance(definition.parameters, dict):
+        if not isinstance(definition.parameters, dict):
             raise _unsupported(
-                definition, "function definition without description and parameters"
+                definition,
+                "function definition whose parameters are absent or not a schema object",
             )
         if definition.name in converted_names:
             raise OtelToLangchaintConversionError(

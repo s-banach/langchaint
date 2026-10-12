@@ -92,6 +92,7 @@ from anthropic.types import (
     ThinkingBlockParam,
     ThinkingConfigParam,
     ToolChoiceParam,
+    ToolParam,
     ToolResultBlockParam,
     ToolUnionParam,
     ToolUseBlockParam,
@@ -843,6 +844,14 @@ def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> 
     return {"type": "none"}
 
 
+def _wire_function_tool(tool_schema: ToolSchema) -> ToolParam:
+    """Convert one tool schema. `description=None` omits the description key."""
+    tool: ToolParam = {"name": tool_schema.name, "input_schema": dict(tool_schema.args_schema)}
+    if tool_schema.description is not None:
+        tool["description"] = tool_schema.description
+    return tool
+
+
 def _wire_tools(
     tool_schemas: tuple[ToolSchema, ...],
     provider_executed_tools: tuple[Mapping[str, object], ...],
@@ -856,12 +865,7 @@ def _wire_tools(
     The last tool carries the cache breakpoint when no system prompt follows the tools.
     """
     tools: list[ToolUnionParam] = [
-        {
-            "name": tool_schema.name,
-            "description": tool_schema.description,
-            "input_schema": dict(tool_schema.args_schema),
-        }
-        for tool_schema in tool_schemas
+        _wire_function_tool(tool_schema) for tool_schema in tool_schemas
     ]
     # cast: the neutral Mapping type exceeds the SDK TypedDict union.
     # The adapter validated each mapping's type discriminator.

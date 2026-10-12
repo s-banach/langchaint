@@ -1145,6 +1145,20 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
     assert "cache_control" not in provider_executed_tool
 
 
+def test_tool_without_description_omits_the_description_key() -> None:
+    """`description=None` sends the tool without a description."""
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt="system",
+            tool_schemas=(ToolSchema(name="lookup", args_schema={"type": "object"}),),
+            automatic_cache_breakpoints=False,
+        )
+    )
+    assert _block_list(precomputed.tools) == [
+        {"name": "lookup", "input_schema": {"type": "object"}}
+    ]
+
+
 def test_provider_executed_tool_binds_without_function_tools() -> None:
     """A provider-executed tool does not require an application function."""
     precomputed = _adapter()._precompute_fields(

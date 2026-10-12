@@ -37,7 +37,7 @@ Document every public parameter and cross-provider difference.
 - Give a keyword and the variable passed to it one name, as in `tool_manager=tool_manager`.
 - Put units and encodings in public names and in values that cross modules, such as `cost_in_usd`, `elapsed_seconds`, and the `_json` suffix.
 - A holder named for its unit, such as `usd_per_million_tokens`, covers its fields.
-- A rate class whose docstring states the unit, such as `OpenAIRates`, covers its fields.
+- A rate class whose docstring states the unit, such as `TokenRates`, covers its fields.
 - Prefix related fields so sorting and completion group them, as in `input_tokens_*`, `generate_one`, and `generate_many`.
 - Do not repeat the holder in an attribute name: write `tool.name`, not `tool.tool_name`.
 - Use the full name for a cross-object reference, such as `tool_call_id` on `ToolMessage`.

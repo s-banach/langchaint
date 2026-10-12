@@ -79,13 +79,12 @@ from langchaint.adapter import (
     ResponseOutcome,
     UsableResponse,
 )
-from langchaint.billing.pricing import Billing
+from langchaint.billing.pricing import Billing, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.conformance import AdapterConformance
 from langchaint.openai import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
-    OpenAIRates,
     OpenAIResponsesAdapter,
     OpenAIResponsesServiceTier,
     ReasoningSummary,
@@ -118,7 +117,7 @@ def _billing_from_response(response: OpenAIResponse, pricing: OpenAIPricingTable
     return _provider_billing_from_response(response, pricing, regional_processing=False).billing
 
 
-_DEFAULT_RATES = OpenAIRates(
+_DEFAULT_RATES = TokenRates(
     input_tokens_cache_none=2.5,
     output_tokens=10.0,
     input_tokens_cache_read=1.25,
@@ -132,7 +131,7 @@ _PRICING = OpenAIPricingTable(
 )
 """The default tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = OpenAIRates(
+_PRIORITY_RATES = TokenRates(
     input_tokens_cache_none=5.0,
     output_tokens=20.0,
     input_tokens_cache_read=2.5,

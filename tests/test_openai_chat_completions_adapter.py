@@ -50,14 +50,13 @@ from langchaint.adapter import (
     ResponseOutcome,
     UsableResponse,
 )
-from langchaint.billing.pricing import Billing, ProviderBilling
+from langchaint.billing.pricing import Billing, ProviderBilling, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.conformance import AdapterConformance
 from langchaint.deepseek import input_tokens_cache_read_from_usage_deepseek
 from langchaint.openai import (
     OpenAIChatCompletionsAdapter,
     OpenAIPricingTable,
-    OpenAIRates,
     OpenAIServiceTier,
 )
 from langchaint.openai.chat_completions_adapter import (
@@ -78,7 +77,7 @@ from tests.helpers import (
     transient,
 )
 
-_DEFAULT_RATES = OpenAIRates(
+_DEFAULT_RATES = TokenRates(
     input_tokens_cache_none=2.5,
     output_tokens=10.0,
     input_tokens_cache_read=1.25,
@@ -88,7 +87,7 @@ _DEFAULT_RATES = OpenAIRates(
 _PRICING = OpenAIPricingTable(default=_DEFAULT_RATES)
 """The default tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = OpenAIRates(
+_PRIORITY_RATES = TokenRates(
     input_tokens_cache_none=5.0,
     output_tokens=20.0,
     input_tokens_cache_read=2.5,

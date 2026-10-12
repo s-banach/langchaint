@@ -51,7 +51,6 @@ from langchaint.openai.responses_adapter import (
 from langchaint.openai.shared import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
-    OpenAIRates,
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
     client_without_retries,
@@ -362,7 +361,6 @@ __all__ = [
     "OpenAILongContextPricing",
     "OpenAIModelId",
     "OpenAIPricingTable",
-    "OpenAIRates",
     "OpenAIResponsesAdapter",
     "OpenAIResponsesServiceTier",
     "OpenAIServiceTier",

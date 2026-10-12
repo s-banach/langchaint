@@ -81,10 +81,11 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
 
 
 class TokenRates(CheckedCopyModel):
-    """The rates applied to one request's priced `Usage` token counters.
+    """Rates for the priced `Usage` token counters.
 
     Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
     A missing category rate is NaN.
+    A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     Pydantic validates stored rates and serializes NaN as a string, so a stored `Billing` reproduces its token costs.
     """
 

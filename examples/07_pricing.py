@@ -1,7 +1,7 @@
 """Price an uncataloged model and read the cost of a generation."""
 
-from langchaint import PlainGeneration
-from langchaint.openai import OpenAI, OpenAIPricingTable, OpenAIRates
+from langchaint import PlainGeneration, TokenRates
+from langchaint.openai import OpenAI, OpenAIPricingTable
 
 
 async def price_at_negotiated_rates() -> PlainGeneration[str]:
@@ -11,7 +11,7 @@ async def price_at_negotiated_rates() -> PlainGeneration[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: Generation fails.
     """
-    negotiated_default_rates = OpenAIRates(
+    negotiated_default_rates = TokenRates(
         input_tokens_cache_none=1.00,
         output_tokens=8.00,
         input_tokens_cache_read=0.10,

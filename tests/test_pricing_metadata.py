@@ -8,10 +8,10 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicRates,
 )
+from langchaint.billing.pricing import TokenRates
 from langchaint.openai.shared import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
-    OpenAIRates,
     OpenAIResponsesServiceTier,
 )
 from scripts.update_pricing_metadata import (
@@ -37,20 +37,20 @@ from scripts.update_pricing_metadata import (
 )
 
 
-def _sample_openai_rates() -> OpenAIRates:
-    return OpenAIRates(
-        input_tokens_cache_none=10.0,
-        output_tokens=20.0,
-        input_tokens_cache_read=1.0,
-        input_tokens_cache_write=12.5,
+def _sample_openai_rates(multiplier: float = 1.0) -> TokenRates:
+    return TokenRates(
+        input_tokens_cache_none=10.0 * multiplier,
+        output_tokens=20.0 * multiplier,
+        input_tokens_cache_read=1.0 * multiplier,
+        input_tokens_cache_write=12.5 * multiplier,
     )
 
 
 def _openai_table() -> OpenAIPricingTable:
     return OpenAIPricingTable(
         default=_sample_openai_rates(),
-        flex=_sample_openai_rates().multiplied(input_multiplier=0.5, output_multiplier=0.5),
-        fast=_sample_openai_rates().multiplied(input_multiplier=2.0, output_multiplier=2.0),
+        flex=_sample_openai_rates(0.5),
+        fast=_sample_openai_rates(2.0),
         long_context=OpenAILongContextPricing(
             input_tokens_total_above=272_000,
             input_multiplier=2.0,
@@ -93,7 +93,7 @@ def test_openai_modifiers_compose_after_service_tier_selection() -> None:
 
 def test_openai_ultrafast_rates_are_selected() -> None:
     """Keep pricing coverage independent of the installed openai SDK types."""
-    ultrafast = _sample_openai_rates().multiplied(input_multiplier=3.0, output_multiplier=3.0)
+    ultrafast = _sample_openai_rates(3.0)
     rates = OpenAIPricingTable(default=_sample_openai_rates(), ultrafast=ultrafast).rates_for(
         service_tier="ultrafast",
         input_tokens_total=1,

@@ -150,6 +150,7 @@ from langchaint.openai.shared import (
     _OpenAIGenerationAdapterBase,
     _priced_tier,
     client_without_retries,
+    price_at_rates,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -657,7 +658,8 @@ def _billing_from_response(
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = float("nan")
     if usage_raw is None:
-        return rates.price(
+        return price_at_rates(
+            rates,
             service_tier=service_tier,
             usage_raw=None,
             input_tokens_cache_read=0,
@@ -668,7 +670,8 @@ def _billing_from_response(
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     details = usage_raw.input_tokens_details
-    return rates.price(
+    return price_at_rates(
+        rates,
         service_tier=service_tier,
         usage_raw=usage_raw,
         input_tokens_cache_read=details.cached_tokens,
@@ -1010,7 +1013,8 @@ class _OpenAIResponsesStream(AdapterStream):
             input_tokens_total=0,
             regional_processing=self._regional_processing,
         )
-        return rates.price(
+        return price_at_rates(
+            rates,
             service_tier=_DEFAULT_TIER,
             usage_raw=None,
             input_tokens_cache_read=0,

@@ -2,11 +2,8 @@
 
 from typing import Literal
 
-from langchaint.openai.shared import (
-    OpenAILongContextPricing,
-    OpenAIPricingTable,
-    OpenAIRates,
-)
+from langchaint.billing.pricing import TokenRates
+from langchaint.openai.shared import OpenAILongContextPricing, OpenAIPricingTable
 
 type OpenAIModelId = Literal[
     "gpt-5.6",
@@ -20,19 +17,19 @@ type OpenAIModelId = Literal[
 ]
 
 _GPT_5_6_SOL = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=4,
         output_tokens=20,
         input_tokens_cache_read=0.4,
         input_tokens_cache_write=5,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=2,
         output_tokens=10,
         input_tokens_cache_read=0.2,
         input_tokens_cache_write=2.5,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=8,
         output_tokens=40,
         input_tokens_cache_read=0.8,
@@ -49,19 +46,19 @@ _GPT_5_6_SOL = OpenAIPricingTable(
 )
 
 _GPT_5_6_TERRA = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=2,
         output_tokens=12,
         input_tokens_cache_read=0.2,
         input_tokens_cache_write=2.5,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=1,
         output_tokens=6,
         input_tokens_cache_read=0.1,
         input_tokens_cache_write=1.25,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=4,
         output_tokens=24,
         input_tokens_cache_read=0.4,
@@ -78,19 +75,19 @@ _GPT_5_6_TERRA = OpenAIPricingTable(
 )
 
 _GPT_5_6_LUNA = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=0.2,
         output_tokens=1.2,
         input_tokens_cache_read=0.02,
         input_tokens_cache_write=0.25,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=0.1,
         output_tokens=0.6,
         input_tokens_cache_read=0.01,
         input_tokens_cache_write=0.125,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=0.4,
         output_tokens=2.4,
         input_tokens_cache_read=0.04,
@@ -107,19 +104,19 @@ _GPT_5_6_LUNA = OpenAIPricingTable(
 )
 
 _GPT_6_1_SOL = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=2,
         output_tokens=10,
         input_tokens_cache_read=0.1,
         input_tokens_cache_write=2.5,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=1,
         output_tokens=5,
         input_tokens_cache_read=0.05,
         input_tokens_cache_write=1.25,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=4,
         output_tokens=20,
         input_tokens_cache_read=0.2,
@@ -136,19 +133,19 @@ _GPT_6_1_SOL = OpenAIPricingTable(
 )
 
 _GPT_6_SOL = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=2,
         output_tokens=10,
         input_tokens_cache_read=0.2,
         input_tokens_cache_write=2.5,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=1,
         output_tokens=5,
         input_tokens_cache_read=0.1,
         input_tokens_cache_write=1.25,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=4,
         output_tokens=20,
         input_tokens_cache_read=0.4,
@@ -165,19 +162,19 @@ _GPT_6_SOL = OpenAIPricingTable(
 )
 
 _GPT_6_LUNA = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=0.1,
         output_tokens=0.5,
         input_tokens_cache_read=0.01,
         input_tokens_cache_write=0.125,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=0.05,
         output_tokens=0.25,
         input_tokens_cache_read=0.005,
         input_tokens_cache_write=0.0625,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=0.2,
         output_tokens=1,
         input_tokens_cache_read=0.02,
@@ -194,25 +191,25 @@ _GPT_6_LUNA = OpenAIPricingTable(
 )
 
 _GPT_6_ASTRA = OpenAIPricingTable(
-    default=OpenAIRates(
+    default=TokenRates(
         input_tokens_cache_none=10,
         output_tokens=50,
         input_tokens_cache_read=1,
         input_tokens_cache_write=12.5,
     ),
-    flex=OpenAIRates(
+    flex=TokenRates(
         input_tokens_cache_none=5,
         output_tokens=25,
         input_tokens_cache_read=0.5,
         input_tokens_cache_write=6.25,
     ),
-    fast=OpenAIRates(
+    fast=TokenRates(
         input_tokens_cache_none=20,
         output_tokens=100,
         input_tokens_cache_read=2,
         input_tokens_cache_write=25,
     ),
-    ultrafast=OpenAIRates(
+    ultrafast=TokenRates(
         input_tokens_cache_none=60,
         output_tokens=300,
         input_tokens_cache_read=6,

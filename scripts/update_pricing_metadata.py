@@ -574,7 +574,7 @@ def _openai_rates(
     if all(rate is None for rate in fields):
         return []
     return [
-        f"{indent}{field_name}=OpenAIRates(",
+        f"{indent}{field_name}=TokenRates(",
         f"{indent}    input_tokens_cache_none={_million_rate(fields.input_tokens_cache_none_usd_per_token)},",
         f"{indent}    output_tokens={_million_rate(fields.output_tokens_usd_per_token)},",
         f"{indent}    input_tokens_cache_read={_million_rate(fields.input_tokens_cache_read_usd_per_token)},",
@@ -733,11 +733,8 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         "",
         "from typing import Literal",
         "",
-        "from langchaint.openai.shared import (",
-        "    OpenAILongContextPricing,",
-        "    OpenAIPricingTable,",
-        "    OpenAIRates,",
-        ")",
+        "from langchaint.billing.pricing import TokenRates",
+        "from langchaint.openai.shared import OpenAILongContextPricing, OpenAIPricingTable",
         "",
         "type OpenAIModelId = Literal[",
         *[f'    "{model}",' for model in model_ids],

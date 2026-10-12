@@ -144,6 +144,7 @@ from langchaint.openai.shared import (
     _OpenAIGenerationAdapterBase,
     _priced_tier,
     client_without_retries,
+    price_at_rates,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -631,7 +632,8 @@ def _billing_from_chat_completion(
         float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
     if usage_raw is None:
-        return rates.price(
+        return price_at_rates(
+            rates,
             service_tier=service_tier,
             usage_raw=None,
             input_tokens_cache_read=0,
@@ -647,7 +649,8 @@ def _billing_from_chat_completion(
     input_tokens_cache_write = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
-    return rates.price(
+    return price_at_rates(
+        rates,
         service_tier=service_tier,
         usage_raw=usage_raw,
         input_tokens_cache_read=input_tokens_cache_read,

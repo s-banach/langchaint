@@ -13,7 +13,7 @@ from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from pydantic import TypeAdapter
 
-from langchaint import LLM, JsonValue, SharedBackoff
+from langchaint import LLM, JsonValue, SharedBackoff, TokenRates
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK_PRICING,
@@ -44,13 +44,12 @@ from langchaint.openai import (
     OpenAIBedrock,
     OpenAIChatCompletionsAdapter,
     OpenAIPricingTable,
-    OpenAIRates,
     OpenAIResponsesAdapter,
 )
 from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 from tests.helpers import run_with_timeout
 
-_ARBITRARY_RATES = OpenAIRates(
+_ARBITRARY_RATES = TokenRates(
     input_tokens_cache_none=1.0,
     output_tokens=1.0,
     input_tokens_cache_read=1.0,

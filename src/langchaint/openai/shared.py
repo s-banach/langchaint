@@ -120,92 +120,76 @@ def _priced_tier(
     return service_tier
 
 
-@dataclass(frozen=True, kw_only=True)
-class OpenAIRates:
-    """OpenAI token rates for one service tier.
+def price_at_rates(
+    rates: TokenRates,
+    *,
+    service_tier: str,
+    usage_raw: BaseModel | None,
+    input_tokens_cache_read: int,
+    input_tokens_cache_write: int,
+    input_tokens_cache_none: int,
+    output_tokens: int,
+    output_tokens_reasoning: int,
+    provider_executed_tool_cost_in_usd: float,
+) -> ProviderBilling:
+    """Price one response's counters at `rates`.
 
-    Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
-    Pass NaN for an unknown rate.
-    A nonzero counter in that category then costs NaN, and a zero counter costs zero.
+    output_tokens_reasoning is the reasoning share of output_tokens.
+    The output rate applies to output_tokens_reasoning.
+    The returned Usage carries output_tokens_reasoning.
+
+    Token cost is the sum of four token category costs.
+    provider_executed_tool_cost_in_usd adds the provider-executed tool charge.
+
+    Raises:
+        pydantic.ValidationError: a counter is negative.
     """
-
-    input_tokens_cache_none: float
-    output_tokens: float
-    input_tokens_cache_read: float
-    input_tokens_cache_write: float
-
-    def price(
-        self,
-        *,
-        service_tier: str,
-        usage_raw: BaseModel | None,
-        input_tokens_cache_read: int,
-        input_tokens_cache_write: int,
-        input_tokens_cache_none: int,
-        output_tokens: int,
-        output_tokens_reasoning: int,
-        provider_executed_tool_cost_in_usd: float,
-    ) -> ProviderBilling:
-        """Price one response's counters at these rates.
-
-        output_tokens_reasoning is the reasoning share of output_tokens.
-        The output rate applies to output_tokens_reasoning.
-        The returned Usage carries output_tokens_reasoning.
-
-        Token cost is the sum of four token category costs.
-        provider_executed_tool_cost_in_usd adds the provider-executed tool charge.
-
-        Raises:
-            pydantic.ValidationError: a counter is negative.
-        """
-        return ProviderBilling(
-            billing=Billing(
-                usage=Usage(
-                    input_tokens_cache_read=input_tokens_cache_read,
-                    input_tokens_cache_write=input_tokens_cache_write,
-                    input_tokens_cache_none=input_tokens_cache_none,
-                    output_tokens=output_tokens,
-                    output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_read,
-                        usd_per_million_tokens=self.input_tokens_cache_read,
-                    ),
-                    input_tokens_cache_write_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_write,
-                        usd_per_million_tokens=self.input_tokens_cache_write,
-                    ),
-                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_none,
-                        usd_per_million_tokens=self.input_tokens_cache_none,
-                    ),
-                    output_tokens_cost_in_usd=category_cost_in_usd(
-                        output_tokens,
-                        usd_per_million_tokens=self.output_tokens,
-                    ),
-                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+    return ProviderBilling(
+        billing=Billing(
+            usage=Usage(
+                input_tokens_cache_read=input_tokens_cache_read,
+                input_tokens_cache_write=input_tokens_cache_write,
+                input_tokens_cache_none=input_tokens_cache_none,
+                output_tokens=output_tokens,
+                output_tokens_reasoning=output_tokens_reasoning,
+                input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
+                    input_tokens_cache_read,
+                    usd_per_million_tokens=rates.input_tokens_cache_read,
                 ),
-                service_tier=service_tier,
-                usd_per_million_tokens=TokenRates(
-                    input_tokens_cache_read=self.input_tokens_cache_read,
-                    input_tokens_cache_write=self.input_tokens_cache_write,
-                    input_tokens_cache_none=self.input_tokens_cache_none,
-                    output_tokens=self.output_tokens,
+                input_tokens_cache_write_cost_in_usd=category_cost_in_usd(
+                    input_tokens_cache_write,
+                    usd_per_million_tokens=rates.input_tokens_cache_write,
                 ),
+                input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
+                    input_tokens_cache_none,
+                    usd_per_million_tokens=rates.input_tokens_cache_none,
+                ),
+                output_tokens_cost_in_usd=category_cost_in_usd(
+                    output_tokens,
+                    usd_per_million_tokens=rates.output_tokens,
+                ),
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),
-            usage_raw=usage_raw,
-        )
-
-    def multiplied(self, *, input_multiplier: float, output_multiplier: float) -> "OpenAIRates":
-        """Return rates multiplied by category."""
-        return OpenAIRates(
-            input_tokens_cache_none=self.input_tokens_cache_none * input_multiplier,
-            output_tokens=self.output_tokens * output_multiplier,
-            input_tokens_cache_read=self.input_tokens_cache_read * input_multiplier,
-            input_tokens_cache_write=self.input_tokens_cache_write * input_multiplier,
-        )
+            service_tier=service_tier,
+            usd_per_million_tokens=rates,
+        ),
+        usage_raw=usage_raw,
+    )
 
 
-_UNPRICED_RATES = OpenAIRates(
+def _multiplied_rates(
+    rates: TokenRates, *, input_multiplier: float, output_multiplier: float
+) -> TokenRates:
+    """Return `rates` with input categories multiplied by `input_multiplier` and output by `output_multiplier`."""
+    return TokenRates(
+        input_tokens_cache_read=rates.input_tokens_cache_read * input_multiplier,
+        input_tokens_cache_write=rates.input_tokens_cache_write * input_multiplier,
+        input_tokens_cache_none=rates.input_tokens_cache_none * input_multiplier,
+        output_tokens=rates.output_tokens * output_multiplier,
+    )
+
+
+_UNPRICED_RATES = TokenRates(
     input_tokens_cache_none=float("nan"),
     output_tokens=float("nan"),
     input_tokens_cache_read=float("nan"),
@@ -239,13 +223,17 @@ class OpenAILongContextPricing:
 
 @dataclass(frozen=True, kw_only=True)
 class OpenAIPricingTable:
-    """OpenAI rates and modifiers for one model."""
+    """OpenAI rates and modifiers for one model.
 
-    default: OpenAIRates
-    flex: OpenAIRates | None = None
-    fast: OpenAIRates | None = None
-    ultrafast: OpenAIRates | None = None
-    scale: OpenAIRates | None = None
+    A `priority` response uses the `fast` rates, and a response that reports no tier or `auto` uses the `default` rates.
+    A response at a tier whose rates are None costs NaN in every nonzero category.
+    """
+
+    default: TokenRates
+    flex: TokenRates | None = None
+    fast: TokenRates | None = None
+    ultrafast: TokenRates | None = None
+    scale: TokenRates | None = None
     long_context: OpenAILongContextPricing | None = None
     regional_processing_multiplier: float | None = None
     web_search_usd_per_invocation: float | None = None
@@ -269,14 +257,16 @@ class OpenAIPricingTable:
         Long-context multipliers, the regional multiplier, and per-invocation prices are unchanged.
         """
 
-        def scaled(rates: OpenAIRates | None) -> OpenAIRates | None:
+        def scaled(rates: TokenRates | None) -> TokenRates | None:
             if rates is None:
                 return None
-            return rates.multiplied(input_multiplier=multiplier, output_multiplier=multiplier)
+            return _multiplied_rates(
+                rates, input_multiplier=multiplier, output_multiplier=multiplier
+            )
 
         return OpenAIPricingTable(
-            default=self.default.multiplied(
-                input_multiplier=multiplier, output_multiplier=multiplier
+            default=_multiplied_rates(
+                self.default, input_multiplier=multiplier, output_multiplier=multiplier
             ),
             flex=scaled(self.flex),
             fast=scaled(self.fast),
@@ -294,7 +284,7 @@ class OpenAIPricingTable:
         service_tier: OpenAIResponsesServiceTier | None,
         input_tokens_total: int,
         regional_processing: bool,
-    ) -> OpenAIRates:
+    ) -> TokenRates:
         """Select token rates using reported response metadata."""
         priced_tier = _priced_tier(service_tier)
         if priced_tier == "default":
@@ -311,7 +301,8 @@ class OpenAIPricingTable:
             return _UNPRICED_RATES
         long_context = self.long_context
         if long_context is not None and input_tokens_total > long_context.input_tokens_total_above:
-            rates = rates.multiplied(
+            rates = _multiplied_rates(
+                rates,
                 input_multiplier=long_context.input_multiplier,
                 output_multiplier=long_context.output_multiplier,
             )
@@ -320,7 +311,7 @@ class OpenAIPricingTable:
         multiplier = self.regional_processing_multiplier
         if multiplier is None:
             return _UNPRICED_RATES
-        return rates.multiplied(input_multiplier=multiplier, output_multiplier=multiplier)
+        return _multiplied_rates(rates, input_multiplier=multiplier, output_multiplier=multiplier)
 
 
 def require_prompt_cache_options_support(

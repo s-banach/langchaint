@@ -11,7 +11,6 @@ DeepSeek charges twice those prices during its documented peak windows.
 Cache hits use the `input_tokens_cache_read` rate.
 Cache misses use the `input_tokens_cache_none` rate.
 Cache writes cost zero.
-`DeepSeek.llm(pricing=...)` takes `OpenAIRates` because DeepSeek bills the same categories as OpenAI.
 """
 
 import os
@@ -28,27 +27,27 @@ except ModuleNotFoundError as exc:
 
 from openai.types.completion_usage import CompletionUsage
 
+from langchaint.billing.pricing import TokenRates
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
 from langchaint.generation.observer import Observer
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.shared import (
     OpenAIPricingTable,
-    OpenAIRates,
     client_without_retries,
 )
 
 type DeepSeekModelId = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
 
-DEEPSEEK_PRICING: dict[DeepSeekModelId, OpenAIRates] = {
-    "deepseek-v4-flash": OpenAIRates(
+DEEPSEEK_PRICING: dict[DeepSeekModelId, TokenRates] = {
+    "deepseek-v4-flash": TokenRates(
         input_tokens_cache_none=0.14,
         output_tokens=0.28,
         input_tokens_cache_read=0.0028,
         input_tokens_cache_write=0.0,
     ),
-    "deepseek-v4-pro": OpenAIRates(
+    "deepseek-v4-pro": TokenRates(
         input_tokens_cache_none=0.435,
         output_tokens=0.87,
         input_tokens_cache_read=0.003625,
@@ -57,7 +56,7 @@ DEEPSEEK_PRICING: dict[DeepSeekModelId, OpenAIRates] = {
 }
 """Public off-peak prices that `DeepSeek.llm` uses by default."""
 
-_PRICING_BY_MODEL_ID = dict[str, OpenAIRates](DEEPSEEK_PRICING.items())
+_PRICING_BY_MODEL_ID = dict[str, TokenRates](DEEPSEEK_PRICING.items())
 """`DEEPSEEK_PRICING` with `str` keys for runtime model lookup."""
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -123,7 +122,7 @@ class DeepSeek:
         self,
         model: DeepSeekModelId,
         *,
-        pricing: OpenAIRates | None = ...,
+        pricing: TokenRates | None = ...,
     ) -> LLM: ...
 
     @overload
@@ -131,14 +130,14 @@ class DeepSeek:
         self,
         model: str,
         *,
-        pricing: OpenAIRates,
+        pricing: TokenRates,
     ) -> LLM: ...
 
     def llm(
         self,
         model: str,
         *,
-        pricing: OpenAIRates | None = None,
+        pricing: TokenRates | None = None,
     ) -> LLM:
         """Build an `LLM` for one DeepSeek Chat Completions model.
 
@@ -151,15 +150,15 @@ class DeepSeek:
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when the SDK client contradicts the DeepSeek provider.
         """
-        table = pricing if pricing is not None else _PRICING_BY_MODEL_ID.get(model)
-        if table is None:
+        rates = pricing if pricing is not None else _PRICING_BY_MODEL_ID.get(model)
+        if rates is None:
             raise ValueError(
                 f"model {model!r} is not in DEEPSEEK_PRICING; pass pricing= stating its rates"
             )
         adapter = OpenAIChatCompletionsAdapter(
             client=self.client,
             model=model,
-            pricing=OpenAIPricingTable(default=table),
+            pricing=OpenAIPricingTable(default=rates),
             provider_name="deepseek",
             supports_prompt_cache_options=False,
             input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage_deepseek,
@@ -171,6 +170,5 @@ __all__ = [
     "DEEPSEEK_PRICING",
     "DeepSeek",
     "DeepSeekModelId",
-    "OpenAIRates",
     "input_tokens_cache_read_from_usage_deepseek",
 ]

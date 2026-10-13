@@ -142,3 +142,8 @@ Run `scripts/CI.sh` until it reports zero errors.
 Keep tests offline.
 Use constructed SDK objects and stub adapters.
 Never use API keys in tests.
+
+## Releases
+
+Release by committing a higher `version` in `pyproject.toml` to main.
+Never create or push a `v*` tag, because `.github/workflows/publish.yml` publishes only when that version is above every `v*` tag, then creates the tag and the GitHub Release itself.

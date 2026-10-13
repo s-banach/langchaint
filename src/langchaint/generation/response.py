@@ -27,7 +27,7 @@ from langchaint.generation.request_history import (
 )
 
 # Declared covariant because pyrefly infers a PEP 695 parameter invariant through the record's
-# `output` field, and `AttributeMapper` takes `GenerationOutcome[object]`.
+# `output` field, and `ChatAttributeTransform` takes `GenerationOutcome[object]`.
 _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 

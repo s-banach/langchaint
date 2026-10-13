@@ -71,15 +71,15 @@ from langchaint.span_parsing import (
     parse_otel_execute_tool,
 )
 from langchaint.tracing import (
-    AttributeMapper,
+    ChatAttributeTransform,
     ContentFilter,
+    ExecuteToolAttributeTransform,
     OtelObserver,
     SpanAttributes,
     _input_content_attributes,
     _output_content_attributes,
     _record_every_part,
     _tool_call_arguments,
-    gen_ai_attributes,
 )
 from scripts import refresh_semconv_genai
 from tests.fake_adapter import (
@@ -106,11 +106,12 @@ from tests.helpers import (
 
 _APPLICATION_KEYS = frozenset({
     "custom.agent",
-    "custom.mapped_output",
+    "custom.app_data",
     "custom.model",
+    "custom.output",
     "shared.key",
 })
-"""The keys this module's mappers and `extra_attributes` set as an application would."""
+"""The keys this module's transforms and `extra_attributes` set as an application would."""
 
 
 def _in_memory_tracer_provider() -> tuple[TracerProvider, InMemorySpanExporter]:
@@ -125,7 +126,7 @@ def _traced(
     adapter: FakeAdapter,
     *,
     capture_message_content: bool = False,
-    attribute_mapper: AttributeMapper = gen_ai_attributes,
+    chat_attribute_transform: ChatAttributeTransform | None = None,
     extra_attributes: SpanAttributes | None = None,
     max_concurrent_requests: int = 8,
 ) -> tuple[LLM, InMemorySpanExporter]:
@@ -139,7 +140,7 @@ def _traced(
         shared_backoff=fast_shared_backoff(max_concurrent_requests=max_concurrent_requests),
         observer=OtelObserver(
             capture_message_content=capture_message_content,
-            attribute_mapper=attribute_mapper,
+            chat_attribute_transform=chat_attribute_transform,
             extra_attributes=extra_attributes,
             tracer_provider=tracer_provider,
         ),
@@ -359,7 +360,7 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attri
 
     A 200 that ended the input contributes its real tokens, cost, finish reason, and assistant message.
     An input that reached no 200 records zero usage and no finish reason, response model, or output.
-    The input attributes set at span start stay on the span.
+    The failed span records the input content attributes built when the span started.
     """
 
     async def scenario() -> None:
@@ -506,23 +507,26 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
     run_with_timeout(scenario())
 
 
-def test_generate_many_maps_and_captures_each_item_from_its_own_outcome() -> None:
-    """Each item's span carries that item's mapped outcome and generation_input, never the batch's."""
+def test_generate_many_transforms_and_captures_each_item_from_its_own_outcome() -> None:
+    """Each item's span carries that item's transformed outcome and generation_input, never the batch's."""
 
     async def scenario() -> None:
-        """Run a serialized two-item batch under a recording mapper and capture."""
-        mapped_outputs: list[object] = []
+        """Run a serialized two-item batch under a recording transform and capture."""
+        transformed_outputs: list[object] = []
 
-        def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
-            """Record the mapped outcome and emit it as an attribute."""
-            output = outcome.output if outcome.kind == "plain" else None
-            mapped_outputs.append(output)
-            return {"custom.mapped_output": str(output)}
+        def _transform(
+            outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+            attributes: SpanAttributes,
+        ) -> SpanAttributes:
+            """Record the outcome's output and add it as an attribute."""
+            output = outcome.output if outcome is not None and outcome.kind == "plain" else None
+            transformed_outputs.append(output)
+            return {**attributes, "custom.output": str(output)}
 
         llm, exporter = _traced(
             FakeAdapter(echo=True),
             capture_message_content=True,
-            attribute_mapper=_mapper,
+            chat_attribute_transform=_transform,
             max_concurrent_requests=1,
         )
         results = await llm.bind().generate_many(["a", "b"])
@@ -530,11 +534,11 @@ def test_generate_many_maps_and_captures_each_item_from_its_own_outcome() -> Non
             "a",
             "b",
         ]
-        assert mapped_outputs == ["a", "b"]
+        assert transformed_outputs == ["a", "b"]
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
         for span, content in zip(spans, ["a", "b"], strict=True):
-            assert _attribute(span, "custom.mapped_output") == content
+            assert _attribute(span, "custom.output") == content
             assert _json_attribute(span, "gen_ai.input.messages") == [
                 {"role": "user", "parts": [{"type": "text", "content": content}]}
             ]
@@ -712,7 +716,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 
 
 class _Answer(BaseModel):
-    """The response_format of the round-trip test and the mapper covariance check."""
+    """The response_format of the round-trip test and the transform covariance check."""
 
     value: int
 
@@ -814,23 +818,26 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
     run_with_timeout(scenario())
 
 
-def test_mapper_not_invoked_on_a_non_recording_span() -> None:
-    """A custom attribute_mapper never fires when the tracer's spans are non-recording."""
+def test_transform_not_invoked_on_a_non_recording_span() -> None:
+    """A chat_attribute_transform never runs when the tracer's spans are non-recording."""
 
     async def scenario() -> None:
-        """Generate under a no-op tracer and assert the mapper never ran."""
+        """Generate under a no-op tracer and assert the transform never ran."""
         calls: list[int] = []
 
-        def _mapper(_outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
+        def _transform(
+            _outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+            attributes: SpanAttributes,
+        ) -> SpanAttributes:
             """Count each invocation."""
             calls.append(1)
-            return {}
+            return attributes
 
         tracer_provider = trace.NoOpTracerProvider()
         llm = LLM(
             FakeAdapter(),
             observer=OtelObserver(
-                attribute_mapper=_mapper,
+                chat_attribute_transform=_transform,
                 tracer_provider=tracer_provider,
                 capture_message_content=False,
             ),
@@ -842,64 +849,110 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
     run_with_timeout(scenario())
 
 
-def _raising_mapper(_outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
-    """Raise to simulate a buggy user mapper.
+def _raising_transform(
+    _outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+    _attributes: SpanAttributes,
+) -> SpanAttributes:
+    """Raise to simulate a buggy application transform.
 
     Raises:
         RuntimeError: always.
     """
-    raise RuntimeError("mapper bug")
+    raise RuntimeError("transform bug")
+
+
+_START_ATTRIBUTES: Mapping[str, object] = {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.output.type": "text",
+    "gen_ai.provider.name": "fake",
+    "gen_ai.request.model": "fake-model",
+}
+"""The start attributes of a chat span for a plain `FakeAdapter` input."""
 
 
 @pytest.mark.parametrize("path", ["generate", "stream"])
-def test_raising_mapper_is_caught_and_the_generation_survives(
+def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation_survives(
     path: _GenerationPath, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A raising mapper is logged, the input still returns its Generation, and the span still ends."""
+    """A raising transform is logged, the input still returns its Generation, and the span keeps its start attributes.
+
+    Capture is on, so a span whose attributes equal its start attributes shows that no content reaches it.
+    """
 
     async def scenario() -> None:
-        """Run the input under a mapper that raises and confirm the generation and span survive."""
-        llm, exporter = _traced(FakeAdapter(), attribute_mapper=_raising_mapper)
+        """Run the input under a transform that raises and read the span and the log."""
+        llm, exporter = _traced(
+            FakeAdapter(),
+            capture_message_content=True,
+            chat_attribute_transform=_raising_transform,
+        )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             response = await _generate_through(path, llm.bind())
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
-        assert any("mapper" in record.message for record in caplog.records)
+        stream_attribute: Mapping[str, object] = (
+            {"gen_ai.request.stream": True} if path == "stream" else {}
+        )
+        assert dict(span.attributes or {}) == {**_START_ATTRIBUTES, **stream_attribute}
+        assert "the attribute transform raised" in caplog.text
+
+    run_with_timeout(scenario())
+
+
+def test_a_raising_transform_keeps_error_type_beside_the_error_status() -> None:
+    """A failed input's span keeps error.type when the transform raises, because its error status requires it."""
+
+    async def scenario() -> None:
+        """Refuse the input under a transform that raises and read the span."""
+        llm, exporter = _traced(
+            FakeAdapter(stream=FakeStream(outcome=REFUSAL)),
+            chat_attribute_transform=_raising_transform,
+        )
+        with pytest.raises(GenerationError):
+            await llm.bind().generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.ERROR
+        assert dict(span.attributes or {}) == {**_START_ATTRIBUTES, "error.type": "refusal_error"}
 
     run_with_timeout(scenario())
 
 
 def _covariance_pin(
-    mapper: AttributeMapper, generation: PlainGeneration[_Answer]
+    transform: ChatAttributeTransform, generation: PlainGeneration[_Answer]
 ) -> SpanAttributes:
-    """Pin that a PlainGeneration[_Answer] satisfies the mapper's GenerationOutcome[object] parameter.
+    """Pin that a PlainGeneration[_Answer] satisfies the transform's GenerationOutcome[object] parameter.
 
     pyrefly checks the OutputT covariance at the call below.
     """
-    return mapper(generation)
+    return transform(generation, {})
 
 
-def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
-    """A custom mapper replaces the default outcome attributes on generate, stream, and batch item spans.
+def test_a_transform_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
+    """A transform edits the attributes of generate, stream, and batch item spans.
 
     A replacement binding keeps the observer.
-    A mapper key of the same name as an extra wins when the outcome attributes are set.
+    A transform that returns only its own keys records them beside the start attributes.
+    A transform key of the same name as an extra replaces the extra when the span ends.
     The observer-owned gen_ai.operation.name wins at span start.
     """
 
     async def scenario() -> None:
         """Generate, stream, and batch on a replacement binding, then read every span."""
-        mapped_models: list[str] = []
+        transformed_models: list[str] = []
 
-        def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
-            """Record the outcome and emit one attribute from it and one colliding with an extra."""
-            mapped_models.append(outcome.request_history.model)
-            return {"custom.model": outcome.request_history.model, "shared.key": "mapped"}
+        def _transform(
+            outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+            _attributes: SpanAttributes,
+        ) -> SpanAttributes:
+            """Record the outcome and return one attribute from it and one colliding with an extra."""
+            assert outcome is not None
+            transformed_models.append(outcome.request_history.model)
+            return {"custom.model": outcome.request_history.model, "shared.key": "transformed"}
 
         llm, exporter = _traced(
             FakeAdapter(echo=True),
-            attribute_mapper=_mapper,
+            chat_attribute_transform=_transform,
             extra_attributes={
                 "custom.agent": "agent_a",
                 "shared.key": "extra",
@@ -913,22 +966,100 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
         spans = exporter.get_finished_spans()
         # One generate span, one stream span, and one span per batch item.
         assert len(spans) == 4
-        assert mapped_models == ["fake-model"] * 4
-        # The observer sets the request attributes at span start, outside the mapper's control.
+        assert transformed_models == ["fake-model"] * 4
         assert spans[0].attributes == {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.output.type": "text",
-            "gen_ai.provider.name": "fake",
-            "gen_ai.request.model": "fake-model",
+            **_START_ATTRIBUTES,
             "custom.agent": "agent_a",
             "custom.model": "fake-model",
-            "shared.key": "mapped",
+            "shared.key": "transformed",
         }
         for span in spans:
             assert _attribute(span, "custom.agent") == "agent_a"
             assert _attribute(span, "custom.model") == "fake-model"
-            assert _attribute(span, "shared.key") == "mapped"
+            assert _attribute(span, "shared.key") == "transformed"
             assert _attribute(span, "gen_ai.operation.name") == "chat"
+
+    run_with_timeout(scenario())
+
+
+def test_a_chat_transform_receives_every_attribute_and_edits_what_the_span_records() -> None:
+    """The transform receives the start attributes beside every attribute group.
+
+    A dropped content key is absent from the span.
+    A start attribute left out of the result stays on the span, and a returned start attribute replaces it.
+    """
+
+    async def scenario() -> None:
+        """Generate under capture and a transform that drops and replaces keys, then read the span."""
+        received: list[SpanAttributes] = []
+
+        def _transform(
+            _outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+            attributes: SpanAttributes,
+        ) -> SpanAttributes:
+            """Drop the input messages and gen_ai.output.type, and replace the request model."""
+            received.append(attributes)
+            dropped = {"gen_ai.input.messages", "gen_ai.output.type"}
+            kept = {key: value for key, value in attributes.items() if key not in dropped}
+            return {**kept, "gen_ai.request.model": "replaced-model"}
+
+        llm, exporter = _traced(
+            FakeAdapter(),
+            capture_message_content=True,
+            chat_attribute_transform=_transform,
+            extra_attributes={"custom.agent": "agent_a"},
+        )
+        await llm.bind().generate_one("hi")
+        (attributes,) = received
+        assert {
+            "custom.agent",
+            "gen_ai.provider.name",
+            "gen_ai.request.model",
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "gen_ai.usage.input_tokens",
+        } <= attributes.keys()
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert "gen_ai.input.messages" not in span.attributes
+        assert "gen_ai.output.messages" in span.attributes
+        assert span.attributes["gen_ai.output.type"] == "text"
+        assert span.attributes["gen_ai.request.model"] == "replaced-model"
+
+    run_with_timeout(scenario())
+
+
+def test_a_cancelled_input_passes_none_to_the_transform_and_records_its_result() -> None:
+    """An input cancelled before its outcome passes None, and the content the transform drops is absent."""
+
+    async def scenario() -> None:
+        """Cancel an input whose open hangs, then read the transform's calls and the span."""
+        calls: list[tuple[object, bool]] = []
+
+        def _transform(
+            outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
+            attributes: SpanAttributes,
+        ) -> SpanAttributes:
+            """Record the outcome and whether the input messages arrived, then drop them."""
+            calls.append((outcome, "gen_ai.input.messages" in attributes))
+            return {
+                key: value for key, value in attributes.items() if key != "gen_ai.input.messages"
+            }
+
+        adapter = FakeAdapter(hang_from_open=1)
+        llm, exporter = _traced(
+            adapter, capture_message_content=True, chat_attribute_transform=_transform
+        )
+        with pytest.raises(TimeoutError):
+            await time_out_when(
+                llm.bind().generate_one("hi"),
+                lambda: adapter.bound_adapters[0].open_count == 1,
+            )
+        assert calls == [(None, True)]
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.UNSET
+        assert span.attributes is not None
+        assert "gen_ai.input.messages" not in span.attributes
 
     run_with_timeout(scenario())
 
@@ -1043,11 +1174,12 @@ def test_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
 ) -> None:
     """Each dispatch emits one execute_tool span classified by its outcome.
 
-    Capture is off, so the exact attribute set shows that no arguments or result are recorded.
+    Capture is off, and the span's attributes equal `expected_attributes`, so it records no arguments or result.
     """
     expected_attributes: dict[str, object] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_call.name,
+        "gen_ai.tool.type": "function",
         "gen_ai.tool.call.id": "call1",
     }
     if expected_error_type is not None:
@@ -1112,7 +1244,11 @@ def test_parse_otel_execute_tool_reads_each_key_a_dispatch_span_records(
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_execute_tool(_exported_attributes(span))
         assert parsed.unused_attributes == {}
-        assert (parsed.tool_name, parsed.tool_call_id) == (tool_call.name, tool_call.id)
+        assert (parsed.tool_name, parsed.tool_type, parsed.tool_call_id) == (
+            tool_call.name,
+            "function",
+            tool_call.id,
+        )
         assert parsed.tool_call_arguments == json.loads(tool_call.args_json)
         assert isinstance(parsed.tool_call_result, OtelToolCallResponsePart) == records_result
 
@@ -1270,6 +1406,58 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
         assert span.attributes is not None
         assert span.attributes["gen_ai.agent.name"] == "agent_a"
         assert span.attributes[colliding_key] == expected_value
+
+    run_with_timeout(scenario())
+
+
+async def _lookup_tool_function(args: _EchoToolArgs) -> ToolReturnExplicit[Mapping[str, object]]:
+    """Return the text with application-only row data."""
+    return ToolReturnExplicit(content=f"found {args.text}", app_data={"rows": 3})
+
+
+def _drop_lookup_results(
+    outcome: DispatchOutcome | Exception | None, attributes: SpanAttributes
+) -> SpanAttributes:
+    """Drop the lookup tool's result and add its app_data, leaving every other tool's span unchanged."""
+    if attributes.get("gen_ai.tool.name") != "lookup":
+        return attributes
+    kept = {key: value for key, value in attributes.items() if key != "gen_ai.tool.call.result"}
+    if outcome is None or isinstance(outcome, Exception) or outcome.kind != "handled":
+        return kept
+    return {**kept, "custom.app_data": json.dumps(outcome.app_data)}
+
+
+def test_an_execute_tool_transform_edits_the_spans_of_the_tool_it_names() -> None:
+    """The transform reads gen_ai.tool.name, so it drops one tool's result and adds that tool's app_data."""
+
+    async def scenario() -> None:
+        """Dispatch the echo and lookup tools under capture, then read both spans."""
+        tracer_provider, exporter = _in_memory_tracer_provider()
+        lookup_tool = PydanticTool(
+            name="lookup",
+            description="Look the text up",
+            args_model=_EchoToolArgs,
+            function=_lookup_tool_function,
+        )
+        transform: ExecuteToolAttributeTransform = _drop_lookup_results
+        tool_manager = ToolManager(
+            [_echo_tool(), lookup_tool],
+            observer=OtelObserver(
+                tracer_provider=tracer_provider,
+                capture_message_content=True,
+                execute_tool_attribute_transform=transform,
+            ),
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "a"}'))
+        await tool_manager.dispatch(ToolCall(id="call2", name="lookup", args_json='{"text": "b"}'))
+        echo_span, lookup_span = exporter.get_finished_spans()
+        assert echo_span.attributes is not None
+        assert "gen_ai.tool.call.result" in echo_span.attributes
+        assert "custom.app_data" not in echo_span.attributes
+        assert lookup_span.attributes is not None
+        assert "gen_ai.tool.call.result" not in lookup_span.attributes
+        assert "gen_ai.tool.call.arguments" in lookup_span.attributes
+        assert json.loads(str(lookup_span.attributes["custom.app_data"])) == {"rows": 3}
 
     run_with_timeout(scenario())
 

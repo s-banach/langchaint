@@ -144,8 +144,8 @@ Document every public parameter and cross-provider difference.
 - A backend constructor passes its `observer` to every `LLM` it creates, and `LLM(observer=...)` and `ToolManager(observer=...)` accept one directly.
 - Use OTel SDK configuration to enable, disable, and route tracing.
 - Never make a span measure an event boundary that did not occur.
-- Limit an attribute mapper's output to attribute names and values.
-- Never pass the `GenerationInput` to an attribute mapper.
+- Limit an attribute transform's output to attribute names and values.
+- Never pass the `GenerationInput` to an attribute transform.
 - Catch and log telemetry failures without propagating them.
 - Require `capture_message_content` without a default for recording message content.
 - Use OTel convention keys where available and `langchaint.*` otherwise.

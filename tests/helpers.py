@@ -509,7 +509,7 @@ class ValidatingSpanExporter(InMemorySpanExporter):
     """
 
     def __init__(self, *, application_keys: frozenset[str] = frozenset()) -> None:
-        """Accept `application_keys` on every span, as the keys a test's mapper or `extra_attributes` sets."""
+        """Accept `application_keys` on every span, as the keys a test's transform or `extra_attributes` sets."""
         super().__init__()
         self._application_keys = application_keys
 

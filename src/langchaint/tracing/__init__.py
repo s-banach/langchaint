@@ -24,11 +24,16 @@ A stream span is never current, because the application's code runs between stre
 `capture_message_content=True` records every content part unchanged, including image and audio bytes.
 `content_filter` decides per part what each content attribute records.
 `gen_ai.tool.definitions` is not filtered because a tool schema is not a message part.
-A filter that raises or returns a part of another kind is logged, and every attribute in the same build is omitted.
+Each span starts with its start attributes: `extra_attributes`, then the request or dispatch identity attributes.
+Request and dispatch identity attributes replace matching `extra_attributes` keys.
+langchaint builds the span's other attributes as attribute groups.
+A chat span's attribute groups are, in order, input content, outcome attributes, and output content.
+An execute_tool span's attribute groups are `gen_ai.tool.call.arguments` and then `gen_ai.tool.call.result`.
+`error.type` follows the attribute groups.
+A key of a later attribute group replaces a matching earlier key.
+A filter that raises or returns a part of another kind is logged, and its attribute group is omitted.
+`chat_attribute_transform` and `execute_tool_attribute_transform` edit the attributes when the span ends.
 Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
-`extra_attributes` sets constant attributes when each span starts.
-Request and outcome attributes replace matching `extra_attributes` keys.
-Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
 They report provider, request model, response model, finish reasons, token usage, request count, and cost.
@@ -39,16 +44,17 @@ Stream spans also report `gen_ai.request.stream=True`.
 A stream span reports `gen_ai.response.time_to_first_chunk` once an item arrives, including for a stream left early.
 A stream span whose block exits before the stream stores a `GenerationOutcome` reports its usage and cost.
 Its status stays unset, because handling the input did not fail.
-Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
+Tool spans use `gen_ai.operation.name="execute_tool"` and `gen_ai.tool.type="function"`.
+They report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
 
 `langchaint.*` names the request count and cost because the convention has no matching keys.
 Each failed request adds `langchaint.request_failed` with `error_text` and `elapsed_seconds`.
 
 Each span starts and ends exactly once, including for failed, cancelled, and abandoned streams.
-A mapper may set only attribute names and values.
-A mapper cannot change the span name, kind, or status.
-Telemetry failures, including mapper and content filter failures, are logged and never propagate.
+A transform may set only attribute names and values.
+A transform cannot change the span name, kind, status, or events.
+Telemetry failures, including transform and content filter failures, are logged and never propagate.
 
 Readable reasoning uses `ReasoningPart` in content payloads.
 Content payloads follow the convention's JSON schemas.
@@ -101,17 +107,39 @@ type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
 type SpanAttributes = Mapping[str, SpanAttributeValue]
 """A span's attributes, keyed by name."""
 
-type AttributeMapper = Callable[
-    [GenerationOutcome[object] | AbandonedStreamRecord], SpanAttributes
+type ChatAttributeTransform = Callable[
+    [GenerationOutcome[object] | AbandonedStreamRecord | None, SpanAttributes], SpanAttributes
 ]
-"""Maps one `GenerationOutcome`, or a stream's `abandoned` record, to its span attributes.
+"""Edits a chat span's attributes once, when the span ends.
 
-The mapper reads the fields shared by each `GenerationOutcome` variant and `AbandonedStreamRecord`.
-No mapper receives the input messages, so `gen_ai_attributes` cannot put a prompt on a span.
-A custom mapper can reach `raw` on a `Generation`, which holds the final SDK response by reference.
-It can reach `request_provider_data` on a `Generation` or `GenerationError`.
-`AbandonedStreamRecord` has no `raw`, because no response completed.
-`capture_message_content` controls prompt capture because `OtelObserver` receives the messages when an input starts.
+The first argument is `None` for an input cancelled before its outcome.
+The second argument holds every attribute langchaint records on the span.
+It includes the start attributes that `start_span` received.
+The span records the returned attributes.
+A returned key replaces the attribute of the same name.
+A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
+A transform that raises is logged, and the span keeps only its start attributes.
+A span with error status also keeps `error.type`.
+Extension keys must use the application's namespace because langchaint.* is reserved.
+"""
+
+type ExecuteToolAttributeTransform = Callable[
+    [DispatchOutcome | Exception | None, SpanAttributes], SpanAttributes
+]
+"""Edits an execute_tool span's attributes once, when the span ends.
+
+The first argument is `None` for a dispatch cancelled before its outcome.
+The second argument holds every attribute langchaint records on the span.
+It includes the start attributes that `start_span` received.
+`gen_ai.tool.name` is one of those start attributes, so a transform can edit one tool's spans.
+The span records the returned attributes.
+A returned key replaces the attribute of the same name.
+A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
+A transform that raises is logged, and the span keeps only its start attributes.
+A span with error status also keeps `error.type`.
+When the tool function raises, the span's exception event and status description record its message.
+The transform cannot change either.
+Extension keys must use the application's namespace because langchaint.* is reserved.
 """
 
 type ContentFilter = Callable[
@@ -134,8 +162,13 @@ Message-level fields such as `role`, `tool_call_id`, `is_error`, and `finish_rea
 def _record_every_part(
     _attribute_name: str, part: ContentPart | AssistantPart
 ) -> ContentPart | AssistantPart:
-    """Return `part` unchanged, as the filter that `content_filter=None` selects."""
+    """Return `part` unchanged."""
     return part
+
+
+def _keep_every_attribute(_outcome: object, attributes: SpanAttributes) -> SpanAttributes:
+    """Return `attributes` unchanged."""
+    return attributes
 
 
 @overload
@@ -194,37 +227,11 @@ def _guarding_telemetry_failures(what: str) -> Generator[None]:
         _logger.warning("%s raised; this span's telemetry is incomplete", what, exc_info=True)
 
 
-def _set_ok_status(span: Span) -> None:
-    """Mark one span OK, without letting an OTel exception reach the caller."""
-    with _guarding_telemetry_failures("setting the span status"):
-        span.set_status(Status(StatusCode.OK))
-
-
-def _set_span_attributes(span: Span, attributes: SpanAttributes) -> None:
-    """Set a mapping of attributes, without letting an OTel exception reach the caller.
-
-    A non-recording span ignores them, as the OTel API specifies.
-    """
-    with _guarding_telemetry_failures("setting the span attributes"):
-        span.set_attributes(attributes)
-
-
-def _set_built_attributes(span: Span, what: str, build: Callable[[], SpanAttributes]) -> None:
-    """Set the attributes `build` returns on a recording span, logging an Exception from either step.
-
-    `build` runs only for a recording span, so an application without a TracerProvider pays nothing for it.
-    `what` names the step in the log message.
-    Existing span attributes remain when `build` raises.
-    """
-    with _guarding_telemetry_failures(what):
-        if span.is_recording():
-            span.set_attributes(build())
-
-
 @dataclass(frozen=True, kw_only=True)
 class _SpanConfig:
     tracer: Tracer
-    attribute_mapper: AttributeMapper
+    chat_attribute_transform: ChatAttributeTransform
+    execute_tool_attribute_transform: ExecuteToolAttributeTransform
     extra_attributes: SpanAttributes
     capture_message_content: bool
     content_filter: ContentFilter
@@ -261,17 +268,14 @@ def _finish_reason(stop_reason: StopReason) -> str:
     return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
 
 
-def gen_ai_attributes[OutputT](
-    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
-) -> SpanAttributes:
+def _outcome_attributes(
+    outcome: GenerationOutcome[object] | AbandonedStreamRecord,
+) -> dict[str, SpanAttributeValue]:
     """Map a `GenerationOutcome` to GenAI-convention span attributes plus langchaint scalars.
 
     `outcome` supplies the response identity, usage, stop reason, and request records.
-    This is the default attribute_mapper.
-    A custom AttributeMapper can extend the returned dict.
-    Extension keys must use the application's namespace because langchaint.* is reserved.
-    `extra_attributes` sets a constant on every span.
-    Each call builds and returns a fresh dict, so extending it mutates nothing shared.
+    gen_ai.provider.name and gen_ai.request.model are omitted, because they are request attributes.
+    Both come from the adapter's `provider_name` and `model` in either place.
     This function reads only the fields shared by every `GenerationOutcome` variant and `AbandonedStreamRecord`.
     The langchaint.* prefix is used only when the GenAI convention has no corresponding key.
     This applies to langchaint.request_count and langchaint.cost_in_usd.
@@ -294,8 +298,6 @@ def gen_ai_attributes[OutputT](
         final_record if final_record is not None and final_record.kind == "settled" else None
     )
     attributes: dict[str, SpanAttributeValue] = {
-        "gen_ai.provider.name": request_history.provider_name,
-        "gen_ai.request.model": request_history.model,
         "gen_ai.usage.input_tokens": usage.input_tokens_total,
         "gen_ai.usage.output_tokens": usage.output_tokens,
         "gen_ai.usage.reasoning.output_tokens": usage.output_tokens_reasoning,
@@ -532,31 +534,8 @@ def _output_content_attributes(
     }
 
 
-def _apply_output_content[OutputT](
-    span: Span,
-    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
-    span_config: _SpanConfig,
-) -> None:
-    """Set gen_ai.output.messages from the outcome's assistant message, when capture is on and the span is recording.
-
-    GenerationError carries the last assistant message. The key is omitted when no request produced one.
-    Per-request detail stays on the langchaint.request_failed events, which carry no content.
-    """
-    assistant_message = outcome.assistant_message
-    if assistant_message is None:
-        return
-    stop_reason = outcome.stop_reason
-    _apply_content_attributes(
-        span,
-        span_config,
-        lambda content_filter: _output_content_attributes(
-            assistant_message.parts, stop_reason, content_filter
-        ),
-    )
-
-
-def _record_request_failed_events[OutputT](
-    span: Span, outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord
+def _record_request_failed_events(
+    span: Span, outcome: GenerationOutcome[object] | AbandonedStreamRecord
 ) -> None:
     """Add one langchaint.request_failed event per failed request in the outcome's request records.
 
@@ -570,60 +549,6 @@ def _record_request_failed_events[OutputT](
                 "langchaint.request_failed",
                 {"error_text": str(record.error), "elapsed_seconds": record.elapsed_seconds},
             )
-
-
-def _apply_outcome_attributes[OutputT](
-    span: Span,
-    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
-    attribute_mapper: AttributeMapper,
-) -> None:
-    """Set the langchaint.request_failed events and the mapper's attributes on a recording span.
-
-    A non-recording span skips both, because an `AttributeMapper` may be expensive.
-    The events are added before the mapper runs.
-    Events and mapper attributes use separate guards, so a mapper that raises keeps the events.
-    An error whose str() raises can leave the events partial.
-    """
-    with _guarding_telemetry_failures("adding the langchaint.request_failed events"):
-        if span.is_recording():
-            _record_request_failed_events(span, outcome)
-    _set_built_attributes(span, "attribute_mapper", lambda: attribute_mapper(outcome))
-
-
-def _apply_content_attributes(
-    span: Span, span_config: _SpanConfig, build: Callable[[ContentFilter], SpanAttributes]
-) -> None:
-    """Set the content attributes `build` returns, when capture is on and the span is recording.
-
-    `build` receives the observer's content filter.
-    The content keys are JSON strings, and some of what they serialize is arbitrary application data:
-    An application supplies `JSONSchemaTool.args_schema` values verbatim.
-    `json.dumps` can reject one of those values.
-    A `ContentFilter` can raise or return a part of another kind.
-    A build Exception is logged and does not propagate.
-    """
-    if span_config.capture_message_content:
-        _set_built_attributes(span, "content capture", lambda: build(span_config.content_filter))
-
-
-def _set_error_status(span: Span, error_type: str, description: str) -> None:
-    """Set error.type and error status, without letting an OTel exception reach the caller.
-
-    An empty description sets a status without a description.
-    """
-    _set_span_attributes(span, {"error.type": error_type})
-    with _guarding_telemetry_failures("setting the error status"):
-        span.set_status(Status(StatusCode.ERROR, description or None))
-
-
-def _record_tool_exception(span: Span, exc: Exception) -> None:
-    """Record the tool function's exception as a span event, set error.type from its class, and set error status.
-
-    error.type uses the exception class name for low-cardinality grouping.
-    """
-    with _guarding_telemetry_failures("recording the exception"):
-        span.record_exception(exc)
-    _set_error_status(span, type(exc).__name__, str(exc))
 
 
 def _tool_call_arguments_attribute(
@@ -640,7 +565,7 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
     """Classify a dispatch outcome for error.type, or None where the call succeeded.
 
     error.type values "invalid_tool_args" and "unknown_tool" mean the tool function never ran.
-    A raising tool function is classified by _record_tool_exception with its exception class name instead.
+    A raising tool function is classified by `_DispatchSpan.conclude` with its exception class name instead.
     """
     match outcome.kind:
         case "handled":
@@ -649,13 +574,30 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
             return outcome.kind
 
 
-class _SpanOperation:
-    """The span of one observed operation."""
+class _SpanOperation[OutcomeT]:
+    """The span of one observed operation.
 
-    def __init__(self, span: Span, span_config: _SpanConfig) -> None:
-        """Hold the started span and the observer's configuration."""
+    The span holds only its start attributes until it ends.
+    The operation collects every other attribute and records them, edited by the transform, when the span ends.
+    """
+
+    def __init__(
+        self,
+        span: Span,
+        span_config: _SpanConfig,
+        start_attributes: SpanAttributes,
+        transform: Callable[[OutcomeT | None, SpanAttributes], SpanAttributes],
+    ) -> None:
+        """Hold the started span, the observer's configuration, and the attributes `start_span` received.
+
+        `transform` edits the attributes when the span ends.
+        """
         self._span = span
         self._span_config = span_config
+        self._transform = transform
+        self._attributes: dict[str, SpanAttributeValue] = dict(start_attributes)
+        self._outcome: OutcomeT | None = None
+        self._status: Status | None = None
 
     @contextmanager
     def current(self) -> Generator[None]:
@@ -666,56 +608,131 @@ class _SpanOperation:
         finally:
             context.detach(token)
 
+    def add_attribute_group(self, what: str, build: Callable[[], SpanAttributes]) -> None:
+        """Add the attribute group `build` returns, replacing matching keys.
+
+        `build` runs only for a recording span, so an application without a TracerProvider pays nothing for it.
+        `what` names the attribute group in the log message.
+        A `build` Exception is logged, and the attribute group is omitted.
+        """
+        with _guarding_telemetry_failures(what):
+            if self._span.is_recording():
+                self._attributes.update(build())
+
+    def add_content_attribute_group(
+        self, build: Callable[[ContentFilter], SpanAttributes]
+    ) -> None:
+        """Add the content attribute group `build` returns, when capture is on.
+
+        `build` receives the observer's content filter.
+        The content keys are JSON strings, and some of what they serialize is arbitrary application data:
+        An application supplies `JSONSchemaTool.args_schema` values verbatim.
+        `json.dumps` can reject one of those values.
+        A `ContentFilter` can raise or return a part of another kind.
+        """
+        span_config = self._span_config
+        if span_config.capture_message_content:
+            self.add_attribute_group("content capture", lambda: build(span_config.content_filter))
+
+    def _conclude_with_error(self, error_type: str, description: str) -> None:
+        """Add error.type and keep error status for the end of the span.
+
+        An empty description sets a status without a description.
+        """
+        self._attributes["error.type"] = error_type
+        self._status = Status(StatusCode.ERROR, description or None)
+
+    def _transformed_attributes(self) -> SpanAttributes:
+        """Return the transform's result, or only error.type when the transform raises.
+
+        The start attributes are on the span already, so the span keeps them either way.
+        """
+        try:
+            return self._transform(self._outcome, self._attributes)
+        except Exception:
+            _logger.warning(
+                "the attribute transform raised; "
+                "this span records only its start attributes and error.type",
+                exc_info=True,
+            )
+            error_type = self._attributes.get("error.type")
+            return {} if error_type is None else {"error.type": error_type}
+
     def end(self) -> None:
-        """End the span."""
+        """Record the transformed attributes on a recording span, set the status, and end the span."""
+        with _guarding_telemetry_failures("setting the span attributes"):
+            if self._span.is_recording():
+                self._span.set_attributes(self._transformed_attributes())
+        status = self._status
+        if status is not None:
+            with _guarding_telemetry_failures("setting the span status"):
+                self._span.set_status(status)
         self._span.end()
 
 
-class _GenerationSpan(_SpanOperation):
+class _GenerationSpan(_SpanOperation[GenerationOutcome[object] | AbandonedStreamRecord]):
     """The CLIENT chat span of one input."""
 
     def conclude(self, outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> None:
-        """Set the span's outcome attributes, output content, and status from the input's outcome.
+        """Add the outcome's events and attribute groups, and keep its status for the end of the span.
 
         A `Generation` sets OK status, and a `GenerationError` sets error status and error.type.
         An `AbandonedStreamRecord` leaves the status unset, because the application's code ended the stream.
+        With capture on, gen_ai.output.messages records the outcome's assistant message.
+        GenerationError carries the last assistant message, and the key is omitted when no request produced one.
+        Per-request detail stays on the langchaint.request_failed events, which carry no content.
+        An error whose str() raises can leave the events partial.
         """
-        _apply_outcome_attributes(self._span, outcome, self._span_config.attribute_mapper)
-        _apply_output_content(self._span, outcome, self._span_config)
+        self._outcome = outcome
+        with _guarding_telemetry_failures("adding the langchaint.request_failed events"):
+            if self._span.is_recording():
+                _record_request_failed_events(self._span, outcome)
+        self.add_attribute_group("_outcome_attributes", lambda: _outcome_attributes(outcome))
+        assistant_message = outcome.assistant_message
+        if assistant_message is not None:
+            stop_reason = outcome.stop_reason
+            self.add_content_attribute_group(
+                lambda content_filter: _output_content_attributes(
+                    assistant_message.parts, stop_reason, content_filter
+                )
+            )
         if isinstance(outcome, GenerationError):
-            _set_error_status(self._span, outcome.kind, outcome.error_text)
+            self._conclude_with_error(outcome.kind, outcome.error_text)
         elif outcome.kind != "abandoned_stream":
-            _set_ok_status(self._span)
+            self._status = Status(StatusCode.OK)
 
 
-class _DispatchSpan(_SpanOperation):
+class _DispatchSpan(_SpanOperation[DispatchOutcome | Exception]):
     """The INTERNAL execute_tool span of one tool dispatch."""
 
     def conclude(self, outcome: DispatchOutcome | Exception) -> None:
-        """Attribute the span from the dispatch outcome, or record the tool function's exception.
+        """Add the dispatch outcome's attribute groups, or record the tool function's exception.
 
         The outcome selects the span status and error.type, as `OtelObserver.dispatch_started` lists.
         With capture on, `gen_ai.tool.call.result` records the outcome's `ToolMessage`.
+        A raising tool function adds an exception event.
+        Its error.type is the exception class name, for low-cardinality grouping.
         """
+        self._outcome = outcome
         if isinstance(outcome, Exception):
-            _record_tool_exception(self._span, outcome)
+            with _guarding_telemetry_failures("recording the exception"):
+                self._span.record_exception(outcome)
+            self._conclude_with_error(type(outcome).__name__, str(outcome))
             return
-        _apply_content_attributes(
-            self._span,
-            self._span_config,
+        self.add_content_attribute_group(
             lambda content_filter: {
                 "gen_ai.tool.call.result": json.dumps(
                     _tool_call_response_part(
                         outcome.tool_message, content_filter, "gen_ai.tool.call.result"
                     )
                 )
-            },
+            }
         )
         error_type = _dispatch_error_type(outcome)
         if error_type is None:
-            _set_ok_status(self._span)
+            self._status = Status(StatusCode.OK)
         else:
-            _set_error_status(self._span, error_type, error_type)
+            self._conclude_with_error(error_type, error_type)
 
 
 class OtelObserver:
@@ -724,8 +741,8 @@ class OtelObserver:
     Pass one instance to a backend constructor, `LLM(observer=...)`, or `ToolManager(observer=...)`.
     The OTel SDK configures whether tracing records and where it sends spans.
     An application without an SDK configuration gets non-recording no-op spans.
-    This class owns each span's name, kind, and status.
-    A custom mapper changes only attributes.
+    This class owns each span's name, kind, status, and events.
+    A transform changes only attributes.
     There is no langchaint.elapsed_seconds attribute:
     The span duration covers request admission, backoff, and completion.
     """
@@ -736,7 +753,8 @@ class OtelObserver:
         *,
         capture_message_content: Literal[True],
         content_filter: ContentFilter | None = None,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
+        chat_attribute_transform: ChatAttributeTransform | None = None,
+        execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None: ...
@@ -745,7 +763,8 @@ class OtelObserver:
         self,
         *,
         capture_message_content: bool,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
+        chat_attribute_transform: ChatAttributeTransform | None = None,
+        execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None: ...
@@ -754,7 +773,8 @@ class OtelObserver:
         *,
         capture_message_content: bool,
         content_filter: ContentFilter | None = None,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
+        chat_attribute_transform: ChatAttributeTransform | None = None,
+        execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None:
@@ -771,12 +791,13 @@ class OtelObserver:
             def drop_binary(name: str, part: ContentPart | AssistantPart) -> ContentPart | AssistantPart | None:
                 return None if part.kind in ("image", "audio") else part
 
-        `attribute_mapper` sets the outcome attributes of each chat span.
-        It defaults to `gen_ai_attributes`.
+        `chat_attribute_transform` edits the attributes of each chat span when the span ends.
+        `execute_tool_attribute_transform` edits the attributes of each execute_tool span when the span ends.
+        A `None` transform records the attributes unchanged.
         `extra_attributes` applies at the start of every span.
         `extra_attributes=None` supplies no extra attributes.
         Request and dispatch identity attributes replace matching `extra_attributes` keys at span start.
-        A key the mapper also emits resolves to the mapper's value, set with the outcome attributes.
+        A matching key of a later attribute group replaces an `extra_attributes` value when the span ends.
         `tracer_provider` decides where spans go, and `tracer_provider=None` uses the global tracer provider.
         Either way, the tracer is named `langchaint.tracing` with the package version.
         That name is every span's instrumentation scope, which identifies langchaint as the span's source.
@@ -785,7 +806,16 @@ class OtelObserver:
             tracer=trace.get_tracer(
                 "langchaint.tracing", _PACKAGE_VERSION, tracer_provider=tracer_provider
             ),
-            attribute_mapper=attribute_mapper,
+            chat_attribute_transform=(
+                chat_attribute_transform
+                if chat_attribute_transform is not None
+                else _keep_every_attribute
+            ),
+            execute_tool_attribute_transform=(
+                execute_tool_attribute_transform
+                if execute_tool_attribute_transform is not None
+                else _keep_every_attribute
+            ),
             extra_attributes=extra_attributes if extra_attributes is not None else {},
             capture_message_content=capture_message_content,
             content_filter=content_filter if content_filter is not None else _record_every_part,
@@ -797,23 +827,26 @@ class OtelObserver:
         """Open the CLIENT chat span and set its start attributes.
 
         The span is named "chat {start.model}".
-        With capture on, the input content attributes are set at span start and remain on failed spans.
+        The span starts with `extra_attributes` and the request attributes, so a sampler sees them.
+        With capture on, the input content attributes are built when the span starts.
+        Later changes to `start.messages` therefore do not affect them.
+        The span records them when it ends, including when handling the input fails.
         They are built only for a recording span, so an application without a TracerProvider serializes nothing.
         """
         span_config = self._span_config
+        start_attributes = {**span_config.extra_attributes, **_request_attributes(start)}
         span = span_config.tracer.start_span(
-            f"{_CHAT_OPERATION} {start.model}", kind=SpanKind.CLIENT
+            f"{_CHAT_OPERATION} {start.model}", kind=SpanKind.CLIENT, attributes=start_attributes
         )
-        _set_span_attributes(span, span_config.extra_attributes)
-        _set_span_attributes(span, _request_attributes(start))
-        _apply_content_attributes(
-            span,
-            span_config,
+        generation_span = _GenerationSpan(
+            span, span_config, start_attributes, span_config.chat_attribute_transform
+        )
+        generation_span.add_content_attribute_group(
             lambda content_filter: _input_content_attributes(
                 start.binding, start.messages, content_filter=content_filter
-            ),
+            )
         )
-        return _GenerationSpan(span, span_config)
+        return generation_span
 
     def dispatch_started(
         self, tool_call: ToolCall
@@ -821,8 +854,10 @@ class OtelObserver:
         """Open the INTERNAL execute_tool span and set its identity attributes.
 
         The span name is "execute_tool {tool_call.name}".
-        The identity attributes gen_ai.operation.name, gen_ai.tool.name, and gen_ai.tool.call.id are set at span start.
-        With capture on, gen_ai.tool.call.arguments is set at span start.
+        The span starts with `extra_attributes` and the identity attributes, so a sampler sees them.
+        The identity attributes are gen_ai.operation.name, gen_ai.tool.name, gen_ai.tool.type, and gen_ai.tool.call.id.
+        gen_ai.tool.type is "function", the convention's type for a tool the client application executes.
+        With capture on, gen_ai.tool.call.arguments is built when the span starts, and the span records it when it ends.
         `content_filter` sees the `ToolCall` under gen_ai.tool.call.arguments.
         It sees each `ToolMessage` content part under gen_ai.tool.call.result.
         gen_ai.tool.call.arguments uses best-effort JSON deserialization.
@@ -840,30 +875,31 @@ class OtelObserver:
         invalid_tool_args and unknown_tool mean that the tool function never ran.
         """
         span_config = self._span_config
+        start_attributes = {
+            **span_config.extra_attributes,
+            "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
+            "gen_ai.tool.name": tool_call.name,
+            "gen_ai.tool.type": "function",
+            "gen_ai.tool.call.id": tool_call.id,
+        }
         span = span_config.tracer.start_span(
-            f"{_EXECUTE_TOOL_OPERATION} {tool_call.name}", kind=SpanKind.INTERNAL
+            f"{_EXECUTE_TOOL_OPERATION} {tool_call.name}",
+            kind=SpanKind.INTERNAL,
+            attributes=start_attributes,
         )
-        _set_span_attributes(span, span_config.extra_attributes)
-        _set_span_attributes(
-            span,
-            {
-                "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
-                "gen_ai.tool.name": tool_call.name,
-                "gen_ai.tool.call.id": tool_call.id,
-            },
+        dispatch_span = _DispatchSpan(
+            span, span_config, start_attributes, span_config.execute_tool_attribute_transform
         )
-        _apply_content_attributes(
-            span,
-            span_config,
-            lambda content_filter: _tool_call_arguments_attribute(tool_call, content_filter),
+        dispatch_span.add_content_attribute_group(
+            lambda content_filter: _tool_call_arguments_attribute(tool_call, content_filter)
         )
-        return _DispatchSpan(span, span_config)
+        return dispatch_span
 
 
 __all__ = [
-    "AttributeMapper",
+    "ChatAttributeTransform",
     "ContentFilter",
+    "ExecuteToolAttributeTransform",
     "OtelObserver",
     "SpanAttributes",
-    "gen_ai_attributes",
 ]

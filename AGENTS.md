@@ -32,18 +32,14 @@ Document every public parameter and cross-provider difference.
 - Compose a concrete adapter name from its provider and `Adapter`, as in `AnthropicMessagesAdapter`.
 - Name each backend class for its provider.
 - Compose a Bedrock class name with the model provider.
-- Allow one adapter to report different `provider_name` values for direct and Bedrock clients.
 - Use neutral vocabulary when providers disagree, such as `ToolCall` instead of `ToolUse`.
 - Give a keyword and the variable passed to it one name, as in `tool_manager=tool_manager`.
 - Put units and encodings in public names and in values that cross modules, such as `cost_in_usd`, `elapsed_seconds`, and the `_json` suffix.
-- A holder named for its unit, such as `usd_per_million_tokens`, covers its fields.
-- A rate class whose docstring states the unit, such as `TokenRates`, covers its fields.
+- A holder whose name or docstring states the unit, such as `usd_per_million_tokens` or `TokenRates`, covers its fields.
 - Prefix related fields so sorting and completion group them, as in `input_tokens_*`, `generate_one`, and `generate_many`.
 - Do not repeat the holder in an attribute name: write `tool.name`, not `tool.tool_name`.
 - Use the full name for a cross-object reference, such as `tool_call_id` on `ToolMessage`.
-- Give an interface the plain noun.
 - Call every prompt-cache boundary a cache breakpoint, whether a part with `cache_breakpoint=True` places it or the adapter places it automatically, as with `automatic_cache_breakpoints`.
-- `cache_breakpoint=True` means the reusable prompt prefix ends at that part.
 - Never write bare `input_tokens` because providers count it differently.
 - Use `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and the derived `input_tokens_total`.
 - Keep `content`, `output`, and `raw` distinct: model-facing message body, `Generation` payload, and unchanged provider data.
@@ -68,8 +64,6 @@ Document every public parameter and cross-provider difference.
 - Send model ids, `system_prompt`, and every message exactly as given, including a replayed assistant message.
 - When a provider rejects a message the user wrote, return the provider's error.
 - Never build a `TextPart` from empty provider text, because Anthropic rejects an empty text block on replay.
-- Applications replay an assistant message to continue after its tool calls, so dropping empty text leaves no replayed assistant message without parts.
-- An assistant message without tool calls ends a tool loop, and an application that continues after one chooses what to send.
 - Do not predict provider responses, probe endpoints, or add guards based on guessed provider rules.
 - Raise client-side only for documented provider facts and detectable defects that would otherwise produce a silently wrong result.
 - Keep SDKs as optional dependencies.
@@ -82,11 +76,9 @@ Document every public parameter and cross-provider difference.
 
 - Validate a structured response against the caller's model while preserving the response and billing.
 - Map each failed request to a neutral `RequestFailure`, which decides the retry and the rate-limit quota pause.
-- Retry transient failures in `generate_one`, `generate_many`, and `generate_many_records`, and while `stream_one` opens a stream.
-- Stop handling the input on other provider failures.
+- Stop handling the input on a provider failure that is not transient.
 - Return one outcome per `GenerationInput` without letting one non-transient failure cancel a sibling.
 - Raise detectable binding defects before sending a request.
-- Never return a parse without output as data.
 - Preserve provider error text verbatim after a prefix that names the failure.
 - Keep generated content out of `error_text` and `__str__` because tracing records both without regard to `capture_message_content`.
 - Put recoverable content in its own field.
@@ -105,14 +97,11 @@ Document every public parameter and cross-provider difference.
 
 - Add a field to `Usage` only for a provider-invariant counter or a priced category that partitions request cost.
 - Keep provider-specific details on the raw SDK usage.
-- Require `usage` on every `Generation` and `GenerationError`.
 - Derive totals from categories.
 - Let applications carry their own fees.
 - Make `usage` aggregate every available `Billing` across the input's requests.
 - Represent a nonzero category with no configured rate as NaN.
 - Never fabricate prices or model catalogs.
-- Use a provider subpackage's default rate table only when it maps the model id.
-- Require caller-supplied `pricing` when the default rate table does not map the model id.
 - Label provider-published list pricing as an estimate.
 - Pass provider values through by reference.
 - Construct a langchaint model only when its shape differs from the SDK object.
@@ -141,13 +130,9 @@ Document every public parameter and cross-provider difference.
 
 - Keep OTel tracing in a guarded-import subpackage outside top-level `__all__`.
 - Connect tracing to the core only through the SDK-free `Observer`, so application code is the same with or without tracing.
-- A backend constructor passes its `observer` to every `LLM` it creates, and `LLM(observer=...)` and `ToolManager(observer=...)` accept one directly.
 - Use OTel SDK configuration to enable, disable, and route tracing.
 - Never make a span measure an event boundary that did not occur.
-- Limit an attribute transform's output to attribute names and values.
-- Never pass the `GenerationInput` to an attribute transform.
 - Catch and log telemetry failures without propagating them.
-- Require `capture_message_content` without a default for recording message content.
 - Use OTel convention keys where available and `langchaint.*` otherwise.
 
 ## Checks

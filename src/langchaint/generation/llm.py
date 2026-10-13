@@ -863,7 +863,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     async def _request_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _RequestLedger, deadline: Deadline
     ) -> Generation[OutputT | None]:
-        """Send requests until a response is usable, a terminal failure, or `max_requests`.
+        """Retry transient failures until a request ends otherwise or `max_requests` is reached.
 
         Raises:
             GenerationError: Handling the input reaches a terminal failure.
@@ -1006,7 +1006,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     async def generate_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> Generation[Any]:
-        """Return the `Generation` for one input, retrying until a response is usable.
+        """Return the `Generation` for one input, retrying transient failures while `max_requests` allows.
 
         `timeout_seconds` bounds admission, requests, and backoff waits.
 
@@ -1143,6 +1143,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[Any]:
         """Generate an input-aligned batch.
 
+        Each input retries transient failures as `generate_one` does.
         Each `GenerationError` becomes that input's outcome and does not cancel sibling inputs.
         `SharedBackoff.max_concurrent_requests` limits request starts and pending items.
         `max_working_seconds_per_input` excludes admission and shared-pause waits.
@@ -1232,6 +1233,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[Any]:
         """Restore reusable records and generate the remaining input records.
 
+        Each input retries transient failures as `generate_one` does.
         The JSON file stores one item per current input.
         It stores input fingerprints instead of `GenerationInput` values.
         It stores normalized records without live provider SDK objects.

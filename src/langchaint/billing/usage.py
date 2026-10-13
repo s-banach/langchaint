@@ -5,10 +5,30 @@ The three `input_tokens_*` counters partition all input tokens.
 
 import math
 from collections.abc import Iterable
+from typing import Annotated
 
-from pydantic import ConfigDict, NonNegativeInt, field_serializer
+from pydantic import ConfigDict, NonNegativeInt, PlainSerializer
 
 from langchaint.common.checked_copy import CheckedCopyModel
+
+
+def _serialize_nonfinite_float(value: float) -> float | str:
+    if math.isnan(value):
+        return "NaN"
+    if value == float("inf"):
+        return "Infinity"
+    if value == float("-inf"):
+        return "-Infinity"
+    return value
+
+
+type JSONFloat = Annotated[
+    float, PlainSerializer(_serialize_nonfinite_float, return_type=float | str, when_used="json")
+]
+"""A float that JSON serialization writes as "NaN", "Infinity", or "-Infinity" when it is not finite.
+
+Validation reads those strings back as the same float.
+"""
 
 
 class Usage(CheckedCopyModel):
@@ -20,29 +40,18 @@ class Usage(CheckedCopyModel):
     Cost fields accept NaN and negative caller-supplied rates.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     input_tokens_cache_read: NonNegativeInt
     input_tokens_cache_write: NonNegativeInt
     input_tokens_cache_none: NonNegativeInt
     output_tokens: NonNegativeInt
     output_tokens_reasoning: NonNegativeInt
-    input_tokens_cache_read_cost_in_usd: float
-    input_tokens_cache_write_cost_in_usd: float
-    input_tokens_cache_none_cost_in_usd: float
-    output_tokens_cost_in_usd: float
-    provider_executed_tool_cost_in_usd: float
-
-    @field_serializer(
-        "input_tokens_cache_read_cost_in_usd",
-        "input_tokens_cache_write_cost_in_usd",
-        "input_tokens_cache_none_cost_in_usd",
-        "output_tokens_cost_in_usd",
-        "provider_executed_tool_cost_in_usd",
-        when_used="json",
-    )
-    def _serialize_cost(self, cost_in_usd: float) -> float | str:
-        return _serialize_nonfinite_float(cost_in_usd)
+    input_tokens_cache_read_cost_in_usd: JSONFloat
+    input_tokens_cache_write_cost_in_usd: JSONFloat
+    input_tokens_cache_none_cost_in_usd: JSONFloat
+    output_tokens_cost_in_usd: JSONFloat
+    provider_executed_tool_cost_in_usd: JSONFloat
 
     @property
     def input_tokens_total(self) -> int:
@@ -111,13 +120,3 @@ ZERO_USAGE: Usage = Usage(
     provider_executed_tool_cost_in_usd=0.0,
 )
 """Usage for an empty sum or a request with no reported billing."""
-
-
-def _serialize_nonfinite_float(value: float) -> float | str:
-    if math.isnan(value):
-        return "NaN"
-    if value == float("inf"):
-        return "Infinity"
-    if value == float("-inf"):
-        return "-Infinity"
-    return value

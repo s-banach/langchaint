@@ -42,14 +42,17 @@ except ModuleNotFoundError as exc:
 
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
-from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelId
+from langchaint.openai._generated_pricing import (
+    OPENAI_PRICING,
+    OPENAI_REGIONAL_PROCESSING_MULTIPLIER,
+    OpenAIModelId,
+)
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
     OpenAIResponsesAdapter,
     ReasoningSummary,
 )
 from langchaint.openai.shared import (
-    OpenAILongContextPricing,
     OpenAIPricingTable,
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
@@ -76,6 +79,11 @@ OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelId] = frozenset({
 
 _PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](OPENAI_PRICING.items())
 """`OPENAI_PRICING` with `str` keys for runtime model lookup."""
+
+_REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID = dict[str, float](
+    OPENAI_REGIONAL_PROCESSING_MULTIPLIER.items()
+)
+"""`OPENAI_REGIONAL_PROCESSING_MULTIPLIER` with `str` keys for runtime model lookup."""
 
 PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelId] = frozenset({
     "gpt-5.6-luna",
@@ -160,8 +168,10 @@ class OpenAI:
         Cataloged models receive `OPENAI_PRICING`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
-        `regional_processing=False` uses the standard `1.0` token-price multiplier.
-        Set it to `True` when the configured endpoint uses regional processing.
+        Set `regional_processing=True` when the configured endpoint uses regional processing.
+        It multiplies every token rate by the model's `OPENAI_REGIONAL_PROCESSING_MULTIPLIER`.
+        An uncataloged model has no multiplier, so every nonzero token category then costs NaN.
+        State its regional rates in `pricing` and leave `regional_processing=False`.
         `supports_prompt_cache_options` states whether the model accepts that request parameter.
         Cataloged models derive that value from `PROMPT_CACHE_OPTIONS_MODELS`.
         `reasoning_summary` requests readable reasoning summary text.
@@ -191,12 +201,15 @@ class OpenAI:
             pricing = pricing or catalog_table
             if supports_prompt_cache_options is None:
                 supports_prompt_cache_options = model in PROMPT_CACHE_OPTIONS_MODELS
+        if regional_processing:
+            pricing = pricing.scaled(
+                _REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID.get(model, float("nan"))
+            )
         adapter = OpenAIResponsesAdapter(
             client=self.client,
             model=model,
             pricing=pricing,
             provider_name="openai",
-            regional_processing=regional_processing,
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
@@ -343,7 +356,6 @@ class OpenAIBedrock:
             model=model,
             pricing=pricing,
             provider_name="aws.bedrock",
-            regional_processing=False,
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
@@ -353,12 +365,12 @@ class OpenAIBedrock:
 __all__ = [
     "OPENAI_EMBEDDING_MODELS",
     "OPENAI_PRICING",
+    "OPENAI_REGIONAL_PROCESSING_MULTIPLIER",
     "PROMPT_CACHE_OPTIONS_MODELS",
     "OpenAI",
     "OpenAIBedrock",
     "OpenAIChatCompletionsAdapter",
     "OpenAIEmbeddingModelId",
-    "OpenAILongContextPricing",
     "OpenAIModelId",
     "OpenAIPricingTable",
     "OpenAIResponsesAdapter",

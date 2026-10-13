@@ -1,6 +1,7 @@
 """Pricing metadata selection and generation tests."""
 
 import math
+from typing import Literal
 
 import pytest
 
@@ -8,12 +9,8 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicRates,
 )
-from langchaint.billing.pricing import TokenRates
-from langchaint.openai.shared import (
-    OpenAILongContextPricing,
-    OpenAIPricingTable,
-    OpenAIResponsesServiceTier,
-)
+from langchaint.billing.pricing import LongContextPricing, TokenRates
+from langchaint.openai.shared import OpenAIPricingTable
 from scripts.update_pricing_metadata import (
     _LITELLM_FILE,
     ANTHROPIC_ALIASES,
@@ -24,6 +21,7 @@ from scripts.update_pricing_metadata import (
     OPENAI_KNOWN_TIERS,
     OPENAI_LITELLM_KEYS,
     OPENAI_OUTPUT_PATH,
+    OPENAI_RENDERED_TIERS,
     SNAPSHOT_PATH,
     _anthropic_module,
     _LiteLLMEntry,
@@ -51,89 +49,32 @@ def _openai_table() -> OpenAIPricingTable:
         default=_sample_openai_rates(),
         flex=_sample_openai_rates(0.5),
         fast=_sample_openai_rates(2.0),
-        long_context=OpenAILongContextPricing(
-            input_tokens_total_above=272_000,
+        long_context=LongContextPricing(
+            prompt_tokens_above=272_000,
             input_multiplier=2.0,
             output_multiplier=1.5,
         ),
-        regional_processing_multiplier=1.1,
     )
-
-
-def test_openai_long_context_starts_above_the_threshold() -> None:
-    """The threshold remains inclusive of base rates."""
-    table = _openai_table()
-    base = table.rates_for(
-        service_tier="default",
-        input_tokens_total=272_000,
-        regional_processing=False,
-    )
-    long_context = table.rates_for(
-        service_tier="default",
-        input_tokens_total=272_001,
-        regional_processing=False,
-    )
-    assert base.input_tokens_cache_none == 10.0
-    assert long_context.input_tokens_cache_none == 20.0
-    assert long_context.input_tokens_cache_read == 2.0
-    assert long_context.input_tokens_cache_write == 25.0
-    assert long_context.output_tokens == 30.0
-
-
-def test_openai_modifiers_compose_after_service_tier_selection() -> None:
-    """Fast, long-context, and regional modifiers compose."""
-    rates = _openai_table().rates_for(
-        service_tier="priority",
-        input_tokens_total=272_001,
-        regional_processing=True,
-    )
-    assert rates.input_tokens_cache_none == 44.0
-    assert rates.output_tokens == 66.0
 
 
 def test_openai_ultrafast_rates_are_selected() -> None:
     """Keep pricing coverage independent of the installed openai SDK types."""
     ultrafast = _sample_openai_rates(3.0)
     rates = OpenAIPricingTable(default=_sample_openai_rates(), ultrafast=ultrafast).rates_for(
-        service_tier="ultrafast",
-        input_tokens_total=1,
-        regional_processing=False,
+        service_tier="ultrafast", input_tokens_total=1
     )
     assert rates is ultrafast
 
 
 @pytest.mark.parametrize("service_tier", ["scale", "ultrafast"])
 def test_openai_missing_optional_tier_rates_produce_nan(
-    service_tier: OpenAIResponsesServiceTier,
+    service_tier: Literal["scale", "ultrafast"],
 ) -> None:
     """Missing optional tier rates produce NaN."""
     rates = OpenAIPricingTable(default=_sample_openai_rates()).rates_for(
-        service_tier=service_tier,
-        input_tokens_total=1,
-        regional_processing=False,
+        service_tier=service_tier, input_tokens_total=1
     )
     assert math.isnan(rates.input_tokens_cache_none)
-
-
-def test_openai_missing_regional_rates_produce_nan() -> None:
-    """Missing regional rates produce NaN."""
-    regional = OpenAIPricingTable(default=_sample_openai_rates()).rates_for(
-        service_tier="default",
-        input_tokens_total=1,
-        regional_processing=True,
-    )
-    assert math.isnan(regional.output_tokens)
-
-
-@pytest.mark.parametrize("value", [True, 0, -1])
-def test_openai_long_context_rejects_invalid_thresholds(value: int) -> None:
-    """Long-context thresholds must be positive integers."""
-    with pytest.raises(ValueError, match="input_tokens_total_above"):
-        _ = OpenAILongContextPricing(
-            input_tokens_total_above=value,
-            input_multiplier=2.0,
-            output_multiplier=1.5,
-        )
 
 
 def _anthropic_rates() -> AnthropicRates:
@@ -146,42 +87,73 @@ def _anthropic_rates() -> AnthropicRates:
     )
 
 
+def _anthropic_rates_for(
+    table: AnthropicPricingTable,
+    *,
+    service_tier: Literal["standard", "priority", "batch"],
+    inference_geo: str | None,
+    input_tokens_total: int = 0,
+) -> TokenRates:
+    """Select rates for a response that wrote no cache, so the five-minute write rate is reported."""
+    return table.rates_for(
+        service_tier=service_tier,
+        inference_geo=inference_geo,
+        input_tokens_cache_write_5m=0,
+        input_tokens_cache_write_1h=0,
+        input_tokens_total=input_tokens_total,
+    )
+
+
 def test_anthropic_geo_and_service_tier_select_rates() -> None:
     """US pricing multiplies the selected service-tier rates."""
     table = AnthropicPricingTable(
         standard=_anthropic_rates(),
-        batch=_anthropic_rates().multiplied(0.5),
+        batch=_anthropic_rates().scaled(0.5),
         inference_geo_us_multiplier=1.1,
     )
-    rates = table.rates_for(service_tier="batch", inference_geo="us")
+    rates = _anthropic_rates_for(table, service_tier="batch", inference_geo="us")
     assert rates.input_tokens_cache_none == 5.5
     assert rates.output_tokens == 11.0
-    global_rates = table.rates_for(service_tier=None, inference_geo="global")
-    assert global_rates is table.standard
+    global_rates = _anthropic_rates_for(table, service_tier="standard", inference_geo="global")
+    assert global_rates.input_tokens_cache_none == 10.0
+
+
+def test_anthropic_long_context_applies_above_threshold_before_geo() -> None:
+    """Long-context multipliers apply above the threshold, and the US multiplier stacks on them."""
+    table = AnthropicPricingTable(
+        standard=_anthropic_rates(),
+        long_context=LongContextPricing(
+            prompt_tokens_above=100, input_multiplier=5.0, output_multiplier=2.0
+        ),
+        inference_geo_us_multiplier=2.0,
+    )
+    above = _anthropic_rates_for(
+        table, service_tier="standard", inference_geo="us", input_tokens_total=101
+    )
+    assert above == TokenRates(
+        input_tokens_cache_none=100.0,
+        output_tokens=80.0,
+        input_tokens_cache_read=10.0,
+        input_tokens_cache_write=125.0,
+    )
+
+
+def test_anthropic_cache_write_rate_is_the_written_shares_mean() -> None:
+    """One written share reports its own rate, and both shares report their token-weighted mean."""
+    rates = _anthropic_rates()
+    only_1h = rates.token_rates(input_tokens_cache_write_5m=0, input_tokens_cache_write_1h=7)
+    assert only_1h.input_tokens_cache_write == 20.0
+    both = rates.token_rates(input_tokens_cache_write_5m=10, input_tokens_cache_write_1h=30)
+    assert both.input_tokens_cache_write == (10 * 12.5 + 30 * 20.0) / 40
 
 
 def test_anthropic_missing_modifier_rates_produce_nan() -> None:
     """Missing priority and US rates produce NaN."""
     table = AnthropicPricingTable(standard=_anthropic_rates())
-    priority = table.rates_for(service_tier="priority", inference_geo="global")
+    priority = _anthropic_rates_for(table, service_tier="priority", inference_geo="global")
     assert math.isnan(priority.output_tokens)
-    regional = table.rates_for(service_tier="standard", inference_geo="us")
+    regional = _anthropic_rates_for(table, service_tier="standard", inference_geo="us")
     assert math.isnan(regional.input_tokens_cache_none)
-
-
-@pytest.mark.parametrize("value", [True, 0.0, -1.0, float("nan"), float("inf")])
-def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
-    """Both provider tables validate regional multipliers."""
-    with pytest.raises(ValueError, match="regional_processing_multiplier"):
-        _ = OpenAIPricingTable(
-            default=_sample_openai_rates(),
-            regional_processing_multiplier=value,
-        )
-    with pytest.raises(ValueError, match="inference_geo_us_multiplier"):
-        _ = AnthropicPricingTable(
-            standard=_anthropic_rates(),
-            inference_geo_us_multiplier=value,
-        )
 
 
 def test_vendored_inputs_reproduce_generated_modules() -> None:
@@ -272,7 +244,35 @@ def test_tier_long_context_rates_must_follow_the_default_multipliers() -> None:
         "input_cost_per_token_above_272k_tokens_flex": 1.5e-06,
     })
     with pytest.raises(ValueError, match="input_cost_per_token_above_272k_tokens_flex"):
-        entry.require_shared_long_context()
+        _ = entry.long_context_fields(OPENAI_RENDERED_TIERS)
+
+
+def test_long_context_multipliers_cover_cache_rates_and_rendered_tiers() -> None:
+    """Every input-side rate, including the one-hour cache write, shares one input multiplier across rendered tiers.
+
+    An unrendered tier is skipped.
+    """
+    entry = _LiteLLMEntry.model_validate({
+        "litellm_provider": "anthropic",
+        "input_cost_per_token": 1e-07,
+        "output_cost_per_token": 5e-07,
+        "cache_read_input_token_cost": 1e-08,
+        "cache_creation_input_token_cost_above_1hr": 2e-07,
+        "input_cost_per_token_batches": 5e-08,
+        "input_cost_per_token_above_100k_tokens": 5e-07,
+        "output_cost_per_token_above_100k_tokens": 2.5e-06,
+        "cache_read_input_token_cost_above_100k_tokens": 5e-08,
+        "cache_creation_input_token_cost_above_1hr_above_100k_tokens": 1e-06,
+        "input_cost_per_token_above_100k_tokens_batches": 2.5e-07,
+    })
+    assert entry.long_context_fields(frozenset({"batches"})) == (100_000, 5, 5)
+    mismatched = entry.model_copy(update={"cache_creation_input_token_cost_above_1hr": 4e-07})
+    with pytest.raises(ValueError, match="do not share"):
+        _ = mismatched.long_context_fields(frozenset())
+    unrendered = entry.model_copy(update={"input_cost_per_token_batches": 1e-07})
+    assert unrendered.long_context_fields(frozenset()) == (100_000, 5, 5)
+    with pytest.raises(ValueError, match="do not share"):
+        _ = unrendered.long_context_fields(frozenset({"batches"}))
 
 
 @pytest.mark.parametrize(
@@ -312,7 +312,7 @@ def test_web_search_price_requires_one_price_for_every_context_size(
 def test_openai_regional_multiplier_requires_one_listed_value(
     multipliers: dict[str, float],
 ) -> None:
-    """An unlisted or region-dependent multiplier cannot fill the table's single multiplier."""
+    """An unlisted or region-dependent multiplier cannot fill the model's single multiplier."""
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **multipliers})
     with pytest.raises(ValueError, match="regional processing multipliers"):
         _ = entry.regional_processing_multiplier()

@@ -124,8 +124,9 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import (
     ProviderBilling,
+    billing_at_rates,
     invocation_cost_in_usd,
-    require_finite_nonnegative_rate,
+    require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
@@ -150,7 +151,6 @@ from langchaint.openai.shared import (
     _OpenAIGenerationAdapterBase,
     _priced_tier,
     client_without_retries,
-    price_at_rates,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -616,8 +616,6 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
 def _billing_from_response(
     response: OpenAIResponse,
     pricing: OpenAIPricingTable,
-    *,
-    regional_processing: bool = False,
 ) -> ProviderBilling:
     """Price response counters at the reported `service_tier`.
 
@@ -637,11 +635,7 @@ def _billing_from_response(
     service_tier = _priced_tier(response.service_tier)
     usage_raw = response.usage
     input_tokens_total = 0 if usage_raw is None else usage_raw.input_tokens
-    rates = pricing.rates_for(
-        service_tier=response.service_tier,
-        input_tokens_total=input_tokens_total,
-        regional_processing=regional_processing,
-    )
+    rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)
     web_search_invocations = sum(
         1
         for item in response.output
@@ -658,30 +652,34 @@ def _billing_from_response(
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = float("nan")
     if usage_raw is None:
-        return price_at_rates(
-            rates,
-            service_tier=service_tier,
+        return ProviderBilling(
+            billing=billing_at_rates(
+                rates,
+                service_tier=service_tier,
+                input_tokens_cache_read=0,
+                input_tokens_cache_write=0,
+                input_tokens_cache_none=0,
+                output_tokens=0,
+                output_tokens_reasoning=0,
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+            ),
             usage_raw=None,
-            input_tokens_cache_read=0,
-            input_tokens_cache_write=0,
-            input_tokens_cache_none=0,
-            output_tokens=0,
-            output_tokens_reasoning=0,
-            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     details = usage_raw.input_tokens_details
-    return price_at_rates(
-        rates,
-        service_tier=service_tier,
-        usage_raw=usage_raw,
-        input_tokens_cache_read=details.cached_tokens,
-        input_tokens_cache_write=details.cache_write_tokens,
-        input_tokens_cache_none=(
-            usage_raw.input_tokens - details.cached_tokens - details.cache_write_tokens
+    return ProviderBilling(
+        billing=billing_at_rates(
+            rates,
+            service_tier=service_tier,
+            input_tokens_cache_read=details.cached_tokens,
+            input_tokens_cache_write=details.cache_write_tokens,
+            input_tokens_cache_none=(
+                usage_raw.input_tokens - details.cached_tokens - details.cache_write_tokens
+            ),
+            output_tokens=usage_raw.output_tokens,
+            output_tokens_reasoning=usage_raw.output_tokens_details.reasoning_tokens,
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
-        output_tokens=usage_raw.output_tokens,
-        output_tokens_reasoning=usage_raw.output_tokens_details.reasoning_tokens,
-        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+        usage_raw=usage_raw,
     )
 
 
@@ -712,7 +710,6 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         model: str,
         pricing: OpenAIPricingTable,
         provider_name: str,
-        regional_processing: bool = False,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIResponsesServiceTier | None = None,
@@ -730,9 +727,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         `OpenAI.llm` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
         It requires the parameter for uncataloged identifiers.
         `OpenAIBedrock.llm` always requires it because Bedrock ids have no catalog.
-        `pricing` supplies rates and modifiers.
-        `regional_processing=False` uses the standard `1.0` token-price multiplier.
-        `regional_processing=True` applies the regional token-price multiplier.
+        `pricing` supplies the rates the endpoint charges.
         `service_tier` requests a tier, while the reported tier selects pricing.
 
         Raises:
@@ -746,7 +741,6 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         )
         self.client: AsyncOpenAI = client_without_retries(client)
         self.pricing: OpenAIPricingTable = pricing
-        self.regional_processing: bool = regional_processing
         self.supports_prompt_cache_options: bool = supports_prompt_cache_options
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
         self.service_tier: OpenAIResponsesServiceTier | None = service_tier
@@ -767,7 +761,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
             ValueError: `extra_body` contains a key in `_ADAPTER_POPULATED_WIRE_KEYS`.
             ValueError: A provider-executed tool type is unsupported or uses another provider.
-            ValueError: A configured charged rate is not finite and nonnegative.
+            ValueError: A bound charged tool has no stated price.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
@@ -787,12 +781,12 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
                 "OpenAI Responses provider_executed_tools require provider_name='openai'"
             )
         if provider_executed_tool_types & _WEB_SEARCH_TOOL_TYPES:
-            require_finite_nonnegative_rate(
+            require_stated_rate(
                 rate_name="web_search_usd_per_invocation",
                 rate=self.pricing.web_search_usd_per_invocation,
             )
         if "file_search" in provider_executed_tool_types:
-            require_finite_nonnegative_rate(
+            require_stated_rate(
                 rate_name="file_search_usd_per_invocation",
                 rate=self.pricing.file_search_usd_per_invocation,
             )
@@ -878,12 +872,10 @@ class _OpenAIResponsesStream(AdapterStream):
         *,
         sdk_stream: AsyncResponseStream[Any],
         pricing: OpenAIPricingTable,
-        regional_processing: bool,
         charged_provider_executed_tools: bool,
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
-        self._regional_processing = regional_processing
         self._charged_provider_executed_tools = charged_provider_executed_tools
         self._terminal_response: OpenAIResponse | None = None
 
@@ -1001,28 +993,21 @@ class _OpenAIResponsesStream(AdapterStream):
         `ResponseUsage` arrives only with the terminal response.
         """
         if self._terminal_response is not None:
-            return _billing_from_response(
-                self._terminal_response,
-                self._pricing,
-                regional_processing=self._regional_processing,
-            )
+            return _billing_from_response(self._terminal_response, self._pricing)
         if not self._charged_provider_executed_tools:
             return None
-        rates = self._pricing.rates_for(
-            service_tier=_DEFAULT_TIER,
-            input_tokens_total=0,
-            regional_processing=self._regional_processing,
-        )
-        return price_at_rates(
-            rates,
-            service_tier=_DEFAULT_TIER,
+        return ProviderBilling(
+            billing=billing_at_rates(
+                self._pricing.rates_for(service_tier=_DEFAULT_TIER, input_tokens_total=0),
+                service_tier=_DEFAULT_TIER,
+                input_tokens_cache_read=0,
+                input_tokens_cache_write=0,
+                input_tokens_cache_none=0,
+                output_tokens=0,
+                output_tokens_reasoning=0,
+                provider_executed_tool_cost_in_usd=float("nan"),
+            ),
             usage_raw=None,
-            input_tokens_cache_read=0,
-            input_tokens_cache_write=0,
-            input_tokens_cache_none=0,
-            output_tokens=0,
-            output_tokens_reasoning=0,
-            provider_executed_tool_cost_in_usd=float("nan"),
         )
 
     @override
@@ -1061,11 +1046,7 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
             TypeError: raw is not an openai Response.
             pydantic.ValidationError: Cache counters exceed total input tokens.
         """
-        return _billing_from_response(
-            _as_response(raw),
-            pricing=self._adapter.pricing,
-            regional_processing=self._adapter.regional_processing,
-        )
+        return _billing_from_response(_as_response(raw), pricing=self._adapter.pricing)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
@@ -1126,7 +1107,6 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
         return _OpenAIResponsesStream(
             sdk_stream=await manager.__aenter__(),
             pricing=self._adapter.pricing,
-            regional_processing=self._adapter.regional_processing,
             charged_provider_executed_tools=precomputed.charged_provider_executed_tools,
         )
 

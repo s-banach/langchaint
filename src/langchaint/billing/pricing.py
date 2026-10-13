@@ -4,32 +4,12 @@ Provider subpackages define rate tables.
 A nonzero category with no configured rate costs NaN.
 """
 
-import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict
 
-from langchaint.billing.usage import Usage, _serialize_nonfinite_float
+from langchaint.billing.usage import JSONFloat, Usage
 from langchaint.common.checked_copy import CheckedCopyModel
-
-
-def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, model: str) -> None:
-    """Require the pricing key used for a response that reports no service tier.
-
-    Args:
-        pricing: The rate table to check.
-        key: The key used for a response with no service tier.
-        model: The model id used in the error message.
-
-    Raises:
-        ValueError: `key` is absent from `pricing`.
-    """
-    if key not in pricing:
-        raise ValueError(
-            f"pricing for model {model!r} has no {key!r} key; "
-            f"it prices every response that reports no tier of its own, so it is required"
-        )
 
 
 def category_cost_in_usd(tokens: int, *, usd_per_million_tokens: float) -> float:
@@ -66,18 +46,49 @@ def invocation_cost_in_usd(invocation_count: int, *, usd_per_invocation: float |
     return invocation_count * usd_per_invocation
 
 
-def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> None:
-    """Reject a configured charged rate that cannot produce a finite nonnegative cost.
+def require_stated_rate(*, rate_name: str, rate: float | None) -> None:
+    """Require the price of a charged tool the binding enables.
+
+    Without it, every response that uses the tool would cost NaN.
 
     Args:
         rate_name: The rate name used in the error message.
         rate: The configured rate.
 
     Raises:
-        ValueError: `rate` is unavailable, boolean, negative, infinite, or NaN.
+        ValueError: `rate` is None.
     """
-    if rate is None or isinstance(rate, bool) or not math.isfinite(rate) or rate < 0:
-        raise ValueError(f"{rate_name} must be finite and nonnegative")
+    if rate is None:
+        raise ValueError(f"{rate_name} is None; state the price of every charged tool you bind")
+
+
+@dataclass(frozen=True, kw_only=True)
+class LongContextPricing:
+    """Rate multipliers for a request whose prompt length exceeds `prompt_tokens_above` tokens.
+
+    Providers count prompt length differently:
+    - `OpenAIPricingTable` and `AnthropicPricingTable` count `input_tokens_total`, including cache reads and writes.
+    - `GeminiPricingTable` counts `prompt_token_count`, which includes cached input and excludes tool-execution input.
+
+    `input_multiplier` scales every input rate, including cache-read and cache-write rates.
+    `output_multiplier` scales the output rate.
+    """
+
+    prompt_tokens_above: int
+    input_multiplier: float
+    output_multiplier: float
+
+    def applied_to(self, rates: "TokenRates", *, prompt_tokens: int) -> "TokenRates":
+        """Return the rates a request whose prompt length is `prompt_tokens` pays.
+
+        A prompt longer than `prompt_tokens_above` tokens pays `rates` scaled by these multipliers.
+        A shorter prompt pays `rates`.
+        """
+        if prompt_tokens <= self.prompt_tokens_above:
+            return rates
+        return rates.scaled(
+            input_multiplier=self.input_multiplier, output_multiplier=self.output_multiplier
+        )
 
 
 class TokenRates(CheckedCopyModel):
@@ -89,22 +100,33 @@ class TokenRates(CheckedCopyModel):
     Pydantic validates stored rates and serializes NaN as a string, so a stored `Billing` reproduces its token costs.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    input_tokens_cache_read: float
-    input_tokens_cache_write: float
-    input_tokens_cache_none: float
-    output_tokens: float
+    input_tokens_cache_read: JSONFloat
+    input_tokens_cache_write: JSONFloat
+    input_tokens_cache_none: JSONFloat
+    output_tokens: JSONFloat
 
-    @field_serializer(
-        "input_tokens_cache_read",
-        "input_tokens_cache_write",
-        "input_tokens_cache_none",
-        "output_tokens",
-        when_used="json",
-    )
-    def _serialize_rate(self, rate: float) -> float | str:
-        return _serialize_nonfinite_float(rate)
+    def scaled(self, *, input_multiplier: float, output_multiplier: float) -> "TokenRates":
+        """Multiply every input rate by `input_multiplier` and the output rate by `output_multiplier`."""
+        return TokenRates(
+            input_tokens_cache_read=self.input_tokens_cache_read * input_multiplier,
+            input_tokens_cache_write=self.input_tokens_cache_write * input_multiplier,
+            input_tokens_cache_none=self.input_tokens_cache_none * input_multiplier,
+            output_tokens=self.output_tokens * output_multiplier,
+        )
+
+
+UNPRICED_TOKEN_RATES: TokenRates = TokenRates(
+    input_tokens_cache_read=float("nan"),
+    input_tokens_cache_write=float("nan"),
+    input_tokens_cache_none=float("nan"),
+    output_tokens=float("nan"),
+)
+"""The rates of a response whose served tier, region, or model has no configured rates.
+
+Every nonzero counter costs NaN, and every zero counter costs zero.
+"""
 
 
 class Billing(CheckedCopyModel):
@@ -138,6 +160,53 @@ class Billing(CheckedCopyModel):
             + self.usage.input_tokens_cache_none_cost_in_usd
         )
         return uncached - billed
+
+
+def billing_at_rates(
+    rates: TokenRates,
+    *,
+    service_tier: str,
+    input_tokens_cache_read: int,
+    input_tokens_cache_write: int,
+    input_tokens_cache_none: int,
+    output_tokens: int,
+    output_tokens_reasoning: int,
+    provider_executed_tool_cost_in_usd: float,
+) -> Billing:
+    """Price one response's counters at `rates`.
+
+    `service_tier` is the tier that selected `rates`, stored on the `Billing`.
+    Each token category costs its counter at the rate of the same name.
+    `output_tokens_reasoning` is the reasoning share of `output_tokens`, so the output rate prices it.
+    `provider_executed_tool_cost_in_usd` adds the provider-executed tool charge.
+
+    Raises:
+        pydantic.ValidationError: A counter is negative.
+    """
+    return Billing(
+        usage=Usage(
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write,
+            input_tokens_cache_none=input_tokens_cache_none,
+            output_tokens=output_tokens,
+            output_tokens_reasoning=output_tokens_reasoning,
+            input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
+                input_tokens_cache_read, usd_per_million_tokens=rates.input_tokens_cache_read
+            ),
+            input_tokens_cache_write_cost_in_usd=category_cost_in_usd(
+                input_tokens_cache_write, usd_per_million_tokens=rates.input_tokens_cache_write
+            ),
+            input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
+                input_tokens_cache_none, usd_per_million_tokens=rates.input_tokens_cache_none
+            ),
+            output_tokens_cost_in_usd=category_cost_in_usd(
+                output_tokens, usd_per_million_tokens=rates.output_tokens
+            ),
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+        ),
+        service_tier=service_tier,
+        usd_per_million_tokens=rates,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)

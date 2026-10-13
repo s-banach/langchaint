@@ -64,7 +64,6 @@ Request and response mappings:
 
 import base64
 import json
-import math
 from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -134,14 +133,14 @@ from langchaint.adapter import (
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
-    Billing,
+    UNPRICED_TOKEN_RATES,
+    LongContextPricing,
     ProviderBilling,
     TokenRates,
-    category_cost_in_usd,
+    billing_at_rates,
     invocation_cost_in_usd,
-    require_finite_nonnegative_rate,
+    require_stated_rate,
 )
-from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
@@ -248,81 +247,34 @@ class AnthropicRates:
     input_tokens_cache_write_5m: float
     input_tokens_cache_write_1h: float
 
-    def price(
-        self,
-        *,
-        service_tier: str,
-        usage_raw: BaseModel | None,
-        input_tokens_cache_read: int,
-        input_tokens_cache_write_5m: int,
-        input_tokens_cache_write_1h: int,
-        input_tokens_cache_none: int,
-        output_tokens: int,
-        output_tokens_reasoning: int,
-        provider_executed_tool_cost_in_usd: float,
-    ) -> ProviderBilling:
-        """Price one response's counters, the two cache-write TTLs each at their own rate.
+    def token_rates(
+        self, *, input_tokens_cache_write_5m: int, input_tokens_cache_write_1h: int
+    ) -> TokenRates:
+        """Return the rates of one response that wrote these cache-write shares.
 
-        `Usage.input_tokens_cache_write` sums both write counters.
-        `input_tokens_cache_write_cost_in_usd` sums both write costs.
-        The reported cache-write price blends the rates to reproduce that cost.
-        Zero writes use Anthropic's default five-minute rate.
-
-        Raises:
-            pydantic.ValidationError: a counter is negative.
+        `Usage.input_tokens_cache_write` sums both shares, so `TokenRates` has one cache-write rate.
+        A response that wrote one share reports that share's rate.
+        A response that wrote both reports the token-weighted mean of both rates.
+        A response that wrote neither reports the five-minute rate.
         """
-        cache_write_5m_cost_in_usd = category_cost_in_usd(
-            input_tokens_cache_write_5m,
-            usd_per_million_tokens=self.input_tokens_cache_write_5m,
-        )
-        cache_write_1h_cost_in_usd = category_cost_in_usd(
-            input_tokens_cache_write_1h,
-            usd_per_million_tokens=self.input_tokens_cache_write_1h,
-        )
-        input_tokens_cache_write = input_tokens_cache_write_5m + input_tokens_cache_write_1h
-        input_tokens_cache_write_cost_in_usd = (
-            cache_write_5m_cost_in_usd + cache_write_1h_cost_in_usd
-        )
-        return ProviderBilling(
-            billing=Billing(
-                usage=Usage(
-                    input_tokens_cache_read=input_tokens_cache_read,
-                    input_tokens_cache_write=input_tokens_cache_write,
-                    input_tokens_cache_none=input_tokens_cache_none,
-                    output_tokens=output_tokens,
-                    output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_read,
-                        usd_per_million_tokens=self.input_tokens_cache_read,
-                    ),
-                    input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
-                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_none,
-                        usd_per_million_tokens=self.input_tokens_cache_none,
-                    ),
-                    output_tokens_cost_in_usd=category_cost_in_usd(
-                        output_tokens,
-                        usd_per_million_tokens=self.output_tokens,
-                    ),
-                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
-                ),
-                service_tier=service_tier,
-                usd_per_million_tokens=TokenRates(
-                    input_tokens_cache_read=self.input_tokens_cache_read,
-                    input_tokens_cache_write=(
-                        input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
-                        if input_tokens_cache_write
-                        else self.input_tokens_cache_write_5m
-                    ),
-                    input_tokens_cache_none=self.input_tokens_cache_none,
-                    output_tokens=self.output_tokens,
-                ),
-            ),
-            usage_raw=usage_raw,
+        if not input_tokens_cache_write_1h:
+            input_tokens_cache_write = self.input_tokens_cache_write_5m
+        elif not input_tokens_cache_write_5m:
+            input_tokens_cache_write = self.input_tokens_cache_write_1h
+        else:
+            input_tokens_cache_write = (
+                input_tokens_cache_write_5m * self.input_tokens_cache_write_5m
+                + input_tokens_cache_write_1h * self.input_tokens_cache_write_1h
+            ) / (input_tokens_cache_write_5m + input_tokens_cache_write_1h)
+        return TokenRates(
+            input_tokens_cache_read=self.input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write,
+            input_tokens_cache_none=self.input_tokens_cache_none,
+            output_tokens=self.output_tokens,
         )
 
-    def multiplied(self, multiplier: float) -> "AnthropicRates":
-        """Return token rates multiplied by one value."""
+    def scaled(self, multiplier: float) -> "AnthropicRates":
+        """Return the rates multiplied by `multiplier`."""
         return AnthropicRates(
             input_tokens_cache_none=self.input_tokens_cache_none * multiplier,
             output_tokens=self.output_tokens * multiplier,
@@ -332,71 +284,67 @@ class AnthropicRates:
         )
 
 
-_UNPRICED_RATES = AnthropicRates(
-    input_tokens_cache_none=float("nan"),
-    output_tokens=float("nan"),
-    input_tokens_cache_read=float("nan"),
-    input_tokens_cache_write_5m=float("nan"),
-    input_tokens_cache_write_1h=float("nan"),
-)
-
-
 @dataclass(frozen=True, kw_only=True)
 class AnthropicPricingTable:
-    """Anthropic rates and modifiers for one model."""
+    """Anthropic rates and modifiers for one model.
+
+    A response at a tier without rates costs NaN in every nonzero token category.
+    `long_context` prices a request whose input tokens, including cache reads and writes, exceed its threshold.
+    The `inference_geo_us_multiplier` applies on top of the long-context rates.
+    Source: https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-13.
+    """
 
     standard: AnthropicRates
     priority: AnthropicRates | None = None
     batch: AnthropicRates | None = None
+    long_context: LongContextPricing | None = None
     inference_geo_us_multiplier: float | None = None
     web_search_usd_per_invocation: float | None = None
-
-    def __post_init__(self) -> None:
-        """Reject an invalid regional multiplier.
-
-        Raises:
-            ValueError: The regional multiplier is invalid.
-        """
-        multiplier = self.inference_geo_us_multiplier
-        if multiplier is None:
-            return
-        if isinstance(multiplier, bool) or not math.isfinite(multiplier) or multiplier <= 0:
-            raise ValueError("inference_geo_us_multiplier must be finite and positive")
 
     def rates_for(
         self,
         *,
-        service_tier: _AnthropicReportedServiceTier | None,
+        service_tier: _AnthropicReportedServiceTier,
         inference_geo: str | None,
-    ) -> AnthropicRates:
-        """Select token rates using reported response metadata."""
-        priced_tier = _priced_tier(service_tier)
-        if priced_tier == "standard":
-            rates = self.standard
-        elif priced_tier == "priority":
-            rates = self.priority
-        else:
-            rates = self.batch
-        if rates is None:
-            return _UNPRICED_RATES
+        input_tokens_cache_write_5m: int,
+        input_tokens_cache_write_1h: int,
+        input_tokens_total: int,
+    ) -> TokenRates:
+        """Select the token rates for the normalized reported metadata and the request's input tokens."""
+        match service_tier:
+            case "standard":
+                anthropic_rates = self.standard
+            case "priority":
+                anthropic_rates = self.priority
+            case "batch":
+                anthropic_rates = self.batch
+            case _:
+                anthropic_rates = None
+        if anthropic_rates is None:
+            return UNPRICED_TOKEN_RATES
+        rates = anthropic_rates.token_rates(
+            input_tokens_cache_write_5m=input_tokens_cache_write_5m,
+            input_tokens_cache_write_1h=input_tokens_cache_write_1h,
+        )
+        if self.long_context is not None:
+            rates = self.long_context.applied_to(rates, prompt_tokens=input_tokens_total)
         if inference_geo != "us":
             return rates
         multiplier = self.inference_geo_us_multiplier
         if multiplier is None:
-            return _UNPRICED_RATES
-        return rates.multiplied(multiplier)
+            return UNPRICED_TOKEN_RATES
+        return rates.scaled(input_multiplier=multiplier, output_multiplier=multiplier)
 
-    def multiplied(self, multiplier: float) -> "AnthropicPricingTable":
-        """Return the table with every token rate multiplied by one value.
+    def scaled(self, multiplier: float) -> "AnthropicPricingTable":
+        """Return the table with every token rate multiplied by `multiplier`.
 
         Modifiers and per-invocation prices are unchanged.
         """
-        return AnthropicPricingTable(
-            standard=self.standard.multiplied(multiplier),
-            priority=None if self.priority is None else self.priority.multiplied(multiplier),
-            batch=None if self.batch is None else self.batch.multiplied(multiplier),
-            inference_geo_us_multiplier=self.inference_geo_us_multiplier,
-            web_search_usd_per_invocation=self.web_search_usd_per_invocation,
+        return replace(
+            self,
+            standard=self.standard.scaled(multiplier),
+            priority=None if self.priority is None else self.priority.scaled(multiplier),
+            batch=None if self.batch is None else self.batch.scaled(multiplier),
         )
 
 
@@ -1005,10 +953,19 @@ def _billing_from_sdk_usage(
     if usage_raw.cache_creation is not None:
         input_tokens_cache_write_5m = usage_raw.cache_creation.ephemeral_5m_input_tokens
         input_tokens_cache_write_1h = usage_raw.cache_creation.ephemeral_1h_input_tokens
+    input_tokens_cache_read = usage_raw.cache_read_input_tokens or 0
     service_tier = _priced_tier(usage_raw.service_tier)
     rates = pricing.rates_for(
-        service_tier=usage_raw.service_tier,
+        service_tier=service_tier,
         inference_geo=usage_raw.inference_geo,
+        input_tokens_cache_write_5m=input_tokens_cache_write_5m,
+        input_tokens_cache_write_1h=input_tokens_cache_write_1h,
+        input_tokens_total=(
+            usage_raw.input_tokens
+            + input_tokens_cache_read
+            + input_tokens_cache_write_5m
+            + input_tokens_cache_write_1h
+        ),
     )
     server_tool_use = usage_raw.server_tool_use
     web_search_requests = 0 if server_tool_use is None else server_tool_use.web_search_requests
@@ -1033,18 +990,20 @@ def _billing_from_sdk_usage(
         )
         if unaccounted_counter_fired:
             provider_executed_tool_cost_in_usd = float("nan")
-    return rates.price(
-        service_tier=service_tier,
-        usage_raw=usage_raw,
-        input_tokens_cache_read=usage_raw.cache_read_input_tokens or 0,
-        input_tokens_cache_write_5m=input_tokens_cache_write_5m,
-        input_tokens_cache_write_1h=input_tokens_cache_write_1h,
-        input_tokens_cache_none=usage_raw.input_tokens,
-        output_tokens=usage_raw.output_tokens,
-        output_tokens_reasoning=(
-            output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
+    return ProviderBilling(
+        billing=billing_at_rates(
+            rates,
+            service_tier=service_tier,
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write_5m + input_tokens_cache_write_1h,
+            input_tokens_cache_none=usage_raw.input_tokens,
+            output_tokens=usage_raw.output_tokens,
+            output_tokens_reasoning=(
+                output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
+            ),
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
-        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+        usage_raw=usage_raw,
     )
 
 
@@ -1210,7 +1169,7 @@ class AnthropicMessagesAdapter(Adapter):
         if binding.provider_executed_tools and self.provider_name != "anthropic":
             raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
         if provider_executed_tools.web_search:
-            require_finite_nonnegative_rate(
+            require_stated_rate(
                 rate_name="web_search_usd_per_invocation",
                 rate=self.pricing.web_search_usd_per_invocation,
             )

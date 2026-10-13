@@ -6,6 +6,7 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicRates,
 )
+from langchaint.billing.pricing import LongContextPricing
 
 type AnthropicModelId = Literal[
     "claude-fable-5-1",
@@ -14,6 +15,7 @@ type AnthropicModelId = Literal[
     "claude-opus-5",
     "claude-sonnet-5-5",
     "claude-sonnet-5",
+    "claude-haiku-5-5",
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5",
 ]
@@ -98,14 +100,14 @@ _CLAUDE_SONNET_5_5 = AnthropicPricingTable(
     standard=AnthropicRates(
         input_tokens_cache_none=2,
         output_tokens=10,
-        input_tokens_cache_read=0.2,
+        input_tokens_cache_read=0.1,
         input_tokens_cache_write_5m=2.5,
         input_tokens_cache_write_1h=4,
     ),
     batch=AnthropicRates(
         input_tokens_cache_none=1,
         output_tokens=5,
-        input_tokens_cache_read=0.1,
+        input_tokens_cache_read=0.05,
         input_tokens_cache_write_5m=1.25,
         input_tokens_cache_write_1h=2,
     ),
@@ -127,6 +129,30 @@ _CLAUDE_SONNET_5 = AnthropicPricingTable(
         input_tokens_cache_read=0.1,
         input_tokens_cache_write_5m=1.25,
         input_tokens_cache_write_1h=2,
+    ),
+    inference_geo_us_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+)
+
+_CLAUDE_HAIKU_5_5 = AnthropicPricingTable(
+    standard=AnthropicRates(
+        input_tokens_cache_none=0.1,
+        output_tokens=0.5,
+        input_tokens_cache_read=0.01,
+        input_tokens_cache_write_5m=0.125,
+        input_tokens_cache_write_1h=0.2,
+    ),
+    batch=AnthropicRates(
+        input_tokens_cache_none=0.05,
+        output_tokens=0.25,
+        input_tokens_cache_read=0.005,
+        input_tokens_cache_write_5m=0.0625,
+        input_tokens_cache_write_1h=0.1,
+    ),
+    long_context=LongContextPricing(
+        prompt_tokens_above=100000,
+        input_multiplier=5.0,
+        output_multiplier=5.0,
     ),
     inference_geo_us_multiplier=1.1,
     web_search_usd_per_invocation=0.01,
@@ -158,6 +184,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelId, AnthropicPricingTable] = {
     "claude-opus-5": _CLAUDE_OPUS_5,
     "claude-sonnet-5-5": _CLAUDE_SONNET_5_5,
     "claude-sonnet-5": _CLAUDE_SONNET_5,
+    "claude-haiku-5-5": _CLAUDE_HAIKU_5_5,
     "claude-haiku-4-5-20251001": _CLAUDE_HAIKU_4_5_20251001,
     "claude-haiku-4-5": _CLAUDE_HAIKU_4_5_20251001,
 }
@@ -233,7 +260,7 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
         standard=AnthropicRates(
             input_tokens_cache_none=2,
             output_tokens=10,
-            input_tokens_cache_read=0.2,
+            input_tokens_cache_read=0.1,
             input_tokens_cache_write_5m=2.5,
             input_tokens_cache_write_1h=4,
         ),
@@ -247,6 +274,22 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
             input_tokens_cache_read=0.2,
             input_tokens_cache_write_5m=2.5,
             input_tokens_cache_write_1h=4,
+        ),
+        inference_geo_us_multiplier=None,
+        web_search_usd_per_invocation=0.01,
+    ),
+    "anthropic.claude-haiku-5-5": AnthropicPricingTable(
+        standard=AnthropicRates(
+            input_tokens_cache_none=0.1,
+            output_tokens=0.5,
+            input_tokens_cache_read=0.01,
+            input_tokens_cache_write_5m=0.125,
+            input_tokens_cache_write_1h=0.2,
+        ),
+        long_context=LongContextPricing(
+            prompt_tokens_above=100000,
+            input_multiplier=5.0,
+            output_multiplier=5.0,
         ),
         inference_geo_us_multiplier=None,
         web_search_usd_per_invocation=0.01,

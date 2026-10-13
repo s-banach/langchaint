@@ -6,9 +6,9 @@ Importing this subpackage requires `google-genai`.
 Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
 Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
 
-Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
+Cataloged models receive `GEMINI_PRICING`, which states `ON_DEMAND` rates.
 Uncataloged Gemini models require `pricing`.
-Responses from uncataloged traffic types cost NaN.
+Responses from traffic types without rates cost NaN.
 
 Token prices use USD per one million tokens.
 Google Search prices use USD per query.
@@ -23,7 +23,6 @@ langchaint sends no audio.
 Explicit cache-resource storage charges have no request `Usage` field.
 """
 
-from collections.abc import Mapping
 from typing import Literal, overload
 
 try:
@@ -35,6 +34,7 @@ except ModuleNotFoundError as exc:
         "langchaint's gemini backend requires google-genai; install langchaint[gemini]."
     ) from exc
 
+from langchaint.billing.pricing import LongContextPricing
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.gemini.generate_content_adapter import (
     GeminiGenerateContentAdapter,
@@ -58,7 +58,7 @@ type GeminiModelId = Literal[
 
 GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
     "gemini-3.6-flash": GeminiPricingTable(
-        rates=GeminiRates(
+        on_demand=GeminiRates(
             input_tokens_cache_none=1.50,
             input_tokens_cache_read=0.15,
             output_tokens=7.50,
@@ -67,7 +67,7 @@ GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.5-flash": GeminiPricingTable(
-        rates=GeminiRates(
+        on_demand=GeminiRates(
             input_tokens_cache_none=1.50,
             input_tokens_cache_read=0.15,
             output_tokens=9.00,
@@ -77,7 +77,7 @@ GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
     ),
     # The pricing page lists no cache-read price for gemini-3.5-flash-lite, so the rate is NaN.
     "gemini-3.5-flash-lite": GeminiPricingTable(
-        rates=GeminiRates(
+        on_demand=GeminiRates(
             input_tokens_cache_none=0.30,
             input_tokens_cache_read=float("nan"),
             output_tokens=2.50,
@@ -86,7 +86,7 @@ GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-flash-lite": GeminiPricingTable(
-        rates=GeminiRates(
+        on_demand=GeminiRates(
             input_tokens_cache_none=0.25,
             input_tokens_cache_read=0.025,
             output_tokens=1.50,
@@ -95,16 +95,13 @@ GEMINI_PRICING: dict[GeminiModelId, GeminiPricingTable] = {
         google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-pro-preview": GeminiPricingTable(
-        rates=GeminiRates(
+        on_demand=GeminiRates(
             input_tokens_cache_none=2.00,
             input_tokens_cache_read=0.20,
             output_tokens=12.00,
         ),
-        long_context_prompt_token_count_above=200_000,
-        long_context_rates=GeminiRates(
-            input_tokens_cache_none=4.00,
-            input_tokens_cache_read=0.40,
-            output_tokens=18.00,
+        long_context=LongContextPricing(
+            prompt_tokens_above=200_000, input_multiplier=2.0, output_multiplier=1.5
         ),
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
@@ -147,7 +144,7 @@ class Gemini:
         self,
         model: GeminiModelId,
         *,
-        pricing: Mapping[str, GeminiPricingTable] | None = ...,
+        pricing: GeminiPricingTable | None = ...,
         service_tier: GeminiServiceTier | None = ...,
     ) -> LLM: ...
 
@@ -156,7 +153,7 @@ class Gemini:
         self,
         model: str,
         *,
-        pricing: Mapping[str, GeminiPricingTable],
+        pricing: GeminiPricingTable,
         service_tier: GeminiServiceTier | None = ...,
     ) -> LLM: ...
 
@@ -164,30 +161,28 @@ class Gemini:
         self,
         model: str,
         *,
-        pricing: Mapping[str, GeminiPricingTable] | None = None,
+        pricing: GeminiPricingTable | None = None,
         service_tier: GeminiServiceTier | None = None,
     ) -> LLM:
         """Build an `LLM` for one Gemini Developer API model.
 
         `model` is sent verbatim.
-        Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
-        Stated `pricing` replaces catalog pricing and must contain an `"ON_DEMAND"` entry.
+        Cataloged models receive `GEMINI_PRICING`.
+        Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
         `service_tier` sets the requested Gemini service tier.
         The reported traffic type selects pricing.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
-                Also raised when `pricing` lacks `"ON_DEMAND"`.
                 Also raised when `client` reaches Vertex AI.
         """
         if pricing is None:
-            catalog_table = _PRICING_BY_MODEL_ID.get(model)
-            if catalog_table is None:
+            pricing = _PRICING_BY_MODEL_ID.get(model)
+            if pricing is None:
                 raise ValueError(
                     f"model {model!r} is not in GEMINI_PRICING; pass pricing= stating its rates"
                 )
-            pricing = {"ON_DEMAND": catalog_table}
         adapter = GeminiGenerateContentAdapter(
             client=self.client,
             model=model,

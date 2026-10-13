@@ -5,7 +5,12 @@ import math
 import pytest
 
 from langchaint import ZERO_USAGE, Usage
-from langchaint.billing.pricing import category_cost_in_usd, invocation_cost_in_usd
+from langchaint.billing.pricing import (
+    LongContextPricing,
+    TokenRates,
+    category_cost_in_usd,
+    invocation_cost_in_usd,
+)
 from tests.helpers import stated_billing
 
 
@@ -81,3 +86,23 @@ def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
         (stated_billing(ZERO_USAGE), 0.0),
     ):
         assert billing.cache_savings_in_usd == pytest.approx(expected, nan_ok=True)
+
+
+def test_long_context_rates_start_above_the_threshold() -> None:
+    """A prompt at the threshold pays the base rates, and a longer one pays input and output multipliers apart."""
+    rates = TokenRates(
+        input_tokens_cache_read=1.0,
+        input_tokens_cache_write=12.5,
+        input_tokens_cache_none=10.0,
+        output_tokens=20.0,
+    )
+    long_context = LongContextPricing(
+        prompt_tokens_above=100, input_multiplier=2.0, output_multiplier=1.5
+    )
+    assert long_context.applied_to(rates, prompt_tokens=100) is rates
+    assert long_context.applied_to(rates, prompt_tokens=101) == TokenRates(
+        input_tokens_cache_read=2.0,
+        input_tokens_cache_write=25.0,
+        input_tokens_cache_none=20.0,
+        output_tokens=30.0,
+    )

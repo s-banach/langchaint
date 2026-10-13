@@ -105,15 +105,14 @@ from langchaint.adapter import (
     retry_after_seconds_from_headers,
 )
 from langchaint.billing.pricing import (
-    Billing,
+    UNPRICED_TOKEN_RATES,
+    LongContextPricing,
     ProviderBilling,
     TokenRates,
-    category_cost_in_usd,
+    billing_at_rates,
     invocation_cost_in_usd,
-    require_finite_nonnegative_rate,
-    require_pricing_key,
+    require_stated_rate,
 )
-from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
@@ -154,8 +153,8 @@ type GeminiReportedServiceTier = Literal[
 ]
 """What a response's usage_metadata.traffic_type reports having been served at (google-genai 2.16.0).
 
-The pricing mapping uses these values as keys.
-Its key type is `str` because the SDK's open enum constructs unknown values.
+`GeminiPricingTable` has one rates field per value.
+The SDK's open enum also constructs unknown values.
 The request and response tier vocabularies share no value.
 """
 
@@ -240,7 +239,7 @@ def _normalize_provider_executed_tools(
 
 @dataclass(frozen=True, kw_only=True)
 class GeminiRates:
-    """One rate per category Gemini bills on a request.
+    """One token rate per category Gemini bills on a request at one served tier.
 
     Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
     No cache-write rate: no cache write is ever billed, so none exists to state.
@@ -252,176 +251,87 @@ class GeminiRates:
     input_tokens_cache_read: float
     output_tokens: float
 
-    def multiplied(self, multiplier: float) -> "GeminiRates":
-        """Return token rates multiplied by one value."""
-        return GeminiRates(
-            input_tokens_cache_none=self.input_tokens_cache_none * multiplier,
-            input_tokens_cache_read=self.input_tokens_cache_read * multiplier,
-            output_tokens=self.output_tokens * multiplier,
+    def token_rates(self) -> TokenRates:
+        """Return the rates with a NaN cache-write rate.
+
+        The cache-write counter of a Gemini response is always zero, so it costs zero.
+        """
+        return TokenRates(
+            input_tokens_cache_read=self.input_tokens_cache_read,
+            input_tokens_cache_write=float("nan"),
+            input_tokens_cache_none=self.input_tokens_cache_none,
+            output_tokens=self.output_tokens,
         )
-
-
-_NO_CACHE_WRITE_RATE = float("nan")
-"""The cache-write price every Gemini Billing reports.
-
-Gemini bills no cache writes, so no rate exists to state.
-The write counter is always zero, and `category_cost_in_usd(0, usd_per_million_tokens=float("nan"))` is `0.0`.
-"""
 
 
 @dataclass(frozen=True, kw_only=True)
 class GeminiPricingTable:
-    """Store one model's rates for one served tier.
+    """Gemini rates and modifiers for one model.
 
-    `price` compares its `prompt_token_count` with long_context_prompt_token_count_above.
-    Above that threshold, long_context_rates prices input, cache reads, and output.
-    Models without this pricing leave both long-context fields None.
+    Each rates field prices the responses whose `traffic_type` is the `GeminiReportedServiceTier` of the same name.
+    A response that reports no `traffic_type` uses the `on_demand` rates.
+    A response at a tier without rates costs NaN in every nonzero token category.
+    `long_context` prices a request whose `prompt_token_count` exceeds its threshold.
+    The per-query prices apply at every tier.
+    A `None` per-query price makes a nonzero query count cost NaN.
     """
 
-    rates: GeminiRates
+    on_demand: GeminiRates
+    on_demand_priority: GeminiRates | None = None
+    on_demand_flex: GeminiRates | None = None
+    provisioned_throughput: GeminiRates | None = None
+    long_context: LongContextPricing | None = None
     google_search_usd_per_query: float | None = None
     google_maps_usd_per_query: float | None = None
-    long_context_prompt_token_count_above: int | None = None
-    long_context_rates: GeminiRates | None = None
 
-    def __post_init__(self) -> None:
-        """Require the two long-context fields together.
-
-        Raises:
-            ValueError: Exactly one of long_context_prompt_token_count_above and long_context_rates is set.
-        """
-        if (self.long_context_prompt_token_count_above is None) != (
-            self.long_context_rates is None
-        ):
-            raise ValueError(
-                "long_context_prompt_token_count_above and long_context_rates must be set together"
-            )
-
-    def multiplied(self, multiplier: float) -> "GeminiPricingTable":
-        """Return the table with every token rate multiplied by one value.
-
-        Per-query tool prices and the long-context threshold are unchanged.
-        """
-        return GeminiPricingTable(
-            rates=self.rates.multiplied(multiplier),
-            google_search_usd_per_query=self.google_search_usd_per_query,
-            google_maps_usd_per_query=self.google_maps_usd_per_query,
-            long_context_prompt_token_count_above=self.long_context_prompt_token_count_above,
-            long_context_rates=(
-                None
-                if self.long_context_rates is None
-                else self.long_context_rates.multiplied(multiplier)
-            ),
-        )
-
-    def price(
-        self,
-        *,
-        service_tier: str,
-        usage_raw: BaseModel | None,
-        prompt_token_count: int,
-        input_tokens_cache_read: int,
-        input_tokens_cache_none: int,
-        output_tokens: int,
-        output_tokens_reasoning: int,
-        provider_executed_tool_cost_in_usd: float,
-    ) -> ProviderBilling:
-        """Price one response's counters, at the long-context rates when the prompt crosses the threshold.
-
-        prompt_token_count excludes the tool-execution input the categories include.
-        The zero cache-write counter costs zero despite its NaN price.
-
-        Raises:
-            pydantic.ValidationError: a counter is negative.
-        """
-        rates = self.rates
-        if (
-            self.long_context_prompt_token_count_above is not None
-            and self.long_context_rates is not None
-            and prompt_token_count > self.long_context_prompt_token_count_above
-        ):
-            rates = self.long_context_rates
-        return ProviderBilling(
-            billing=Billing(
-                usage=Usage(
-                    input_tokens_cache_read=input_tokens_cache_read,
-                    input_tokens_cache_write=0,
-                    input_tokens_cache_none=input_tokens_cache_none,
-                    output_tokens=output_tokens,
-                    output_tokens_reasoning=output_tokens_reasoning,
-                    input_tokens_cache_read_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_read,
-                        usd_per_million_tokens=rates.input_tokens_cache_read,
-                    ),
-                    input_tokens_cache_write_cost_in_usd=0.0,
-                    input_tokens_cache_none_cost_in_usd=category_cost_in_usd(
-                        input_tokens_cache_none,
-                        usd_per_million_tokens=rates.input_tokens_cache_none,
-                    ),
-                    output_tokens_cost_in_usd=category_cost_in_usd(
-                        output_tokens,
-                        usd_per_million_tokens=rates.output_tokens,
-                    ),
-                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
-                ),
-                service_tier=service_tier,
-                usd_per_million_tokens=TokenRates(
-                    input_tokens_cache_read=rates.input_tokens_cache_read,
-                    input_tokens_cache_write=_NO_CACHE_WRITE_RATE,
-                    input_tokens_cache_none=rates.input_tokens_cache_none,
-                    output_tokens=rates.output_tokens,
-                ),
-            ),
-            usage_raw=usage_raw,
-        )
-
-
-_UNPRICED = GeminiPricingTable(
-    rates=GeminiRates(
-        input_tokens_cache_none=float("nan"),
-        input_tokens_cache_read=float("nan"),
-        output_tokens=float("nan"),
-    ),
-    google_search_usd_per_query=float("nan"),
-    google_maps_usd_per_query=float("nan"),
-)
-"""What prices a response reporting a traffic_type the adapter holds no table for.
-
-Every nonzero counter costs NaN.
-Every zero counter costs zero.
-"""
+    def rates_for(self, *, service_tier: str, prompt_token_count: int) -> TokenRates:
+        """Select the token rates for the reported `service_tier` and the request's `prompt_token_count`."""
+        match service_tier:
+            case "ON_DEMAND":
+                gemini_rates = self.on_demand
+            case "ON_DEMAND_PRIORITY":
+                gemini_rates = self.on_demand_priority
+            case "ON_DEMAND_FLEX":
+                gemini_rates = self.on_demand_flex
+            case "PROVISIONED_THROUGHPUT":
+                gemini_rates = self.provisioned_throughput
+            case _:
+                gemini_rates = None
+        if gemini_rates is None:
+            return UNPRICED_TOKEN_RATES
+        rates = gemini_rates.token_rates()
+        if self.long_context is None:
+            return rates
+        return self.long_context.applied_to(rates, prompt_tokens=prompt_token_count)
 
 
 def _require_provider_executed_tool_support(
     *,
     model: str,
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     provider_executed_tool_fields: frozenset[str],
 ) -> None:
-    """Require Gemini 3 and finite configured rates across supplied pricing tables.
+    """Require Gemini 3 and a stated per-query price for each bound charged tool.
 
     Raises:
         ValueError: the model is not Gemini 3.
-            Also raised for unavailable, negative, infinite, or NaN configured rates.
+            Also raised when a bound charged tool has no stated price.
     """
     model_id = model.rsplit("/", 1)[-1]
     if provider_executed_tool_fields and not model_id.startswith("gemini-3"):
         raise ValueError("Gemini provider_executed_tools require a Gemini 3 model")
-    for pricing_table in pricing.values():
-        if "google_search" in provider_executed_tool_fields:
-            google_search_rate = pricing_table.google_search_usd_per_query
-            require_finite_nonnegative_rate(
-                rate_name="google_search_usd_per_query", rate=google_search_rate
-            )
-        if "google_maps" in provider_executed_tool_fields:
-            google_maps_rate = pricing_table.google_maps_usd_per_query
-            require_finite_nonnegative_rate(
-                rate_name="google_maps_usd_per_query", rate=google_maps_rate
-            )
+    if "google_search" in provider_executed_tool_fields:
+        require_stated_rate(
+            rate_name="google_search_usd_per_query", rate=pricing.google_search_usd_per_query
+        )
+    if "google_maps" in provider_executed_tool_fields:
+        require_stated_rate(
+            rate_name="google_maps_usd_per_query", rate=pricing.google_maps_usd_per_query
+        )
 
 
 def _priced_tier(traffic_type: types.TrafficType | None) -> str:
-    """Return the tier that selects the table: what the response reports, "ON_DEMAND" where it reports none.
+    """Return the tier that selects the rates: what the response reports, "ON_DEMAND" where it reports none.
 
     TRAFFIC_TYPE_UNSPECIFIED counts as reporting none: it is the proto zero value, not a tier.
     """
@@ -432,11 +342,11 @@ def _priced_tier(traffic_type: types.TrafficType | None) -> str:
 
 def _billing_from_usage(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     *,
     provider_executed_tool_cost_in_usd: float,
 ) -> ProviderBilling:
-    """Price the reported counters at the table the served tier selects.
+    """Price the reported counters at the rates the served tier selects.
 
     prompt_token_count includes cached_content_token_count (google-genai 2.16.0 field description).
     This includes implicit cache reads (https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03).
@@ -445,37 +355,44 @@ def _billing_from_usage(
     output_tokens is their sum, and output_tokens_reasoning is thoughts_token_count.
     Source: google-genai 2.16.0 total_token_count field description.
     tool_use_prompt_token_count is outside prompt_token_count and uses the uncached input rate.
-    None usage_metadata bills zero counters at the "ON_DEMAND" table's prices.
+    Long-context pricing compares prompt_token_count with its threshold, so tool-use input does not count toward it.
+    None usage_metadata bills zero counters at the "ON_DEMAND" rates.
 
     Raises:
         pydantic.ValidationError: the counters leave a category negative.
     """
     if usage_metadata is None:
-        return pricing.get(_ON_DEMAND_TIER, _UNPRICED).price(
-            service_tier=_ON_DEMAND_TIER,
+        return ProviderBilling(
+            billing=billing_at_rates(
+                pricing.rates_for(service_tier=_ON_DEMAND_TIER, prompt_token_count=0),
+                service_tier=_ON_DEMAND_TIER,
+                input_tokens_cache_read=0,
+                input_tokens_cache_write=0,
+                input_tokens_cache_none=0,
+                output_tokens=0,
+                output_tokens_reasoning=0,
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+            ),
             usage_raw=None,
-            prompt_token_count=0,
-            input_tokens_cache_read=0,
-            input_tokens_cache_none=0,
-            output_tokens=0,
-            output_tokens_reasoning=0,
-            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     service_tier = _priced_tier(usage_metadata.traffic_type)
     prompt_token_count = usage_metadata.prompt_token_count or 0
     input_tokens_cache_read = usage_metadata.cached_content_token_count or 0
     output_tokens_reasoning = usage_metadata.thoughts_token_count or 0
-    return pricing.get(service_tier, _UNPRICED).price(
-        service_tier=service_tier,
+    return ProviderBilling(
+        billing=billing_at_rates(
+            pricing.rates_for(service_tier=service_tier, prompt_token_count=prompt_token_count),
+            service_tier=service_tier,
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=0,
+            input_tokens_cache_none=prompt_token_count
+            - input_tokens_cache_read
+            + (usage_metadata.tool_use_prompt_token_count or 0),
+            output_tokens=(usage_metadata.candidates_token_count or 0) + output_tokens_reasoning,
+            output_tokens_reasoning=output_tokens_reasoning,
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+        ),
         usage_raw=usage_metadata,
-        prompt_token_count=prompt_token_count,
-        input_tokens_cache_read=input_tokens_cache_read,
-        input_tokens_cache_none=prompt_token_count
-        - input_tokens_cache_read
-        + (usage_metadata.tool_use_prompt_token_count or 0),
-        output_tokens=(usage_metadata.candidates_token_count or 0) + output_tokens_reasoning,
-        output_tokens_reasoning=output_tokens_reasoning,
-        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
     )
 
 
@@ -514,7 +431,7 @@ def _queries_from_tool_call(tool_call: types.ToolCall, *, maps: bool) -> list[st
 def _provider_executed_tool_cost_in_usd(
     provider_executed_tool_parts: Sequence[types.Part],
     *,
-    table: GeminiPricingTable,
+    pricing: GeminiPricingTable,
     provider_executed_tool_fields: frozenset[str],
     billing_complete: bool,
 ) -> float:
@@ -567,32 +484,28 @@ def _provider_executed_tool_cost_in_usd(
 
     return invocation_cost_in_usd(
         len(search_queries),
-        usd_per_invocation=table.google_search_usd_per_query,
+        usd_per_invocation=pricing.google_search_usd_per_query,
     ) + invocation_cost_in_usd(
         maps_query_count,
-        usd_per_invocation=table.google_maps_usd_per_query,
+        usd_per_invocation=pricing.google_maps_usd_per_query,
     )
 
 
 def _billing_from_provider_evidence(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
     provider_executed_tool_parts: Sequence[types.Part],
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     *,
     provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
 ) -> ProviderBilling:
     """Price token counters and assembled provider-executed tool evidence."""
-    service_tier = _ON_DEMAND_TIER
-    if usage_metadata is not None:
-        service_tier = _priced_tier(usage_metadata.traffic_type)
-    table = pricing.get(service_tier, _UNPRICED)
     return _billing_from_usage(
         usage_metadata,
         pricing,
         provider_executed_tool_cost_in_usd=_provider_executed_tool_cost_in_usd(
             provider_executed_tool_parts,
-            table=table,
+            pricing=pricing,
             provider_executed_tool_fields=provider_executed_tool_fields,
             billing_complete=billing_complete,
         ),
@@ -601,7 +514,7 @@ def _billing_from_provider_evidence(
 
 def _billing_from_response(
     response: types.GenerateContentResponse,
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     *,
     provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
@@ -1167,7 +1080,7 @@ class GeminiGenerateContentAdapter(Adapter):
         *,
         client: genai.Client,
         model: str,
-        pricing: Mapping[str, GeminiPricingTable],
+        pricing: GeminiPricingTable,
         provider_name: str,
         service_tier: GeminiServiceTier | None = None,
     ) -> None:
@@ -1176,15 +1089,12 @@ class GeminiGenerateContentAdapter(Adapter):
         `provider_name` records the provider reached by `client`.
         A Vertex AI client requires `"gcp.vertex_ai"`.
         Per-request options disable retries without copying the client.
-        `pricing` maps each `GeminiReportedServiceTier` to rates.
-        Missing reported tiers cost NaN.
-        Missing `traffic_type` uses `"ON_DEMAND"`.
+        `pricing` prices each reported `traffic_type`.
         `service_tier` requests a tier, while reported `traffic_type` selects pricing.
 
         Raises:
-            ValueError: `pricing` lacks `"ON_DEMAND"` or a Vertex client uses another `provider_name`.
+            ValueError: A Vertex client uses another `provider_name`.
         """
-        require_pricing_key(pricing, key=_ON_DEMAND_TIER, model=model)
         if client.vertexai and provider_name != _VERTEX_PROVIDER_NAME:
             raise ValueError(
                 f"provider_name={provider_name!r} contradicts the client: "
@@ -1197,7 +1107,7 @@ class GeminiGenerateContentAdapter(Adapter):
             automatic_cache_breakpoints_default=False,
         )
         self.client: genai.Client = client
-        self.pricing: Mapping[str, GeminiPricingTable] = pricing
+        self.pricing: GeminiPricingTable = pricing
         self.service_tier: GeminiServiceTier | None = service_tier
 
     @override
@@ -1218,7 +1128,7 @@ class GeminiGenerateContentAdapter(Adapter):
             ValueError: Parallel calls are disabled, `system_prompt` is empty, or a key is reserved.
                 A system part that sets `cache_breakpoint` also raises it.
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
-            ValueError: A configured charged rate is not finite and nonnegative.
+            ValueError: A bound charged tool has no stated price.
         """
         _reject_extra_body_keys(binding.extra_body)
         if not binding.parallel_tool_calls:
@@ -1513,7 +1423,7 @@ class _GeminiStream(AdapterStream):
         self,
         *,
         chunks: AsyncIterator[types.GenerateContentResponse],
-        pricing: Mapping[str, GeminiPricingTable],
+        pricing: GeminiPricingTable,
         provider_executed_tool_fields: frozenset[str] = frozenset(),
         first_chunk: types.GenerateContentResponse | None = None,
     ) -> None:
@@ -1717,7 +1627,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
-        """Price the response's counters at the table its reported traffic_type selects.
+        """Price the response's counters at the rates its reported traffic_type selects.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.

@@ -19,7 +19,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from langchaint.billing.pricing import Billing, TokenRates
+from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, Billing
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.common.messages import (
@@ -725,12 +725,7 @@ def generation_record_from_otel(
     billing = Billing(
         usage=ZERO_USAGE,
         service_tier="unknown",
-        usd_per_million_tokens=TokenRates(
-            input_tokens_cache_read=float("nan"),
-            input_tokens_cache_write=float("nan"),
-            input_tokens_cache_none=float("nan"),
-            output_tokens=float("nan"),
-        ),
+        usd_per_million_tokens=UNPRICED_TOKEN_RATES,
     )
     request_record = SettledRequestRecord(
         started_after_seconds=0.0,

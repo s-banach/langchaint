@@ -315,7 +315,7 @@ def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
     assert billing.service_tier == "default"
 
 
-def test_the_reported_tier_selects_the_table() -> None:
+def test_the_reported_tier_selects_the_rates() -> None:
     """Priority rates price a priority response. "auto" and no tier both price at default."""
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
 
@@ -1348,7 +1348,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at flex, which _PRICING holds no table for."""
+        """Return a response served at flex, which _PRICING states no rates for."""
         return _completion(usage=_usage_with_cache(), service_tier="flex")
 
     @override

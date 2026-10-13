@@ -3,6 +3,7 @@
 These tests cover identifiers, pricing objects, overrides, and client routing.
 """
 
+import math
 import pathlib
 from collections.abc import Callable
 
@@ -40,6 +41,7 @@ from langchaint.gemini import (
 )
 from langchaint.openai import (
     OPENAI_PRICING,
+    OPENAI_REGIONAL_PROCESSING_MULTIPLIER,
     OpenAI,
     OpenAIBedrock,
     OpenAIChatCompletionsAdapter,
@@ -73,15 +75,13 @@ _ARBITRARY_ANTHROPIC_PRICING = AnthropicPricingTable(
 )
 """The anthropic counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
-_ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
-    "ON_DEMAND": GeminiPricingTable(
-        rates=GeminiRates(
-            input_tokens_cache_none=1.0,
-            input_tokens_cache_read=1.0,
-            output_tokens=1.0,
-        ),
+_ARBITRARY_GEMINI_PRICING = GeminiPricingTable(
+    on_demand=GeminiRates(
+        input_tokens_cache_none=1.0,
+        input_tokens_cache_read=1.0,
+        output_tokens=1.0,
     )
-}
+)
 """The gemini counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
 _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
@@ -132,7 +132,7 @@ def test_gemini_llm_wires_model_and_pricing() -> None:
     adapter = llm.adapter
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.model == model
-    assert adapter.pricing["ON_DEMAND"] is GEMINI_PRICING[model]
+    assert adapter.pricing is GEMINI_PRICING[model]
 
 
 def test_openai_llm_wires_model_and_pricing() -> None:
@@ -211,17 +211,18 @@ def test_gemini_llm_accepts_an_uncataloged_model() -> None:
 
 
 def test_gemini_pricing_override_replaces_catalog_pricing() -> None:
-    """A caller-supplied mapping is the whole pricing; the catalog table is not merged in."""
-    custom = GeminiPricingTable(
-        rates=GeminiRates(
-            input_tokens_cache_none=2.0,
-            input_tokens_cache_read=0.2,
-            output_tokens=20.0,
-        ),
+    """A caller-supplied table is the whole pricing; the catalog table is not merged in."""
+    custom_rates = GeminiRates(
+        input_tokens_cache_none=2.0,
+        input_tokens_cache_read=0.2,
+        output_tokens=20.0,
+    )
+    pricing = GeminiPricingTable(
+        on_demand=custom_rates,
+        on_demand_flex=custom_rates,
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     )
-    pricing = {"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom}
     adapter = (
         Gemini(client=genai.Client(api_key="offline", vertexai=False))
         .llm("gemini-3.5-flash", pricing=pricing)
@@ -229,26 +230,6 @@ def test_gemini_pricing_override_replaces_catalog_pricing() -> None:
     )
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.pricing is pricing
-
-
-def test_gemini_llm_requires_on_demand_in_a_pricing_override() -> None:
-    """A cataloged model no longer supplies "ON_DEMAND" when the caller states pricing."""
-    flex_only = {"ON_DEMAND_FLEX": GEMINI_PRICING["gemini-3.5-flash"]}
-    with pytest.raises(ValueError, match="ON_DEMAND"):
-        _ = Gemini(client=genai.Client(api_key="offline", vertexai=False)).llm(
-            "gemini-3.5-flash", pricing=flex_only
-        )
-
-
-def test_gemini_adapter_requires_on_demand_pricing() -> None:
-    """A pricing mapping without "ON_DEMAND" would price every tierless response NaN silently."""
-    with pytest.raises(ValueError, match="ON_DEMAND"):
-        _ = GeminiGenerateContentAdapter(
-            client=genai.Client(api_key="offline", vertexai=False),
-            model="gemini-3.5-flash",
-            pricing={},
-            provider_name="gcp.gemini",
-        )
 
 
 def test_gemini_llm_raises_on_a_vertex_client() -> None:
@@ -377,7 +358,6 @@ def test_openai_bedrock_llm_forwards_prompt_cache_options_support(*, supported: 
                 model="gpt-5.6-terra",
                 pricing=_ARBITRARY_PRICING,
                 provider_name="groq",
-                regional_processing=False,
                 supports_prompt_cache_options=False,
             ),
             "groq",
@@ -521,10 +501,27 @@ def test_service_tier_reaches_each_first_party_adapter() -> None:
     ).adapter
     assert isinstance(openai_adapter, OpenAIResponsesAdapter)
     assert openai_adapter.service_tier == "flex"
-    assert openai_adapter.regional_processing is False
     unstated = openai.llm("gpt-5.6-terra").adapter
     assert isinstance(unstated, OpenAIResponsesAdapter)
     assert unstated.service_tier is None
+
+
+def test_openai_llm_regional_processing_scales_every_token_rate() -> None:
+    """Regional processing scales the table by the model's regional multiplier, and an uncataloged model's by NaN."""
+    openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
+    regional = openai.llm("gpt-5.6-terra", regional_processing=True).adapter
+    assert isinstance(regional, OpenAIResponsesAdapter)
+    assert regional.pricing == OPENAI_PRICING["gpt-5.6-terra"].scaled(
+        OPENAI_REGIONAL_PROCESSING_MULTIPLIER["gpt-5.6-terra"]
+    )
+    unstated = openai.llm(
+        "uncataloged-model",
+        regional_processing=True,
+        pricing=_ARBITRARY_PRICING,
+        supports_prompt_cache_options=False,
+    ).adapter
+    assert isinstance(unstated, OpenAIResponsesAdapter)
+    assert math.isnan(unstated.pricing.default.output_tokens)
 
 
 def test_openai_shares_client_and_shared_backoff() -> None:

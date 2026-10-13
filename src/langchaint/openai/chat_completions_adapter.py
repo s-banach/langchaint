@@ -122,7 +122,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
 )
-from langchaint.billing.pricing import ProviderBilling
+from langchaint.billing.pricing import ProviderBilling, billing_at_rates
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
@@ -144,7 +144,6 @@ from langchaint.openai.shared import (
     _OpenAIGenerationAdapterBase,
     _priced_tier,
     client_without_retries,
-    price_at_rates,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -623,25 +622,23 @@ def _billing_from_chat_completion(
     service_tier = _priced_tier(completion.service_tier)
     usage_raw = completion.usage
     input_tokens_total = 0 if usage_raw is None else usage_raw.prompt_tokens
-    rates = pricing.rates_for(
-        service_tier=completion.service_tier,
-        input_tokens_total=input_tokens_total,
-        regional_processing=False,
-    )
+    rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)
     provider_executed_tool_cost_in_usd = (
         float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
     if usage_raw is None:
-        return price_at_rates(
-            rates,
-            service_tier=service_tier,
+        return ProviderBilling(
+            billing=billing_at_rates(
+                rates,
+                service_tier=service_tier,
+                input_tokens_cache_read=0,
+                input_tokens_cache_write=0,
+                input_tokens_cache_none=0,
+                output_tokens=0,
+                output_tokens_reasoning=0,
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+            ),
             usage_raw=None,
-            input_tokens_cache_read=0,
-            input_tokens_cache_write=0,
-            input_tokens_cache_none=0,
-            output_tokens=0,
-            output_tokens_reasoning=0,
-            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     prompt_details = usage_raw.prompt_tokens_details
     completion_details = usage_raw.completion_tokens_details
@@ -649,20 +646,22 @@ def _billing_from_chat_completion(
     input_tokens_cache_write = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
-    return price_at_rates(
-        rates,
-        service_tier=service_tier,
-        usage_raw=usage_raw,
-        input_tokens_cache_read=input_tokens_cache_read,
-        input_tokens_cache_write=input_tokens_cache_write,
-        input_tokens_cache_none=usage_raw.prompt_tokens
-        - input_tokens_cache_read
-        - input_tokens_cache_write,
-        output_tokens=usage_raw.completion_tokens,
-        output_tokens_reasoning=(
-            completion_details.reasoning_tokens or 0 if completion_details is not None else 0
+    return ProviderBilling(
+        billing=billing_at_rates(
+            rates,
+            service_tier=service_tier,
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write,
+            input_tokens_cache_none=usage_raw.prompt_tokens
+            - input_tokens_cache_read
+            - input_tokens_cache_write,
+            output_tokens=usage_raw.completion_tokens,
+            output_tokens_reasoning=(
+                completion_details.reasoning_tokens or 0 if completion_details is not None else 0
+            ),
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
-        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+        usage_raw=usage_raw,
     )
 
 

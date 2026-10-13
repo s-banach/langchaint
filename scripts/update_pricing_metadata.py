@@ -5,6 +5,7 @@ import re
 from collections.abc import Iterator, Mapping
 from datetime import date
 from decimal import Decimal
+from fractions import Fraction
 from itertools import chain
 from pathlib import Path
 from typing import Annotated, Literal, NamedTuple, overload
@@ -54,6 +55,7 @@ ANTHROPIC_LITELLM_KEYS = {
     "claude-opus-5": "claude-opus-5",
     "claude-sonnet-5-5": "claude-sonnet-5-5",
     "claude-sonnet-5": "claude-sonnet-5",
+    "claude-haiku-5-5": "claude-haiku-5-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 }
 ANTHROPIC_ALIASES = {"claude-haiku-4-5": "claude-haiku-4-5-20251001"}
@@ -64,6 +66,7 @@ ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
     "claude-opus-5",
     "claude-sonnet-5-5",
     "claude-sonnet-5",
+    "claude-haiku-5-5",
 })
 ANTHROPIC_BEDROCK_LITELLM_KEYS = {
     "anthropic.claude-fable-5-1": "anthropic.claude-fable-5-1",
@@ -74,27 +77,32 @@ ANTHROPIC_BEDROCK_LITELLM_KEYS = {
     "anthropic.claude-opus-4-7": "anthropic.claude-opus-4-7",
     "anthropic.claude-sonnet-5-5": "anthropic.claude-sonnet-5-5",
     "anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
+    "anthropic.claude-haiku-5-5": "anthropic.claude-haiku-5-5",
     "anthropic.claude-haiku-4-5": "anthropic.claude-haiku-4-5-20251001-v1:0",
     "us.anthropic.claude-opus-4-6-v1": "us.anthropic.claude-opus-4-6-v1",
     "us.anthropic.claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
 }
 BEDROCK_CROSS_REGION_PREFIXES = ("us", "eu", "au", "jp", "apac", "global", "us-gov")
 """Bedrock cross-region inference profile prefixes whose LiteLLM entries are kept when present."""
-_LONG_CONTEXT_INPUT_FIELD = re.compile(r"input_cost_per_token_above_(\d+)k_tokens")
 _TIER_RATE_FIELD = re.compile(
     r"(?:input_cost_per_token|output_cost_per_token|cache_read_input_token_cost"
-    r"|cache_creation_input_token_cost)(?:_above_\d+k_tokens)?_(?P<tier>[a-z]+)"
+    r"|cache_creation_input_token_cost(?:_above_1hr)?)(?:_above_\d+k_tokens)?_(?P<tier>[a-z]+)"
 )
 """A LiteLLM rate field of one pricing tier, such as `input_cost_per_token_flex`."""
 _LONG_CONTEXT_RATE_FIELD = re.compile(
     r"(?P<rate>input_cost_per_token|output_cost_per_token|cache_read_input_token_cost"
-    r"|cache_creation_input_token_cost)_above_(?P<thousands>\d+)k_tokens(?:_(?P<tier>[a-z]+))?"
+    r"|cache_creation_input_token_cost(?:_above_1hr)?)_above_(?P<thousands>\d+)k_tokens"
+    r"(?:_(?P<tier>[a-z]+))?"
 )
 """A LiteLLM long-context rate field, such as `output_cost_per_token_above_272k_tokens_flex`."""
 OPENAI_RENDERED_TIERS: frozenset[str] = frozenset({"flex", "priority", "ultrafast"})
 """LiteLLM tiers the OpenAI tables render besides the default tier."""
-OPENAI_KNOWN_TIERS: frozenset[str] = frozenset({*OPENAI_RENDERED_TIERS, "batches"})
-"""`OPENAI_RENDERED_TIERS` plus `batches`, which no langchaint OpenAI adapter sends."""
+OPENAI_KNOWN_TIERS: frozenset[str] = frozenset({*OPENAI_RENDERED_TIERS, "batches", "decisions"})
+"""`OPENAI_RENDERED_TIERS` plus the tiers of endpoints no langchaint OpenAI adapter calls.
+
+`batches` prices the Batch API.
+`decisions` prices the Decisions API (`POST /v1/decisions`).
+"""
 ANTHROPIC_KNOWN_TIERS: frozenset[str] = frozenset({"batches"})
 """LiteLLM tiers the Anthropic tables render; Bedrock tables omit batch rates."""
 
@@ -139,11 +147,11 @@ class _OpenAIRateFields(NamedTuple):
 
 
 class _LongContextFields(NamedTuple):
-    """The OpenAI long-context threshold and the rates above it."""
+    """The long-context threshold and the exact ratios of the rates above it to the base rates."""
 
-    input_tokens_total_above: int
-    input_tokens_cache_none_usd_per_token: Decimal
-    output_tokens_usd_per_token: Decimal
+    prompt_tokens_above: int
+    input_multiplier: Fraction
+    output_multiplier: Fraction
 
 
 class _SearchContextCost(BaseModel):
@@ -288,7 +296,7 @@ class _LiteLLMEntry(BaseModel):
     def regional_processing_multiplier(self) -> float:
         """Return the OpenAI token-price multiplier for regional processing endpoints.
 
-        LiteLLM lists one multiplier per region, and `OpenAIPricingTable` holds one for all regions.
+        LiteLLM lists one multiplier per region, and `OPENAI_REGIONAL_PROCESSING_MULTIPLIER` holds one for all regions.
 
         Raises:
             ValueError: A regional multiplier is unlisted, or the US and EU multipliers differ.
@@ -352,79 +360,55 @@ class _LiteLLMEntry(BaseModel):
                     ),
                 )
 
-    def long_context_fields(self) -> _LongContextFields:
-        """Read the single OpenAI long-context threshold and the rates above it.
+    def long_context_fields(self, rendered_tiers: frozenset[str]) -> _LongContextFields | None:
+        """Read the long-context pricing of the default tier and `rendered_tiers`.
+
+        `LongContextPricing` holds one threshold for every tier, one input multiplier for the
+        input, cache-read, and cache-write rates, and one output multiplier for the output rate.
+        Each multiplier is the exact ratio of a long-context rate to its base rate.
+
+        Returns:
+            The shared threshold and multipliers, or `None` when the entry lists no long-context
+            rate in those tiers.
 
         Raises:
-            ValueError: The threshold is missing or ambiguous, or a rate above it is missing or
-                invalid.
+            ValueError: A long-context rate lacks its base rate, a base rate is zero, the listed
+                rates do not share one threshold, one input multiplier, and one output multiplier,
+                or they include no output rate or no input, cache-read, or cache-write rate.
         """
-        extra_fields = self.model_extra or {}
+        fields = self.model_dump(exclude_none=True)
         matches = [
             match
-            for field in extra_fields
-            if (match := _LONG_CONTEXT_INPUT_FIELD.fullmatch(field)) is not None
+            for field in fields
+            if (match := _LONG_CONTEXT_RATE_FIELD.fullmatch(field)) is not None
+            and (match.group("tier") is None or match.group("tier") in rendered_tiers)
         ]
-        if len(matches) != 1:
-            raise ValueError("OpenAI long-context threshold is ambiguous")
-        (match,) = matches
-        thousands = match.group(1)
-        return _LongContextFields(
-            input_tokens_total_above=int(thousands) * 1_000,
-            input_tokens_cache_none_usd_per_token=_decimal(
-                _RATE_ADAPTER.validate_python(extra_fields[match.group(0)])
-            ),
-            output_tokens_usd_per_token=_decimal(
-                _RATE_ADAPTER.validate_python(
-                    extra_fields.get(f"output_cost_per_token_above_{thousands}k_tokens")
-                )
-            ),
-        )
-
-    def require_shared_long_context(self) -> None:
-        """Require each rendered tier's long-context rates to follow the default tier's multipliers.
-
-        `OpenAIPricingTable.rates_for` applies one long-context threshold to every tier, one input
-        multiplier to the input, cache-read, and cache-write rates, and one output multiplier to the
-        output rate.
-        Rates are compared by cross-multiplication, so the check is exact in decimal.
-
-        Raises:
-            ValueError: A rendered tier lists a long-context rate at another threshold, without its
-                base rate, or at another multiplier.
-        """
-        long_context = self.long_context_fields()
-        default = self.openai_rate_fields("default")
-        fields = self.model_dump(exclude_none=True)
-        for field, value in fields.items():
-            match = _LONG_CONTEXT_RATE_FIELD.fullmatch(field)
-            if match is None or match.group("tier") not in {None, *OPENAI_RENDERED_TIERS}:
-                continue
-            rate, tier = match.group("rate"), match.group("tier")
-            base_field = rate if tier is None else f"{rate}_{tier}"
-            base_value = fields.get(base_field)
-            if base_value is None:
-                raise ValueError(f"LiteLLM lists {field} without {base_field}")
-            base = _decimal(_RATE_ADAPTER.validate_python(base_value))
-            above = _decimal(_RATE_ADAPTER.validate_python(value))
-            default_base, default_above = (
-                (
-                    _positive(default.output_tokens_usd_per_token),
-                    long_context.output_tokens_usd_per_token,
-                )
-                if rate == "output_cost_per_token"
-                else (
-                    _positive(default.input_tokens_cache_none_usd_per_token),
-                    long_context.input_tokens_cache_none_usd_per_token,
-                )
+        if not matches:
+            return None
+        thresholds = {int(match.group("thousands")) * 1_000 for match in matches}
+        input_multipliers = {
+            _long_context_ratio(fields, match)
+            for match in matches
+            if match.group("rate") != "output_cost_per_token"
+        }
+        output_multipliers = {
+            _long_context_ratio(fields, match)
+            for match in matches
+            if match.group("rate") == "output_cost_per_token"
+        }
+        if len(thresholds) != 1 or len(input_multipliers) != 1 or len(output_multipliers) != 1:
+            raise ValueError(
+                "LiteLLM long-context rates do not share one threshold, input multiplier, "
+                f"and output multiplier: {sorted(match.group(0) for match in matches)}"
             )
-            threshold = int(match.group("thousands")) * 1_000
-            if threshold != long_context.input_tokens_total_above or (
-                above * default_base != base * default_above
-            ):
-                raise ValueError(
-                    f"LiteLLM {field} does not follow the shared long-context pricing"
-                )
+        (prompt_tokens_above,) = thresholds
+        (input_multiplier,) = input_multipliers
+        (output_multiplier,) = output_multipliers
+        return _LongContextFields(
+            prompt_tokens_above=prompt_tokens_above,
+            input_multiplier=input_multiplier,
+            output_multiplier=output_multiplier,
+        )
 
 
 class _MetadataValue(CheckedCopyModel):
@@ -540,13 +524,19 @@ def _positive(rate: Decimal | None) -> Decimal:
     return rate
 
 
-def _decimal_ratio(rate: Decimal | None, base_rate: Decimal | None) -> float:
-    """Divide two listed positive rates in decimal, so `7.5e-05 / 5e-05` renders as `1.5`.
+def _long_context_ratio(fields: Mapping[str, object], match: re.Match[str]) -> Fraction:
+    """Return the exact ratio of one long-context rate to its base rate in the same tier.
 
     Raises:
-        ValueError: A rate is unlisted or zero.
+        ValueError: The base rate is unlisted or zero.
     """
-    return float(_positive(rate) / _positive(base_rate))
+    rate, tier = match.group("rate"), match.group("tier")
+    base_field = rate if tier is None else f"{rate}_{tier}"
+    base = fields.get(base_field)
+    if base is None:
+        raise ValueError(f"LiteLLM lists {match.group(0)} without {base_field}")
+    above = _decimal(_RATE_ADAPTER.validate_python(fields[match.group(0)]))
+    return Fraction(above) / Fraction(_positive(_decimal(_RATE_ADAPTER.validate_python(base))))
 
 
 def _million_rate(rate: Decimal | None) -> str:
@@ -583,28 +573,15 @@ def _openai_rates(
     ]
 
 
-def _long_context(entry: _LiteLLMEntry, *, indent: str) -> list[str]:
-    """Render OpenAI long-context pricing.
-
-    Raises:
-        ValueError: Long-context fields are missing, invalid, or ambiguous, a base rate is
-            unlisted or zero, or a tier's long-context rates follow other multipliers.
-    """
-    entry.require_shared_long_context()
-    fields = entry.long_context_fields()
-    default_fields = entry.openai_rate_fields("default")
-    input_multiplier = _decimal_ratio(
-        fields.input_tokens_cache_none_usd_per_token,
-        default_fields.input_tokens_cache_none_usd_per_token,
-    )
-    output_multiplier = _decimal_ratio(
-        fields.output_tokens_usd_per_token, default_fields.output_tokens_usd_per_token
-    )
+def _long_context(fields: _LongContextFields | None, *, indent: str) -> list[str]:
+    """Render long-context pricing, or nothing when the entry lists none."""
+    if fields is None:
+        return []
     return [
-        f"{indent}long_context=OpenAILongContextPricing(",
-        f"{indent}    input_tokens_total_above={fields.input_tokens_total_above},",
-        f"{indent}    input_multiplier={input_multiplier!r},",
-        f"{indent}    output_multiplier={output_multiplier!r},",
+        f"{indent}long_context=LongContextPricing(",
+        f"{indent}    prompt_tokens_above={fields.prompt_tokens_above},",
+        f"{indent}    input_multiplier={float(fields.input_multiplier)!r},",
+        f"{indent}    output_multiplier={float(fields.output_multiplier)!r},",
         f"{indent}),",
     ]
 
@@ -626,6 +603,9 @@ def _openai_table(
     default_fields = entry.openai_rate_fields("default")
     if None in default_fields:
         raise ValueError("OpenAI default rates are missing")
+    long_context = entry.long_context_fields(OPENAI_RENDERED_TIERS)
+    if long_context is None:
+        raise ValueError("OpenAI long-context rates are missing")
     inner = f"{indent}    "
     closing = f"{indent})," if trailing_comma else f"{indent})"
     return [
@@ -636,8 +616,7 @@ def _openai_table(
         *_openai_rates(
             entry.openai_rate_fields("ultrafast"), field_name="ultrafast", indent=inner
         ),
-        *_long_context(entry, indent=inner),
-        f"{inner}regional_processing_multiplier={entry.regional_processing_multiplier()!r},",
+        *_long_context(long_context, indent=inner),
         f"{inner}web_search_usd_per_invocation={entry.web_search_usd_per_invocation()!r},",
         f"{inner}file_search_usd_per_invocation={metadata.openai.file_search_usd_per_invocation.value!r},",
         closing,
@@ -688,6 +667,7 @@ def _anthropic_table(
         if direct
         else []
     )
+    long_context = entry.long_context_fields(ANTHROPIC_KNOWN_TIERS if direct else frozenset())
     regional_multiplier = (
         metadata.anthropic.inference_geo_us_multiplier.value if inference_geo else None
     )
@@ -696,6 +676,7 @@ def _anthropic_table(
         f"{indent}{prefix}AnthropicPricingTable(",
         *_anthropic_rates(entry.anthropic_rate_fields(), field_name="standard", indent=inner),
         *batch,
+        *_long_context(long_context, indent=inner),
         f"{inner}inference_geo_us_multiplier={regional_multiplier!r},",
         f"{inner}web_search_usd_per_invocation={entry.web_search_usd_per_invocation()!r},",
         closing,
@@ -733,8 +714,8 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         "",
         "from typing import Literal",
         "",
-        "from langchaint.billing.pricing import TokenRates",
-        "from langchaint.openai.shared import OpenAILongContextPricing, OpenAIPricingTable",
+        "from langchaint.billing.pricing import LongContextPricing, TokenRates",
+        "from langchaint.openai.shared import OpenAIPricingTable",
         "",
         "type OpenAIModelId = Literal[",
         *[f'    "{model}",' for model in model_ids],
@@ -748,6 +729,18 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         ],
         *[f'    "{model}": {_constant_name(model)},' for model in OPENAI_LITELLM_KEYS],
         "}",
+        "",
+        "OPENAI_REGIONAL_PROCESSING_MULTIPLIER: dict[OpenAIModelId, float] = {",
+        *[
+            f'    "{alias}": {entries[OPENAI_LITELLM_KEYS[canonical]].regional_processing_multiplier()!r},'
+            for alias, canonical in OPENAI_ALIASES.items()
+        ],
+        *[
+            f'    "{model}": {entries[key].regional_processing_multiplier()!r},'
+            for model, key in OPENAI_LITELLM_KEYS.items()
+        ],
+        "}",
+        '"""Token-rate multiplier for each model on an endpoint that uses regional processing."""',
         "",
     ]
     return "\n".join(lines)
@@ -797,6 +790,7 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         "    AnthropicPricingTable,",
         "    AnthropicRates,",
         ")",
+        "from langchaint.billing.pricing import LongContextPricing",
         "",
         "type AnthropicModelId = Literal[",
         *[f'    "{model}",' for model in model_ids],
@@ -838,8 +832,9 @@ def _cross_region_multiplier(entries: Mapping[str, _LiteLLMEntry], prefix: str) 
     A rate unlisted in a prefixed entry contributes no ratio.
 
     Raises:
-        ValueError: No prefixed entry exists, a base rate is unlisted or zero, or the ratio
-            differs across models or rate fields.
+        ValueError: No prefixed entry exists, a base rate is unlisted or zero, the ratio
+            differs across models or rate fields, or a prefixed entry's long-context pricing
+            differs from its base entry's.
     """
     ratios = {
         ratio
@@ -859,13 +854,21 @@ def _rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decim
         The exact ratio of each token rate listed in `prefixed` to the same rate in `base`.
 
     Raises:
-        ValueError: A base rate is unlisted or zero.
+        ValueError: A base rate is unlisted or zero, or `prefixed` lists long-context pricing
+            that differs from `base`.
     """
     for prefixed_rate, base_rate in zip(
         prefixed.anthropic_rate_fields(), base.anthropic_rate_fields(), strict=True
     ):
         if prefixed_rate is not None:
             yield prefixed_rate / _positive(base_rate)
+    prefixed_long_context = prefixed.long_context_fields(frozenset())
+    if prefixed_long_context is not None and prefixed_long_context != base.long_context_fields(
+        frozenset()
+    ):
+        raise ValueError(
+            "a cross-region entry's long-context pricing differs from its base entry's"
+        )
 
 
 def _expected_providers(key: str) -> frozenset[str]:

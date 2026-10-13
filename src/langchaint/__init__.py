@@ -18,7 +18,7 @@ from langchaint.adapter import (
     ToolCallDelta,
     ToolChoice,
 )
-from langchaint.billing.pricing import Billing, TokenRates
+from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.billing.usage import ZERO_USAGE, Usage
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.messages import (
@@ -162,6 +162,7 @@ __all__ = [
     "InvalidToolArgsError",
     "JSONSchemaTool",
     "JsonValue",
+    "LongContextPricing",
     "Message",
     "MessageContent",
     "PlainErrorRecord",

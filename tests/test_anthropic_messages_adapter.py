@@ -1,6 +1,7 @@
 """Test Anthropic Messages adapters with constructed SDK objects."""
 
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
@@ -32,6 +33,7 @@ from langchaint import (
     Billing,
     ImagePart,
     ImageUrlPart,
+    LongContextPricing,
     Message,
     PydanticTool,
     RawPart,
@@ -289,13 +291,24 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
 
 
 def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
-    """A response served at a tier no table prices still reports what it billed and who served it."""
+    """A response served at a tier without rates still reports what it billed and who served it."""
     billing = _billing_from_sdk_usage(
         at.Usage(input_tokens=100, output_tokens=50, service_tier="priority"), _PRICING
     )
     assert billing.service_tier == "priority"
     assert billing.usage.input_tokens_total == 100
     assert billing.usage.output_tokens == 50
+
+
+def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
+    """The SDK passes through tier strings its types do not list, and their rates are unknown."""
+    usage_raw = at.Usage(input_tokens=100, output_tokens=50).model_copy(
+        update={"service_tier": "flex"}
+    )
+    pricing = replace(_PRICING, priority=_PRICING.standard, batch=_PRICING.standard)
+    usage = _billing_from_sdk_usage(usage_raw, pricing).usage
+    assert math.isnan(usage.input_tokens_cache_none_cost_in_usd)
+    assert math.isnan(usage.output_tokens_cost_in_usd)
 
 
 class _ToolCostCase(NamedTuple):
@@ -376,11 +389,10 @@ def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
     )
 
 
-@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
-def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None) -> None:
-    """A configured search rejects an unusable caller rate before requests."""
-    adapter = _adapter(pricing=replace(_PRICING, web_search_usd_per_invocation=rate))
-    with pytest.raises(ValueError, match="finite and nonnegative"):
+def test_a_bound_anthropic_web_search_requires_its_price() -> None:
+    """Binding web search whose price is None fails before any request."""
+    adapter = _adapter(pricing=replace(_PRICING, web_search_usd_per_invocation=None))
+    with pytest.raises(ValueError, match="is None"):
         _ = adapter._precompute_fields(
             _binding(
                 system_prompt="system",
@@ -427,7 +439,7 @@ def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> N
     assert billing.usd_per_million_tokens.input_tokens_cache_write == 3.75
 
 
-def test_the_reported_tier_selects_the_table() -> None:
+def test_the_reported_tier_selects_the_rates() -> None:
     """Priority rates price a priority response, standard rates a response reporting no tier."""
     pricing = AnthropicPricingTable(
         standard=_STANDARD_RATES,
@@ -442,6 +454,20 @@ def test_the_reported_tier_selects_the_table() -> None:
     reporting_none = _billing_from_sdk_usage(at.Usage(input_tokens=100, output_tokens=50), pricing)
     assert at_priority.usage.cost_in_usd == pytest.approx(2 * at_standard.usage.cost_in_usd)
     assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
+
+
+def test_cache_reads_and_writes_count_toward_the_long_context_threshold() -> None:
+    """Uncached input alone is under the threshold, and cache reads and writes put the request over it."""
+    usage_raw = _usage_with_cache_split()
+    long_context = LongContextPricing(
+        prompt_tokens_above=329, input_multiplier=5.0, output_multiplier=5.0
+    )
+    over = _billing_from_sdk_usage(usage_raw, replace(_PRICING, long_context=long_context))
+    at_threshold = _billing_from_sdk_usage(
+        usage_raw,
+        replace(_PRICING, long_context=replace(long_context, prompt_tokens_above=330)),
+    )
+    assert over.usage.cost_in_usd == pytest.approx(5 * at_threshold.usage.cost_in_usd)
 
 
 def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
@@ -1922,7 +1948,7 @@ def test_prefixed_bedrock_model_applies_its_multiplier_by_default(prefix: str) -
     )
     base = ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
     multiplier = BEDROCK_CROSS_REGION_MULTIPLIER[prefix]
-    assert adapter.pricing == replace(base, standard=base.standard.multiplied(multiplier))
+    assert adapter.pricing == replace(base, standard=base.standard.scaled(multiplier))
 
 
 @pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
@@ -1938,8 +1964,8 @@ def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
 
 
-def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> None:
-    """`multiplied` scales standard, priority, and batch rates and preserves the other fields."""
+def test_pricing_table_scaled_scales_every_tier_and_keeps_modifiers() -> None:
+    """`scaled` scales standard, priority, and batch rates and preserves the other fields."""
     table = AnthropicPricingTable(
         standard=_PRICING.standard,
         priority=_PRICING.standard,
@@ -1947,8 +1973,8 @@ def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> Non
         inference_geo_us_multiplier=1.1,
         web_search_usd_per_invocation=0.01,
     )
-    scaled = table.multiplied(2.0)
-    doubled = _PRICING.standard.multiplied(2.0)
+    scaled = table.scaled(2.0)
+    doubled = _PRICING.standard.scaled(2.0)
     assert scaled == replace(table, standard=doubled, priority=doubled, batch=doubled)
 
 
@@ -2141,7 +2167,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at priority, which _PRICING holds no table for."""
+        """Return a response served at priority, which _PRICING states no rates for."""
         return _finished_message(
             at.Usage(
                 input_tokens=100,

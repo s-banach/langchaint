@@ -13,10 +13,12 @@ from typing import ClassVar, Literal, NamedTuple
 from pydantic import BaseModel
 
 from langchaint.billing.pricing import (
+    UNPRICED_TOKEN_RATES,
     ProviderBilling,
+    billing_at_rates,
     category_cost_in_usd,
     invocation_cost_in_usd,
-    require_finite_nonnegative_rate,
+    require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
@@ -865,6 +867,7 @@ class Adapter(ABC):
 __all__ = [
     "AUTH_STATUSES",
     "REASONING_PART_SEPARATOR",
+    "UNPRICED_TOKEN_RATES",
     "Adapter",
     "AdapterStream",
     "AllowedToolsChoice",
@@ -893,6 +896,7 @@ __all__ = [
     "UnfinishedAssistantMessage",
     "UnusableResponse",
     "UsableResponse",
+    "billing_at_rates",
     "category_cost_in_usd",
     "invocation_cost_in_usd",
     "narrowed_request_params",
@@ -900,7 +904,7 @@ __all__ = [
     "reject_extra_body_keys_the_adapter_populates",
     "request_failure_from_response",
     "request_params_json",
-    "require_finite_nonnegative_rate",
+    "require_stated_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
     "validated_provider_executed_tool_types",

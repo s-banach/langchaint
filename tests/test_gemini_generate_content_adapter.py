@@ -6,6 +6,7 @@ Tests cover Usage, stop reasons, reasoning, tool calls, streams, and errors.
 import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from typing import NamedTuple, override
 
 import httpx
@@ -23,6 +24,7 @@ from langchaint import (
     ContentPart,
     ImagePart,
     ImageUrlPart,
+    LongContextPricing,
     Message,
     RawPart,
     ReasoningDelta,
@@ -36,6 +38,7 @@ from langchaint import (
 )
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
+    UNPRICED_TOKEN_RATES,
     Adapter,
     AdapterStream,
     Binding,
@@ -70,7 +73,7 @@ from tests.helpers import run_with_timeout, terminal, transient
 
 def _billing_from_usage(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     *,
     provider_executed_tool_cost_in_usd: float,
 ) -> Billing:
@@ -83,7 +86,7 @@ def _billing_from_usage(
 
 def _billing_from_response(
     response: types.GenerateContentResponse,
-    pricing: Mapping[str, GeminiPricingTable],
+    pricing: GeminiPricingTable,
     *,
     provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
@@ -102,27 +105,25 @@ _ON_DEMAND_RATES = GeminiRates(
     output_tokens=10.0,
 )
 
-_PRICING: dict[str, GeminiPricingTable] = {
-    "ON_DEMAND": GeminiPricingTable(
-        rates=_ON_DEMAND_RATES,
-        google_search_usd_per_query=0.014,
-        google_maps_usd_per_query=0.014,
-    )
-}
-"""The on-demand tier alone, so a response reporting another traffic_type prices NaN."""
-
-_LONG_PROMPT_TABLE = GeminiPricingTable(
-    rates=_ON_DEMAND_RATES,
+_PRICING = GeminiPricingTable(
+    on_demand=_ON_DEMAND_RATES,
     google_search_usd_per_query=0.014,
     google_maps_usd_per_query=0.014,
-    long_context_prompt_token_count_above=200,
-    long_context_rates=GeminiRates(
-        input_tokens_cache_none=2.0,
-        input_tokens_cache_read=0.2,
-        output_tokens=20.0,
+)
+"""The on-demand tier alone, so a response reporting another traffic_type prices its tokens at NaN."""
+
+_LONG_PROMPT_TABLE = GeminiPricingTable(
+    on_demand=_ON_DEMAND_RATES,
+    google_search_usd_per_query=0.014,
+    google_maps_usd_per_query=0.014,
+    long_context=LongContextPricing(
+        prompt_tokens_above=200, input_multiplier=2.0, output_multiplier=1.5
     ),
 )
-"""Every long rate is twice its base rate, so a test tells the two tiers apart by one factor."""
+"""Long input rates are twice the base rates, and the long output rate is 1.5 times the base.
+
+The unequal multipliers let a test detect swapped multipliers.
+"""
 
 _OFFLINE_CLIENT = genai.Client(api_key="offline", vertexai=False)
 """The client every adapter here shares unless a test needs another, since each construction takes milliseconds."""
@@ -132,7 +133,7 @@ def _adapter(
     *,
     client: genai.Client = _OFFLINE_CLIENT,
     model: str = "gemini-3.5-flash",
-    pricing: Mapping[str, GeminiPricingTable] = _PRICING,
+    pricing: GeminiPricingTable = _PRICING,
     provider_name: str = "gcp.gemini",
     service_tier: GeminiServiceTier | None = None,
 ) -> GeminiGenerateContentAdapter:
@@ -531,17 +532,13 @@ def test_tool_choice_mapping(
     assert config.tool_config == types.ToolConfig(function_calling_config=expected)
 
 
-def _pricing_with_query_rate(
-    provider_field: str, rate: float | None
-) -> dict[str, GeminiPricingTable]:
+def _pricing_with_query_rate(provider_field: str, rate: float | None) -> GeminiPricingTable:
     """Price provider_field's queries at rate and every other charged tool at a usable rate."""
-    return {
-        "ON_DEMAND": GeminiPricingTable(
-            rates=_ON_DEMAND_RATES,
-            google_search_usd_per_query=(rate if provider_field == "google_search" else 0.014),
-            google_maps_usd_per_query=(rate if provider_field == "google_maps" else 0.014),
-        )
-    }
+    return replace(
+        _PRICING,
+        google_search_usd_per_query=(rate if provider_field == "google_search" else 0.014),
+        google_maps_usd_per_query=(rate if provider_field == "google_maps" else 0.014),
+    )
 
 
 _UNSUPPORTED_PROVIDER_EXECUTED_TOOLS: tuple[Mapping[str, object], ...] = (
@@ -648,16 +645,15 @@ _BIND_DEFECTS = [
             client=genai.Client(api_key="offline", vertexai=True), provider_name="gcp.vertex_ai"
         ),
     ),
-    # Every supplied pricing table must price each configured charged tool.
+    # The pricing table must price each bound charged tool.
     *(
         _BindDefect(
-            f"{provider_field}_rate_{rate}",
+            f"{provider_field}_price_none",
             _binding(provider_executed_tools=({provider_field: {}},)),
-            "unavailable|finite and nonnegative",
-            _adapter(pricing=_pricing_with_query_rate(provider_field, rate)),
+            "is None",
+            _adapter(pricing=_pricing_with_query_rate(provider_field, None)),
         )
         for provider_field in ("google_search", "google_maps")
-        for rate in (None, True, float("nan"), float("inf"), -0.01)
     ),
     # Binding rejects extra_body keys that duplicate adapter fields.
     *(
@@ -1153,7 +1149,7 @@ class _ToolCost(NamedTuple):
     response: types.GenerateContentResponse
     provider_executed_tool_fields: frozenset[str]
     cost_in_usd: float
-    pricing: Mapping[str, GeminiPricingTable] = _PRICING
+    pricing: GeminiPricingTable = _PRICING
     billing_complete: bool = True
 
 
@@ -1181,13 +1177,7 @@ _TOOL_COSTS = [
         ),
         frozenset({"google_search", "google_maps"}),
         2 * 0.01 + 3 * 0.02,
-        {
-            "ON_DEMAND": GeminiPricingTable(
-                rates=_ON_DEMAND_RATES,
-                google_search_usd_per_query=0.01,
-                google_maps_usd_per_query=0.02,
-            )
-        },
+        replace(_PRICING, google_search_usd_per_query=0.01, google_maps_usd_per_query=0.02),
     ),
     # Code execution, URL context, and file search add no separate fee.
     _ToolCost(
@@ -1211,15 +1201,15 @@ _TOOL_COSTS = [
         frozenset({"code_execution", "url_context", "file_search"}),
         0.0,
     ),
-    # A charged query at a served tier no table prices costs NaN.
+    # Per-query prices apply at a served tier without token rates.
     _ToolCost(
-        "unpriced_tier",
+        "tier_without_token_rates",
         _response(
             _search_call(["query"]),
             usage_metadata=_usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT),
         ),
         frozenset({"google_search"}),
-        float("nan"),
+        0.014,
     ),
     # Unexpected query shapes cannot produce an exact provider-executed cost.
     *(
@@ -1284,103 +1274,34 @@ def test_provider_executed_tool_cost(case: _ToolCost) -> None:
     assert usage.provider_executed_tool_cost_in_usd == pytest.approx(case.cost_in_usd, nan_ok=True)
 
 
-def test_the_long_context_threshold_reprices_every_category() -> None:
-    """Above the threshold the long rates price. At or below it the base rates do."""
-    short = _LONG_PROMPT_TABLE.price(
-        service_tier="ON_DEMAND",
-        usage_raw=None,
-        prompt_token_count=200,
-        input_tokens_cache_read=100,
-        input_tokens_cache_none=100,
-        output_tokens=10,
-        output_tokens_reasoning=0,
-        provider_executed_tool_cost_in_usd=0.0,
-    ).billing
-    assert short.usd_per_million_tokens.input_tokens_cache_none == 1.0
-    long = _LONG_PROMPT_TABLE.price(
-        service_tier="ON_DEMAND",
-        usage_raw=None,
-        prompt_token_count=201,
-        input_tokens_cache_read=100,
-        input_tokens_cache_none=101,
-        output_tokens=10,
-        output_tokens_reasoning=0,
-        provider_executed_tool_cost_in_usd=0.0,
-    ).billing
-    assert long.usd_per_million_tokens.input_tokens_cache_none == 2.0
-    assert long.usd_per_million_tokens.input_tokens_cache_read == 0.2
-    assert long.usd_per_million_tokens.output_tokens == 20.0
-
-
 def test_tool_execution_input_does_not_cross_the_long_context_threshold() -> None:
     """The threshold reads prompt_token_count, which excludes the tool-execution input priced beside it."""
     billing = _billing_from_usage(
         _usage_metadata(prompt_token_count=200, tool_use_prompt_token_count=50),
-        {"ON_DEMAND": _LONG_PROMPT_TABLE},
+        _LONG_PROMPT_TABLE,
         provider_executed_tool_cost_in_usd=0.0,
     )
     assert billing.usage.input_tokens_cache_none == 210
     assert billing.usd_per_million_tokens.input_tokens_cache_none == 1.0
 
 
-def test_the_long_context_fields_are_required_together() -> None:
-    """A threshold without rates prices nothing, and rates without a threshold never apply."""
-    with pytest.raises(ValueError, match="together"):
-        _ = GeminiPricingTable(
-            rates=_ON_DEMAND_RATES,
-            google_search_usd_per_query=0.014,
-            google_maps_usd_per_query=0.014,
-            long_context_prompt_token_count_above=200,
-        )
-    with pytest.raises(ValueError, match="together"):
-        _ = GeminiPricingTable(
-            rates=_ON_DEMAND_RATES,
-            google_search_usd_per_query=0.014,
-            google_maps_usd_per_query=0.014,
-            long_context_rates=_ON_DEMAND_RATES,
-        )
-
-
-def test_pricing_table_multiplied_scales_both_rate_sets_and_keeps_tool_prices() -> None:
-    """`multiplied` scales base and long-context token rates and preserves the threshold and tool prices."""
-    doubled_on_demand_rates = GeminiRates(
-        input_tokens_cache_none=2.0,
-        input_tokens_cache_read=0.2,
-        output_tokens=20.0,
+def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
+    """The SDK's open enum constructs traffic types its types do not list, and their rates are unknown."""
+    assert (
+        _PRICING.rates_for(service_tier="NEW_TIER", prompt_token_count=0) is UNPRICED_TOKEN_RATES
     )
-    assert _LONG_PROMPT_TABLE.multiplied(2.0) == GeminiPricingTable(
-        rates=doubled_on_demand_rates,
-        google_search_usd_per_query=0.014,
-        google_maps_usd_per_query=0.014,
-        long_context_prompt_token_count_above=200,
-        long_context_rates=GeminiRates(
-            input_tokens_cache_none=4.0,
-            input_tokens_cache_read=0.4,
-            output_tokens=40.0,
+
+
+def test_traffic_type_selects_the_rates() -> None:
+    """A reported tier prices at its own rates. UNSPECIFIED and None price at ON_DEMAND."""
+    pricing = replace(
+        _PRICING,
+        on_demand_flex=GeminiRates(
+            input_tokens_cache_none=0.5,
+            input_tokens_cache_read=0.05,
+            output_tokens=5.0,
         ),
     )
-    assert _PRICING["ON_DEMAND"].multiplied(2.0) == GeminiPricingTable(
-        rates=doubled_on_demand_rates,
-        google_search_usd_per_query=0.014,
-        google_maps_usd_per_query=0.014,
-    )
-
-
-def test_traffic_type_selects_the_table() -> None:
-    """A reported tier prices at its own table. UNSPECIFIED and None price at ON_DEMAND."""
-    flex_rates = GeminiRates(
-        input_tokens_cache_none=0.5,
-        input_tokens_cache_read=0.05,
-        output_tokens=5.0,
-    )
-    pricing = {
-        **_PRICING,
-        "ON_DEMAND_FLEX": GeminiPricingTable(
-            rates=flex_rates,
-            google_search_usd_per_query=0.014,
-            google_maps_usd_per_query=0.014,
-        ),
-    }
     flexed = _billing_from_usage(
         _usage_metadata(traffic_type=types.TrafficType.ON_DEMAND_FLEX),
         pricing,
@@ -1688,7 +1609,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at PROVISIONED_THROUGHPUT, which _PRICING holds no table for."""
+        """Return a response served at PROVISIONED_THROUGHPUT, which _PRICING states no rates for."""
         return _reasoning_response(
             _usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT)
         )

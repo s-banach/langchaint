@@ -19,9 +19,11 @@ Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
 Token, Batch API, and web-search price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
 `inference_geo` price source: https://platform.claude.com/docs/en/manage-claude/data-residency.
-Cache reads cost 0.1 times base input, except 0.05 times on Claude Opus 5.5 and 0.025 times on Claude Fable 5.1.
+Cache reads cost 0.05 times base input on Claude Opus 5.5 and Claude Sonnet 5.5, and 0.025 times on Claude Fable 5.1.
+Cache reads cost 0.1 times base input on other models.
 Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
+Claude Haiku 5.5 multiplies every token rate by five above 100,000 input tokens, counting cache reads and writes.
 `ANTHROPIC_PRICING` web-search rates are public list-price estimates.
 A cataloged model without a web-search rate requires `pricing` to bind the web search tool.
 `Anthropic.llm(pricing=...)` replaces cataloged estimates.
@@ -74,6 +76,7 @@ type AnthropicBedrockModelId = (
         "anthropic.claude-opus-4-7",
         "anthropic.claude-sonnet-5-5",
         "anthropic.claude-sonnet-5",
+        "anthropic.claude-haiku-5-5",
         "anthropic.claude-haiku-4-5",
         "us.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-sonnet-4-6",
@@ -129,6 +132,7 @@ ANTHROPIC_BEDROCK_ROUTING: dict[AnthropicBedrockModelId, BedrockRouting] = {
     "anthropic.claude-opus-4-7": BedrockRouting(api="mantle"),
     "anthropic.claude-sonnet-5-5": BedrockRouting(api="mantle"),
     "anthropic.claude-sonnet-5": BedrockRouting(api="mantle"),
+    "anthropic.claude-haiku-5-5": BedrockRouting(api="mantle"),
     "anthropic.claude-haiku-4-5": BedrockRouting(api="mantle"),
     "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy"),
     "us.anthropic.claude-sonnet-4-6": BedrockRouting(api="legacy"),
@@ -369,7 +373,7 @@ class AnthropicBedrock:
             )
         if resolution.cross_region_multiplier is None or not self.apply_cross_region_multiplier:
             return catalog_table
-        return catalog_table.multiplied(resolution.cross_region_multiplier)
+        return catalog_table.scaled(resolution.cross_region_multiplier)
 
 
 __all__ = [

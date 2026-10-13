@@ -112,7 +112,7 @@ class AdapterConformance(ABC):
     def make_adapter(self) -> Adapter:
         """Build the adapter under test.
 
-        Include a rate table for every fixture tier except `response_at_an_unpriced_tier`.
+        Give the pricing table rates for every fixture tier except the tier of `response_at_an_unpriced_tier`.
         """
         ...
 
@@ -131,7 +131,9 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return an SDK response reporting nonzero counters at a tier no table of make_adapter prices.
+        """Return an SDK response reporting nonzero counters at a tier without rates.
+
+        The pricing table of make_adapter states no rates for that tier.
 
         Use nonzero counters because zero tokens cost zero at every rate.
         """
@@ -260,8 +262,8 @@ class AdapterConformance(ABC):
         assert billing.usage == ZERO_USAGE
         assert billing.service_tier
 
-    def test_a_served_tier_the_adapter_holds_no_table_for_prices_nan(self) -> None:
-        """Every price and the total cost are NaN at a tier no table prices.
+    def test_a_served_tier_without_rates_prices_nan(self) -> None:
+        """Every price and the total cost are NaN at a tier without rates.
 
         NaN preserves paid output without reporting a free request.
         """

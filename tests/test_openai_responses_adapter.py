@@ -79,11 +79,10 @@ from langchaint.adapter import (
     ResponseOutcome,
     UsableResponse,
 )
-from langchaint.billing.pricing import Billing, TokenRates
+from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.conformance import AdapterConformance
 from langchaint.openai import (
-    OpenAILongContextPricing,
     OpenAIPricingTable,
     OpenAIResponsesAdapter,
     OpenAIResponsesServiceTier,
@@ -114,7 +113,7 @@ from tests.helpers import (
 
 
 def _billing_from_response(response: OpenAIResponse, pricing: OpenAIPricingTable) -> Billing:
-    return _provider_billing_from_response(response, pricing, regional_processing=False).billing
+    return _provider_billing_from_response(response, pricing).billing
 
 
 _DEFAULT_RATES = TokenRates(
@@ -230,7 +229,7 @@ def _response(
 def test_billing_partitions_and_prices_complete_usage() -> None:
     """Expose one complete SDK response's neutral counters, costs, and applied rates."""
     raw = _response(usage=_usage_with_cache())
-    provider_billing = _provider_billing_from_response(raw, _PRICING, regional_processing=False)
+    provider_billing = _provider_billing_from_response(raw, _PRICING)
     billing = provider_billing.billing
     usage = billing.usage
     assert provider_billing.usage_raw is raw.usage
@@ -281,7 +280,7 @@ def test_the_reported_tier_selects_the_rates_and_names_the_billing(
 ) -> None:
     """Use the response's `service_tier` because it may differ from the request's (openai 3.0.0).
 
-    A tier no table prices keeps its name and prices NaN, except that zero counters cost zero.
+    A tier without rates keeps its name and prices NaN, except that zero counters cost zero.
     """
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
     billing = _billing_from_response(_response(usage=usage, service_tier=service_tier), pricing)
@@ -360,26 +359,32 @@ def test_provider_executed_tool_cost_counts_priced_output_items(
     assert usage.provider_executed_tool_cost_in_usd == pytest.approx(expected_cost, nan_ok=True)
 
 
-def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> None:
-    """`multiplied` scales every stated tier's token rates and preserves the other fields."""
-    long_context = OpenAILongContextPricing(
-        input_tokens_total_above=272_000, input_multiplier=2.0, output_multiplier=1.5
+def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
+    """The SDK passes through tier strings its types do not list, and their rates are unknown."""
+    raw = _response(usage=_usage_with_cache()).model_copy(update={"service_tier": "decisions"})
+    usage = _billing_from_response(raw, _PRICING).usage
+    assert math.isnan(usage.input_tokens_cache_none_cost_in_usd)
+    assert math.isnan(usage.output_tokens_cost_in_usd)
+
+
+def test_pricing_table_scaled_scales_every_tier_and_keeps_modifiers() -> None:
+    """`scaled` scales every stated tier's token rates and preserves the other fields."""
+    long_context = LongContextPricing(
+        prompt_tokens_above=272_000, input_multiplier=2.0, output_multiplier=1.5
     )
     table = OpenAIPricingTable(
         default=_DEFAULT_RATES,
         flex=_DEFAULT_RATES,
         scale=_DEFAULT_RATES,
         long_context=long_context,
-        regional_processing_multiplier=1.1,
         web_search_usd_per_invocation=0.01,
         file_search_usd_per_invocation=0.0025,
     )
-    assert table.multiplied(2.0) == OpenAIPricingTable(
+    assert table.scaled(2.0) == OpenAIPricingTable(
         default=_PRIORITY_RATES,
         flex=_PRIORITY_RATES,
         scale=_PRIORITY_RATES,
         long_context=long_context,
-        regional_processing_multiplier=1.1,
         web_search_usd_per_invocation=0.01,
         file_search_usd_per_invocation=0.0025,
     )
@@ -708,7 +713,6 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
         model="m",
         pricing=_PRICING,
         provider_name="openai",
-        regional_processing=True,
         supports_prompt_cache_options=False,
         reasoning_summary="detailed",
         service_tier="ultrafast",
@@ -909,17 +913,14 @@ def test_provider_executed_tools_require_direct_openai_billing() -> None:
 
 
 @pytest.mark.parametrize("tool_type", ["web_search", "file_search"])
-@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
-def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
-    tool_type: str, rate: float | None
-) -> None:
-    """A configured charged tool rejects an unusable caller rate before requests."""
+def test_a_bound_openai_tool_requires_its_price(tool_type: str) -> None:
+    """Binding a charged tool whose price is None fails before any request."""
     pricing = OpenAIPricingTable(
         default=_DEFAULT_RATES,
-        web_search_usd_per_invocation=rate if tool_type == "web_search" else 0.01,
-        file_search_usd_per_invocation=rate if tool_type == "file_search" else 0.0025,
+        web_search_usd_per_invocation=None if tool_type == "web_search" else 0.01,
+        file_search_usd_per_invocation=None if tool_type == "file_search" else 0.0025,
     )
-    with pytest.raises(ValueError, match="finite and nonnegative"):
+    with pytest.raises(ValueError, match="is None"):
         _ = _adapter(pricing=pricing)._precompute_fields(
             _binding(
                 automatic_cache_breakpoints=True,
@@ -1134,7 +1135,6 @@ def _stream(
     return _OpenAIResponsesStream(
         sdk_stream=_FakeSDKStream(replay_events, headers),
         pricing=_PRICING,
-        regional_processing=False,
         charged_provider_executed_tools=charged_provider_executed_tools,
     )
 
@@ -1909,7 +1909,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at flex, which _PRICING holds no table for."""
+        """Return a response served at flex, which _PRICING states no rates for."""
         return _response(
             usage=_usage_with_cache(), output=_conformance_output(), service_tier="flex"
         )

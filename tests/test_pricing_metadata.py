@@ -16,14 +16,20 @@ from scripts.update_pricing_metadata import (
     ANTHROPIC_ALIASES,
     ANTHROPIC_LITELLM_KEYS,
     ANTHROPIC_OUTPUT_PATH,
+    COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS,
+    COHERE_OUTPUT_PATH,
     METADATA_PATH,
     OPENAI_ALIASES,
+    OPENAI_EMBEDDING_LITELLM_KEYS,
     OPENAI_KNOWN_TIERS,
     OPENAI_LITELLM_KEYS,
     OPENAI_OUTPUT_PATH,
     OPENAI_RENDERED_TIERS,
     SNAPSHOT_PATH,
     _anthropic_module,
+    _cohere_module,
+    _cross_region_multiplier,
+    _embedding_rate_ratios,
     _LiteLLMEntry,
     _million_rate,
     _openai_module,
@@ -157,16 +163,21 @@ def test_anthropic_missing_modifier_rates_produce_nan() -> None:
 
 
 def test_vendored_inputs_reproduce_generated_modules() -> None:
-    """Vendored inputs reproduce the snapshot and both generated modules offline."""
+    """Vendored inputs reproduce the snapshot and every generated module offline."""
     entries = _selected_entries(_LITELLM_FILE.validate_json(SNAPSHOT_PATH.read_bytes()))
     metadata = _ProviderMetadata.model_validate_json(METADATA_PATH.read_bytes())
     assert _snapshot_json(entries) == SNAPSHOT_PATH.read_text()
     assert _openai_module(entries, metadata) == OPENAI_OUTPUT_PATH.read_text()
     assert _anthropic_module(entries, metadata) == ANTHROPIC_OUTPUT_PATH.read_text()
+    assert _cohere_module(entries) == COHERE_OUTPUT_PATH.read_text()
 
 
-def test_untracked_model_keys_report_only_new_direct_api_text_models() -> None:
-    """Detection skips generated, aliased, ignored, non-text, and non-direct-API entries."""
+def test_untracked_model_keys_report_only_new_models_of_reported_kinds() -> None:
+    """Detection reports new text and embedding models.
+
+    It skips generated, aliased, ignored, and unreported-kind entries.
+    It also skips a cross-region key whose unprefixed key is generated or ignored.
+    """
     raw_entries = _LITELLM_FILE.validate_python({
         "untracked-openai-responses-model": {"litellm_provider": "openai", "mode": "responses"},
         "untracked-anthropic-chat-model": {"litellm_provider": "anthropic", "mode": "chat"},
@@ -180,12 +191,63 @@ def test_untracked_model_keys_report_only_new_direct_api_text_models() -> None:
         "ignored-openai-chat-model": {"litellm_provider": "openai", "mode": "chat"},
         "untracked-openai-image-model": {"litellm_provider": "openai", "mode": "image_generation"},
         "azure/untracked-chat-model": {"litellm_provider": "azure", "mode": "chat"},
+        "untracked-openai-embedding-model": {"litellm_provider": "openai", "mode": "embedding"},
+        OPENAI_EMBEDDING_LITELLM_KEYS[0]: {"litellm_provider": "openai", "mode": "embedding"},
+        "cohere.untracked-embed": {"litellm_provider": "bedrock", "mode": "embedding"},
+        "eu.cohere.untracked-embed": {"litellm_provider": "bedrock", "mode": "embedding"},
+        COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS[0]: {
+            "litellm_provider": "bedrock",
+            "mode": "embedding",
+        },
+        f"eu.{COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS[0]}": {
+            "litellm_provider": "bedrock",
+            "mode": "embedding",
+        },
+        "amazon.untracked-embed": {"litellm_provider": "bedrock", "mode": "embedding"},
+        "cohere.ignored-embed": {"litellm_provider": "bedrock", "mode": "embedding"},
+        "us.cohere.ignored-embed": {"litellm_provider": "bedrock", "mode": "embedding"},
         "sample_spec": {"litellm_provider": "one of https://docs.litellm.ai/docs/providers"},
     })
-    assert _untracked_model_keys(raw_entries, frozenset({"ignored-openai-chat-model"})) == [
+    assert _untracked_model_keys(
+        raw_entries, frozenset({"ignored-openai-chat-model", "cohere.ignored-embed"})
+    ) == [
+        "cohere.untracked-embed",
+        "eu.cohere.untracked-embed",
         "untracked-anthropic-chat-model",
+        "untracked-openai-embedding-model",
         "untracked-openai-responses-model",
     ]
+
+
+def _bedrock_embedding_entry(usd_per_token: float) -> _LiteLLMEntry:
+    return _LiteLLMEntry.model_validate({
+        "litellm_provider": "bedrock",
+        "input_cost_per_token": usd_per_token,
+    })
+
+
+def test_cross_region_multiplier_is_the_listed_ratio_or_nan() -> None:
+    """A listed prefixed entry gives its rate ratio, and an unlisted prefix gives NaN."""
+    entries = {
+        "cohere.embed-v4:0": _bedrock_embedding_entry(1e-7),
+        "eu.cohere.embed-v4:0": _bedrock_embedding_entry(1.1e-7),
+    }
+    keys = ["cohere.embed-v4:0"]
+    assert _cross_region_multiplier(entries, "eu", keys, _embedding_rate_ratios) == 1.1
+    assert math.isnan(_cross_region_multiplier(entries, "jp", keys, _embedding_rate_ratios))
+
+
+def test_cross_region_multiplier_rejects_differing_ratios() -> None:
+    """Prefixed entries whose ratios differ across models have no single multiplier."""
+    entries = {
+        "cohere.embed-v4:0": _bedrock_embedding_entry(1e-7),
+        "eu.cohere.embed-v4:0": _bedrock_embedding_entry(1.1e-7),
+        "cohere.embed-english-v3": _bedrock_embedding_entry(1e-7),
+        "eu.cohere.embed-english-v3": _bedrock_embedding_entry(1.2e-7),
+    }
+    keys = ["cohere.embed-v4:0", "cohere.embed-english-v3"]
+    with pytest.raises(ValueError, match="no single cross-region multiplier"):
+        _ = _cross_region_multiplier(entries, "eu", keys, _embedding_rate_ratios)
 
 
 def test_litellm_rates_accept_zero() -> None:
@@ -195,6 +257,23 @@ def test_litellm_rates_accept_zero() -> None:
         _million_rate(entry.openai_rate_fields("default").input_tokens_cache_none_usd_per_token)
         == "0"
     )
+
+
+@pytest.mark.parametrize(
+    "rates",
+    [
+        {},
+        {"input_cost_per_token": 1e-07, "output_cost_per_token": 1e-07},
+        {"input_cost_per_token": 1e-07, "cache_read_input_token_cost": 0},
+        {"input_cost_per_token": 1e-07, "regional_processing_uplift_multiplier_us": 1.1},
+        {"input_cost_per_token": 1e-07, "input_cost_per_character": 2.5e-08},
+    ],
+)
+def test_embedding_rate_rejects_unrendered_prices(rates: dict[str, float]) -> None:
+    """An embedding entry lists an input rate, a zero output rate at most, and no other price except batch rates."""
+    entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **rates})
+    with pytest.raises(ValueError, match="LiteLLM lists"):
+        _ = entry.embedding_input_tokens_usd_per_token()
 
 
 def test_anthropic_batch_rates_follow_listed_batch_rates() -> None:

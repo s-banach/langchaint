@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 import langchaint
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.concurrency.shared_backoff import PrivateBackoff
+from langchaint.embedding import _EmbeddingBatchResponse
 from langchaint.openai import OpenAI
 from langchaint.openai.embedding_adapter import (
     _OpenAIEmbeddingAdapter,
@@ -213,20 +214,21 @@ def test_ada_request_omits_dimensions() -> None:
 
 
 def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
-    """Restore indexed rows into writable C-contiguous owned float32 storage."""
+    """Restore indexed rows into writable C-contiguous owned float32 storage, and report `usage.prompt_tokens`."""
     client = _client(lambda _request: _response([[3.0, 4.0], [0.0, 2.0]], indexes=[1, 0]))
 
-    async def scenario() -> np.ndarray[tuple[int, int], np.dtype[np.float32]]:
+    async def scenario() -> _EmbeddingBatchResponse:
         adapter = _OpenAIEmbeddingAdapter(
             client=client,
             model="text-embedding-3-small",
             dimension=2,
         )
-        vectors = await adapter.embed_batch(("first", "second"), task="clustering")
+        response = await adapter.embed_batch(("first", "second"), task="clustering")
         await client.close()
-        return vectors
+        return response
 
-    vectors = run_with_timeout(scenario())
+    vectors, input_tokens_total = run_with_timeout(scenario())
+    assert input_tokens_total == 1
     np.testing.assert_allclose(vectors, [[0.0, 1.0], [0.6, 0.8]])
     assert vectors.dtype == np.float32
     assert vectors.flags.c_contiguous
@@ -254,8 +256,9 @@ def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
             model="text-embedding-3-small",
             dimension=1,
         )
-        with pytest.raises(EmbeddingOutputError, match="indexes"):
+        with pytest.raises(EmbeddingOutputError, match="indexes") as caught:
             _ = await adapter.embed_batch(("first", "second"), task="clustering")
+        assert caught.value.input_tokens_total == 1
         await client.close()
 
     run_with_timeout(scenario())
@@ -410,8 +413,12 @@ def test_transport_failure_retries_the_failed_batch(
             dimension=1,
             max_requests=2,
         )
-        vectors = await model.embed(["text"], task="retrieval_query")
-        assert vectors.tolist() == [[1.0]]
+        embeddings = await model.embed(["text"], task="retrieval_query")
+        assert embeddings.output.tolist() == [[1.0]]
+        assert [record.error_text is None for record in embeddings.request_history] == [
+            False,
+            True,
+        ]
         await client.close()
 
     run_with_timeout(scenario())

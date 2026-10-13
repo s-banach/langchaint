@@ -124,5 +124,6 @@
   "o4-mini-2025-04-16",
   "o4-mini-deep-research",
   "o4-mini-deep-research-2025-06-26",
-  "openai/container"
+  "openai/container",
+  "text-embedding-ada-002-v2"
 ]

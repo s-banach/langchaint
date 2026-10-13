@@ -5,11 +5,18 @@ Every cataloged model identifier is sent verbatim.
 `CohereBedrock` creates its default client before the first request admission.
 Each `EmbeddingModel` shares that client and one `SharedBackoff`.
 AWS v4 documentation shows list and float-keyed response forms.
+Cohere v4 and v3 `invoke_model` responses carry the billed input token count.
+Its header is `x-amzn-bedrock-input-token-count`, observed on 2026-10-13.
+botocore 1.43.112 does not model that header.
+The adapter reads it from `ResponseMetadata.HTTPHeaders`, which holds lowercased header names.
+Cataloged models receive `COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS`.
+An identifier with a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix resolves through the unprefixed identifier.
+`CohereBedrock` multiplies that rate by the prefix multiplier unless `apply_cross_region_multiplier=False`.
 
 Request source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed.html.
 Model source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-cohere-embed-v4.html.
-Pricing source: https://aws.amazon.com/bedrock/pricing/.
-Recheck that page before relying on its prices.
+Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+Recheck https://aws.amazon.com/bedrock/pricing/ before relying on these prices.
 """
 
 from __future__ import annotations
@@ -37,6 +44,16 @@ from langchaint.adapter import (
     RequestFailure,
     retry_after_seconds_from_headers,
 )
+from langchaint.cohere._generated_pricing import (
+    _COHERE_EMBED_V3_MODELS,
+    _COHERE_EMBED_V4_MODELS,
+    COHERE_BEDROCK_CROSS_REGION_MULTIPLIER,
+    COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS,
+    CohereEmbedV3ModelId,
+    CohereEmbedV4ModelId,
+    _CohereBedrockEmbeddingModelId,
+)
+from langchaint.common.bedrock import BedrockCatalogResolution, resolve_bedrock_catalog_id
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.concurrency.cancellation import (
     await_task_cancellation_safe,
@@ -46,8 +63,8 @@ from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.embedding import (
     EmbeddingModel,
     EmbeddingTask,
-    Float2D,
     _EmbeddingAdapter,
+    _EmbeddingBatchResponse,
     _validated_embeddings,
 )
 
@@ -60,21 +77,6 @@ if TYPE_CHECKING:
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]
 """Output dimensions accepted by every cataloged Cohere Embed v4 model."""
 
-type CohereEmbedV4ModelId = Literal[
-    "cohere.embed-v4:0",
-    "global.cohere.embed-v4:0",
-    "us.cohere.embed-v4:0",
-    "eu.cohere.embed-v4:0",
-]
-"""Cataloged Cohere Embed v4 identifiers for Amazon Bedrock."""
-
-type CohereEmbedV3ModelId = Literal[
-    "cohere.embed-english-v3",
-    "cohere.embed-multilingual-v3",
-]
-"""Cataloged Cohere Embed v3 identifiers for Amazon Bedrock."""
-
-type _CohereBedrockEmbeddingModelId = CohereEmbedV4ModelId | CohereEmbedV3ModelId
 type _CohereInputType = Literal[
     "search_document",
     "search_query",
@@ -82,20 +84,13 @@ type _CohereInputType = Literal[
     "clustering",
 ]
 
-_COHERE_EMBED_V4_MODELS: frozenset[CohereEmbedV4ModelId] = frozenset({
-    "cohere.embed-v4:0",
-    "global.cohere.embed-v4:0",
-    "us.cohere.embed-v4:0",
-    "eu.cohere.embed-v4:0",
-})
-_COHERE_EMBED_V3_MODELS: frozenset[CohereEmbedV3ModelId] = frozenset({
-    "cohere.embed-english-v3",
-    "cohere.embed-multilingual-v3",
-})
 COHERE_BEDROCK_EMBEDDING_MODELS: frozenset[_CohereBedrockEmbeddingModelId] = (
     _COHERE_EMBED_V4_MODELS | _COHERE_EMBED_V3_MODELS
 )
-"""Cohere embedding identifiers accepted by `CohereBedrock`."""
+"""Cataloged unprefixed Cohere embedding identifiers.
+
+`CohereBedrock` also accepts each under a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix.
+"""
 _COHERE_EMBED_V4_DIMENSIONS: frozenset[CohereEmbedV4Dimension] = frozenset({256, 512, 1024, 1536})
 _COHERE_INPUT_TYPE_BY_TASK: dict[EmbeddingTask, _CohereInputType] = {
     "retrieval_document": "search_document",
@@ -107,6 +102,7 @@ _COHERE_MAX_INPUTS = 96
 _COHERE_V4_BODY_TARGET_BYTES = 20_000_000
 _INVOKE_MODEL_MAX_BODY_BYTES = 25_000_000
 _JSON_CONTENT_TYPE = "application/json"
+_INPUT_TOKEN_COUNT_HEADER = "x-amzn-bedrock-input-token-count"
 _BEDROCK_RESPONSE = TypeAdapter(dict[str, object])
 type _CohereEmbeddings = list[list[float]] | dict[Literal["float"], list[list[float]]]
 _FLOAT_EMBEDDINGS: TypeAdapter[_CohereEmbeddings] = TypeAdapter(
@@ -229,12 +225,17 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         self,
         *,
         client_cache: _CohereBedrockClientCache,
-        model: _CohereBedrockEmbeddingModelId,
+        model: str,
+        is_embed_v4: bool,
         dimension: int,
     ) -> None:
-        """Store one model's validated request configuration."""
+        """Store one model's validated request configuration.
+
+        `is_embed_v4` states whether `model` resolves to a Cohere Embed v4 catalog identifier.
+        """
         self._client_cache = client_cache
         self.model = model
+        self.is_embed_v4 = is_embed_v4
         self.dimension = dimension
 
     def _request_body(
@@ -249,7 +250,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             "embedding_types": ["float"],
             "truncate": "NONE",
         }
-        if self.model in _COHERE_EMBED_V4_MODELS:
+        if self.is_embed_v4:
             payload["output_dimension"] = self.dimension
         return json.dumps(
             payload,
@@ -268,9 +269,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         batches: list[tuple[str, ...]] = []
         current: list[str] = []
         target_bytes = (
-            _COHERE_V4_BODY_TARGET_BYTES
-            if self.model in _COHERE_EMBED_V4_MODELS
-            else _INVOKE_MODEL_MAX_BODY_BYTES
+            _COHERE_V4_BODY_TARGET_BYTES if self.is_embed_v4 else _INVOKE_MODEL_MAX_BODY_BYTES
         )
         for input_text in inputs:
             current.append(input_text)
@@ -320,11 +319,11 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         client: BedrockRuntimeClient,
         inputs: tuple[str, ...],
         task: EmbeddingTask,
-    ) -> Float2D:
-        """Invoke Bedrock and validate its response vectors.
+    ) -> _EmbeddingBatchResponse:
+        """Invoke Bedrock and validate its response vectors and billed token count.
 
         Raises:
-            EmbeddingOutputError: Cohere returned an invalid response.
+            EmbeddingOutputError: Cohere returned an invalid response, or one without a token count.
             Exception: The SDK request, read, or body closure failed.
         """
         response = client.invoke_model(
@@ -338,21 +337,34 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             body_bytes = response_body.read()
         finally:
             response_body.close()
+        token_count_text = response["ResponseMetadata"]["HTTPHeaders"].get(
+            _INPUT_TOKEN_COUNT_HEADER
+        )
+        if token_count_text is None:
+            raise EmbeddingOutputError(
+                f"Bedrock returned no {_INPUT_TOKEN_COUNT_HEADER} header", input_tokens_total=None
+            )
+        input_tokens_total = int(token_count_text)
         try:
             payload = _BEDROCK_RESPONSE.validate_json(body_bytes)
             embeddings_response = _FLOAT_EMBEDDINGS.validate_python(payload.get("embeddings"))
         except ValidationError as error:
-            raise EmbeddingOutputError("Cohere returned an invalid embedding response") from error
+            raise EmbeddingOutputError(
+                "Cohere returned an invalid embedding response",
+                input_tokens_total=input_tokens_total,
+            ) from error
         embeddings = (
             embeddings_response["float"]
             if isinstance(embeddings_response, dict)
             else embeddings_response
         )
-        return _validated_embeddings(
+        vectors = _validated_embeddings(
             embeddings,
             expected_rows=len(inputs),
             dimension=self.dimension,
+            input_tokens_total=input_tokens_total,
         )
+        return _EmbeddingBatchResponse(vectors=vectors, input_tokens_total=input_tokens_total)
 
     @override
     async def embed_batch(
@@ -360,11 +372,11 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         inputs: tuple[str, ...],
         *,
         task: EmbeddingTask,
-    ) -> Float2D:
+    ) -> _EmbeddingBatchResponse:
         """Invoke Bedrock and close its response body outside the event loop.
 
         Raises:
-            EmbeddingOutputError: Cohere returned invalid vectors.
+            EmbeddingOutputError: Cohere returned invalid vectors or no token count.
             asyncio.CancelledError: Cancellation follows completed synchronous work.
             Exception: The SDK request, read, or body closure failed.
         """
@@ -385,12 +397,14 @@ class CohereBedrock:
         *,
         aws_region: str | None = None,
         client: BedrockRuntimeClient | None = None,
+        apply_cross_region_multiplier: bool = True,
         shared_backoff: SharedBackoff | None = None,
     ) -> None:
         """Build `CohereBedrock` without creating a client.
 
         `aws_region` selects the region for a client created by `CohereBedrock`.
         A passed `client` must disable SDK retries.
+        `apply_cross_region_multiplier=False` leaves a prefixed identifier's catalog rate unmultiplied.
         `shared_backoff` admits every request of the created `EmbeddingModel` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.
 
@@ -404,6 +418,7 @@ class CohereBedrock:
             _require_one_sdk_request(client)
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.aws_region: str | None = aws_region
+        self.apply_cross_region_multiplier: bool = apply_cross_region_multiplier
         self._client_cache = _CohereBedrockClientCache(
             aws_region=aws_region,
             client=client,
@@ -412,40 +427,55 @@ class CohereBedrock:
     @overload
     def embedding_model(
         self,
-        model: CohereEmbedV4ModelId,
+        model: CohereEmbedV3ModelId,
         *,
-        dimension: CohereEmbedV4Dimension = 1536,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel: ...
 
     @overload
     def embedding_model(
         self,
-        model: CohereEmbedV3ModelId,
+        model: CohereEmbedV4ModelId | str,
         *,
+        dimension: CohereEmbedV4Dimension = 1536,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel: ...
 
     def embedding_model(
         self,
-        model: _CohereBedrockEmbeddingModelId,
+        model: str,
         *,
         dimension: CohereEmbedV4Dimension | object = _DIMENSION_UNSET,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged Bedrock model.
 
+        `model` is sent verbatim.
+        An exact catalog identifier selects the model and its rate.
+        Otherwise a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped before the catalog lookups.
+        The type checker accepts `dimension` for a prefixed v3 identifier, which is typed as `str`.
         V4 models default to 1536 dimensions.
         V3 models always return 1024 dimensions.
+        `usd_per_million_tokens` prices input tokens and replaces the catalog rate.
+        A NaN prefix multiplier makes the catalog rate NaN.
 
         Raises:
             ValueError: `model`, `dimension`, or `max_requests` is invalid.
         """
-        if model in _COHERE_EMBED_V4_MODELS:
+        resolution = resolve_bedrock_catalog_id(
+            model,
+            catalog_ids=COHERE_BEDROCK_EMBEDDING_MODELS,
+            cross_region_multipliers=COHERE_BEDROCK_CROSS_REGION_MULTIPLIER,
+        )
+        is_embed_v4 = resolution.catalog_id in _COHERE_EMBED_V4_MODELS
+        if is_embed_v4:
             dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
             if type(dimension) is not int or dimension not in _COHERE_EMBED_V4_DIMENSIONS:
                 raise ValueError(f"dimension is invalid for Cohere Embed v4: {dimension!r}")
-        elif model in _COHERE_EMBED_V3_MODELS:
+        elif resolution.catalog_id in _COHERE_EMBED_V3_MODELS:
             if dimension is not _DIMENSION_UNSET:
                 raise ValueError("Cohere Embed v3 accepts no dimension argument")
             dimension = 1024
@@ -454,17 +484,35 @@ class CohereBedrock:
         adapter = _CohereBedrockEmbeddingAdapter(
             client_cache=self._client_cache,
             model=model,
+            is_embed_v4=is_embed_v4,
             dimension=dimension,
         )
         return EmbeddingModel(
             adapter=adapter,
             shared_backoff=self._shared_backoff,
             max_requests=max_requests,
+            usd_per_million_tokens=(
+                self._catalog_usd_per_million_tokens(resolution)
+                if usd_per_million_tokens is None
+                else usd_per_million_tokens
+            ),
         )
+
+    def _catalog_usd_per_million_tokens(self, resolution: BedrockCatalogResolution) -> float:
+        """Return the catalog input-token rate for `resolution`.
+
+        `apply_cross_region_multiplier` multiplies the rate by the prefix multiplier of `resolution`.
+        """
+        catalog_rate = COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS[resolution.catalog_id]
+        if resolution.cross_region_multiplier is None or not self.apply_cross_region_multiplier:
+            return catalog_rate
+        return catalog_rate * resolution.cross_region_multiplier
 
 
 __all__ = [
+    "COHERE_BEDROCK_CROSS_REGION_MULTIPLIER",
     "COHERE_BEDROCK_EMBEDDING_MODELS",
+    "COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS",
     "CohereBedrock",
     "CohereEmbedV3ModelId",
     "CohereEmbedV4Dimension",

@@ -1,6 +1,7 @@
 """OpenAI embeddings use the official asynchronous SDK.
 
-OpenAI 2.53.0 returns indexed float embeddings in `CreateEmbeddingResponse`.
+OpenAI 3.29.0 returns indexed float embeddings in `CreateEmbeddingResponse`.
+Its `usage.prompt_tokens` is the billed input token count.
 OpenAI accepts at most 2048 inputs and 300,000 tokens per request.
 The adapter counts tokens with `cl100k_base` through tiktoken 0.13.0.
 """
@@ -18,8 +19,8 @@ from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.cancellation import to_thread_cancellation_safe
 from langchaint.embedding import (
     EmbeddingTask,
-    Float2D,
     _EmbeddingAdapter,
+    _EmbeddingBatchResponse,
     _validated_embeddings,
 )
 from langchaint.openai.shared import (
@@ -104,8 +105,8 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
         inputs: tuple[str, ...],
         *,
         task: EmbeddingTask,
-    ) -> Float2D:
-        """Return normalized embeddings for one prepared request batch.
+    ) -> _EmbeddingBatchResponse:
+        """Return normalized embeddings and the billed token count for one prepared request batch.
 
         Raises:
             openai.OpenAIError: The SDK request fails.
@@ -118,13 +119,18 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
             dimensions=(omit if self.model == "text-embedding-ada-002" else self.dimension),
             encoding_format="float",
         )
+        input_tokens_total = response.usage.prompt_tokens
         response_data = response.data
         if not isinstance(response_data, list):
-            raise EmbeddingOutputError("OpenAI returned invalid embedding data")
+            raise EmbeddingOutputError(
+                "OpenAI returned invalid embedding data", input_tokens_total=input_tokens_total
+            )
         vectors_by_index: dict[int, Sequence[float]] = {}
         for embedding in response_data:
             if not isinstance(embedding, OpenAIEmbedding):
-                raise EmbeddingOutputError("OpenAI returned invalid embedding data")
+                raise EmbeddingOutputError(
+                    "OpenAI returned invalid embedding data", input_tokens_total=input_tokens_total
+                )
             index = embedding.index
             if (
                 type(index) is not int
@@ -132,16 +138,23 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
                 or index >= len(inputs)
                 or index in vectors_by_index
             ):
-                raise EmbeddingOutputError("OpenAI returned invalid embedding indexes")
+                raise EmbeddingOutputError(
+                    "OpenAI returned invalid embedding indexes",
+                    input_tokens_total=input_tokens_total,
+                )
             vectors_by_index[index] = embedding.embedding
         if set(vectors_by_index) != set(range(len(inputs))):
-            raise EmbeddingOutputError("OpenAI returned invalid embedding indexes")
+            raise EmbeddingOutputError(
+                "OpenAI returned invalid embedding indexes", input_tokens_total=input_tokens_total
+            )
         ordered_vectors = [vectors_by_index[index] for index in range(len(inputs))]
-        return _validated_embeddings(
+        vectors = _validated_embeddings(
             ordered_vectors,
             expected_rows=len(inputs),
             dimension=self.dimension,
+            input_tokens_total=input_tokens_total,
         )
+        return _EmbeddingBatchResponse(vectors=vectors, input_tokens_total=input_tokens_total)
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:

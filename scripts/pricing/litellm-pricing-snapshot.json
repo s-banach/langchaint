@@ -1395,6 +1395,37 @@
     "supports_xhigh_reasoning_effort": true,
     "thinking_always_on": true
   },
+  "cohere.embed-english-v3": {
+    "input_cost_per_token": 1e-07,
+    "litellm_provider": "bedrock",
+    "max_input_tokens": 512,
+    "max_tokens": 512,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "source": "https://aws.amazon.com/bedrock/pricing/",
+    "supports_embedding_image_input": true
+  },
+  "cohere.embed-multilingual-v3": {
+    "input_cost_per_token": 1e-07,
+    "litellm_provider": "bedrock",
+    "max_input_tokens": 512,
+    "max_tokens": 512,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "source": "https://aws.amazon.com/bedrock/pricing/",
+    "supports_embedding_image_input": true
+  },
+  "cohere.embed-v4:0": {
+    "input_cost_per_token": 1.2e-07,
+    "litellm_provider": "bedrock",
+    "max_input_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_vector_size": 1536,
+    "source": "https://aws.amazon.com/bedrock/pricing/",
+    "supports_embedding_image_input": true
+  },
   "eu.anthropic.claude-fable-5": {
     "bedrock_output_config_effort_ceiling": "xhigh",
     "cache_creation_input_token_cost": 1.375e-05,
@@ -2166,6 +2197,17 @@
     "supports_vision": true,
     "supports_xhigh_reasoning_effort": true,
     "thinking_always_on": true
+  },
+  "global.cohere.embed-v4:0": {
+    "input_cost_per_token": 1.2e-07,
+    "litellm_provider": "bedrock",
+    "max_input_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_vector_size": 1536,
+    "source": "https://aws.amazon.com/bedrock/pricing/",
+    "supports_embedding_image_input": true
   },
   "gpt-5.6-luna": {
     "cache_creation_input_token_cost": 2.5e-07,
@@ -3027,6 +3069,40 @@
     "supports_xhigh_reasoning_effort": true,
     "thinking_always_on": true
   },
+  "text-embedding-3-large": {
+    "input_cost_per_token": 1.3e-07,
+    "input_cost_per_token_batches": 6.5e-08,
+    "litellm_provider": "openai",
+    "max_input_tokens": 8191,
+    "max_tokens": 8191,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_cost_per_token_batches": 0.0,
+    "output_vector_size": 3072,
+    "source": "https://developers.openai.com/api/docs/pricing"
+  },
+  "text-embedding-3-small": {
+    "input_cost_per_token": 2e-08,
+    "input_cost_per_token_batches": 1e-08,
+    "litellm_provider": "openai",
+    "max_input_tokens": 8191,
+    "max_tokens": 8191,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_cost_per_token_batches": 0.0,
+    "output_vector_size": 1536,
+    "source": "https://developers.openai.com/api/docs/pricing"
+  },
+  "text-embedding-ada-002": {
+    "input_cost_per_token": 1e-07,
+    "litellm_provider": "openai",
+    "max_input_tokens": 8191,
+    "max_tokens": 8191,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_vector_size": 1536,
+    "source": "https://developers.openai.com/api/docs/pricing"
+  },
   "us-gov.anthropic.claude-fable-5-1": {
     "bedrock_output_config_effort_ceiling": "xhigh",
     "cache_creation_input_token_cost": 1.5e-05,
@@ -3730,5 +3806,16 @@
     "supports_vision": true,
     "supports_xhigh_reasoning_effort": true,
     "thinking_always_on": true
+  },
+  "us.cohere.embed-v4:0": {
+    "input_cost_per_token": 1.2e-07,
+    "litellm_provider": "bedrock",
+    "max_input_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "embedding",
+    "output_cost_per_token": 0.0,
+    "output_vector_size": 1536,
+    "source": "https://aws.amazon.com/bedrock/pricing/",
+    "supports_embedding_image_input": true
   }
 }

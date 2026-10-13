@@ -246,3 +246,20 @@ OPENAI_REGIONAL_PROCESSING_MULTIPLIER: dict[OpenAIModelId, float] = {
     "gpt-6-astra": 1.1,
 }
 """Token-rate multiplier for each model on an endpoint that uses regional processing."""
+
+type OpenAIEmbeddingModelId = Literal[
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+]
+"""Cataloged OpenAI model identifiers accepted by `embedding_model()`."""
+
+OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS: dict[OpenAIEmbeddingModelId, float] = {
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+    "text-embedding-ada-002": 0.1,
+}
+"""USD per million input tokens of each cataloged OpenAI embedding model.
+
+LiteLLM lists no other nonzero rate that a langchaint embedding request incurs.
+"""

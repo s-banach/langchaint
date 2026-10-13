@@ -25,8 +25,8 @@ class RequestFailure:
     - `provider_failed_terminally`: the provider reported a failure that sending the request again would repeat.
     - `unknown_exception`: the adapter could not place the exception.
     In generation, each kind except `transient` ends handling the input with a `GenerationError`.
-    Its kind appends `_error` to the `RequestFailure` kind.
-    `EmbeddingModel` re-raises the exception.
+    In `EmbeddingModel.embed`, it ends the call with an `EmbeddingError`.
+    Either error's kind appends `_error` to the `RequestFailure` kind.
 
     `pauses_quota` starts or extends the `SharedBackoff` pause of every request on the rate-limit quota.
     It applies whatever `kind` is.

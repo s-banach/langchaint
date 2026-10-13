@@ -338,4 +338,7 @@ BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {
     "global": 1.0,
     "us-gov": 1.2,
 }
-"""Token-rate multiplier for each Bedrock cross-region inference profile prefix."""
+"""Token-rate multiplier for each Bedrock cross-region inference profile prefix.
+
+It is NaN for a prefix that LiteLLM prices for no Anthropic Bedrock model.
+"""

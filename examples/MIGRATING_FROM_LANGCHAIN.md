@@ -180,8 +180,10 @@ See [`11_provider_executed_tools.py`](11_provider_executed_tools.py) for a compl
 
 ## Embeddings
 
-`EmbeddingModel.embed` returns normalized `float32` rows.
-Row order matches input order.
+`EmbeddingModel.embed` returns `Embeddings`.
+Its `output` holds one normalized `float32` row per input, in input order.
+Its `usage` holds the billed input tokens and their estimated cost.
+A failed request batch raises `EmbeddingError`, whose `usage` keeps the billing of requests that returned.
 
 ```python
 from langchaint.openai import OpenAI
@@ -199,7 +201,8 @@ query = await embedding_model.embed(
     ["Which city is in Norway?"],
     task="retrieval_query",
 )
-print(documents.shape, query.shape)
+print(documents.output.shape, query.output.shape)
+print(documents.usage.cost_in_usd + query.usage.cost_in_usd)
 ```
 
 `OpenAI.llm()` returns `LLM`.

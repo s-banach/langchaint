@@ -1,8 +1,9 @@
 """Refresh vendored pricing metadata and generated pricing modules."""
 
 import json
+import math
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from datetime import date
 from decimal import Decimal
 from fractions import Fraction
@@ -28,9 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_PATH = ROOT / "scripts/pricing/litellm-pricing-snapshot.json"
 METADATA_PATH = ROOT / "scripts/pricing/provider-pricing-metadata.json"
 IGNORED_MODEL_KEYS_PATH = ROOT / "scripts/pricing/ignored-litellm-model-keys.json"
-"""Hand-maintained direct-API LiteLLM keys that langchaint deliberately does not price."""
+"""Hand-maintained LiteLLM keys of reported model kinds that langchaint deliberately does not price."""
 OPENAI_OUTPUT_PATH = ROOT / "src/langchaint/openai/_generated_pricing.py"
 ANTHROPIC_OUTPUT_PATH = ROOT / "src/langchaint/anthropic/_generated_pricing.py"
+COHERE_OUTPUT_PATH = ROOT / "src/langchaint/cohere/_generated_pricing.py"
 
 LITELLM_COMMIT_URL = "https://api.github.com/repos/BerriAI/litellm/commits/main"
 LITELLM_RAW_URL = (
@@ -82,6 +84,42 @@ ANTHROPIC_BEDROCK_LITELLM_KEYS = {
     "us.anthropic.claude-opus-4-6-v1": "us.anthropic.claude-opus-4-6-v1",
     "us.anthropic.claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
 }
+OPENAI_EMBEDDING_LITELLM_KEYS = (
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+)
+"""LiteLLM keys of the cataloged OpenAI embedding models, each equal to its model id.
+
+The generator emits `OpenAIEmbeddingModelId` from them.
+"""
+COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS = ("cohere.embed-v4:0",)
+"""LiteLLM keys of the cataloged Cohere Embed v4 models on Bedrock, each equal to its model id.
+
+The generator emits `CohereEmbedV4ModelId` from them.
+These models accept `dimension`.
+"""
+COHERE_BEDROCK_EMBED_V3_LITELLM_KEYS = (
+    "cohere.embed-english-v3",
+    "cohere.embed-multilingual-v3",
+)
+"""LiteLLM keys of the cataloged Cohere Embed v3 models on Bedrock, each equal to its model id.
+
+The generator emits `CohereEmbedV3ModelId` from them.
+These models accept no `dimension`.
+"""
+_PRICE_FIELD = re.compile(r"cost|multiplier")
+"""A LiteLLM field that sets or scales a price."""
+_EMBEDDING_DROPPED_PRICE_FIELD = re.compile(r"(?:input|output)_cost_per_token_batches")
+"""Embedding price fields the rate tables may drop.
+
+No langchaint embedding adapter sends batch requests.
+"""
+_COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS = (
+    *COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS,
+    *COHERE_BEDROCK_EMBED_V3_LITELLM_KEYS,
+)
+"""LiteLLM keys of every cataloged unprefixed Cohere Bedrock embedding model."""
 BEDROCK_CROSS_REGION_PREFIXES = ("us", "eu", "au", "jp", "apac", "global", "us-gov")
 """Bedrock cross-region inference profile prefixes whose LiteLLM entries are kept when present."""
 _TIER_RATE_FIELD = re.compile(
@@ -293,6 +331,32 @@ class _LiteLLMEntry(BaseModel):
             input_tokens_cache_write_1h_usd_per_token=batch_input_tokens_cache_write_1h_usd_per_token,
         )
 
+    def embedding_input_tokens_usd_per_token(self) -> Decimal:
+        """Return the one rate of an embedding entry, which prices input tokens.
+
+        The embedding tables hold one rate per model, so any other listed rate would be dropped.
+
+        Raises:
+            ValueError: The entry lists no input rate, lists a nonzero output rate, or lists a
+                price outside `_EMBEDDING_DROPPED_PRICE_FIELD` that the table cannot hold.
+        """
+        if self.input_cost_per_token is None:
+            raise ValueError("LiteLLM lists no input rate for an embedding model")
+        if self.output_cost_per_token:
+            raise ValueError("LiteLLM lists a nonzero output rate for an embedding model")
+        unrendered_fields = [
+            field
+            for field in self.model_dump(exclude_none=True)
+            if field not in {"input_cost_per_token", "output_cost_per_token"}
+            and _PRICE_FIELD.search(field) is not None
+            and _EMBEDDING_DROPPED_PRICE_FIELD.fullmatch(field) is None
+        ]
+        if unrendered_fields:
+            raise ValueError(
+                f"LiteLLM lists prices {unrendered_fields} that an embedding rate table cannot hold"
+            )
+        return _decimal(self.input_cost_per_token)
+
     def regional_processing_multiplier(self) -> float:
         """Return the OpenAI token-price multiplier for regional processing endpoints.
 
@@ -478,7 +542,7 @@ class _GitHubCommit(BaseModel):
 
 
 class _LiteLLMModelKind(BaseModel):
-    """The LiteLLM entry fields that decide whether new-model detection reports an entry.
+    """The LiteLLM entry fields that, with the entry's key, decide whether new-model detection reports an entry.
 
     Entries carry many other fields, so this model ignores extras and does not inherit
     `CheckedCopyModel`.
@@ -489,12 +553,26 @@ class _LiteLLMModelKind(BaseModel):
     litellm_provider: str | None = None
     mode: str | None = None
 
-    def is_direct_api_text_model(self) -> bool:
-        """Report whether the entry is an OpenAI or Anthropic direct-API text generation model."""
-        return self.litellm_provider in {"openai", "anthropic"} and self.mode in {
-            "chat",
-            "responses",
-        }
+    def is_reported_model(self, unprefixed_key: str) -> bool:
+        """Report whether new-model detection covers the entry.
+
+        `unprefixed_key` is the entry's LiteLLM key without a `BEDROCK_CROSS_REGION_PREFIXES` prefix.
+        Detection covers OpenAI and Anthropic direct-API text generation models, OpenAI embedding
+        models, and Cohere embedding models on Bedrock.
+        """
+        if self.litellm_provider in {"openai", "anthropic"} and self.mode in {"chat", "responses"}:
+            return True
+        if self.mode != "embedding":
+            return False
+        return self.litellm_provider == "openai" or (
+            self.litellm_provider == "bedrock" and unprefixed_key.startswith("cohere.")
+        )
+
+
+def _unprefixed_bedrock_key(key: str) -> str:
+    """Strip a `BEDROCK_CROSS_REGION_PREFIXES` prefix from `key`, which resolves through the unprefixed key."""
+    prefix, _, unprefixed_key = key.partition(".")
+    return unprefixed_key if prefix in BEDROCK_CROSS_REGION_PREFIXES else key
 
 
 _LITELLM_FILE = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
@@ -688,6 +766,30 @@ def _constant_name(model: str) -> str:
     return f"_{model.upper().replace('-', '_').replace('.', '_')}"
 
 
+def _embedding_rates(entries: Mapping[str, _LiteLLMEntry], keys: tuple[str, ...]) -> list[str]:
+    """Render one `model id: USD per million input tokens` dict entry per embedding key.
+
+    Raises:
+        KeyError: A required model entry is missing.
+        ValueError: An entry prices more than input tokens.
+    """
+    return [
+        f'    "{key}": {_million_rate(entries[key].embedding_input_tokens_usd_per_token())},'
+        for key in keys
+    ]
+
+
+def _literal_alias_lines(name: str, values: Iterable[str]) -> list[str]:
+    """Render `type <name> = Literal[...]` as ruff formats it.
+
+    Ruff keeps a single subscript value with a trailing comma on one line, so a single value renders inline.
+    """
+    quoted = [f'"{value}"' for value in values]
+    if len(quoted) == 1:
+        return [f"type {name} = Literal[{quoted[0]}]"]
+    return [f"type {name} = Literal[", *[f"    {value}," for value in quoted], "]"]
+
+
 def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMetadata) -> str:
     """Render the generated OpenAI module.
 
@@ -717,9 +819,7 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         "from langchaint.billing.pricing import LongContextPricing, TokenRates",
         "from langchaint.openai.shared import OpenAIPricingTable",
         "",
-        "type OpenAIModelId = Literal[",
-        *[f'    "{model}",' for model in model_ids],
-        "]",
+        *_literal_alias_lines("OpenAIModelId", model_ids),
         "",
         *tables,
         "OPENAI_PRICING: dict[OpenAIModelId, OpenAIPricingTable] = {",
@@ -741,6 +841,85 @@ def _openai_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderMeta
         ],
         "}",
         '"""Token-rate multiplier for each model on an endpoint that uses regional processing."""',
+        "",
+        *_literal_alias_lines("OpenAIEmbeddingModelId", OPENAI_EMBEDDING_LITELLM_KEYS),
+        '"""Cataloged OpenAI model identifiers accepted by `embedding_model()`."""',
+        "",
+        "OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS: dict[OpenAIEmbeddingModelId, float] = {",
+        *_embedding_rates(entries, OPENAI_EMBEDDING_LITELLM_KEYS),
+        "}",
+        '"""USD per million input tokens of each cataloged OpenAI embedding model.',
+        "",
+        "LiteLLM lists no other nonzero rate that a langchaint embedding request incurs.",
+        '"""',
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _embedding_rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decimal]:
+    """Compare the input-token rate of one prefixed embedding entry with its unprefixed entry.
+
+    Yields:
+        The exact ratio of the input-token rate in `prefixed` to the one in `base`.
+
+    Raises:
+        ValueError: The base rate is zero, or either entry prices more than input tokens.
+    """
+    yield prefixed.embedding_input_tokens_usd_per_token() / _positive(
+        base.embedding_input_tokens_usd_per_token()
+    )
+
+
+def _float_literal(value: float) -> str:
+    """Render a float as Python source, writing NaN as `float("nan")`."""
+    return 'float("nan")' if math.isnan(value) else repr(value)
+
+
+def _cohere_module(entries: Mapping[str, _LiteLLMEntry]) -> str:
+    """Render the generated Cohere module.
+
+    Raises:
+        KeyError: A required model entry is missing.
+        ValueError: An entry prices more than input tokens, or a cross-region multiplier is not single.
+    """
+    lines = [
+        '"""Generated Cohere pricing metadata. Refresh with `uv run python -m scripts.update_pricing_metadata`."""',
+        "",
+        "from typing import Literal",
+        "",
+        *_literal_alias_lines("CohereEmbedV4ModelId", COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS),
+        '"""Cataloged unprefixed Cohere Embed v4 identifiers for Amazon Bedrock."""',
+        "",
+        *_literal_alias_lines("CohereEmbedV3ModelId", COHERE_BEDROCK_EMBED_V3_LITELLM_KEYS),
+        '"""Cataloged unprefixed Cohere Embed v3 identifiers for Amazon Bedrock."""',
+        "",
+        "type _CohereBedrockEmbeddingModelId = CohereEmbedV4ModelId | CohereEmbedV3ModelId",
+        "",
+        "_COHERE_EMBED_V4_MODELS: frozenset[CohereEmbedV4ModelId] = frozenset({",
+        *[f'    "{model}",' for model in COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS],
+        "})",
+        "_COHERE_EMBED_V3_MODELS: frozenset[CohereEmbedV3ModelId] = frozenset({",
+        *[f'    "{model}",' for model in COHERE_BEDROCK_EMBED_V3_LITELLM_KEYS],
+        "})",
+        "",
+        "COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS: dict[str, float] = {",
+        *_embedding_rates(entries, _COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS),
+        "}",
+        '"""USD per million input tokens of each cataloged unprefixed Cohere Bedrock embedding model.',
+        "",
+        "LiteLLM lists no other nonzero rate that a langchaint embedding request incurs.",
+        '"""',
+        "",
+        "COHERE_BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {",
+        *_cross_region_multiplier_lines(
+            entries, _COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS, _embedding_rate_ratios
+        ),
+        "}",
+        '"""Input-token rate multiplier of a Cohere model for each Bedrock cross-region prefix.',
+        "",
+        "It is NaN for a prefix that LiteLLM prices for no Cohere model.",
+        '"""',
         "",
     ]
     return "\n".join(lines)
@@ -792,9 +971,7 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         ")",
         "from langchaint.billing.pricing import LongContextPricing",
         "",
-        "type AnthropicModelId = Literal[",
-        *[f'    "{model}",' for model in model_ids],
-        "]",
+        *_literal_alias_lines("AnthropicModelId", model_ids),
         "",
         *direct_tables,
         "ANTHROPIC_PRICING: dict[AnthropicModelId, AnthropicPricingTable] = {",
@@ -810,12 +987,14 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         "}",
         "",
         "BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {",
-        *[
-            f'    "{prefix}": {_cross_region_multiplier(entries, prefix)!r},'
-            for prefix in BEDROCK_CROSS_REGION_PREFIXES
-        ],
+        *_cross_region_multiplier_lines(
+            entries, ANTHROPIC_BEDROCK_LITELLM_KEYS.values(), _rate_ratios
+        ),
         "}",
-        '"""Token-rate multiplier for each Bedrock cross-region inference profile prefix."""',
+        '"""Token-rate multiplier for each Bedrock cross-region inference profile prefix.',
+        "",
+        "It is NaN for a prefix that LiteLLM prices for no Anthropic Bedrock model.",
+        '"""',
         "",
     ]
     return "\n".join(lines)
@@ -826,25 +1005,47 @@ def _prefixed_key(prefix: str, key: str) -> str:
     return f"{prefix}.{key}"
 
 
-def _cross_region_multiplier(entries: Mapping[str, _LiteLLMEntry], prefix: str) -> float:
-    """Return the ratio of prefixed to unprefixed Bedrock token rates for one prefix.
+def _cross_region_multiplier(
+    entries: Mapping[str, _LiteLLMEntry],
+    prefix: str,
+    keys: Collection[str],
+    rate_ratios: Callable[[_LiteLLMEntry, _LiteLLMEntry], Iterable[Decimal]],
+) -> float:
+    """Return the ratio of prefixed to unprefixed Bedrock rates of `keys` for one prefix.
 
-    A rate unlisted in a prefixed entry contributes no ratio.
+    `rate_ratios` yields the ratios of one prefixed entry to its unprefixed entry.
+    The multiplier is NaN when no prefixed entry yields a ratio.
 
     Raises:
-        ValueError: No prefixed entry exists, a base rate is unlisted or zero, the ratio
-            differs across models or rate fields, or a prefixed entry's long-context pricing
-            differs from its base entry's.
+        ValueError: The ratio differs across models or rate fields, or `rate_ratios` raised it.
     """
     ratios = {
         ratio
-        for key in ANTHROPIC_BEDROCK_LITELLM_KEYS.values()
+        for key in keys
         if (prefixed_key := _prefixed_key(prefix, key)) in entries
-        for ratio in _rate_ratios(entries[prefixed_key], entries[key])
+        for ratio in rate_ratios(entries[prefixed_key], entries[key])
     }
+    if not ratios:
+        return float("nan")
     if len(ratios) != 1:
         raise ValueError(f"{prefix} has no single cross-region multiplier: {sorted(ratios)}")
     return float(ratios.pop())
+
+
+def _cross_region_multiplier_lines(
+    entries: Mapping[str, _LiteLLMEntry],
+    keys: Collection[str],
+    rate_ratios: Callable[[_LiteLLMEntry, _LiteLLMEntry], Iterable[Decimal]],
+) -> list[str]:
+    """Render one `prefix: multiplier` dict entry per `BEDROCK_CROSS_REGION_PREFIXES` prefix.
+
+    Raises:
+        ValueError: A prefix has no single multiplier, or `rate_ratios` raised it.
+    """
+    return [
+        f'    "{prefix}": {_float_literal(_cross_region_multiplier(entries, prefix, keys, rate_ratios))},'
+        for prefix in BEDROCK_CROSS_REGION_PREFIXES
+    ]
 
 
 def _rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decimal]:
@@ -873,7 +1074,7 @@ def _rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decim
 
 def _expected_providers(key: str) -> frozenset[str]:
     """Return the LiteLLM provider values accepted for one selected key."""
-    if key in OPENAI_LITELLM_KEYS.values():
+    if key in OPENAI_LITELLM_KEYS.values() or key in OPENAI_EMBEDDING_LITELLM_KEYS:
         return frozenset({"openai"})
     if key in ANTHROPIC_LITELLM_KEYS.values():
         return frozenset({"anthropic"})
@@ -903,11 +1104,16 @@ def _selected_entries(raw_entries: Mapping[str, JsonValue]) -> dict[str, _LiteLL
         *OPENAI_LITELLM_KEYS.values(),
         *ANTHROPIC_LITELLM_KEYS.values(),
         *ANTHROPIC_BEDROCK_LITELLM_KEYS.values(),
+        *OPENAI_EMBEDDING_LITELLM_KEYS,
+        *_COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS,
     }
     optional_keys = {
         _prefixed_key(prefix, key)
         for prefix in BEDROCK_CROSS_REGION_PREFIXES
-        for key in ANTHROPIC_BEDROCK_LITELLM_KEYS.values()
+        for key in (
+            *ANTHROPIC_BEDROCK_LITELLM_KEYS.values(),
+            *_COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS,
+        )
     }
     return {
         key: _validated_entry(key, raw_entries[key])
@@ -918,23 +1124,26 @@ def _selected_entries(raw_entries: Mapping[str, JsonValue]) -> dict[str, _LiteLL
 def _untracked_model_keys(
     raw_entries: Mapping[str, JsonValue], ignored_keys: frozenset[str]
 ) -> list[str]:
-    """List the direct-API text model keys that are neither generated nor ignored.
+    """List the keys of reported models that are neither generated nor ignored.
 
     An OpenAI or Anthropic direct-API LiteLLM key equals the model id, so an alias key such as
     `gpt-5.6` counts as generated.
+    A Bedrock key under a cross-region prefix counts as generated or ignored when its unprefixed key is.
     """
     generated_keys = {
         *OPENAI_LITELLM_KEYS.values(),
         *OPENAI_ALIASES,
         *ANTHROPIC_LITELLM_KEYS.values(),
         *ANTHROPIC_ALIASES,
+        *OPENAI_EMBEDDING_LITELLM_KEYS,
+        *_COHERE_BEDROCK_EMBEDDING_LITELLM_KEYS,
     }
     return sorted(
         key
         for key, raw_entry in raw_entries.items()
-        if key not in generated_keys
-        and key not in ignored_keys
-        and _LiteLLMModelKind.model_validate(raw_entry).is_direct_api_text_model()
+        if (unprefixed_key := _unprefixed_bedrock_key(key)) not in generated_keys
+        and unprefixed_key not in ignored_keys
+        and _LiteLLMModelKind.model_validate(raw_entry).is_reported_model(unprefixed_key)
     )
 
 
@@ -947,7 +1156,7 @@ def _snapshot_json(entries: Mapping[str, _LiteLLMEntry]) -> str:
 def main() -> None:
     """Refresh pricing files from current upstream data.
 
-    Print one line per direct-API text model key that is neither generated nor in
+    Print one line per reported model key that is neither generated nor in
     `IGNORED_MODEL_KEYS_PATH`, so the refresh workflow can report new models.
 
     Raises:
@@ -967,11 +1176,14 @@ def main() -> None:
     snapshot = _snapshot_json(entries)
     openai_module = _openai_module(entries, metadata)
     anthropic_module = _anthropic_module(entries, metadata)
+    cohere_module = _cohere_module(entries)
     _ = compile(openai_module, str(OPENAI_OUTPUT_PATH), "exec")
     _ = compile(anthropic_module, str(ANTHROPIC_OUTPUT_PATH), "exec")
+    _ = compile(cohere_module, str(COHERE_OUTPUT_PATH), "exec")
     _ = SNAPSHOT_PATH.write_text(snapshot)
     _ = OPENAI_OUTPUT_PATH.write_text(openai_module)
     _ = ANTHROPIC_OUTPUT_PATH.write_text(anthropic_module)
+    _ = COHERE_OUTPUT_PATH.write_text(cohere_module)
     for key in untracked_model_keys:
         print(key)
 

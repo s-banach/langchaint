@@ -7,6 +7,7 @@ Use `OpenAIChatCompletionsAdapter` directly for compatible endpoints.
 Use `OpenAIResponsesAdapter` directly for Azure.
 
 Cataloged models receive `OPENAI_PRICING`.
+Cataloged embedding models receive `OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS`.
 Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
 `OpenAIBedrock.llm` always requires both parameters.
 Missing optional rates produce NaN token costs.
@@ -43,8 +44,10 @@ except ModuleNotFoundError as exc:
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
 from langchaint.openai._generated_pricing import (
+    OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS,
     OPENAI_PRICING,
     OPENAI_REGIONAL_PROCESSING_MULTIPLIER,
+    OpenAIEmbeddingModelId,
     OpenAIModelId,
 )
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
@@ -63,18 +66,9 @@ if TYPE_CHECKING:
     from langchaint.embedding import EmbeddingModel
     from langchaint.generation.observer import Observer
 
-type OpenAIEmbeddingModelId = Literal[
-    "text-embedding-3-small",
-    "text-embedding-3-large",
-    "text-embedding-ada-002",
-]
-"""Cataloged OpenAI model identifiers accepted by `embedding_model()`."""
-
-OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelId] = frozenset({
-    "text-embedding-3-small",
-    "text-embedding-3-large",
-    "text-embedding-ada-002",
-})
+OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelId] = frozenset(
+    OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS
+)
 """Cataloged OpenAI embedding model identifiers."""
 
 _PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](OPENAI_PRICING.items())
@@ -223,6 +217,7 @@ class OpenAI:
         *,
         dimension: int = 1536,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel: ...
 
     @overload
@@ -232,6 +227,7 @@ class OpenAI:
         *,
         dimension: int = 3072,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel: ...
 
     @overload
@@ -240,6 +236,7 @@ class OpenAI:
         model: Literal["text-embedding-ada-002"],
         *,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel: ...
 
     def embedding_model(
@@ -248,12 +245,15 @@ class OpenAI:
         *,
         dimension: int | None = None,
         max_requests: int = 3,
+        usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged OpenAI model.
 
         Third-generation models accept their documented dimension range.
         `text-embedding-ada-002` has dimension 1536 and accepts no dimension argument.
         Every model counts batching tokens with tiktoken's `cl100k_base` encoding.
+        `usd_per_million_tokens` prices input tokens.
+        It replaces the model's rate in `OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS`.
 
         Raises:
             ValueError: `model`, `dimension`, or `max_requests` is invalid.
@@ -297,6 +297,11 @@ class OpenAI:
             adapter=adapter,
             shared_backoff=self._shared_backoff,
             max_requests=max_requests,
+            usd_per_million_tokens=(
+                OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS[model]
+                if usd_per_million_tokens is None
+                else usd_per_million_tokens
+            ),
         )
 
 
@@ -364,6 +369,7 @@ class OpenAIBedrock:
 
 __all__ = [
     "OPENAI_EMBEDDING_MODELS",
+    "OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS",
     "OPENAI_PRICING",
     "OPENAI_REGIONAL_PROCESSING_MULTIPLIER",
     "PROMPT_CACHE_OPTIONS_MODELS",

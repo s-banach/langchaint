@@ -17,10 +17,14 @@ from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
-from langchaint import SharedBackoff
+from langchaint import EmbeddingError, SharedBackoff
 from langchaint.adapter import RequestFailure
-from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
-from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.cohere import (
+    COHERE_BEDROCK_CROSS_REGION_MULTIPLIER,
+    COHERE_BEDROCK_EMBEDDING_MODELS,
+    COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS,
+    CohereBedrock,
+)
 from tests.helpers import run_with_timeout
 
 if TYPE_CHECKING:
@@ -32,6 +36,11 @@ if TYPE_CHECKING:
 
 
 _JSON_CONTENT_TYPE = "application/json"
+_INPUT_TOKENS_TOTAL = 2
+_RESPONSE_METADATA: dict[str, object] = {
+    "HTTPHeaders": {"x-amzn-bedrock-input-token-count": str(_INPUT_TOKENS_TOTAL)}
+}
+"""Response metadata carrying the billed input token count, as botocore exposes it."""
 
 
 def _run_async_test[**Parameters](
@@ -63,12 +72,15 @@ def _request_body(payload: dict[str, object]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def _response(vectors: list[list[float]]) -> dict[str, object]:
+def _response(
+    vectors: list[list[float]], *, response_metadata: dict[str, object] = _RESPONSE_METADATA
+) -> dict[str, object]:
     """Build one constructed `invoke_model` response."""
     body_bytes = json.dumps({"embeddings": vectors}).encode()
     return {
         "body": StreamingBody(BytesIO(body_bytes), len(body_bytes)),
         "contentType": _JSON_CONTENT_TYPE,
+        "ResponseMetadata": response_metadata,
     }
 
 
@@ -120,7 +132,8 @@ async def test_v4_routes_model_and_dimension_verbatim(
             dimension=dimension,
             max_requests=1,
         ).embed(["document"], task="retrieval_document")
-        assert embeddings.shape == (1, dimension)
+        assert embeddings.output.shape == (1, dimension)
+        assert embeddings.usage.input_tokens_total == _INPUT_TOKENS_TOTAL
         stubber.assert_no_pending_responses()
     finally:
         stubber.deactivate()
@@ -188,7 +201,7 @@ async def test_v3_omits_dimension() -> None:
         cohere_bedrock = CohereBedrock(client=client)
         model = cohere_bedrock.embedding_model("cohere.embed-multilingual-v3")
         embeddings = await model.embed(["query"], task="retrieval_query")
-        assert embeddings.shape == (1, 1024)
+        assert embeddings.output.shape == (1, 1024)
         stubber.assert_no_pending_responses()
     finally:
         stubber.deactivate()
@@ -212,6 +225,7 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
     response = {
         "body": StreamingBody(BytesIO(body_bytes), len(body_bytes)),
         "contentType": _JSON_CONTENT_TYPE,
+        "ResponseMetadata": _RESPONSE_METADATA,
     }
     stubber.add_response(
         "invoke_model",
@@ -222,8 +236,8 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
     try:
         cohere_bedrock = CohereBedrock(client=client)
         embedding_model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
-        vectors = await embedding_model.embed(["text"], task="classification")
-        assert vectors.shape == (1, 256)
+        embeddings = await embedding_model.embed(["text"], task="classification")
+        assert embeddings.output.shape == (1, 256)
     finally:
         stubber.deactivate()
         client.close()
@@ -350,7 +364,7 @@ async def test_batching_uses_ninety_six_inputs() -> None:
         )
         model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         embeddings = await model.embed(inputs, task="clustering")
-        assert embeddings.shape == (97, 256)
+        assert embeddings.output.shape == (97, 256)
         stubber.assert_no_pending_responses()
     finally:
         stubber.deactivate()
@@ -402,6 +416,7 @@ async def test_invalid_response_hides_vectors() -> None:
     response = {
         "body": StreamingBody(BytesIO(response_bytes), len(response_bytes)),
         "contentType": _JSON_CONTENT_TYPE,
+        "ResponseMetadata": _RESPONSE_METADATA,
     }
     stubber.add_response(
         "invoke_model",
@@ -412,11 +427,106 @@ async def test_invalid_response_hides_vectors() -> None:
     try:
         cohere_bedrock = CohereBedrock(client=client)
         model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
-        with pytest.raises(EmbeddingOutputError) as raised:
+        with pytest.raises(EmbeddingError) as raised:
             await model.embed(["text"], task="classification")
+        assert raised.value.kind == "invalid_output_error"
+        assert raised.value.usage.input_tokens_total == _INPUT_TOKENS_TOTAL
         assert "8675309" not in str(raised.value)
+        assert "8675309" not in str(raised.value.__cause__)
     finally:
         stubber.deactivate()
+        client.close()
+
+
+@_run_async_test
+async def test_a_response_without_a_token_count_is_invalid_output() -> None:
+    """A response without the token-count header ends `embed` with no billed usage."""
+    client = _bedrock_client()
+    stubber = Stubber(client)
+    body = _request_body({
+        "texts": ["text"],
+        "input_type": "classification",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
+    stubber.add_response(
+        "invoke_model",
+        _response([[1.0, *([0.0] * 255)]], response_metadata={"HTTPHeaders": {}}),
+        _expected_parameters(body, "cohere.embed-v4:0"),
+    )
+    stubber.activate()
+    try:
+        model = CohereBedrock(client=client).embedding_model("cohere.embed-v4:0", dimension=256)
+        with pytest.raises(EmbeddingError) as raised:
+            await model.embed(["text"], task="classification")
+        assert raised.value.kind == "invalid_output_error"
+        [request_record] = raised.value.request_history
+        assert request_record.usage is None
+    finally:
+        stubber.deactivate()
+        client.close()
+
+
+_V4_RATE = COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS["cohere.embed-v4:0"]
+
+
+@pytest.mark.parametrize(
+    ("model", "apply_cross_region_multiplier", "usd_per_million_tokens", "expected"),
+    [
+        ("cohere.embed-v4:0", True, None, _V4_RATE),
+        (
+            "eu.cohere.embed-v4:0",
+            True,
+            None,
+            _V4_RATE * COHERE_BEDROCK_CROSS_REGION_MULTIPLIER["eu"],
+        ),
+        ("eu.cohere.embed-v4:0", False, None, _V4_RATE),
+        ("eu.cohere.embed-v4:0", True, 1.5, 1.5),
+    ],
+)
+def test_embedding_model_rate_resolves_through_the_unprefixed_catalog_rate(
+    model: str,
+    *,
+    apply_cross_region_multiplier: bool,
+    usd_per_million_tokens: float | None,
+    expected: float,
+) -> None:
+    """A prefixed identifier's catalog rate is the unprefixed rate times the prefix multiplier.
+
+    `apply_cross_region_multiplier=False` leaves it unmultiplied, and a given rate replaces it.
+    The vendored LiteLLM snapshot lists no `eu.cohere.embed-v4:0` entry, so the eu multiplier is NaN.
+    That makes the multiplied rate differ from the unmultiplied rate.
+    """
+    client = _bedrock_client()
+    try:
+        embedding_model = CohereBedrock(
+            client=client, apply_cross_region_multiplier=apply_cross_region_multiplier
+        ).embedding_model(model, usd_per_million_tokens=usd_per_million_tokens)
+        assert embedding_model.usd_per_million_tokens == pytest.approx(expected, nan_ok=True)
+    finally:
+        client.close()
+
+
+def test_prefixed_v3_identifier_resolves_to_v3() -> None:
+    """A prefixed v3 identifier resolves to its v3 catalog identifier, which accepts no dimension."""
+    client = _bedrock_client()
+    try:
+        cohere_bedrock = CohereBedrock(client=client)
+        assert cohere_bedrock.embedding_model("us.cohere.embed-english-v3").dimension == 1024
+        with pytest.raises(ValueError, match="accepts no dimension"):
+            _ = cohere_bedrock.embedding_model("us.cohere.embed-english-v3", dimension=256)
+    finally:
+        client.close()
+
+
+def test_uncataloged_identifier_is_rejected() -> None:
+    """An identifier that resolves to no catalog identifier raises."""
+    client = _bedrock_client()
+    try:
+        with pytest.raises(ValueError, match="not in COHERE_BEDROCK_EMBEDDING_MODELS"):
+            _ = CohereBedrock(client=client).embedding_model("xx.cohere.embed-v4:0")
+    finally:
         client.close()
 
 
@@ -481,7 +591,7 @@ class _FakeClient:
         body_bytes = json.dumps({"embeddings": [[1.0, *([0.0] * (self.dimension - 1))]]}).encode()
         response_body = _FakeBody(body_bytes)
         self.bodies.append(response_body)
-        return {"body": response_body}
+        return {"body": response_body, "ResponseMetadata": _RESPONSE_METADATA}
 
     def close(self) -> None:
         """Record client closure."""
@@ -573,9 +683,9 @@ async def test_concurrent_preparation_creates_one_client(
     await asyncio.sleep(0)
     assert len(configs) == 1
     creation_release.set()
-    first_vectors, second_vectors = await asyncio.gather(first, second)
-    assert first_vectors.shape == (1, 256)
-    assert second_vectors.shape == (1, 256)
+    first_embeddings, second_embeddings = await asyncio.gather(first, second)
+    assert first_embeddings.output.shape == (1, 256)
+    assert second_embeddings.output.shape == (1, 256)
     assert len(configs) == 1
     assert len(fake_client.requests) == 2
     assert not fake_client.closed
@@ -630,7 +740,7 @@ async def test_transient_client_error_retries_only_failed_request(
         max_requests=2,
     )
     embeddings = await model.embed(["text"], task="classification")
-    assert embeddings.shape == (1, 256)
+    assert embeddings.output.shape == (1, 256)
     assert len(fake_client.requests) == 2
 
 
@@ -684,7 +794,7 @@ async def test_cancelled_creation_retains_completed_client(
     with pytest.raises(asyncio.CancelledError):
         await first_task
     embeddings = await model.embed(["second"], task="classification")
-    assert embeddings.shape == (1, 256)
+    assert embeddings.output.shape == (1, 256)
     assert len(fake_client.requests) == 1
 
 

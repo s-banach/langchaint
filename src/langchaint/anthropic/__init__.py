@@ -31,7 +31,7 @@ A cataloged model without a web-search rate requires `pricing` to bind the web s
 """
 
 from dataclasses import dataclass
-from typing import Literal, NamedTuple, overload
+from typing import Literal, overload
 
 try:
     import httpx2
@@ -58,6 +58,7 @@ from langchaint.anthropic.messages_adapter import (
     CacheTTL,
     client_without_retries,
 )
+from langchaint.common.bedrock import BedrockCatalogResolution, resolve_bedrock_catalog_id
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
 from langchaint.generation.observer import Observer
@@ -89,31 +90,6 @@ Each identifier is sent verbatim.
 The literal values offer preferred endpoint-specific identifiers.
 A `BEDROCK_CROSS_REGION_MULTIPLIER` prefix on a literal value resolves the same routing and catalog pricing.
 """
-
-
-class _CatalogResolution(NamedTuple):
-    """The catalog identifier a Bedrock identifier resolves through."""
-
-    catalog_id: str
-    cross_region_multiplier: float | None
-    """The `BEDROCK_CROSS_REGION_MULTIPLIER` entry of a stripped prefix, or `None` when no prefix was stripped."""
-
-
-def _resolve_catalog_id(model: str) -> _CatalogResolution:
-    """Resolve `model` to its catalog identifier.
-
-    An exact catalog identifier resolves to itself.
-    Otherwise a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped.
-    """
-    if model in ANTHROPIC_BEDROCK_PRICING:
-        return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
-    prefix, _, catalog_id = model.partition(".")
-    cross_region_multiplier = BEDROCK_CROSS_REGION_MULTIPLIER.get(prefix)
-    if cross_region_multiplier is None:
-        return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
-    return _CatalogResolution(
-        catalog_id=catalog_id, cross_region_multiplier=cross_region_multiplier
-    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -299,7 +275,11 @@ class AnthropicBedrock:
             ValueError: An uncataloged model lacks `pricing` or a passed `client`.
                 Also raised when a passed SDK client cannot serve `model`.
         """
-        resolution = _resolve_catalog_id(model)
+        resolution = resolve_bedrock_catalog_id(
+            model,
+            catalog_ids=ANTHROPIC_BEDROCK_PRICING,
+            cross_region_multipliers=BEDROCK_CROSS_REGION_MULTIPLIER,
+        )
         routing = ANTHROPIC_BEDROCK_ROUTING.get(resolution.catalog_id)
         client = self._client_for(routing, model)
         adapter = AnthropicMessagesAdapter(
@@ -357,7 +337,7 @@ class AnthropicBedrock:
         return created_client
 
     def _catalog_pricing(
-        self, model: str, resolution: _CatalogResolution
+        self, model: str, resolution: BedrockCatalogResolution
     ) -> AnthropicPricingTable:
         """Return the catalog table for `resolution`.
 

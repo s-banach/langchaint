@@ -28,7 +28,18 @@ class TransientError(Exception):
 
 
 class EmbeddingOutputError(RuntimeError):
-    """A provider returned unusable embedding vectors."""
+    """A provider returned unusable embedding vectors.
+
+    `input_tokens_total` is the token count the provider reported for the rejected response.
+    It is `None` when the response reported none.
+    """
+
+    input_tokens_total: int | None
+
+    def __init__(self, error_text: str, *, input_tokens_total: int | None) -> None:
+        """Store the reported token count."""
+        super().__init__(error_text)
+        self.input_tokens_total = input_tokens_total
 
 
 class StreamProtocolError(Exception):

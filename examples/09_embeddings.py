@@ -10,8 +10,8 @@ async def retrieve_and_summarize() -> PlainGeneration[str]:
     """Embed documents, select one, and summarize it.
 
     Raises:
-        openai.OpenAIError: OpenAI credentials are unavailable or an embedding request fails.
-        EmbeddingOutputError: An embedding response contains invalid vectors.
+        openai.OpenAIError: OpenAI credentials are unavailable.
+        EmbeddingError: An embedding request failed or returned invalid vectors.
         GenerationError: Summary generation fails.
     """
     openai = OpenAI()
@@ -23,14 +23,19 @@ async def retrieve_and_summarize() -> PlainGeneration[str]:
         "Octopuses have three hearts.",
         "Sea turtles navigate across ocean basins.",
     ]
-    document_vectors = await embedding_model.embed(documents, task="retrieval_document")
-    query_vectors = await embedding_model.embed(
+    document_embeddings = await embedding_model.embed(documents, task="retrieval_document")
+    query_embeddings = await embedding_model.embed(
         ["Which animal has several hearts?"], task="retrieval_query"
     )
+    document_vectors = document_embeddings.output
+    query_vectors = query_embeddings.output
 
     print(f"documents shape: {document_vectors.shape}")
     print(f"query shape: {query_vectors.shape}")
     print(f"document norms: {np.linalg.vector_norm(document_vectors, axis=1)}")
+    print(
+        f"embedding cost: ${document_embeddings.usage.cost_in_usd + query_embeddings.usage.cost_in_usd}"
+    )
     scores: np.ndarray[tuple[int], np.dtype[np.float32]] = document_vectors @ query_vectors[0]
     selected_document = documents[int(scores.argmax())]
     return await summarizer.generate_one(f"Summarize this fact: {selected_document}")

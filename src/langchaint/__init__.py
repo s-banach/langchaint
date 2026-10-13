@@ -20,7 +20,6 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.billing.usage import ZERO_USAGE, Usage
-from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -97,7 +96,28 @@ from langchaint.tools import (
 )
 
 if TYPE_CHECKING:
-    from langchaint.embedding import EmbeddingModel, EmbeddingTask, Float2D
+    from langchaint.embedding import (
+        EmbeddingError,
+        EmbeddingErrorKind,
+        EmbeddingModel,
+        EmbeddingRequestRecord,
+        Embeddings,
+        EmbeddingTask,
+        EmbeddingUsage,
+        Float2D,
+    )
+
+_EMBEDDING_ATTRIBUTES = frozenset({
+    "EmbeddingError",
+    "EmbeddingErrorKind",
+    "EmbeddingModel",
+    "EmbeddingRequestRecord",
+    "EmbeddingTask",
+    "EmbeddingUsage",
+    "Embeddings",
+    "Float2D",
+})
+"""Public attributes of `langchaint.embedding`, resolved on first access because they require `numpy`."""
 
 
 def __getattr__(name: str) -> object:
@@ -107,19 +127,11 @@ def __getattr__(name: str) -> object:
         ModuleNotFoundError: The requested attribute requires unavailable `numpy`.
         AttributeError: `name` is not a deferred public attribute.
     """
-    if name == "EmbeddingModel":
-        from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
+    if name not in _EMBEDDING_ATTRIBUTES:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import langchaint.embedding  # noqa: PLC0415 (defer numpy)
 
-        return EmbeddingModel
-    if name == "EmbeddingTask":
-        from langchaint.embedding import EmbeddingTask  # noqa: PLC0415 (defer numpy)
-
-        return EmbeddingTask
-    if name == "Float2D":
-        from langchaint.embedding import Float2D  # noqa: PLC0415 (defer numpy)
-
-        return Float2D
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return vars(langchaint.embedding)[name]
 
 
 __all__ = [
@@ -143,9 +155,13 @@ __all__ = [
     "DispatchOutcome",
     "DispatchPrecomputed",
     "DispatchUnknownTool",
+    "EmbeddingError",
+    "EmbeddingErrorKind",
     "EmbeddingModel",
-    "EmbeddingOutputError",
+    "EmbeddingRequestRecord",
     "EmbeddingTask",
+    "EmbeddingUsage",
+    "Embeddings",
     "Float2D",
     "Generation",
     "GenerationError",

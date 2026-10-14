@@ -11,6 +11,7 @@ A refresh that produces identical data leaves this file unchanged.
 
 `chat-span-attributes.json` is generated from the resolved `gen_ai.client.inference` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
 `execute-tool-span-attribute-names.json` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
+`embeddings-span-attribute-names.json` lists the attribute names of the resolved `gen_ai.embeddings.client` span.
 `src/langchaint/_semconv_genai_structured_attributes.json` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 

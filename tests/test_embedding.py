@@ -1,6 +1,7 @@
 """Cover provider-neutral embedding execution, accounting, and output invariants."""
 
 import asyncio
+import logging
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -8,13 +9,20 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pytest
 
-from langchaint import EmbeddingError, EmbeddingModel, EmbeddingUsage, Float2D
+from langchaint import (
+    EmbeddingError,
+    EmbeddingModel,
+    EmbeddingRequestErrorRecord,
+    EmbeddingUsage,
+    Float2D,
+)
 from langchaint.adapter import RequestFailure
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.embedding import EmbeddingTask, _EmbeddingBatchResponse, _validated_embeddings
-from tests.helpers import run_with_timeout
+from langchaint.embedding_requests import EmbeddingObserver
+from tests.helpers import RaisingObserver, run_with_timeout
 
 _TOKENS_PER_REQUEST = 7
 _USD_PER_MILLION_TOKENS = 2.0
@@ -42,6 +50,7 @@ class _StubEmbeddingAdapter:
     Each scripted matrix returns with `_TOKENS_PER_REQUEST` reported tokens.
     """
 
+    provider_name = "stub-provider"
     model = "stub-embedding"
     dimension = 2
 
@@ -86,12 +95,15 @@ class _StubEmbeddingAdapter:
         outcome = self._requests.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
-        return _EmbeddingBatchResponse(vectors=outcome, input_tokens_total=_TOKENS_PER_REQUEST)
+        return _EmbeddingBatchResponse(
+            vectors=outcome, input_tokens_total=_TOKENS_PER_REQUEST, model_served="stub-served"
+        )
 
 
 class _PartitioningEmbeddingAdapter:
     """Run one request batch per input under explicit completion controls."""
 
+    provider_name = "stub-provider"
     model = "partitioning-embedding"
     dimension = 2
 
@@ -151,7 +163,9 @@ class _PartitioningEmbeddingAdapter:
             raise _ProviderError(input_text)
         row = [1.0, 0.0] if input_text == "first" else [0.0, 1.0]
         return _EmbeddingBatchResponse(
-            vectors=np.array([row], dtype=np.float32), input_tokens_total=_TOKENS_PER_REQUEST
+            vectors=np.array([row], dtype=np.float32),
+            input_tokens_total=_TOKENS_PER_REQUEST,
+            model_served=None,
         )
 
 
@@ -169,12 +183,14 @@ def _model(
     *,
     max_requests: int = 3,
     max_wait_seconds: float = 0.001,
+    observer: EmbeddingObserver | None = None,
 ) -> EmbeddingModel:
     return EmbeddingModel(
         adapter=adapter,
         shared_backoff=_shared_backoff(max_wait_seconds=max_wait_seconds),
         max_requests=max_requests,
         usd_per_million_tokens=_USD_PER_MILLION_TOKENS,
+        observer=observer,
     )
 
 
@@ -199,7 +215,8 @@ def test_embed_returns_owned_float32_rows_and_priced_usage() -> None:
     np.testing.assert_allclose(vectors, [[0.6, 0.8], [0.0, 1.0]], rtol=1e-6)
     [request_record] = embeddings.request_history
     assert request_record.input_count == 2
-    assert request_record.error_text is None
+    assert request_record.model_served == "stub-served"
+    assert request_record.error is None
     assert embeddings.usage == EmbeddingUsage(
         input_tokens_total=_TOKENS_PER_REQUEST, cost_in_usd=_COST_PER_REQUEST
     )
@@ -259,9 +276,35 @@ def test_a_transient_failure_retries_and_records_both_requests() -> None:
 
     np.testing.assert_array_equal(embeddings.output, [[1.0, 0.0]])
     failed, succeeded = embeddings.request_history
-    assert (failed.error_text, failed.usage) == ("provider", None)
-    assert succeeded.error_text is None
+    assert (failed.error, failed.usage) == (
+        EmbeddingRequestErrorRecord(kind="transient", error_text="provider"),
+        None,
+    )
+    assert failed.model_served is None
+    assert succeeded.error is None
     assert embeddings.usage.input_tokens_total == _TOKENS_PER_REQUEST
+
+
+@pytest.mark.parametrize("raise_at_start", [True, False], ids=["start", "operation"])
+def test_an_observer_that_raises_never_changes_what_embed_returns(
+    *, raise_at_start: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """langchaint logs every observer failure, and `embed` retries and returns as it does unobserved."""
+    adapter = _StubEmbeddingAdapter([
+        _ProviderError("provider"),
+        np.array([[1.0, 0.0]], dtype=np.float32),
+    ])
+    model = _model(adapter, observer=RaisingObserver(raise_at_start=raise_at_start))
+
+    with caplog.at_level(logging.WARNING, logger="langchaint.common.observed_operation"):
+        embeddings = run_with_timeout(model.embed(["one"], task="classification"))
+
+    np.testing.assert_array_equal(embeddings.output, [[1.0, 0.0]])
+    assert [record.error for record in embeddings.request_history] == [
+        EmbeddingRequestErrorRecord(kind="transient", error_text="provider"),
+        None,
+    ]
+    assert "the observer raised" in caplog.text
 
 
 def test_a_retry_after_sets_the_minimum_private_wait() -> None:
@@ -316,7 +359,9 @@ def test_a_terminal_failure_raises_its_kind_without_a_retry(
     assert error.__cause__ is failure
     assert str(error) == f"Embedding failed with {error_kind}: provider text"
     [request_record] = error.request_history
-    assert request_record.error_text == "provider text"
+    assert request_record.error == EmbeddingRequestErrorRecord(
+        kind=request_failure.kind, error_text="provider text"
+    )
     assert adapter.embed_calls == 1
 
 

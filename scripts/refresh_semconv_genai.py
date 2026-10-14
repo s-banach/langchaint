@@ -23,6 +23,7 @@ SOURCE_DOC = DESTINATION / "SOURCE.md"
 TEMPLATES = ROOT / "scripts" / "semconv_genai_templates"
 CHAT_SPAN_ATTRIBUTES_FILE = "chat-span-attributes.json"
 EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE = "execute-tool-span-attribute-names.json"
+EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE = "embeddings-span-attribute-names.json"
 RUNTIME_STRUCTURED_ATTRIBUTES_FILE = "_semconv_genai_structured_attributes.json"
 WEAVER_TARGET = "chat-span"
 OBSOLETE_FILES = {"provider-name-values.json"}
@@ -156,6 +157,7 @@ A refresh that produces identical data leaves this file unchanged.
 
 `{CHAT_SPAN_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.client.inference` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
 `{EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
+`{EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.embeddings.client` span.
 `src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 
@@ -191,6 +193,7 @@ def _generate_staged_files(
     generated_shapes: dict[str, Literal["object", "string_array"]] = {
         CHAT_SPAN_ATTRIBUTES_FILE: "object",
         EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE: "string_array",
+        EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE: "string_array",
         RUNTIME_STRUCTURED_ATTRIBUTES_FILE: "string_array",
     }
     for generated_file, expected_shape in generated_shapes.items():

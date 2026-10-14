@@ -42,6 +42,12 @@ from langchaint.common.messages import (
 )
 from langchaint.concurrency.run_many import run_many
 from langchaint.concurrency.shared_backoff import SharedBackoff
+from langchaint.embedding_requests import (
+    EmbeddingRequestErrorKind,
+    EmbeddingRequestErrorRecord,
+    EmbeddingRequestRecord,
+    EmbeddingUsage,
+)
 from langchaint.generation.errors import (
     GenerationError,
     GenerationErrorKind,
@@ -100,10 +106,8 @@ if TYPE_CHECKING:
         EmbeddingError,
         EmbeddingErrorKind,
         EmbeddingModel,
-        EmbeddingRequestRecord,
         Embeddings,
         EmbeddingTask,
-        EmbeddingUsage,
         Float2D,
     )
 
@@ -111,9 +115,7 @@ _EMBEDDING_ATTRIBUTES = frozenset({
     "EmbeddingError",
     "EmbeddingErrorKind",
     "EmbeddingModel",
-    "EmbeddingRequestRecord",
     "EmbeddingTask",
-    "EmbeddingUsage",
     "Embeddings",
     "Float2D",
 })
@@ -158,6 +160,8 @@ __all__ = [
     "EmbeddingError",
     "EmbeddingErrorKind",
     "EmbeddingModel",
+    "EmbeddingRequestErrorKind",
+    "EmbeddingRequestErrorRecord",
     "EmbeddingRequestRecord",
     "EmbeddingTask",
     "EmbeddingUsage",

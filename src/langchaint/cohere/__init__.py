@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
     from langchaint.common.sequence_not_str import SequenceNotStr
+    from langchaint.embedding_requests import EmbeddingObserver
 
 
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]
@@ -234,6 +235,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         `is_embed_v4` states whether `model` resolves to a Cohere Embed v4 catalog identifier.
         """
         self._client_cache = client_cache
+        self.provider_name = "aws.bedrock"
         self.model = model
         self.is_embed_v4 = is_embed_v4
         self.dimension = dimension
@@ -364,7 +366,9 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             dimension=self.dimension,
             input_tokens_total=input_tokens_total,
         )
-        return _EmbeddingBatchResponse(vectors=vectors, input_tokens_total=input_tokens_total)
+        return _EmbeddingBatchResponse(
+            vectors=vectors, input_tokens_total=input_tokens_total, model_served=None
+        )
 
     @override
     async def embed_batch(
@@ -399,6 +403,7 @@ class CohereBedrock:
         client: BedrockRuntimeClient | None = None,
         apply_cross_region_multiplier: bool = True,
         shared_backoff: SharedBackoff | None = None,
+        observer: EmbeddingObserver | None = None,
     ) -> None:
         """Build `CohereBedrock` without creating a client.
 
@@ -407,6 +412,8 @@ class CohereBedrock:
         `apply_cross_region_multiplier=False` leaves a prefixed identifier's catalog rate unmultiplied.
         `shared_backoff` admits every request of the created `EmbeddingModel` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.
+        `observer` follows every request of the created `EmbeddingModel` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: `client` accompanies `aws_region`.
@@ -416,6 +423,7 @@ class CohereBedrock:
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None:
             _require_one_sdk_request(client)
+        self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.aws_region: str | None = aws_region
         self.apply_cross_region_multiplier: bool = apply_cross_region_multiplier
@@ -496,6 +504,7 @@ class CohereBedrock:
                 if usd_per_million_tokens is None
                 else usd_per_million_tokens
             ),
+            observer=self._observer,
         )
 
     def _catalog_usd_per_million_tokens(self, resolution: BedrockCatalogResolution) -> float:

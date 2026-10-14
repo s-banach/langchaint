@@ -12,10 +12,10 @@ import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import ClassVar, Literal, NamedTuple, get_args, override
 
+import numpy as np
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, JsonValue, TypeAdapter
@@ -56,11 +56,14 @@ from langchaint.adapter import (
     AdapterStream,
     Refusal,
     RejectedMessages,
+    RequestFailure,
     RequestParams,
     TransientError,
     UsableResponse,
 )
 from langchaint.common.messages import StopReason
+from langchaint.embedding import EmbeddingModel, EmbeddingTask, _EmbeddingBatchResponse
+from langchaint.embedding_requests import EmbeddingRequestRecord
 from langchaint.span_parsing import (
     OtelToolCallResponsePart,
     bound_llm_from_otel,
@@ -73,6 +76,7 @@ from langchaint.span_parsing import (
 from langchaint.tracing import (
     ChatAttributeTransform,
     ContentFilter,
+    EmbeddingsAttributeTransform,
     ExecuteToolAttributeTransform,
     OtelObserver,
     SpanAttributes,
@@ -98,7 +102,7 @@ from tests.fake_adapter import (
 from tests.helpers import (
     LANGCHAINT_KEYS,
     SEMCONV_GENAI_DIR,
-    ValidatingSpanExporter,
+    in_memory_tracer_provider,
     run_with_timeout,
     time_out_when,
     transient,
@@ -116,10 +120,7 @@ _APPLICATION_KEYS = frozenset({
 
 def _in_memory_tracer_provider() -> tuple[TracerProvider, InMemorySpanExporter]:
     """Build a tracer provider whose in-memory exporter validates the spans a test reads."""
-    exporter = ValidatingSpanExporter(application_keys=_APPLICATION_KEYS)
-    tracer_provider = TracerProvider()
-    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
-    return tracer_provider, exporter
+    return in_memory_tracer_provider(application_keys=_APPLICATION_KEYS)
 
 
 def _traced(
@@ -2018,3 +2019,144 @@ def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_outp
         assert _CONTENT_SENTINEL not in str(span.status.description)
 
     run_with_timeout(scenario())
+
+
+class _EmbeddingProviderError(Exception):
+    """A transient provider failure of one embedding request."""
+
+
+class _NestingEmbeddingAdapter:
+    """Fail the first request with `_EmbeddingProviderError`, then return one unit row per input.
+
+    Each request opens a span named `inner`, which nests under whatever span is current while the request is awaited.
+    """
+
+    provider_name = "openai"
+    model = "text-embedding-3-small"
+    dimension = 2
+
+    def __init__(self, tracer_provider: TracerProvider) -> None:
+        self._tracer = tracer_provider.get_tracer("test")
+        self._request_count = 0
+
+    def request_failure(self, error: Exception) -> RequestFailure:
+        """Place every failure as transient without a quota pause."""
+        del error
+        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
+
+    async def prepare(self) -> None:
+        """Complete preparation without work."""
+
+    async def partition_inputs(
+        self, inputs: tuple[str, ...], *, task: EmbeddingTask
+    ) -> tuple[tuple[str, ...], ...]:
+        """Send every input in one request."""
+        del task
+        return (inputs,)
+
+    async def embed_batch(
+        self, inputs: tuple[str, ...], *, task: EmbeddingTask
+    ) -> _EmbeddingBatchResponse:
+        """Open the inner span, then fail the first request or return unit rows."""
+        del task
+        self._request_count += 1
+        with self._tracer.start_as_current_span("inner"):
+            if self._request_count == 1:
+                raise _EmbeddingProviderError("overloaded")
+        return _EmbeddingBatchResponse(
+            vectors=np.array([[1.0, 0.0]] * len(inputs), dtype=np.float32),
+            input_tokens_total=3,
+            model_served="text-embedding-3-small-served",
+        )
+
+
+def _traced_embedding_model(
+    tracer_provider: TracerProvider,
+    *,
+    embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
+) -> EmbeddingModel:
+    """Build an `EmbeddingModel` over `_NestingEmbeddingAdapter` that sends at most two requests per batch."""
+    return EmbeddingModel(
+        adapter=_NestingEmbeddingAdapter(tracer_provider),
+        shared_backoff=fast_shared_backoff(),
+        max_requests=2,
+        usd_per_million_tokens=2.0,
+        observer=OtelObserver(
+            capture_message_content=False,
+            embeddings_attribute_transform=embeddings_attribute_transform,
+            tracer_provider=tracer_provider,
+        ),
+    )
+
+
+def _parent_span_id(span: ReadableSpan) -> int | None:
+    """Return the span id of the span's parent, or None for a root span."""
+    return None if span.parent is None else span.parent.span_id
+
+
+def _span_id(span: ReadableSpan) -> int:
+    """Return the span's own span id."""
+    assert span.context is not None
+    return span.context.span_id
+
+
+def test_each_embedding_request_opens_one_embeddings_span_that_is_current_while_awaited() -> None:
+    """A retry opens a second embeddings span, and each one nests under the caller's span.
+
+    The span is current while its request is awaited, so the request's own span nests under it.
+    """
+    tracer_provider, exporter = _in_memory_tracer_provider()
+    model = _traced_embedding_model(tracer_provider)
+    with tracer_provider.get_tracer("test").start_as_current_span("application"):
+        _ = run_with_timeout(model.embed(["first", "second"], task="retrieval_document"))
+
+    first_inner, failed, second_inner, succeeded, application = exporter.get_finished_spans()
+    start_attributes = {
+        "gen_ai.operation.name": "embeddings",
+        "gen_ai.provider.name": "openai",
+        "gen_ai.request.model": "text-embedding-3-small",
+        "gen_ai.request.encoding_formats": ("float",),
+        "gen_ai.embeddings.dimension.count": 2,
+    }
+    assert [failed.name, succeeded.name] == ["embeddings text-embedding-3-small"] * 2
+    assert [failed.kind, succeeded.kind] == [SpanKind.CLIENT] * 2
+    assert _parent_span_id(failed) == _parent_span_id(succeeded) == _span_id(application)
+    assert _parent_span_id(first_inner) == _span_id(failed)
+    assert _parent_span_id(second_inner) == _span_id(succeeded)
+    assert failed.status.status_code == StatusCode.ERROR
+    assert failed.status.description == "overloaded"
+    assert dict(failed.attributes or {}) == {
+        **start_attributes,
+        "error.type": "transient",
+    }
+    assert succeeded.status.status_code == StatusCode.OK
+    assert dict(succeeded.attributes or {}) == {
+        **start_attributes,
+        "gen_ai.usage.input_tokens": 3,
+        "gen_ai.response.model": "text-embedding-3-small-served",
+        "langchaint.cost_in_usd": 3 * 2.0 / 1_000_000,
+    }
+
+
+def _add_input_count(
+    request_record: EmbeddingRequestRecord | None, attributes: SpanAttributes
+) -> SpanAttributes:
+    """Add the request's input count under an application key."""
+    if request_record is None:
+        return attributes
+    return {**attributes, "custom.app_data": request_record.input_count}
+
+
+def test_an_embeddings_transform_reads_each_request_record() -> None:
+    """The transform receives each request's record, so it can record what the convention has no key for."""
+    tracer_provider, exporter = _in_memory_tracer_provider()
+    model = _traced_embedding_model(
+        tracer_provider, embeddings_attribute_transform=_add_input_count
+    )
+
+    _ = run_with_timeout(model.embed(["first", "second"], task="retrieval_document"))
+
+    embeddings_spans = [
+        span for span in exporter.get_finished_spans() if span.name.startswith("embeddings ")
+    ]
+    assert [_attribute(span, "custom.app_data") for span in embeddings_spans] == [2, 2]

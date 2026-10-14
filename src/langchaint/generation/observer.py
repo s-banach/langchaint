@@ -1,6 +1,6 @@
-"""Define the observer that follows every input and every tool dispatch.
+"""Define the observer that follows every input, every tool dispatch, and every embedding request.
 
-A backend constructor passes one observer to every `LLM` it creates.
+A backend constructor passes one observer to every `LLM` and `EmbeddingModel` it creates.
 Each `LLM` passes it to its bindings, their streams, and each `ToolManager` that `bind` builds from a tool sequence.
 `langchaint.tracing.OtelObserver` implements this protocol with OpenTelemetry spans.
 """
@@ -12,6 +12,7 @@ from typing import Protocol
 from langchaint.adapter import Binding
 from langchaint.common.messages import Message
 from langchaint.common.observed_operation import ObservedOperation
+from langchaint.embedding_requests import EmbeddingObserver
 from langchaint.generation.request_history import AbandonedStreamRecord
 from langchaint.generation.response import GenerationOutcome
 from langchaint.tools import DispatchObserver
@@ -33,8 +34,8 @@ class GenerationStart:
     stream: bool
 
 
-class Observer(DispatchObserver, Protocol):
-    """Follows each input and each tool dispatch."""
+class Observer(DispatchObserver, EmbeddingObserver, Protocol):
+    """Follows each input, each tool dispatch, and each embedding request."""
 
     def generation_started(
         self, start: GenerationStart

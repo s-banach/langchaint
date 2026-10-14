@@ -11,29 +11,38 @@ import json
 import pathlib
 import pkgutil
 from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractContextManager
 from types import ModuleType
 from typing import Literal, override
 
 import httpx2
 import jsonschema
 import openai
-from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter
 
 import langchaint
 from langchaint import (
     ZERO_USAGE,
+    AbandonedStreamRecord,
     AssistantMessage,
     Billing,
+    DispatchOutcome,
+    GenerationOutcome,
     RequestHistory,
     RequestRecord,
     SettledRequestRecord,
     TokenRates,
+    ToolCall,
     TransientErrorRecord,
     Usage,
 )
 from langchaint.adapter import ProviderBilling, RequestFailure, TransientError
+from langchaint.common.observed_operation import ObservedOperation
+from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
+from langchaint.generation.observer import GenerationStart
 from scripts import refresh_semconv_genai
 
 
@@ -456,6 +465,7 @@ def _declared_keys_by_operation() -> Mapping[str, frozenset[str]]:
 
     Chat spans may carry the vendored chat span attribute names and the langchaint keys.
     Tool spans may carry the vendored execute_tool span attribute names.
+    Embeddings spans may carry the vendored embeddings span attribute names and langchaint.cost_in_usd.
 
     Raises:
         pydantic.ValidationError: a vendored file does not hold its expected shape.
@@ -467,7 +477,16 @@ def _declared_keys_by_operation() -> Mapping[str, frozenset[str]]:
             SEMCONV_GENAI_DIR / refresh_semconv_genai.EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE
         ).read_text()
     )
-    declared = {"chat": chat_names | LANGCHAINT_KEYS, "execute_tool": execute_tool_names}
+    embeddings_names = TypeAdapter(frozenset[str]).validate_json(
+        (
+            SEMCONV_GENAI_DIR / refresh_semconv_genai.EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE
+        ).read_text()
+    )
+    declared = {
+        "chat": chat_names | LANGCHAINT_KEYS,
+        "execute_tool": execute_tool_names,
+        "embeddings": embeddings_names | {"langchaint.cost_in_usd"},
+    }
     (operation_attribute,) = (
         attribute
         for attribute in _chat_span_declaration().attributes
@@ -525,3 +544,92 @@ class ValidatingSpanExporter(InMemorySpanExporter):
             _validate_attribute_keys(span, self._application_keys)
             _validate_payload_attributes(span)
         return spans
+
+
+def in_memory_tracer_provider(
+    *, application_keys: frozenset[str] = frozenset()
+) -> tuple[TracerProvider, InMemorySpanExporter]:
+    """Build a tracer provider whose in-memory exporter validates the spans a test reads.
+
+    The exporter accepts `application_keys` on every span.
+    """
+    exporter = ValidatingSpanExporter(application_keys=application_keys)
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return tracer_provider, exporter
+
+
+class RaisingOperation:
+    """An `ObservedOperation` whose every method raises."""
+
+    def current(self) -> AbstractContextManager[None]:
+        """Raise instead of returning a context.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("observer current boom")
+
+    def conclude(self, outcome: object) -> None:
+        """Raise instead of recording the outcome.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError(f"observer conclude boom for {type(outcome).__name__}")
+
+    def end(self) -> None:
+        """Raise instead of ending.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("observer end boom")
+
+
+class RaisingObserver:
+    """An `Observer` that raises from its start methods, or returns operations whose every method raises."""
+
+    def __init__(self, *, raise_at_start: bool) -> None:
+        """Raise from the start methods when `raise_at_start` is set, and from the operations otherwise."""
+        self._raise_at_start = raise_at_start
+
+    def generation_started(
+        self, start: GenerationStart
+    ) -> ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]:
+        """Start a raising operation for the input.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        return self._started(start.model)
+
+    def dispatch_started(
+        self, tool_call: ToolCall
+    ) -> ObservedOperation[DispatchOutcome | Exception]:
+        """Start a raising operation for the dispatch.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        return self._started(tool_call.name)
+
+    def embedding_request_started(
+        self, start: EmbeddingRequestStart
+    ) -> ObservedOperation[EmbeddingRequestRecord]:
+        """Start a raising operation for the embedding request.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        return self._started(start.model)
+
+    def _started(self, name: str) -> RaisingOperation:
+        """Raise, or return an operation whose every method raises.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        if self._raise_at_start:
+            raise RuntimeError(f"observer start boom for {name}")
+        return RaisingOperation()

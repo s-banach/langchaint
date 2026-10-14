@@ -68,6 +68,7 @@ from langchaint.adapter import (
 )
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
+from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
 from langchaint.generation.llm import WorkingTimeDeadline, _run_many_with_warm_cache
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.streaming import StreamHandle
@@ -94,6 +95,7 @@ from tests.fake_adapter import (
 )
 from tests.helpers import (
     TEST_TIMEOUT_SECONDS,
+    RaisingObserver,
     run_with_timeout,
     stated_provider_billing,
     terminal,
@@ -2696,6 +2698,13 @@ class _RecordingObserver:
         self.calls.append(f"dispatch_started {tool_call.name}")
         return _RecordingOperation(self.calls)
 
+    def embedding_request_started(
+        self, start: EmbeddingRequestStart
+    ) -> ObservedOperation[EmbeddingRequestRecord]:
+        """Record the start and return an operation that records into the same list."""
+        self.calls.append(f"embedding_request_started {start.model}")
+        return _RecordingOperation(self.calls)
+
 
 def test_a_stream_reports_one_outcome_and_one_end_despite_later_misuse() -> None:
     """Pulling an item after the block and re-entering the handle report nothing more to the observer."""
@@ -2754,71 +2763,6 @@ def test_an_input_cancelled_during_its_open_ends_its_operation(
     run_with_timeout(scenario())
 
 
-class _RaisingOperation:
-    """An `ObservedOperation` whose every method raises."""
-
-    def current(self) -> AbstractContextManager[None]:
-        """Raise instead of returning a context.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError("observer current boom")
-
-    def conclude(self, outcome: object) -> None:
-        """Raise instead of recording the outcome.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError(f"observer conclude boom for {type(outcome).__name__}")
-
-    def end(self) -> None:
-        """Raise instead of ending.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError("observer end boom")
-
-
-class _RaisingObserver:
-    """An `Observer` that raises from its start methods, or returns operations whose every method raises."""
-
-    def __init__(self, *, raise_at_start: bool) -> None:
-        self._raise_at_start = raise_at_start
-
-    def generation_started(
-        self, start: GenerationStart
-    ) -> ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]:
-        """Start a raising operation for the input.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
-        return self._started(start.model)
-
-    def dispatch_started(
-        self, tool_call: ToolCall
-    ) -> ObservedOperation[DispatchOutcome | Exception]:
-        """Start a raising operation for the dispatch.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
-        return self._started(tool_call.name)
-
-    def _started(self, name: str) -> _RaisingOperation:
-        """Raise, or return an operation whose every method raises.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
-        if self._raise_at_start:
-            raise RuntimeError(f"observer start boom for {name}")
-        return _RaisingOperation()
-
-
 @pytest.mark.parametrize("raise_at_start", [True, False], ids=["start", "operation"])
 def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
     *, raise_at_start: bool, caplog: pytest.LogCaptureFixture
@@ -2827,7 +2771,7 @@ def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
 
     async def scenario() -> None:
         """Drive every observed entry point under the raising observer."""
-        observer = _RaisingObserver(raise_at_start=raise_at_start)
+        observer = RaisingObserver(raise_at_start=raise_at_start)
         bound_llm = LLM(
             FakeAdapter(echo=True), shared_backoff=fast_shared_backoff(), observer=observer
         ).bind()

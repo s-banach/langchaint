@@ -74,6 +74,17 @@ templates:
     file_name: execute-tool-span-attribute-names.json
   - template: json.j2
     filter: >-
+      def span_attributes($type):
+        [.registry.spans[] | select(.type == $type)]
+        | if length == 1 then .[0].attributes
+          else error("the resolved registry has \(length) spans of type \($type), expected 1")
+          end;
+      [span_attributes("gen_ai.embeddings.client")[].key]
+      | sort
+    application_mode: single
+    file_name: embeddings-span-attribute-names.json
+  - template: json.j2
+    filter: >-
       .registry.attributes
       | map(
           select(.annotations.type.json_schema != null)

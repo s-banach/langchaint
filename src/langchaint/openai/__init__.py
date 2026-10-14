@@ -111,6 +111,7 @@ class OpenAI:
         `shared_backoff` admits every request of the created `LLM` and `EmbeddingModel` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.
         `observer` follows every input and every tool dispatch of the created `LLM` values.
+        `observer` follows every request of the created `EmbeddingModel` values.
         `observer=None` follows none.
 
         Raises:
@@ -302,6 +303,7 @@ class OpenAI:
                 if usd_per_million_tokens is None
                 else usd_per_million_tokens
             ),
+            observer=self._observer,
         )
 
 

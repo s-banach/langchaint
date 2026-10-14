@@ -1,4 +1,4 @@
-"""Trace langchaint generations and tool dispatches with OTel spans.
+"""Trace langchaint generations, tool dispatches, and embedding requests with OTel spans.
 
 Importing this subpackage requires `opentelemetry-api`.
 Applications configure the OTel SDK.
@@ -7,6 +7,7 @@ Pass one `OtelObserver` to a backend constructor, as in `OpenAI(observer=OtelObs
 Every `LLM`, binding, and stream that backend creates is then traced, and the application's code is otherwise unchanged.
 A `ToolManager` that `bind` builds from a tool sequence traces its dispatches.
 A `ToolManager` the application builds traces its dispatches when built with `observer=`.
+Every `EmbeddingModel` that backend creates traces its requests.
 
 Each input opens one CLIENT span.
 `generate_many` opens one span per started input.
@@ -16,7 +17,9 @@ A stream opens one CLIENT span when its handle is entered.
 Each tool dispatch opens one INTERNAL `execute_tool` span.
 `ToolManager.dispatch_many` uses `dispatch` and gets one span per tool call.
 `precomputed` opens no span because it executes no tool.
+Each embedding request opens one CLIENT `embeddings` span, and each retry is a new request.
 A generation span is current during its retry loop, and a dispatch span is current while the tool function runs.
+An embeddings span is current while its request is awaited.
 Spans started there, such as HTTP client spans, nest under them.
 A stream span is never current, because the application's code runs between stream items.
 
@@ -29,10 +32,11 @@ Request and dispatch identity attributes replace matching `extra_attributes` key
 langchaint builds the span's other attributes as attribute groups.
 A chat span's attribute groups are, in order, input content, outcome attributes, and output content.
 An execute_tool span's attribute groups are `gen_ai.tool.call.arguments` and then `gen_ai.tool.call.result`.
+An embeddings span has one attribute group, its request record's attributes.
 `error.type` follows the attribute groups.
 A key of a later attribute group replaces a matching earlier key.
 A filter that raises or returns a part of another kind is logged, and its attribute group is omitted.
-`chat_attribute_transform` and `execute_tool_attribute_transform` edit the attributes when the span ends.
+Each span kind's attribute transform, such as `chat_attribute_transform`, edits the attributes when the span ends.
 Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
@@ -47,9 +51,12 @@ Its status stays unset, because handling the input did not fail.
 Tool spans use `gen_ai.operation.name="execute_tool"` and `gen_ai.tool.type="function"`.
 They report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
+Embeddings spans use `gen_ai.operation.name="embeddings"`.
+They report provider, request model, encoding formats, dimension count, response model, input tokens, and cost.
+The convention defines no content attribute for embedding inputs, so embeddings spans record no content.
 
 `langchaint.*` names the request count and cost because the convention has no matching keys.
-Each failed request adds `langchaint.request_failed` with `error_text` and `elapsed_seconds`.
+A chat span adds one `langchaint.request_failed` event per failed request, with `error_text` and `elapsed_seconds`.
 
 Each span starts and ends exactly once, including for failed, cancelled, and abandoned streams.
 A transform may set only attribute names and values.
@@ -95,6 +102,7 @@ from langchaint.common.messages import (
     ToolMessage,
 )
 from langchaint.common.observed_operation import ObservedOperation
+from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
 from langchaint.generation.errors import GenerationError
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.request_history import AbandonedStreamRecord
@@ -139,6 +147,22 @@ A transform that raises is logged, and the span keeps only its start attributes.
 A span with error status also keeps `error.type`.
 When the tool function raises, the span's exception event and status description record its message.
 The transform cannot change either.
+Extension keys must use the application's namespace because langchaint.* is reserved.
+"""
+
+type EmbeddingsAttributeTransform = Callable[
+    [EmbeddingRequestRecord | None, SpanAttributes], SpanAttributes
+]
+"""Edits an embeddings span's attributes once, when the span ends.
+
+The first argument is `None` for a request cancelled before it settled.
+The second argument holds every attribute langchaint records on the span.
+It includes the start attributes that `start_span` received.
+The span records the returned attributes.
+A returned key replaces the attribute of the same name.
+A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
+A transform that raises is logged, and the span keeps only its start attributes.
+A span with error status also keeps `error.type`.
 Extension keys must use the application's namespace because langchaint.* is reserved.
 """
 
@@ -210,6 +234,12 @@ _CHAT_OPERATION = "chat"
 _EXECUTE_TOOL_OPERATION = "execute_tool"
 """The GenAI operation value for a tool execution."""
 
+_EMBEDDINGS_OPERATION = "embeddings"
+"""The GenAI operation value for an embeddings request."""
+
+_EMBEDDINGS_ENCODING_FORMATS = ("float",)
+"""The encoding formats every `EmbeddingModel` request asks for."""
+
 _logger = logging.getLogger("langchaint.tracing")
 
 
@@ -232,6 +262,7 @@ class _SpanConfig:
     tracer: Tracer
     chat_attribute_transform: ChatAttributeTransform
     execute_tool_attribute_transform: ExecuteToolAttributeTransform
+    embeddings_attribute_transform: EmbeddingsAttributeTransform
     extra_attributes: SpanAttributes
     capture_message_content: bool
     content_filter: ContentFilter
@@ -735,16 +766,54 @@ class _DispatchSpan(_SpanOperation[DispatchOutcome | Exception]):
             self._conclude_with_error(error_type, error_type)
 
 
+def _embedding_request_attributes(
+    request_record: EmbeddingRequestRecord,
+) -> dict[str, SpanAttributeValue]:
+    """Map one embedding request record to GenAI-convention span attributes plus langchaint.cost_in_usd.
+
+    gen_ai.usage.input_tokens and langchaint.cost_in_usd are omitted when the provider reported no token count.
+    gen_ai.response.model is omitted when the provider reported no model.
+    """
+    attributes: dict[str, SpanAttributeValue] = {}
+    usage = request_record.usage
+    if usage is not None:
+        attributes["gen_ai.usage.input_tokens"] = usage.input_tokens_total
+        attributes["langchaint.cost_in_usd"] = usage.cost_in_usd
+    if request_record.model_served is not None:
+        attributes["gen_ai.response.model"] = request_record.model_served
+    return attributes
+
+
+class _EmbeddingsSpan(_SpanOperation[EmbeddingRequestRecord]):
+    """The CLIENT embeddings span of one embedding request."""
+
+    def conclude(self, outcome: EmbeddingRequestRecord) -> None:
+        """Add the request record's attribute group, and keep its status for the end of the span.
+
+        A request that returned usable vectors sets OK status.
+        A failed request sets error status and error.type from `error.kind`.
+        Its status description is `error.error_text`.
+        """
+        self._outcome = outcome
+        self.add_attribute_group(
+            "_embedding_request_attributes", lambda: _embedding_request_attributes(outcome)
+        )
+        if outcome.error is None:
+            self._status = Status(StatusCode.OK)
+        else:
+            self._conclude_with_error(outcome.error.kind, outcome.error.error_text)
+
+
 class OtelObserver:
-    """Trace generations and tool dispatches with OTel spans.
+    """Trace generations, tool dispatches, and embedding requests with OTel spans.
 
     Pass one instance to a backend constructor, `LLM(observer=...)`, or `ToolManager(observer=...)`.
     The OTel SDK configures whether tracing records and where it sends spans.
     An application without an SDK configuration gets non-recording no-op spans.
     This class owns each span's name, kind, status, and events.
     A transform changes only attributes.
-    There is no langchaint.elapsed_seconds attribute:
-    The span duration covers request admission, backoff, and completion.
+    There is no langchaint.elapsed_seconds attribute, because each span's duration measures its operation.
+    A chat span's duration includes request admission and backoff between requests.
     """
 
     @overload
@@ -755,6 +824,7 @@ class OtelObserver:
         content_filter: ContentFilter | None = None,
         chat_attribute_transform: ChatAttributeTransform | None = None,
         execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
+        embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None: ...
@@ -765,6 +835,7 @@ class OtelObserver:
         capture_message_content: bool,
         chat_attribute_transform: ChatAttributeTransform | None = None,
         execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
+        embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None: ...
@@ -775,6 +846,7 @@ class OtelObserver:
         content_filter: ContentFilter | None = None,
         chat_attribute_transform: ChatAttributeTransform | None = None,
         execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
+        embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
         extra_attributes: SpanAttributes | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None:
@@ -793,6 +865,7 @@ class OtelObserver:
 
         `chat_attribute_transform` edits the attributes of each chat span when the span ends.
         `execute_tool_attribute_transform` edits the attributes of each execute_tool span when the span ends.
+        `embeddings_attribute_transform` edits the attributes of each embeddings span when the span ends.
         A `None` transform records the attributes unchanged.
         `extra_attributes` applies at the start of every span.
         `extra_attributes=None` supplies no extra attributes.
@@ -814,6 +887,11 @@ class OtelObserver:
             execute_tool_attribute_transform=(
                 execute_tool_attribute_transform
                 if execute_tool_attribute_transform is not None
+                else _keep_every_attribute
+            ),
+            embeddings_attribute_transform=(
+                embeddings_attribute_transform
+                if embeddings_attribute_transform is not None
                 else _keep_every_attribute
             ),
             extra_attributes=extra_attributes if extra_attributes is not None else {},
@@ -895,10 +973,41 @@ class OtelObserver:
         )
         return dispatch_span
 
+    def embedding_request_started(
+        self, start: EmbeddingRequestStart
+    ) -> ObservedOperation[EmbeddingRequestRecord]:
+        """Open the CLIENT embeddings span of one embedding request and set its request attributes.
+
+        The span is named "embeddings {start.model}".
+        The span starts with `extra_attributes` and the request attributes, so a sampler sees them.
+        The request attributes are gen_ai.operation.name, gen_ai.provider.name, and gen_ai.request.model.
+        They also include gen_ai.request.encoding_formats and gen_ai.embeddings.dimension.count.
+        The request record selects the span status and error.type.
+        error.type is an `EmbeddingRequestErrorKind`, so it means the same for every provider.
+        """
+        span_config = self._span_config
+        start_attributes = {
+            **span_config.extra_attributes,
+            "gen_ai.operation.name": _EMBEDDINGS_OPERATION,
+            "gen_ai.provider.name": start.provider_name,
+            "gen_ai.request.model": start.model,
+            "gen_ai.request.encoding_formats": _EMBEDDINGS_ENCODING_FORMATS,
+            "gen_ai.embeddings.dimension.count": start.dimension,
+        }
+        span = span_config.tracer.start_span(
+            f"{_EMBEDDINGS_OPERATION} {start.model}",
+            kind=SpanKind.CLIENT,
+            attributes=start_attributes,
+        )
+        return _EmbeddingsSpan(
+            span, span_config, start_attributes, span_config.embeddings_attribute_transform
+        )
+
 
 __all__ = [
     "ChatAttributeTransform",
     "ContentFilter",
+    "EmbeddingsAttributeTransform",
     "ExecuteToolAttributeTransform",
     "OtelObserver",
     "SpanAttributes",

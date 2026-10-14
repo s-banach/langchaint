@@ -25,7 +25,8 @@ from langchaint.cohere import (
     COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS,
     CohereBedrock,
 )
-from tests.helpers import run_with_timeout
+from langchaint.tracing import OtelObserver
+from tests.helpers import in_memory_tracer_provider, run_with_timeout
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -463,6 +464,8 @@ async def test_a_response_without_a_token_count_is_invalid_output() -> None:
         assert raised.value.kind == "invalid_output_error"
         [request_record] = raised.value.request_history
         assert request_record.usage is None
+        assert request_record.error is not None
+        assert request_record.error.kind == "invalid_output"
     finally:
         stubber.deactivate()
         client.close()
@@ -848,3 +851,37 @@ def test_passed_client_retry_configuration() -> None:
     finally:
         retrying_client.close()
         one_request_client.close()
+
+
+@_run_async_test
+async def test_the_cohere_bedrock_observer_traces_embedding_requests() -> None:
+    """A `CohereBedrock` observer traces each embedding request with the Bedrock provider name and no served model."""
+    tracer_provider, exporter = in_memory_tracer_provider()
+    client = _bedrock_client()
+    stubber = Stubber(client)
+    body = _request_body({
+        "texts": ["query"],
+        "input_type": "search_query",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+    })
+    stubber.add_response(
+        "invoke_model",
+        _response([[1.0, *([0.0] * 1023)]]),
+        _expected_parameters(body, "cohere.embed-multilingual-v3"),
+    )
+    stubber.activate()
+    try:
+        cohere_bedrock = CohereBedrock(
+            client=client,
+            observer=OtelObserver(capture_message_content=False, tracer_provider=tracer_provider),
+        )
+        model = cohere_bedrock.embedding_model("cohere.embed-multilingual-v3")
+        _ = await model.embed(["query"], task="retrieval_query")
+    finally:
+        stubber.deactivate()
+        client.close()
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.provider.name"] == "aws.bedrock"
+    assert "gen_ai.response.model" not in span.attributes

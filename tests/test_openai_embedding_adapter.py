@@ -22,7 +22,8 @@ from langchaint.openai.embedding_adapter import (
     _OpenAIEmbeddingAdapter,
     _partition_inputs_sync,
 )
-from tests.helpers import run_with_timeout
+from langchaint.tracing import OtelObserver
+from tests.helpers import in_memory_tracer_provider, run_with_timeout
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
@@ -214,7 +215,7 @@ def test_ada_request_omits_dimensions() -> None:
 
 
 def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
-    """Restore indexed rows into writable C-contiguous owned float32 storage, and report `usage.prompt_tokens`."""
+    """Restore indexed rows into owned writable C-contiguous float32 storage, and report the usage and served model."""
     client = _client(lambda _request: _response([[3.0, 4.0], [0.0, 2.0]], indexes=[1, 0]))
 
     async def scenario() -> _EmbeddingBatchResponse:
@@ -227,8 +228,8 @@ def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
         await client.close()
         return response
 
-    vectors, input_tokens_total = run_with_timeout(scenario())
-    assert input_tokens_total == 1
+    vectors, input_tokens_total, model_served = run_with_timeout(scenario())
+    assert (input_tokens_total, model_served) == (1, "offline")
     np.testing.assert_allclose(vectors, [[0.0, 1.0], [0.6, 0.8]])
     assert vectors.dtype == np.float32
     assert vectors.flags.c_contiguous
@@ -415,7 +416,7 @@ def test_transport_failure_retries_the_failed_batch(
         )
         embeddings = await model.embed(["text"], task="retrieval_query")
         assert embeddings.output.tolist() == [[1.0]]
-        assert [record.error_text is None for record in embeddings.request_history] == [
+        assert [record.error is None for record in embeddings.request_history] == [
             False,
             True,
         ]
@@ -472,3 +473,23 @@ def test_partition_cancellation_waits_for_token_counting(
         await client.close()
 
     run_with_timeout(scenario())
+
+
+def test_the_openai_observer_traces_embedding_requests() -> None:
+    """An `OpenAI` observer traces each embedding request with the OpenAI provider name and the served model."""
+    tracer_provider, exporter = in_memory_tracer_provider()
+    client = _client(lambda _request: _response([[1.0]]))
+    observer = OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
+
+    async def scenario() -> None:
+        model = OpenAI(client=client, observer=observer).embedding_model(
+            "text-embedding-3-small", dimension=1
+        )
+        _ = await model.embed(["text"], task="clustering")
+        await client.close()
+
+    run_with_timeout(scenario())
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.provider.name"] == "openai"
+    assert span.attributes["gen_ai.response.model"] == "offline"

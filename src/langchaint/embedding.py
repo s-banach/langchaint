@@ -7,6 +7,7 @@ The adapter owns provider batching, response decoding, and reading the reported 
 The returned matrix preserves input order.
 The returned matrix owns writable `float32` storage.
 Every returned row has L2 norm one.
+Every adapter requests float vectors.
 """
 
 import asyncio
@@ -30,12 +31,25 @@ except ModuleNotFoundError as exc:
 
 from langchaint.billing.pricing import category_cost_in_usd
 from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.observed_operation import (
+    UNOBSERVED_OPERATION,
+    ObservedOperation,
+    start_observed_operation,
+)
 from langchaint.common.request_failure import RequestFailure, _request_failure_of
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
+    Admission,
     PrivateBackoff,
     SharedBackoff,
+)
+from langchaint.embedding_requests import (
+    EmbeddingObserver,
+    EmbeddingRequestErrorRecord,
+    EmbeddingRequestRecord,
+    EmbeddingRequestStart,
+    EmbeddingUsage,
 )
 
 type EmbeddingTask = Literal[
@@ -63,35 +77,6 @@ type EmbeddingErrorKind = Literal[
 - `invalid_output_error`: a response had unusable vectors or reported no token count.
 - Every other kind appends `_error` to the `RequestFailure` kind of a failure that is not transient.
 """
-
-
-@dataclass(frozen=True, kw_only=True)
-class EmbeddingUsage:
-    """Provider-reported input tokens and their estimated cost.
-
-    Embedding models price input tokens only.
-    `cost_in_usd` is NaN when `input_tokens_total` is nonzero and the model has no rate.
-    """
-
-    input_tokens_total: int
-    cost_in_usd: float
-
-
-@dataclass(frozen=True, kw_only=True)
-class EmbeddingRequestRecord:
-    """One provider request that `EmbeddingModel.embed` sent.
-
-    `input_count` is the number of inputs in the request.
-    `started_after_seconds` runs from the start of `embed` until the request was sent, after admission.
-    `usage` is `None` when the provider reported no token count, as when the request raised before a response arrived.
-    `error_text` is `None` when the request returned usable vectors.
-    """
-
-    input_count: int
-    started_after_seconds: float
-    elapsed_seconds: float
-    usage: EmbeddingUsage | None
-    error_text: str | None
 
 
 def _usage_of(request_history: Iterable[EmbeddingRequestRecord]) -> EmbeddingUsage:
@@ -153,15 +138,23 @@ class EmbeddingError(Exception):
 
 
 class _EmbeddingBatchResponse(NamedTuple):
-    """One request's validated vectors and the input token count the provider reported."""
+    """One request's validated vectors, the input token count the provider reported, and the model it served.
+
+    `model_served` is `None` when the provider reports no model.
+    """
 
     vectors: Float2D
     input_tokens_total: int
+    model_served: str | None
 
 
 class _EmbeddingAdapter(Protocol):
-    """The provider-specific operations `EmbeddingModel` executes."""
+    """The provider-specific operations `EmbeddingModel` executes.
 
+    `provider_name` names the serving provider, as `Adapter.provider_name` does.
+    """
+
+    provider_name: str
     model: str
     dimension: int
 
@@ -289,8 +282,9 @@ class EmbeddingModel:
         shared_backoff: SharedBackoff,
         max_requests: int,
         usd_per_million_tokens: float,
+        observer: EmbeddingObserver | None = None,
     ) -> None:
-        """Store one adapter, `SharedBackoff`, `max_requests`, and input-token rate.
+        """Store one adapter, `SharedBackoff`, `max_requests`, input-token rate, and observer.
 
         Args:
             adapter: The provider-specific embedding operations.
@@ -298,6 +292,7 @@ class EmbeddingModel:
             max_requests: The maximum number of requests sent for one batch; i.e., max_requests = max_retries + 1.
                 `embed` splits its inputs into batches.
             usd_per_million_tokens: The input-token rate that prices `EmbeddingUsage`, or NaN when unknown.
+            observer: The observer that follows every request, or `None` to follow none.
 
         Raises:
             ValueError: `max_requests` is boolean or below one.
@@ -308,8 +303,23 @@ class EmbeddingModel:
         self.dimension: int = adapter.dimension
         self.max_requests: int = max_requests
         self.usd_per_million_tokens: float = usd_per_million_tokens
+        self.observer: EmbeddingObserver | None = observer
         self._adapter = adapter
         self._shared_backoff = shared_backoff
+        self._request_start = EmbeddingRequestStart(
+            provider_name=adapter.provider_name, model=adapter.model, dimension=adapter.dimension
+        )
+
+    def _request_started(self) -> ObservedOperation[EmbeddingRequestRecord]:
+        """Start following one request with the observer, or return a handle that records nothing.
+
+        The returned handle logs the observer's failures, so none reaches the caller.
+        """
+        if self.observer is None:
+            return UNOBSERVED_OPERATION
+        return start_observed_operation(
+            partial(self.observer.embedding_request_started, self._request_start)
+        )
 
     def _request_record(
         self,
@@ -318,7 +328,8 @@ class EmbeddingModel:
         embed_started_at: float,
         request_started_at: float,
         input_tokens_total: int | None,
-        error_text: str | None,
+        model_served: str | None,
+        error: EmbeddingRequestErrorRecord | None,
     ) -> EmbeddingRequestRecord:
         """Record one request that settled now, pricing its reported token count."""
         return EmbeddingRequestRecord(
@@ -335,7 +346,8 @@ class EmbeddingModel:
                     ),
                 )
             ),
-            error_text=error_text,
+            model_served=model_served,
+            error=error,
         )
 
     async def _send_request(
@@ -346,9 +358,7 @@ class EmbeddingModel:
         embed_started_at: float,
         stop: asyncio.Event,
     ) -> tuple[EmbeddingRequestRecord, Float2D | EmbeddingOutputError | _RequestFailed] | None:
-        """Send one request after admission, or return `None` when `stop` is set before or at admission.
-
-        An `EmbeddingOutputError` follows a response, so it bypasses the adapter's `request_failure`.
+        """Send one observed request after admission, or return `None` when `stop` is set before or at admission.
 
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
@@ -359,38 +369,68 @@ class EmbeddingModel:
         async with self._shared_backoff.admitted() as admission:
             if stop.is_set():
                 return None
-            request_started_at = time.monotonic()
+            operation = self._request_started()
             try:
-                response = await self._adapter.embed_batch(inputs, task=task)
-            except EmbeddingOutputError as error:
-                request_record = self._request_record(
-                    input_count=len(inputs),
+                request_record, ending = await self._request_with_record(
+                    inputs,
+                    task=task,
                     embed_started_at=embed_started_at,
-                    request_started_at=request_started_at,
-                    input_tokens_total=error.input_tokens_total,
-                    error_text=str(error),
+                    admission=admission,
+                    operation=operation,
                 )
-                return request_record, error
-            except Exception as error:  # noqa: BLE001 (every failure of a sent request becomes its record)
-                request_failure = admission.record(
-                    _request_failure_of(error, self._adapter.request_failure)
-                )
-                request_record = self._request_record(
-                    input_count=len(inputs),
-                    embed_started_at=embed_started_at,
-                    request_started_at=request_started_at,
-                    input_tokens_total=None,
-                    error_text=str(error),
-                )
-                return request_record, _RequestFailed(error=error, request_failure=request_failure)
-        request_record = self._request_record(
+                operation.conclude(request_record)
+                return request_record, ending
+            finally:
+                operation.end()
+
+    async def _request_with_record(
+        self,
+        inputs: tuple[str, ...],
+        *,
+        task: EmbeddingTask,
+        embed_started_at: float,
+        admission: Admission,
+        operation: ObservedOperation[EmbeddingRequestRecord],
+    ) -> tuple[EmbeddingRequestRecord, Float2D | EmbeddingOutputError | _RequestFailed]:
+        """Send one admitted request with `operation` current, and record how it ended.
+
+        An `EmbeddingOutputError` follows a response, so it bypasses the adapter's `request_failure`.
+
+        Raises:
+            asyncio.CancelledError: The caller cancelled this operation.
+            Exception: The adapter's `request_failure` raised, which is an adapter defect.
+        """
+        request_record = partial(
+            self._request_record,
             input_count=len(inputs),
             embed_started_at=embed_started_at,
-            request_started_at=request_started_at,
-            input_tokens_total=response.input_tokens_total,
-            error_text=None,
+            request_started_at=time.monotonic(),
         )
-        return request_record, response.vectors
+        try:
+            with operation.current():
+                response = await self._adapter.embed_batch(inputs, task=task)
+        except EmbeddingOutputError as error:
+            return request_record(
+                input_tokens_total=error.input_tokens_total,
+                model_served=None,
+                error=EmbeddingRequestErrorRecord(kind="invalid_output", error_text=str(error)),
+            ), error
+        except Exception as error:  # noqa: BLE001 (every failure of a sent request becomes its record)
+            request_failure = admission.record(
+                _request_failure_of(error, self._adapter.request_failure)
+            )
+            return request_record(
+                input_tokens_total=None,
+                model_served=None,
+                error=EmbeddingRequestErrorRecord(
+                    kind=request_failure.kind, error_text=str(error)
+                ),
+            ), _RequestFailed(error=error, request_failure=request_failure)
+        return request_record(
+            input_tokens_total=response.input_tokens_total,
+            model_served=response.model_served,
+            error=None,
+        ), response.vectors
 
     def _error_kind(
         self, request_failed: _RequestFailed, *, request_number: int
@@ -472,6 +512,8 @@ class EmbeddingModel:
         Empty input returns a writable `(0, dimension)` matrix without provider work.
         Once a request batch fails, no batch sends another request.
         Requests already sent finish, so `EmbeddingError.usage` includes their billing.
+        The observer follows each request, retries included, and is current while the request is awaited.
+        An observer failure is logged and never reaches the caller.
 
         Args:
             inputs: The input texts.

@@ -1,7 +1,7 @@
 """OpenAI embeddings use the official asynchronous SDK.
 
 OpenAI 3.29.0 returns indexed float embeddings in `CreateEmbeddingResponse`.
-Its `usage.prompt_tokens` is the billed input token count.
+Its `usage.prompt_tokens` is the billed input token count, and its `model` names the model that served the request.
 OpenAI accepts at most 2048 inputs and 300,000 tokens per request.
 The adapter counts tokens with `cl100k_base` through tiktoken 0.13.0.
 """
@@ -74,9 +74,10 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
         Raises:
             ValueError: The client reaches another known provider.
         """
+        self.provider_name = "openai"
         _require_provider_name(
             client,
-            provider_name="openai",
+            provider_name=self.provider_name,
             provider_name_by_client_class=PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
         )
         self.client = client
@@ -154,7 +155,9 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
             dimension=self.dimension,
             input_tokens_total=input_tokens_total,
         )
-        return _EmbeddingBatchResponse(vectors=vectors, input_tokens_total=input_tokens_total)
+        return _EmbeddingBatchResponse(
+            vectors=vectors, input_tokens_total=input_tokens_total, model_served=response.model
+        )
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:

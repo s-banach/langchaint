@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Literal, overload
+from typing import Annotated, Any, Literal
 
 from pydantic import ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
@@ -211,37 +211,20 @@ class ResumeState[OutputT, ToolCallOutputT]:
         return self._document.model_copy(update={"items": tuple(items)})
 
 
-@overload
 def prepare_resume_state(
     *,
     resume_path: Path,
-    response_format: None,
+    response_format: type[Any] | None,
     config_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     input_ids: tuple[str, ...] | None,
-) -> ResumeState[str, str]: ...
-
-
-@overload
-def prepare_resume_state[OutputT](
-    *,
-    resume_path: Path,
-    response_format: type[OutputT],
-    config_fingerprint: str,
-    input_fingerprints: tuple[str, ...],
-    input_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT, OutputT | None]: ...
-
-
-def prepare_resume_state[OutputT](
-    *,
-    resume_path: Path,
-    response_format: type[OutputT] | None,
-    config_fingerprint: str,
-    input_fingerprints: tuple[str, ...],
-    input_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT, OutputT | None] | ResumeState[str, str]:
+) -> ResumeState[Any, Any]:
     """Validate or replace one resume document before generation starts.
+
+    `response_format` selects the record output types at runtime.
+    Text records hold `str` output.
+    Structured records hold `response_format` output, or `response_format | None` output for tool calls.
+    `ResumeState.store_outcome_record` validates each record against these types before writing it.
 
     Raises:
         ValueError: Caller `input_ids` or existing resume data are invalid.

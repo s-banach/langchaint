@@ -174,12 +174,11 @@ def _attribute(span: ReadableSpan, key: str) -> object:
     return (span.attributes or {}).get(key)
 
 
-def _json_attribute(span: ReadableSpan, key: str) -> object:
+def _json_attribute(span: ReadableSpan, key: str) -> JsonValue:
     """Read one JSON content attribute off a finished span as Python data."""
     value = _attribute(span, key)
     assert isinstance(value, str)
-    parsed: object = json.loads(value)
-    return parsed
+    return TypeAdapter(JsonValue).validate_json(value)
 
 
 def _exported_attributes(span: ReadableSpan) -> dict[str, JsonValue]:
@@ -187,7 +186,7 @@ def _exported_attributes(span: ReadableSpan) -> dict[str, JsonValue]:
     return TypeAdapter(dict[str, JsonValue]).validate_json(json.dumps(dict(span.attributes or {})))
 
 
-def _captured(exporter: InMemorySpanExporter, key: str) -> object:
+def _captured(exporter: InMemorySpanExporter, key: str) -> JsonValue:
     """Read one JSON content attribute off the only finished span as Python data."""
     (span,) = exporter.get_finished_spans()
     return _json_attribute(span, key)
@@ -397,8 +396,9 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attri
         if case.finish_reasons is None:
             assert "gen_ai.output.messages" not in span.attributes
         else:
-            output_messages = _json_attribute(span, "gen_ai.output.messages")
-            assert isinstance(output_messages, list)
+            output_messages = TypeAdapter(list[dict[str, JsonValue]]).validate_python(
+                _json_attribute(span, "gen_ai.output.messages")
+            )
             assert [message["finish_reason"] for message in output_messages] == list(
                 case.finish_reasons
             )
@@ -1561,13 +1561,13 @@ def _drop_binary(
     return None if part.kind in ("image", "audio") else part
 
 
-def _captured_user_parts(exporter: InMemorySpanExporter) -> list[object]:
+def _captured_user_parts(exporter: InMemorySpanExporter) -> list[JsonValue]:
     """Read the parts of the one recorded input message."""
     captured_messages = _captured(exporter, "gen_ai.input.messages")
     assert isinstance(captured_messages, list)
     (captured_message,) = captured_messages
     assert isinstance(captured_message, dict)
-    captured_parts: object = captured_message["parts"]
+    captured_parts = captured_message["parts"]
     assert isinstance(captured_parts, list)
     return captured_parts
 

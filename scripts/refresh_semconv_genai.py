@@ -3,12 +3,13 @@
 Run `uv run python -m scripts.refresh_semconv_genai`.
 """
 
-import json
 import pathlib
 import shutil
 import subprocess
 import tempfile
 from typing import Literal
+
+from pydantic import JsonValue, TypeAdapter
 
 ROOT = pathlib.Path(__file__).parent.parent
 SOURCE_REPOSITORY = "open-telemetry/semantic-conventions-genai"
@@ -127,7 +128,7 @@ def _weaver_executable(required_version: str) -> str:
 def _validate_json_file(
     path: pathlib.Path, *, expected_shape: Literal["object", "string_array"] = "object"
 ) -> None:
-    value: object = json.loads(path.read_text())
+    value = TypeAdapter(JsonValue).validate_json(path.read_text())
     match expected_shape:
         case "object":
             valid = isinstance(value, dict)

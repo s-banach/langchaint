@@ -67,7 +67,7 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, override
+from typing import Literal, TypeGuard, TypeIs, override
 
 import httpx
 from google import genai
@@ -414,16 +414,18 @@ def _all_candidate_parts(response: types.GenerateContentResponse) -> list[types.
     ]
 
 
+_QUERIES_ADAPTER: TypeAdapter[list[str]] = TypeAdapter(list[str])
+
+
 def _queries_from_tool_call(tool_call: types.ToolCall, *, maps: bool) -> list[str] | None:
     """Read validated query evidence, or return None for malformed evidence."""
     if tool_call.args is None:
         return None
-    queries = tool_call.args.get("queries")
-    if not isinstance(queries, list):
+    try:
+        queries = _QUERIES_ADAPTER.validate_python(tool_call.args.get("queries"), strict=True)
+    except ValidationError:
         return None
-    if any(not isinstance(query, str) for query in queries):
-        return None
-    if maps and any(not query for query in queries):
+    if maps and not all(queries):
         return None
     return queries
 
@@ -938,6 +940,21 @@ def _normalized_wire_key(key: str) -> str:
     return key.replace("_", "").lower()
 
 
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:
+    """Report whether `value` is a `Mapping`, whose keys and values are then read as `object`."""
+    return isinstance(value, Mapping)
+
+
+def _has_only_string_keys(mapping: Mapping[object, object]) -> TypeGuard[Mapping[str, object]]:
+    """Report whether every key of `mapping` is a `str`."""
+    return all(isinstance(key, str) for key in mapping)
+
+
+def _is_list(value: object) -> TypeIs[list[object]]:
+    """Report whether `value` is a `list`, whose items are then read as `object`."""
+    return isinstance(value, list)
+
+
 def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
     """Refuse the extra_body keys whose SDK merge would silently override the binding.
 
@@ -955,17 +972,14 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
     for key, nested in extra_body.items():
         if _normalized_wire_key(key) != "generationconfig":
             continue
-        if not isinstance(nested, Mapping):
-            # `Adapter.bind_text` requires `ValueError` for binding defects.
-            raise ValueError(  # noqa: TRY004
+        # `Adapter.bind_text` requires `ValueError` for binding defects.
+        if not _is_mapping(nested):
+            raise ValueError(
                 f"extra_body key {key!r} must map to an object: the SDK merge would substitute "
                 f"a non-object value for the generationConfig fields the adapter populates"
             )
-        for nested_key in nested:
-            if not isinstance(nested_key, str):
-                raise ValueError(  # noqa: TRY004
-                    f"extra_body key {key!r} must map to an object with only string keys"
-                )
+        if not _has_only_string_keys(nested):
+            raise ValueError(f"extra_body key {key!r} must map to an object with only string keys")
         generation_configs.append(nested)
     reject_extra_body_keys_the_adapter_populates(
         extra_body,
@@ -993,7 +1007,7 @@ def _retry_after_seconds_from_retry_info(details: object) -> float | None:
     if not isinstance(error_body, Mapping):
         return None
     entries: object = error_body.get("details")
-    if not isinstance(entries, list):
+    if not _is_list(entries):
         return None
     for entry in entries:
         if not isinstance(entry, Mapping):

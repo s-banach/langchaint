@@ -438,7 +438,7 @@ class Refusal(_UnusableResponseBase):
 
 @dataclass(frozen=True, kw_only=True)
 class MaxCompletionTokensExceeded(_UnusableResponseBase):
-    """A completed 200 that reached the token cap before its JSON closed."""
+    """A completed 200 that reached the token cap before its JSON closed, or at a tool call that may be incomplete."""
 
     kind: Literal["max_completion_tokens_exceeded"] = "max_completion_tokens_exceeded"
 

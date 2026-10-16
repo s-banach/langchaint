@@ -526,6 +526,40 @@ def test_text_output_concatenates_the_text_blocks() -> None:
     assert outcome.stop_reason == "tool_call"
 
 
+def test_a_text_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens() -> None:
+    """A max_tokens stop can leave an incomplete tool_use block, so the text binding reports the cap."""
+    message = _message_with_content(
+        [
+            at.TextBlock(type="text", text="let me look"),
+            at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={}),
+        ],
+        stop_reason="max_tokens",
+    )
+    outcome = (
+        _adapter()
+        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
+        .interpret(message)
+    )
+    assert outcome.kind == "max_completion_tokens_exceeded"
+
+
+def test_a_text_tool_call_before_a_cut_off_block_is_usable() -> None:
+    """Only the last block can be incomplete, so a tool call ahead of the cut-off block is complete."""
+    message = _message_with_content(
+        [
+            at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={}),
+            at.TextBlock(type="text", text="cut"),
+        ],
+        stop_reason="max_tokens",
+    )
+    outcome = (
+        _adapter()
+        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
+        .interpret(message)
+    )
+    assert outcome.kind == "usable_response"
+
+
 def _message_with_content(
     content: list[at.ContentBlock],
     stop_reason: at.StopReason = "tool_use",
@@ -1856,10 +1890,13 @@ def test_a_structured_tool_call_message_has_none_output(text: str | None) -> Non
     assert outcome.output is None
 
 
-def test_a_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens() -> None:
-    """A max_tokens stop can leave an incomplete tool_use block, so the stop reason wins over the tool call."""
-    outcome = _structured_parse(_structured_message(None, stop_reason="max_tokens", tool_use=True))
-    assert outcome.kind == "max_completion_tokens_exceeded"
+@pytest.mark.parametrize("text", [None, _REPORT_JSON], ids=["alone", "after_valid_text"])
+def test_a_structured_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(
+    text: str | None,
+) -> None:
+    """A max_tokens stop at a last tool_use block exceeds the cap, even after text that validates."""
+    message = _structured_message(text, stop_reason="max_tokens", tool_use=True)
+    assert _structured_bound().interpret(message).kind == "max_completion_tokens_exceeded"
 
 
 def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> None:

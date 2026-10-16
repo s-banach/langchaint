@@ -844,6 +844,21 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
     return _STOP_REASON_BY_ANTHROPIC_STOP_REASON.get(stop_reason, "other")
 
 
+def _ends_in_cut_off_tool_call(message: anthropic.types.Message) -> bool:
+    """Return whether `max_tokens` stopped the message at its last block, a `tool_use` block that may be incomplete.
+
+    Only the last block can be incomplete.
+    anthropic 1.15.0 parses an incomplete block's partial input JSON, so its `ToolCall` looks complete.
+    Anthropic says to retry such a message with a higher `max_tokens`.
+    Source: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons, read 2026-10-15.
+    """
+    return (
+        message.stop_reason == "max_tokens"
+        and bool(message.content)
+        and message.content[-1].type == "tool_use"
+    )
+
+
 def _unfinished_message_or_none(
     message: anthropic.types.Message, *, assistant_message: AssistantMessage
 ) -> UnfinishedAssistantMessage | None:
@@ -1487,16 +1502,19 @@ class _BoundAnthropicText(_BoundAnthropic[str | None]):
     """Text-bound adapter: output is `text_output` of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> UsableResponse[str | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
         """Read the assistant message, whose `text_output` is this binding's output.
 
-        Every message supplies its text despite an unhandled stop reason.
+        A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.
+        Every other message returns its text, including one with an unhandled stop reason.
 
         Raises:
             TypeError: `raw` is not an anthropic `Message`.
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
+        if _ends_in_cut_off_tool_call(message):
+            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         return _usable_response(message, text_output(assistant_message), assistant_message)
 
 
@@ -1572,9 +1590,13 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
         """Validate the assistant message's text into the instance, or report why the message produced none.
 
+        A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.
+
         Raises:
             TypeError: raw is not an anthropic Message.
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
+        if _ends_in_cut_off_tool_call(message):
+            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         return self._parsed_outcome(message, assistant_message)

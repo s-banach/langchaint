@@ -379,7 +379,7 @@ class LLM:
             tools: The application tools or an existing `ToolManager`.
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `None` for text.
-                With `None`, `output` is the kept assistant message's joined text, for any stop reason.
+                With `None`, `output` is the kept assistant message's joined text.
                 Without text, `PlainGeneration.output` is `""` and `ToolCallGeneration.output` is `None`.
                 To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.

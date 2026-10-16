@@ -35,6 +35,7 @@ from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff
 from langchaint.generation._config_fingerprint import (
+    ResponseFormatFingerprintData,
     bound_llm_config_fingerprint,
     capture_response_format_fingerprint_data,
     input_fingerprint,
@@ -494,26 +495,26 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         """
         if isinstance(max_requests, bool) or max_requests < 1:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
-        self.adapter: Adapter = adapter
-        self.binding: Binding = binding
+        # Every attribute is `Final`, so a `BoundLLM` keeps the configuration it was bound with.
+        # `Final` also keeps `BoundLLM` sound when widened, as in `BoundLLM[BaseModel]`.
+        # Without it, a widened view could assign a wider value to an attribute typed with a type parameter.
+        self.adapter: Final[Adapter] = adapter
+        self.binding: Final[Binding] = binding
         self.response_format: Final[type[OutputT]] = response_format
-        self.shared_backoff: SharedBackoff = shared_backoff
-        self.max_requests: int = max_requests
-        self.observer: Observer | None = observer
-        self._bound_adapter = bound_adapter
-        self._tool_manager = tool_manager
-        self._adapter_class = type(adapter)
-        self._adapter_model = adapter.model
-        self._adapter_provider_name = adapter.provider_name
-        self._adapter_config_fingerprint_data = adapter.config_fingerprint_data()
-        self._response_format_fingerprint_data = capture_response_format_fingerprint_data(
-            response_format
+        self.tool_manager: Final[ToolManagerT] = tool_manager
+        self.shared_backoff: Final[SharedBackoff] = shared_backoff
+        self.max_requests: Final[int] = max_requests
+        self.observer: Final[Observer | None] = observer
+        self._bound_adapter: Final[BoundAdapter[OutputT | None]] = bound_adapter
+        self._adapter_class: Final[type[Adapter]] = type(adapter)
+        self._adapter_model: Final[str] = adapter.model
+        self._adapter_provider_name: Final[str] = adapter.provider_name
+        self._adapter_config_fingerprint_data: Final[Mapping[str, object]] = (
+            adapter.config_fingerprint_data()
         )
-
-    @property
-    def tool_manager(self) -> ToolManagerT:
-        """Return the bound `ToolManager` or `None`."""
-        return self._tool_manager
+        self._response_format_fingerprint_data: Final[ResponseFormatFingerprintData] = (
+            capture_response_format_fingerprint_data(response_format)
+        )
 
     def config_fingerprint(self) -> str:
         """Return a SHA-256 fingerprint of the current stored request configuration.
@@ -543,7 +544,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
     @property
     def _splits_on_tool_calls(self) -> bool:
-        return self._tool_manager is not None
+        return self.tool_manager is not None
 
     @overload
     def bind[NewModelT: BaseModel](

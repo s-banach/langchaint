@@ -1257,18 +1257,33 @@ _STRUCTURED_FINAL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
 """A structured assistant message without tool calls, whose output is the parsed `_Answer`."""
 
 
+def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
+    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter[OutputT | None]
+) -> BoundLLM[OutputT, ToolManagerT]:
+    """Copy `bound_llm` with every request sent through `bound_adapter`."""
+    return BoundLLM(
+        adapter=bound_llm.adapter,
+        bound_adapter=bound_adapter,
+        response_format=bound_llm.response_format,
+        binding=bound_llm.binding,
+        tool_manager=bound_llm.tool_manager,
+        shared_backoff=bound_llm.shared_backoff,
+        max_requests=bound_llm.max_requests,
+        observer=bound_llm.observer,
+    )
+
+
 def _structured_tool_bound_llm(
     outcome: ResponseOutcome[_Answer | None],
 ) -> BoundLLM[_Answer, ToolManager]:
     """Bind structured plus tools, then swap the scripted fake in for bind's never-generating one.
 
-    Replacing _bound_adapter preserves response_format, tool_manager, and retry behavior.
+    Replacing the bound adapter preserves response_format, tool_manager, and retry behavior.
     """
     bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
         response_format=_Answer, tools=ToolManager([])
     )
-    bound_llm._bound_adapter = _ScriptedBoundAdapter(outcome)
-    return bound_llm
+    return _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(outcome))
 
 
 @pytest.mark.parametrize(
@@ -1354,7 +1369,7 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
             stop_reason="stop",
         )
         bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
-        bound_llm._bound_adapter = _ScriptedBoundAdapter(outcome)
+        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(outcome))
         with pytest.raises(ValueError, match="Input should be a valid number"):
             await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         assert len(replaced_document_json) == 1
@@ -1377,7 +1392,7 @@ def test_text_tool_bound_generate_one_returns_a_tool_call_generation() -> None:
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
             tools=ToolManager([])
         )
-        bound_llm._bound_adapter = _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE)
+        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE))
         result = await bound_llm.generate_one("hi")
         assert result.kind == "tool_call"
         assert result.output is None
@@ -1390,7 +1405,7 @@ def test_none_output_without_a_tool_manager_raises_an_unknown_exception_error() 
 
     async def scenario() -> None:
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
-        bound_llm._bound_adapter = _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE)
+        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE))
         with pytest.raises(GenerationError) as escaped:
             await bound_llm.generate_one("hi")
         assert escaped.value.kind == "unknown_exception_error"

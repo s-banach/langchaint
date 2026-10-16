@@ -71,8 +71,6 @@ search-path = ["src", ".", "examples/full_app"]
 
 [tool.pyrefly.errors]
 implicit-bool = false
-# An @overload set requires a permissive implementation signature, which this rule flags.
-explicit-any = false
 
 [tool.pytest.ini_options]
 # tests/test_full_app.py verifies the example app's documented behavior.

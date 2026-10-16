@@ -57,7 +57,7 @@ Request and response mappings:
 from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast, override
+from typing import Literal, cast, override
 
 import openai
 from openai import AsyncOpenAI, Omit, omit
@@ -871,7 +871,7 @@ class _OpenAIResponsesStream(AdapterStream):
     def __init__(
         self,
         *,
-        sdk_stream: AsyncResponseStream[Any],
+        sdk_stream: AsyncResponseStream[None],
         pricing: OpenAIPricingTable,
         charged_provider_executed_tools: bool,
     ) -> None:

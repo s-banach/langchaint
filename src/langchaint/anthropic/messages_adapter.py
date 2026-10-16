@@ -68,7 +68,7 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal, cast, override
+from typing import ClassVar, Literal, cast, override
 
 import anthropic
 from anthropic import (
@@ -1323,7 +1323,7 @@ class _AnthropicStream(AdapterStream):
     def __init__(
         self,
         *,
-        sdk_stream: AsyncMessageStream[Any],
+        sdk_stream: AsyncMessageStream[None],
         pricing: AnthropicPricingTable,
         provider_executed_tools: _AnthropicProviderExecutedTools = _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS,
     ) -> None:

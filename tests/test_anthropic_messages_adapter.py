@@ -1718,11 +1718,22 @@ def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_
 def _structured_message(
     text: str | None,
     stop_reason: at.StopReason | None = "end_turn",
+    *,
+    tool_use: bool = False,
 ) -> at.Message:
-    """Build a message whose first text block carries the given text. None gives no text block."""
+    """Build a message whose first text block carries the given text. None gives no text block.
+
+    `tool_use=True` appends one tool_use block.
+    """
+    text_blocks: list[at.ContentBlock] = (
+        [at.TextBlock(type="text", text=text)] if text is not None else []
+    )
+    tool_use_blocks: list[at.ContentBlock] = (
+        [at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={})] if tool_use else []
+    )
     return at.Message(
         id="msg_1",
-        content=[at.TextBlock(type="text", text=text)] if text is not None else [],
+        content=text_blocks + tool_use_blocks,
         model="claude-sonnet-5",
         role="assistant",
         stop_reason=stop_reason,
@@ -1808,9 +1819,15 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             None,
             id="pause_turn_ahead_of_schema_violation",
         ),
-        pytest.param(None, "tool_use", "usable_response", None, id="tool_use"),
         pytest.param(
-            "let me look that up", "tool_use", "usable_response", None, id="tool_use_with_prose"
+            None, "tool_use", "empty_assistant_message", None, id="tool_use_without_tool_calls"
+        ),
+        pytest.param(
+            "let me look that up",
+            "tool_use",
+            "schema_violation",
+            None,
+            id="tool_use_without_tool_calls_with_prose",
         ),
     ],
 )
@@ -1823,12 +1840,26 @@ def test_structured_outcome_by_text_and_stop_reason(
     """Valid text validates into the instance, and otherwise the stop reason names the outcome.
 
     A null stop reason or pause_turn leaves the assistant message unfinished, even when text failed validation.
-    A tool_use stop parses no instance and nothing went wrong, so its output is None even beside prose.
+    A tool_use stop without a tool call is not a tool-call message.
     """
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind
     if outcome.kind == "usable_response":
         assert outcome.output == expected_output
+
+
+@pytest.mark.parametrize("text", [None, "let me look that up"], ids=["alone", "with_prose"])
+def test_a_structured_tool_call_message_has_none_output(text: str | None) -> None:
+    """A tool call parses no instance and nothing went wrong, so its output is None even beside prose."""
+    outcome = _structured_parse(_structured_message(text, stop_reason="tool_use", tool_use=True))
+    assert outcome.kind == "usable_response"
+    assert outcome.output is None
+
+
+def test_a_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens() -> None:
+    """A max_tokens stop can leave an incomplete tool_use block, so the stop reason wins over the tool call."""
+    outcome = _structured_parse(_structured_message(None, stop_reason="max_tokens", tool_use=True))
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> None:

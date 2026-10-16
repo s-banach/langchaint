@@ -114,7 +114,7 @@ def _settled_request_records(
 
 
 def _outputs(
-    outcomes: Sequence[PlainGeneration[str] | GenerationError | GenerationOutcomeRecord[str, str]],
+    outcomes: Sequence[PlainGeneration[str] | GenerationError | GenerationOutcomeRecord[str]],
 ) -> list[str]:
     """Assert every outcome is a `PlainGeneration` and return each output in order."""
     outputs: list[str] = []
@@ -1124,13 +1124,13 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     )
     assert_type(
         await structured_with_tools.generate_many(["hi"]),
-        list[GenerationOutcome[_Answer, _Answer | None]],
+        list[GenerationOutcome[_Answer]],
     )
     assert_type(
         await structured_with_tools.generate_many_records(
             ["hi"], resume_path=Path("records.json")
         ),
-        list[GenerationOutcomeRecord[_Answer, _Answer | None]],
+        list[GenerationOutcomeRecord[_Answer]],
     )
     structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), PlainGeneration[_Answer])
@@ -1141,14 +1141,16 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(
         await text_with_tools.generate_one("hi"),
-        PlainGeneration[str] | ToolCallGeneration[str],
+        PlainGeneration[str] | ToolCallGeneration[str | None],
     )
     assert_type(await text_with_tools.generate_many(["hi"]), list[GenerationOutcome[str]])
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[GenerationOutcomeRecord[str, str]],
+        list[GenerationOutcomeRecord[str]],
     )
-    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration[str]])
+    assert_type(
+        text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration[str | None]]
+    )
 
 
 async def _pin_generic_request_method_return_types[
@@ -1157,13 +1159,12 @@ async def _pin_generic_request_method_return_types[
 ](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
     assert_type(
         await bound_llm.generate_many(["hi"]),
-        list[PlainGeneration[OutputT] | GenerationError]
-        | list[GenerationOutcome[OutputT, OutputT | None]],
+        list[PlainGeneration[OutputT] | GenerationError] | list[GenerationOutcome[OutputT]],
     )
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
         list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
-        | list[GenerationOutcomeRecord[OutputT, OutputT | None]],
+        | list[GenerationOutcomeRecord[OutputT]],
     )
 
 
@@ -1335,6 +1336,13 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
     run_with_timeout(scenario())
 
 
+_TEXT_TOOL_CALL_RESPONSE: UsableResponse[str | None] = UsableResponse(
+    output=None,
+    assistant_message=AssistantMessage(parts=(FAKE_TOOL_CALL,)),
+    stop_reason="tool_call",
+)
+
+
 def test_text_tool_bound_generate_one_returns_a_tool_call_generation() -> None:
     """A text binding with tools returns ToolCallGeneration for an assistant message that called tools."""
 
@@ -1342,15 +1350,24 @@ def test_text_tool_bound_generate_one_returns_a_tool_call_generation() -> None:
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
             tools=ToolManager([])
         )
-        tool_call_response: UsableResponse[str] = UsableResponse(
-            output="",
-            assistant_message=AssistantMessage(parts=(FAKE_TOOL_CALL,)),
-            stop_reason="tool_call",
-        )
-        bound_llm._bound_adapter = _ScriptedBoundAdapter(tool_call_response)
+        bound_llm._bound_adapter = _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE)
         result = await bound_llm.generate_one("hi")
         assert result.kind == "tool_call"
-        assert result.output == ""
+        assert result.output is None
+
+    run_with_timeout(scenario())
+
+
+def test_none_output_without_a_tool_manager_raises_an_unknown_exception_error() -> None:
+    """A binding without `ToolManager` returns only `PlainGeneration`, which cannot hold `None` output."""
+
+    async def scenario() -> None:
+        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm._bound_adapter = _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE)
+        with pytest.raises(GenerationError) as escaped:
+            await bound_llm.generate_one("hi")
+        assert escaped.value.kind == "unknown_exception_error"
+        assert isinstance(escaped.value.__cause__, ValueError)
 
     run_with_timeout(scenario())
 

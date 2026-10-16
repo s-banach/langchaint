@@ -752,11 +752,11 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
     ("output_type", "parts", "expected"),
     [
         ("text", [], ("plain", "")),
-        ("text", [_TOOL_CALL_OUTPUT_PART], ("tool_call", "")),
+        ("text", [_TOOL_CALL_OUTPUT_PART], ("tool_call", None)),
         (
             "text",
             [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART],
-            ("tool_call", ""),
+            ("tool_call", None),
         ),
         ("json", [_TOOL_CALL_OUTPUT_PART], ("tool_call", None)),
         (

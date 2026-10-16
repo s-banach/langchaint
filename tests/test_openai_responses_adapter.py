@@ -1026,7 +1026,7 @@ def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_refere
     """The adapter sends store=False, the encrypted-reasoning include, and extra_body as it is when sent."""
     extra_body = {"safety_identifier": "user-7"}
 
-    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter[str]:
+    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter[str | None]:
         bound = adapter.bind_text(
             _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
         )

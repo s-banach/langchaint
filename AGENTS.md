@@ -19,7 +19,7 @@ Document every public parameter and cross-provider difference.
 ## Terms
 
 - input: one value the application passes in to be handled: a `GenerationInput`, or one text passed to `EmbeddingModel.embed`.
-- output: what application code reads from a finished assistant message, either its joined text or a `response_format` instance validated from its text. An assistant message gives output when that value exists.
+- output: what application code reads from a finished assistant message.
 - usable: an assistant message that gives output or has tool calls.
 - kept assistant message: the usable assistant message that ends handling an input.
 - generation: what handling a `GenerationInput` produces when it succeeds. `GenerationError` is its failure.

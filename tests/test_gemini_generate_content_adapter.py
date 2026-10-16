@@ -1507,7 +1507,7 @@ def test_close_closes_the_sdk_iterator() -> None:
     assert closed
 
 
-def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str]:
+def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str | None]:
     """Bind for text over a client whose HTTP requests go to http_client."""
     client = genai.Client(
         api_key="offline",

@@ -142,8 +142,8 @@ class _Answer(BaseModel):
     text: str
 
 
-def _by_generation_kind(generation: Generation[_Answer, _Answer | None]) -> object:
-    """Verify that kind narrows a structured Generation.output, the one whose variants differ."""
+def _by_generation_kind(generation: Generation[_Answer]) -> object:
+    """Verify that kind narrows a structured Generation.output."""
     match generation.kind:
         case "plain":
             assert_type(generation.output, _Answer)

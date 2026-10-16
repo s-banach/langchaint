@@ -83,7 +83,8 @@ class PlainGenerationRecord[OutputT](_GenerationRecordBase):
 class ToolCallGenerationRecord[OutputT](_GenerationRecordBase):
     """The normalized record of one `ToolCallGeneration`.
 
-    `output` is `None` when a structured binding's kept assistant message has no validated caller model.
+    `output` is `None` when the kept assistant message gives no output.
+    A text binding's message gives no output without text, and a structured binding's without a validated caller model.
 
     Validation rejects unknown fields.
     """
@@ -183,9 +184,9 @@ class ToolCallGeneration(
 
     @property
     def output(self) -> _OutputT_co:
-        """Return the kept assistant message's text or validated caller model.
+        """Return the kept assistant message's text or validated caller model, or `None` without either.
 
-        A text binding returns the joined `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
+        A text binding returns the joined `TextPart` text of `assistant_message`, or `None` without a `TextPart`.
         A structured binding returns `None` when the kept assistant message has no validated caller model.
         To continue the conversation, replay `assistant_message`.
         """
@@ -207,49 +208,37 @@ def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseMo
     return final_raw
 
 
-type Generation[OutputT, ToolCallOutputT = OutputT] = (
-    PlainGeneration[OutputT] | ToolCallGeneration[ToolCallOutputT]
-)
-"""What an input produces when it succeeds. `ToolCallOutputT` is `OutputT | None` for a structured binding."""
-type GenerationRecord[OutputT, ToolCallOutputT] = (
-    PlainGenerationRecord[OutputT] | ToolCallGenerationRecord[ToolCallOutputT]
-)
-"""The normalized record of one `PlainGeneration` or `ToolCallGeneration`.
+type Generation[OutputT] = PlainGeneration[OutputT] | ToolCallGeneration[OutputT | None]
+"""What an input produces when it succeeds.
 
-`ToolCallOutputT` has no default: pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
-pydantic then validates that argument as `Any`.
+A `ToolCallGeneration` has `None` output when its kept assistant message gives no output.
 """
-type GenerationOutcome[OutputT, ToolCallOutputT = OutputT] = (
-    Generation[OutputT, ToolCallOutputT] | GenerationError
+type GenerationRecord[OutputT] = (
+    PlainGenerationRecord[OutputT] | ToolCallGenerationRecord[OutputT | None]
 )
+"""The normalized record of one `PlainGeneration` or `ToolCallGeneration`."""
+type GenerationOutcome[OutputT] = Generation[OutputT] | GenerationError
 """Every live outcome of an input: a `Generation` or a `GenerationError`.
 
 `InputOutcomeRecord` also covers abandonment, which has no live form.
 """
 
-type GenerationOutcomeRecord[OutputT, ToolCallOutputT] = Annotated[
+type GenerationOutcomeRecord[OutputT] = Annotated[
     SerializeAsAny[PlainGenerationRecord[OutputT]]
-    | SerializeAsAny[ToolCallGenerationRecord[ToolCallOutputT]]
+    | SerializeAsAny[ToolCallGenerationRecord[OutputT | None]]
     | PlainErrorRecord
     | SchemaViolationErrorRecord,
     Field(discriminator="kind"),
 ]
-"""The normalized record of one `GenerationOutcome`.
+"""The normalized record of one `GenerationOutcome`."""
 
-`ToolCallOutputT` has no default: pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
-pydantic then validates that argument as `Any`.
-"""
-
-type InputOutcomeRecord[OutputT, ToolCallOutputT] = (
-    GenerationOutcomeRecord[OutputT, ToolCallOutputT] | AbandonedStreamRecord
-)
+type InputOutcomeRecord[OutputT] = GenerationOutcomeRecord[OutputT] | AbandonedStreamRecord
 """Every record of an input's outcome, including a stream the application abandoned."""
 
 
-def _generation_outcome_record[OutputT, ToolCallOutputT](
-    generation_outcome: GenerationOutcome[OutputT, ToolCallOutputT]
-    | GenerationOutcomeRecord[OutputT, ToolCallOutputT],
-) -> GenerationOutcomeRecord[OutputT, ToolCallOutputT]:
+def _generation_outcome_record[OutputT](
+    generation_outcome: GenerationOutcome[OutputT] | GenerationOutcomeRecord[OutputT],
+) -> GenerationOutcomeRecord[OutputT]:
     if isinstance(generation_outcome, (PlainGeneration, ToolCallGeneration, GenerationError)):
         if type(generation_outcome) not in (
             PlainGeneration,
@@ -274,12 +263,17 @@ def _generation_outcome_record[OutputT, ToolCallOutputT](
 def _generation_variant[OutputT](
     *,
     splits_on_tool_calls: bool,
-    output: OutputT,
+    output: OutputT | None,
     request_history: RequestHistory,
     request_provider_data: tuple[RequestProviderData, ...],
     stop_reason: StopReason,
 ) -> Generation[OutputT]:
-    """Build one live generation and its normalized record."""
+    """Build one live generation and its normalized record.
+
+    Raises:
+        ValueError: The adapter gives `None` output for a message that does not become a `ToolCallGeneration`.
+            The message has no tool calls, or the binding has no `ToolManager`.
+    """
     final = request_history.records[-1]
     assert final.kind == "settled"
     assert final.assistant_message is not None
@@ -290,6 +284,8 @@ def _generation_variant[OutputT](
             ),
             request_provider_data=request_provider_data,
         )
+    if output is None:
+        raise ValueError("the adapter gave None output for a PlainGeneration")
     return PlainGeneration(
         record=PlainGenerationRecord(
             output=output, request_history=request_history, stop_reason=stop_reason
@@ -299,7 +295,7 @@ def _generation_variant[OutputT](
 
 
 def _generation_outcome_from_response_outcome[OutputT](
-    outcome: ResponseOutcome[OutputT],
+    outcome: ResponseOutcome[OutputT | None],
     *,
     request_history: RequestHistory,
     request_provider_data: tuple[RequestProviderData, ...],

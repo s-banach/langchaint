@@ -121,6 +121,7 @@ from langchaint.adapter import (
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
+    text_output,
 )
 from langchaint.billing.pricing import ProviderBilling, billing_at_rates
 from langchaint.common.exceptions import StreamProtocolError
@@ -805,7 +806,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1089,12 +1090,12 @@ class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
-    """Text-bound adapter: output is the concatenated text of the assistant message."""
+class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str | None]):
+    """Text-bound adapter: output is `text_output` of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message, whose concatenated text is this binding's output.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
+        """Read the assistant message, whose `text_output` is this binding's output.
 
         Refusals and truncations still return their text with a matching stop reason.
 
@@ -1104,7 +1105,7 @@ class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
         finished_message = _finished_message_or_unfinished(_as_chat_completion(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
-        return _usable_response(finished_message, finished_message.assistant_message.text)
+        return _usable_response(finished_message, text_output(finished_message.assistant_message))
 
 
 class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](

@@ -213,12 +213,12 @@ class AdapterConformance(ABC):
         """
         ...
 
-    def _bound_adapter(self) -> BoundAdapter[str]:
+    def _bound_adapter(self) -> BoundAdapter[str | None]:
         """Bind a fresh adapter for plain text under the one binding these invariants use."""
         return self.make_adapter().bind_text(_PLAIN_BINDING)
 
     def _assistant_wire_parts_of(
-        self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
+        self, bound_adapter: BoundAdapter[str | None], messages: Sequence[Message]
     ) -> Sequence[object]:
         """Build request params and read the assistant message's wire parts.
 

@@ -349,7 +349,7 @@ def test_the_reported_tier_selects_the_rates() -> None:
                 finish_reason="tool_calls",
             ),
             "tool_call",
-            "",
+            None,
         ),
         (lambda: _completion(usage=None, finish_reason="length"), "max_completion_tokens", "hey"),
         (lambda: _completion(usage=None, finish_reason="content_filter"), "refusal", "hey"),
@@ -373,7 +373,9 @@ def test_the_reported_tier_selects_the_rates() -> None:
     ],
 )
 def test_stop_reason_mapping(
-    build_completion: Callable[[], ChatCompletion], expected: StopReason, expected_output: str
+    build_completion: Callable[[], ChatCompletion],
+    expected: StopReason,
+    expected_output: str | None,
 ) -> None:
     """Check translated stop reasons alongside the preserved output.
 
@@ -865,7 +867,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
     assert _adapter().client.max_retries == 0
 
 
-def _text_bound() -> BoundAdapter[str]:
+def _text_bound() -> BoundAdapter[str | None]:
     """Bind a keyless adapter for text. No request is sent."""
     return _adapter().bind_text(_binding())
 
@@ -1267,7 +1269,9 @@ def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> N
     """
     extra_body = {"safety_identifier": "user-7"}
 
-    def bind_then_edit_extra_body(adapter: OpenAIChatCompletionsAdapter) -> BoundAdapter[str]:
+    def bind_then_edit_extra_body(
+        adapter: OpenAIChatCompletionsAdapter,
+    ) -> BoundAdapter[str | None]:
         bound = adapter.bind_text(_binding(extra_body=extra_body))
         extra_body["safety_identifier"] = "user-8"
         return bound

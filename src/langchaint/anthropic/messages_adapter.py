@@ -130,6 +130,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_failure_from_response,
     request_params_json,
+    text_output,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -1256,7 +1257,7 @@ class AnthropicMessagesAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1482,12 +1483,12 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundAnthropicText(_BoundAnthropic[str]):
-    """Text-bound adapter: output is the concatenated text of the assistant message."""
+class _BoundAnthropicText(_BoundAnthropic[str | None]):
+    """Text-bound adapter: output is `text_output` of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> UsableResponse[str]:
-        """Read the assistant message, whose concatenated text is this binding's output.
+    def interpret(self, raw: BaseModel) -> UsableResponse[str | None]:
+        """Read the assistant message, whose `text_output` is this binding's output.
 
         Every message supplies its text despite an unhandled stop reason.
 
@@ -1496,7 +1497,7 @@ class _BoundAnthropicText(_BoundAnthropic[str]):
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
-        return _usable_response(message, assistant_message.text, assistant_message)
+        return _usable_response(message, text_output(assistant_message), assistant_message)
 
 
 class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None]):
@@ -1552,7 +1553,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         )
         if unfinished_message is not None:
             return unfinished_message
-        if message.stop_reason == "tool_use":
+        if message.stop_reason == "tool_use" and assistant_message.tool_calls:
             return _usable_response(message, None, assistant_message)
         if message.stop_reason == "refusal":
             return Refusal(assistant_message=assistant_message)

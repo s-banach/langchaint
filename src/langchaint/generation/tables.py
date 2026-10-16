@@ -118,12 +118,10 @@ def _request_row(
     }
 
 
-def to_tables[OutputT, ToolCallOutputT](
-    outcomes: GenerationOutcome[OutputT, ToolCallOutputT]
-    | InputOutcomeRecord[OutputT, ToolCallOutputT]
-    | Iterable[
-        GenerationOutcome[OutputT, ToolCallOutputT] | InputOutcomeRecord[OutputT, ToolCallOutputT]
-    ],
+def to_tables[OutputT](
+    outcomes: GenerationOutcome[OutputT]
+    | InputOutcomeRecord[OutputT]
+    | Iterable[GenerationOutcome[OutputT] | InputOutcomeRecord[OutputT]],
 ) -> Tables:
     """Flatten live outcomes or outcome records into outcome and request tables.
 

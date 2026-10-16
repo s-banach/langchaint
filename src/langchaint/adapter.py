@@ -401,13 +401,25 @@ class UsableResponse[OutputT]:
     """A response whose assistant message is usable: it gives output or has tool calls.
 
     `output` contains text or a validated `response_format` instance.
-    A structured binding's assistant message with tool calls and no instance has `output=None`.
+    `output` is `None` when the assistant message has tool calls and no output.
+    A text binding's message then has no text, and a structured binding's has no validated instance.
     """
 
     output: OutputT
     assistant_message: AssistantMessage
     stop_reason: StopReason
     kind: Literal["usable_response"] = "usable_response"
+
+
+def text_output(assistant_message: AssistantMessage) -> str | None:
+    """Return a text binding's output: the joined `TextPart` text of `assistant_message`.
+
+    The output is `None` when the message has tool calls and no text.
+    A message without tool calls or text gives `""`.
+    """
+    if assistant_message.tool_calls and not assistant_message.text:
+        return None
+    return assistant_message.text
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -804,10 +816,11 @@ class Adapter(ABC):
         ...
 
     @abstractmethod
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind for plain-text output.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
+        `text_output` gives each assistant message's output.
 
         Args:
             binding: The provider-neutral binding.
@@ -907,5 +920,6 @@ __all__ = [
     "require_stated_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
+    "text_output",
     "validated_provider_executed_tool_types",
 ]

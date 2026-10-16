@@ -103,6 +103,7 @@ from langchaint.adapter import (
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
+    text_output,
 )
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -1251,7 +1252,7 @@ class GeminiGenerateContentAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1710,12 +1711,12 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundGeminiText(_BoundGemini[str]):
-    """Text-bound adapter: output is the concatenated text of the assistant message."""
+class _BoundGeminiText(_BoundGemini[str | None]):
+    """Text-bound adapter: output is `text_output` of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message, whose concatenated text is this binding's output.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
+        """Read the assistant message, whose `text_output` is this binding's output.
 
         Every finished assistant message returns its text. stop_reason reports refusal or truncation.
 
@@ -1725,7 +1726,7 @@ class _BoundGeminiText(_BoundGemini[str]):
         finished_message = _finished_message_or_unusable_response(_as_response(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
-        return _usable_response(finished_message, finished_message.assistant_message.text)
+        return _usable_response(finished_message, text_output(finished_message.assistant_message))
 
 
 class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):

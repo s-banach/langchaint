@@ -19,6 +19,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from langchaint.adapter import text_output
 from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, Billing
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
@@ -679,12 +680,13 @@ def output_messages_from_otel(
 
 def generation_record_from_otel(
     otel_chat_span: OtelChatSpan,
-) -> GenerationRecord[JsonValue, JsonValue]:
+) -> GenerationRecord[JsonValue]:
     """Convert one parsed OTel chat span of a generation into a generation record.
 
     An output message with a tool call returns `ToolCallGenerationRecord`.
     Any other output message returns `PlainGenerationRecord`.
     Under `gen_ai.output.type` `"text"` or absent, the output joins the text of every text part.
+    An output message with a tool call and no text part then has output `None`.
     Under `"json"`, the output is the first non-empty text part validated as JSON.
     When that part is not valid JSON, the output is the joined text validated as JSON.
     An output message with a tool call has output `None` when neither is valid JSON.
@@ -927,7 +929,7 @@ def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
     """Return the output `assistant_message` gives under `output_type`.
 
-    Under `"text"`, the output is `assistant_message.text`.
+    Under `"text"`, the output is `text_output(assistant_message)`.
     Under `"json"`, the output is the first text part validated as JSON, or else the joined text validated as JSON.
     An assistant message with a tool call has output `None` when neither is valid JSON.
 
@@ -936,7 +938,7 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
         OtelToLangchaintConversionError: Under `"json"`, a message without tool calls has no valid JSON text.
     """
     if _supported_output_type(output_type) == "text":
-        return assistant_message.text
+        return text_output(assistant_message)
     first_text = next((part.text for part in assistant_message.parts if part.kind == "text"), "")
     with contextlib.suppress(ValidationError):
         return _JSON_VALUE_ADAPTER.validate_json(first_text)

@@ -156,7 +156,7 @@ async def _generate_through[OutputT, ToolManagerT: ToolManager | None](
     path: _GenerationPath,
     bound_llm: BoundLLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
-) -> Generation[OutputT, OutputT | None]:
+) -> Generation[OutputT]:
     """Run one input through `generate_one`, or through `stream_one` drained before its `final()`.
 
     Raises:
@@ -780,7 +780,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             reasoning_level="high",
             temperature=0.25,
         )
-        generation: Generation[str, str | None] | Generation[_Answer, _Answer | None]
+        generation: Generation[str] | Generation[_Answer]
         if response_format is None:
             bound = text_bound
             generation = await _generate_through(path, text_bound, generation_input)

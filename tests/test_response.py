@@ -565,7 +565,7 @@ def test_generation_error_requires_provider_request_alignment() -> None:
 
 def test_mixed_normalized_outcome_list_round_trips() -> None:
     """A mixed normalized outcome list reconstructs through its concrete output type."""
-    records: list[GenerationOutcomeRecord[Report, Report | None]] = [
+    records: list[GenerationOutcomeRecord[Report]] = [
         PlainGenerationRecord(
             output=Report(value=9),
             request_history=_completed_request_history(),
@@ -573,7 +573,7 @@ def test_mixed_normalized_outcome_list_round_trips() -> None:
         ),
         PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history()),
     ]
-    adapter = TypeAdapter(list[GenerationOutcomeRecord[Report, Report | None]])
+    adapter = TypeAdapter(list[GenerationOutcomeRecord[Report]])
     records_json = adapter.dump_json(records)
     restored = adapter.validate_json(records_json)
     assert adapter.dump_json(restored) == records_json

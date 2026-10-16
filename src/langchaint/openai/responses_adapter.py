@@ -120,6 +120,7 @@ from langchaint.adapter import (
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
+    text_output,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -836,7 +837,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1111,12 +1112,12 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
-    """Text-bound adapter: output is the concatenated text of the assistant message."""
+class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str | None]):
+    """Text-bound adapter: output is `text_output` of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message's text as this binding's output, or report the run openai says failed.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
+        """Read the assistant message's `text_output` as this binding's output, or report the run openai says failed.
 
         A failed status returns `_provider_failure` because emitted items are fragments.
         An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
@@ -1129,7 +1130,7 @@ class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
         assistant_message = _assistant_message_from(response)
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
-        return _usable_response(response, assistant_message.text, assistant_message)
+        return _usable_response(response, text_output(assistant_message), assistant_message)
 
 
 class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[ModelT | None]):

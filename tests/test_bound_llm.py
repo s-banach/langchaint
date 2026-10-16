@@ -1168,6 +1168,18 @@ async def _pin_generic_request_method_return_types[
     )
 
 
+def _pin_covariance(
+    structured_with_tools: BoundLLM[_Answer, ToolManager],
+) -> BoundLLM[BaseModel, ToolManager | None]:
+    """Pin `BoundLLM` as covariant in both type parameters.
+
+    Never called: pyrefly checks this body.
+    pyrefly infers each type parameter's variance from every attribute and method signature, private ones included.
+    It treats attributes whose names start with `_` as read-only.
+    """
+    return structured_with_tools
+
+
 class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
     """A bound adapter handing every request one scripted outcome."""
 

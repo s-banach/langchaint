@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol, overload
+from typing import Any, Final, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
@@ -368,7 +368,7 @@ class LLM:
         extra_body: Mapping[str, object] | None = None,
         max_requests: int = 3,
         automatic_cache_breakpoints: bool | None = None,
-    ) -> "BoundLLM[Any, Any]":
+    ) -> "BoundLLM[BaseModel | str, ToolManager | None]":
         """Freeze the prompt prefix and fix the output type.
 
         A `tools` sequence constructs `ToolManager` with this `LLM`'s observer.
@@ -438,6 +438,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """A frozen prompt prefix with generation and streaming methods.
 
     `OutputT` is `str` or the validated `response_format` type.
+    `BoundLLM` is covariant in both type parameters.
+    So a `BoundLLM[Answer, ToolManager]` is also a `BoundLLM[BaseModel, ToolManager | None]`.
     A binding with `ToolManager` returns `ToolCallGeneration` when the kept assistant message has tool calls.
     A `ToolCallGeneration` has `OutputT | None` output, `None` when its kept assistant message gives no output.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
@@ -474,7 +476,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
         self.adapter: Adapter = adapter
         self.binding: Binding = binding
-        self.response_format: type[OutputT] | None = response_format
+        self.response_format: Final[type[OutputT] | None] = response_format
         self.shared_backoff: SharedBackoff = shared_backoff
         self.max_requests: int = max_requests
         self.observer: Observer | None = observer
@@ -692,7 +694,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_requests: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
-    ) -> "BoundLLM[Any, Any]":
+    ) -> "BoundLLM[OutputT | BaseModel | str, ToolManager | None]":
         """Return a new `BoundLLM` with specified fields replaced.
 
         `tools=None` removes `ToolManager`.
@@ -1088,37 +1090,44 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         except GenerationError as failure:
             return failure
 
+    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
+    # Typing the invariant `list` result with it keeps `OutputT` covariant.
+    # That is sound only because each call returns a new `list` that `BoundLLM` does not keep.
     @overload
-    async def generate_many(
-        self: "BoundLLM[OutputT, None]",
+    async def generate_many[CallOutputT](
+        self: "BoundLLM[CallOutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[PlainGeneration[OutputT] | GenerationError]: ...
+    ) -> list[PlainGeneration[CallOutputT] | GenerationError]: ...
     @overload
-    async def generate_many(
-        self: "BoundLLM[OutputT, ToolManager]",
+    async def generate_many[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[GenerationOutcome[OutputT]]: ...
+    ) -> list[GenerationOutcome[CallOutputT]]: ...
     @overload
-    async def generate_many(
-        self: "BoundLLM[OutputT, ToolManagerT]",
+    async def generate_many[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[PlainGeneration[OutputT] | GenerationError] | list[GenerationOutcome[OutputT]]: ...
-    async def generate_many(
-        self,
+    ) -> (
+        list[PlainGeneration[CallOutputT] | GenerationError] | list[GenerationOutcome[CallOutputT]]
+    ): ...
+    async def generate_many[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         max_working_seconds_per_input: float | None = None,
-    ) -> list[PlainGeneration[OutputT] | GenerationError] | list[GenerationOutcome[OutputT]]:
+    ) -> (
+        list[PlainGeneration[CallOutputT] | GenerationError] | list[GenerationOutcome[CallOutputT]]
+    ):
         """Generate an input-aligned batch.
 
         Each input retries transient failures as `generate_one` does.
@@ -1136,7 +1145,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             BaseException: An item raises a non-`Exception` value.
         """
 
-        async def run_one(generation_input: GenerationInput) -> GenerationOutcome[OutputT]:
+        async def run_one(generation_input: GenerationInput) -> GenerationOutcome[CallOutputT]:
             """Run one batch item under a deadline of its own.
 
             Raises:
@@ -1155,29 +1164,32 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
         )
 
+    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
+    # Typing the invariant `list` result with it keeps `OutputT` covariant.
+    # That is sound only because each call returns a new `list` that `BoundLLM` does not keep.
     @overload
-    async def generate_many_records(
-        self: "BoundLLM[OutputT, None]",
+    async def generate_many_records[CallOutputT](
+        self: "BoundLLM[CallOutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]: ...
+    ) -> list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]: ...
     @overload
-    async def generate_many_records(
-        self: "BoundLLM[OutputT, ToolManager]",
+    async def generate_many_records[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[GenerationOutcomeRecord[OutputT]]: ...
+    ) -> list[GenerationOutcomeRecord[CallOutputT]]: ...
     @overload
-    async def generate_many_records(
-        self: "BoundLLM[OutputT, ToolManagerT]",
+    async def generate_many_records[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
@@ -1185,11 +1197,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
     ) -> (
-        list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
-        | list[GenerationOutcomeRecord[OutputT]]
+        list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]
+        | list[GenerationOutcomeRecord[CallOutputT]]
     ): ...
-    async def generate_many_records(
-        self,
+    async def generate_many_records[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path,
@@ -1197,8 +1209,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = False,
         max_working_seconds_per_input: float | None = None,
     ) -> (
-        list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
-        | list[GenerationOutcomeRecord[OutputT]]
+        list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]
+        | list[GenerationOutcomeRecord[CallOutputT]]
     ):
         """Restore reusable records and generate the remaining input records.
 
@@ -1292,23 +1304,29 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             )
             return resume_state.outcome_records()
 
+    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
+    # Typing the invariant `StreamHandle` result with it keeps `OutputT` covariant.
+    # That is sound only because each call returns a new `StreamHandle` that `BoundLLM` does not keep.
     @overload
-    def stream_one(
-        self: "BoundLLM[OutputT, None]",
+    def stream_one[CallOutputT](
+        self: "BoundLLM[CallOutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[OutputT]: ...
+    ) -> StreamHandle[CallOutputT]: ...
     @overload
-    def stream_one(
-        self: "BoundLLM[OutputT, ToolManagerT]",
+    def stream_one[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[OutputT, ToolCallGeneration[OutputT | None]]: ...
-    def stream_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> StreamHandle[OutputT, ToolCallGeneration[OutputT | None]]:
+    ) -> StreamHandle[CallOutputT, ToolCallGeneration[CallOutputT | None]]: ...
+    def stream_one[CallOutputT](
+        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> StreamHandle[CallOutputT, ToolCallGeneration[CallOutputT | None]]:
         """Build a `StreamHandle` that opens on context-manager entry.
 
         `timeout_seconds` starts on entry and covers request opening, iteration, and caller work.

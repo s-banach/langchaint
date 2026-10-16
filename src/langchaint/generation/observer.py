@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from pydantic import BaseModel
+
 from langchaint.adapter import Binding
 from langchaint.common.messages import Message
 from langchaint.common.observed_operation import ObservedOperation
@@ -22,6 +24,7 @@ from langchaint.tools import DispatchObserver
 class GenerationStart:
     """What langchaint knows when handling one input starts.
 
+    `response_format` is `str` for text output, or the pydantic model for structured output.
     `messages` is the input, with a bare `str` input as one `UserMessage`.
     `stream` is `True` for `stream_one`.
     """
@@ -29,7 +32,7 @@ class GenerationStart:
     provider_name: str
     model: str
     binding: Binding
-    response_format: type[object] | None
+    response_format: type[str] | type[BaseModel]
     messages: Sequence[Message]
     stream: bool
 

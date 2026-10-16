@@ -1024,7 +1024,7 @@ def test_bind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
     assert adapter.structured_bind_count == 1
     _ = structured.bind(system_prompt="s2")
     assert adapter.structured_bind_count == 2
-    _ = structured.bind(response_format=None)
+    _ = structured.bind(response_format=str)
     assert len(adapter.bound_adapters) == 3
 
 
@@ -1067,6 +1067,21 @@ def test_bind_tools_replace_the_manager_and_none_removes_it() -> None:
     assert bound.bind(tools=tool_manager).tool_manager is tool_manager
 
 
+class _Label(str):
+    """A `str` subclass, which the `type[str]` annotation of `response_format` accepts."""
+
+    __slots__ = ()
+
+
+def test_bind_rejects_a_str_subclass_response_format() -> None:
+    """Text output is `str` itself, so both `bind` methods reject a `str` subclass."""
+    llm = LLM(FakeAdapter())
+    with pytest.raises(TypeError, match="response_format must be str"):
+        _ = llm.bind(response_format=_Label)
+    with pytest.raises(TypeError, match="response_format must be str"):
+        _ = llm.bind().bind(response_format=_Label)
+
+
 def _pin_initial_and_replacement_bind_types(llm: LLM, tool_manager: ToolManager) -> None:
     text = llm.bind()
     assert_type(text, BoundLLM[str, None])
@@ -1104,7 +1119,7 @@ def _pin_initial_and_replacement_bind_types(llm: LLM, tool_manager: ToolManager)
     assert_type(structured.bind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
     assert_type(structured_with_tools.bind(tools=None), BoundLLM[_Answer, None])
     assert_type(text_with_tools.bind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.bind(response_format=None), BoundLLM[str, ToolManager])
+    assert_type(structured_with_tools.bind(response_format=str), BoundLLM[str, ToolManager])
     assert_type(structured_with_tools.bind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
 
 

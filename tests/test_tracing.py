@@ -152,7 +152,7 @@ def _traced(
 type _GenerationPath = Literal["generate", "stream"]
 
 
-async def _generate_through[OutputT, ToolManagerT: ToolManager | None](
+async def _generate_through[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     path: _GenerationPath,
     bound_llm: BoundLLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
@@ -722,11 +722,11 @@ class _Answer(BaseModel):
     value: int
 
 
-@pytest.mark.parametrize("response_format", [None, _Answer])
+@pytest.mark.parametrize("response_format", [str, _Answer])
 @pytest.mark.parametrize("stop_reason", get_args(StopReason.__value__))
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
-    path: _GenerationPath, stop_reason: StopReason, response_format: type[_Answer] | None
+    path: _GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
 ) -> None:
     """The span_parsing converters rebuild the binding, input, and generation of a captured chat span.
 
@@ -744,7 +744,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
     )
     assistant_message = AssistantMessage(
         parts=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
-        if response_format is None
+        if response_format is str
         else (TextPart(text='{"value":1}'), *tool_calls)
     )
     generation_input = (
@@ -781,11 +781,11 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             temperature=0.25,
         )
         generation: Generation[str] | Generation[_Answer]
-        if response_format is None:
+        if response_format is str:
             bound = text_bound
             generation = await _generate_through(path, text_bound, generation_input)
         else:
-            bound = text_bound.bind(response_format=response_format)
+            bound = text_bound.bind(response_format=_Answer)
             generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_chat(_exported_attributes(span))
@@ -796,7 +796,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert parsed.usage_cache_read_input_tokens == USAGE.input_tokens_cache_read
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
         assert parsed.request_stream == (True if path == "stream" else None)
-        assert parsed.output_type == ("text" if response_format is None else "json")
+        assert parsed.output_type == ("text" if response_format is str else "json")
         reconstructed = bound_llm_from_otel(
             parsed, llm=llm, tools=[_echo_tool()], response_format=response_format
         )

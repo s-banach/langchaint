@@ -781,7 +781,7 @@ def bound_llm_from_otel(
     *,
     llm: LLM,
     tools: ToolManager | ToolSequence,
-    response_format: None = None,
+    response_format: type[str] = str,
 ) -> BoundLLM[str, ToolManager]: ...
 
 
@@ -791,7 +791,7 @@ def bound_llm_from_otel(
     *,
     llm: LLM,
     tools: None = None,
-    response_format: None = None,
+    response_format: type[str] = str,
 ) -> BoundLLM[str, None]: ...
 
 
@@ -800,7 +800,7 @@ def bound_llm_from_otel[ModelT: BaseModel](
     *,
     llm: LLM,
     tools: ToolManager | ToolSequence | None = None,
-    response_format: type[ModelT] | None = None,
+    response_format: type[ModelT] | type[str] = str,
 ) -> (
     BoundLLM[ModelT, ToolManager]
     | BoundLLM[ModelT, None]
@@ -818,7 +818,7 @@ def bound_llm_from_otel[ModelT: BaseModel](
         llm: The provider SDK client state and request-admission configuration.
         tools: Executable Python tools.
             When `gen_ai.tool.definitions` is present, its converted schemas must equal the tool schemas.
-        response_format: The structured response model for JSON output, or `None` for text output.
+        response_format: The structured response model for JSON output, or `str` for text output.
 
     Raises:
         ValueError: The provider name or model on `llm` differs from `otel_chat_span`.
@@ -828,6 +828,7 @@ def bound_llm_from_otel[ModelT: BaseModel](
         OtelToLangchaintConversionError: Captured configuration differs from caller-supplied objects.
         OtelToLangchaintConversionError: A captured value has no lossless langchaint representation.
         TypeError: The adapter does not support the reconstructed binding.
+        TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
         pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool model has no JSON schema.
         pydantic.PydanticUserError: `response_format` or a tool model is not fully defined.
     """
@@ -954,16 +955,17 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
 
 
 def _require_matching_response_format(
-    output_type: str | None, response_format: type[BaseModel] | None
+    output_type: str | None, response_format: type[BaseModel] | type[str]
 ) -> None:
     selected_output_type = _supported_output_type(output_type)
-    if selected_output_type == "json" and response_format is None:
+    if selected_output_type == "json" and response_format is str:
         raise OtelToLangchaintConversionError(
-            f"gen_ai.output.type {output_type!r} requires response_format, got {response_format!r}"
+            f"gen_ai.output.type {output_type!r} requires a pydantic.BaseModel response_format, "
+            f"got {response_format!r}"
         )
-    if selected_output_type == "text" and response_format is not None:
+    if selected_output_type == "text" and response_format is not str:
         raise OtelToLangchaintConversionError(
-            f"gen_ai.output.type {output_type!r} requires response_format=None, got "
+            f"gen_ai.output.type {output_type!r} requires response_format=str, got "
             f"{response_format!r}"
         )
 

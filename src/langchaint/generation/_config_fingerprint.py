@@ -31,7 +31,7 @@ type ResponseFormatFingerprintData = _CanonicalValue | _ResponseFormatFingerprin
 
 
 def capture_response_format_fingerprint_data(
-    response_format: type[object] | None,
+    response_format: type[str] | type[BaseModel],
 ) -> ResponseFormatFingerprintData:
     """Capture response-format identity and schema while binding."""
     try:
@@ -110,12 +110,12 @@ class _Canonicalizer:
     def __init__(self) -> None:
         self._active_container_ids: set[int] = set()
 
-    def response_format(self, response_format: type[object] | None) -> _CanonicalValue:
-        """Encode a response format's class identity and JSON Schema."""
-        if response_format is None:
-            return ["none"]
+    def response_format(self, response_format: type[str] | type[BaseModel]) -> _CanonicalValue:
+        """Encode `str` as text, or a response format's class identity and JSON Schema."""
+        if response_format is str:
+            return ["text"]
         if not _is_base_model_class(response_format):
-            raise TypeError("response_format must derive from pydantic.BaseModel")
+            raise TypeError("response_format must be str or a pydantic.BaseModel subclass")
         try:
             response_json_schema = response_format.model_json_schema()
         except pydantic.PydanticUserError as error:

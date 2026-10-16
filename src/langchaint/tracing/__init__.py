@@ -527,7 +527,7 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
         "gen_ai.operation.name": _CHAT_OPERATION,
         "gen_ai.provider.name": start.provider_name,
         "gen_ai.request.model": start.model,
-        "gen_ai.output.type": "text" if start.response_format is None else "json",
+        "gen_ai.output.type": "text" if start.response_format is str else "json",
     }
     if binding.max_completion_tokens is not None:
         attributes["gen_ai.request.max_tokens"] = binding.max_completion_tokens

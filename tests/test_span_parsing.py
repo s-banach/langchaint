@@ -1098,11 +1098,11 @@ def test_reconstruction_binds_structured_response_model() -> None:
 
 @pytest.mark.parametrize(
     ("output_type", "response_format"),
-    [("json", None), ("text", _StructuredResponse), (None, _StructuredResponse)],
+    [("json", str), ("text", _StructuredResponse), (None, _StructuredResponse)],
 )
 def test_reconstruction_rejects_response_format_mismatch(
     output_type: str | None,
-    response_format: type[BaseModel] | None,
+    response_format: type[BaseModel] | type[str],
 ) -> None:
     """output_type and response_format must select the same output form."""
     span = _generation_chat_span()

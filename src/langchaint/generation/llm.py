@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any, Final, NamedTuple, Protocol, overload
+from typing import Final, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
@@ -233,16 +233,35 @@ def _build_binding(
     )
 
 
+@overload
 def _bind_adapter(
-    adapter: Adapter, binding: Binding, response_format: type[Any] | None
-) -> BoundAdapter[Any]:
-    if response_format is None:
+    adapter: Adapter, binding: Binding, response_format: type[str]
+) -> BoundAdapter[str | None]: ...
+@overload
+def _bind_adapter[ModelT: BaseModel](
+    adapter: Adapter, binding: Binding, response_format: type[ModelT]
+) -> BoundAdapter[ModelT | None]: ...
+@overload
+def _bind_adapter(
+    adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
+) -> BoundAdapter[str | None] | BoundAdapter[BaseModel | None]: ...
+def _bind_adapter(
+    adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
+) -> BoundAdapter[str | None] | BoundAdapter[BaseModel | None]:
+    """Bind `adapter` to `binding` for `response_format` output.
+
+    The third overload accepts a `type[OutputT]` from inside `BoundLLM`, which matches neither of the first two.
+
+    Raises:
+        TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
+    """
+    if response_format is str:
         return adapter.bind_text(binding)
+    if not issubclass(response_format, BaseModel):
+        raise TypeError(
+            f"response_format must be str or a pydantic.BaseModel subclass, got {response_format!r}"
+        )
     return adapter.bind_structured(binding, response_format)
-
-
-def _output_type_of(response_format: type[Any] | None) -> type[Any]:
-    return str if response_format is None else response_format
 
 
 def _resolve_tool_manager(
@@ -326,7 +345,7 @@ class LLM:
         system_prompt: str | Sequence[TextPart] | None = ...,
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: None = ...,
+        response_format: type[str] = ...,
         max_completion_tokens: int | None = ...,
         reasoning_level: str | None = ...,
         temperature: float | None = ...,
@@ -343,7 +362,7 @@ class LLM:
         system_prompt: str | Sequence[TextPart] | None = ...,
         tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: None = ...,
+        response_format: type[str] = ...,
         max_completion_tokens: int | None = ...,
         reasoning_level: str | None = ...,
         temperature: float | None = ...,
@@ -359,7 +378,7 @@ class LLM:
         system_prompt: str | Sequence[TextPart] | None = None,
         tools: ToolManager | ToolSequence | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
-        response_format: type[BaseModel] | None = None,
+        response_format: type[str] | type[BaseModel] = str,
         max_completion_tokens: int | None = None,
         reasoning_level: str | None = None,
         temperature: float | None = None,
@@ -378,8 +397,8 @@ class LLM:
             system_prompt: The bound system prompt, or `None`.
             tools: The application tools or an existing `ToolManager`.
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
-            response_format: The pydantic model for structured output, or `None` for text.
-                With `None`, `output` is the kept assistant message's joined text.
+            response_format: The pydantic model for structured output, or `str` for text.
+                With `str`, `output` is the kept assistant message's joined text.
                 Without text, `PlainGeneration.output` is `""` and `ToolCallGeneration.output` is `None`.
                 To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
@@ -402,6 +421,7 @@ class LLM:
             ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
+            TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -434,10 +454,10 @@ class LLM:
         )
 
 
-class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
+class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None]:
     """A frozen prompt prefix with generation and streaming methods.
 
-    `OutputT` is `str` or the validated `response_format` type.
+    `OutputT` is the `response_format` type: `str`, or the pydantic model that validates structured output.
     `BoundLLM` is covariant in both type parameters.
     So a `BoundLLM[Answer, ToolManager]` is also a `BoundLLM[BaseModel, ToolManager | None]`.
     A binding with `ToolManager` returns `ToolCallGeneration` when the kept assistant message has tool calls.
@@ -450,7 +470,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         adapter: Adapter,
         bound_adapter: BoundAdapter[OutputT | None],
-        response_format: type[OutputT] | None,
+        response_format: type[OutputT],
         binding: Binding,
         tool_manager: ToolManagerT,
         shared_backoff: SharedBackoff,
@@ -461,8 +481,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Args:
             adapter: The provider SDK adapter.
-            bound_adapter: The adapter bound to the prompt prefix.
-            response_format: The pydantic model for structured output, or `None` for text.
+            bound_adapter: `adapter` bound to `binding` for `response_format` output.
+            response_format: The pydantic model for structured output, or `str` for text.
             binding: The frozen provider-neutral prompt prefix.
             tool_manager: The bound `ToolManager`, or `None`.
             shared_backoff: The request admission state.
@@ -476,12 +496,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
         self.adapter: Adapter = adapter
         self.binding: Binding = binding
-        self.response_format: Final[type[OutputT] | None] = response_format
+        self.response_format: Final[type[OutputT]] = response_format
         self.shared_backoff: SharedBackoff = shared_backoff
         self.max_requests: int = max_requests
         self.observer: Observer | None = observer
         self._bound_adapter = bound_adapter
-        self._output_type: type[OutputT] = _output_type_of(response_format)
         self._tool_manager = tool_manager
         self._adapter_class = type(adapter)
         self._adapter_model = adapter.model
@@ -581,7 +600,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def bind(
         self,
         *,
-        response_format: None,
+        response_format: type[str],
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
@@ -598,7 +617,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def bind(
         self,
         *,
-        response_format: None,
+        response_format: type[str],
         tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
@@ -615,7 +634,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def bind(
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
-        response_format: None,
+        response_format: type[str],
         tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
@@ -682,7 +701,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def bind(
         self,
         *,
-        response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
         tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
@@ -694,7 +713,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_requests: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
-    ) -> "BoundLLM[OutputT | BaseModel | str, ToolManager | None]":
+    ) -> "BoundLLM[BaseModel | str, ToolManager | None]":
         """Return a new `BoundLLM` with specified fields replaced.
 
         `tools=None` removes `ToolManager`.
@@ -703,7 +722,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
 
         Args:
-            response_format: The replacement output model, `None` for text, or `UNCHANGED`.
+            response_format: The replacement output model, `str` for text, or `UNCHANGED`.
             system_prompt: The replacement system prompt, `None`, or `UNCHANGED`.
             tools: The replacement tools, `None`, or `UNCHANGED`.
             provider_executed_tools: The replacement provider-shaped tools or `UNCHANGED`.
@@ -727,6 +746,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
+            TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -1092,9 +1112,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
     # Typing the invariant `list` result with it keeps `OutputT` covariant.
-    # That is sound only because each call returns a new `list` that `BoundLLM` does not keep.
+    # That is sound only because the caller holds the only reference to the returned `list`.
     @overload
-    async def generate_many[CallOutputT](
+    async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1102,7 +1122,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_working_seconds_per_input: float | None = ...,
     ) -> list[PlainGeneration[CallOutputT] | GenerationError]: ...
     @overload
-    async def generate_many[CallOutputT](
+    async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1110,7 +1130,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcome[CallOutputT]]: ...
     @overload
-    async def generate_many[CallOutputT](
+    async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1119,7 +1139,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> (
         list[PlainGeneration[CallOutputT] | GenerationError] | list[GenerationOutcome[CallOutputT]]
     ): ...
-    async def generate_many[CallOutputT](
+    async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1166,9 +1186,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
     # Typing the invariant `list` result with it keeps `OutputT` covariant.
-    # That is sound only because each call returns a new `list` that `BoundLLM` does not keep.
+    # That is sound only because the caller holds the only reference to the returned `list`.
     @overload
-    async def generate_many_records[CallOutputT](
+    async def generate_many_records[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1178,7 +1198,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_working_seconds_per_input: float | None = ...,
     ) -> list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]: ...
     @overload
-    async def generate_many_records[CallOutputT](
+    async def generate_many_records[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1188,7 +1208,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_working_seconds_per_input: float | None = ...,
     ) -> list[GenerationOutcomeRecord[CallOutputT]]: ...
     @overload
-    async def generate_many_records[CallOutputT](
+    async def generate_many_records[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1200,7 +1220,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[CallOutputT]]
     ): ...
-    async def generate_many_records[CallOutputT](
+    async def generate_many_records[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1276,7 +1296,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 partial(
                     prepare_resume_state,
                     resume_path=resume_path,
-                    output_type=self._output_type,
+                    output_type=self.response_format,
                     config_fingerprint=config_fingerprint,
                     input_fingerprints=input_fingerprints,
                     input_ids=input_ids,
@@ -1306,22 +1326,22 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
     # Typing the invariant `StreamHandle` result with it keeps `OutputT` covariant.
-    # That is sound only because each call returns a new `StreamHandle` that `BoundLLM` does not keep.
+    # That is sound only because the caller holds the only reference to the returned `StreamHandle`.
     @overload
-    def stream_one[CallOutputT](
+    def stream_one[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[CallOutputT]: ...
     @overload
-    def stream_one[CallOutputT](
+    def stream_one[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[CallOutputT, ToolCallGeneration[CallOutputT | None]]: ...
-    def stream_one[CallOutputT](
+    def stream_one[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_input: GenerationInput,
         *,

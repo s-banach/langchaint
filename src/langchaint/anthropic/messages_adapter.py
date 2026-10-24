@@ -84,6 +84,7 @@ from anthropic.types import (
     Base64ImageSourceParam,
     CacheControlEphemeralParam,
     ImageBlockParam,
+    JSONOutputFormatParam,
     MessageParam,
     OutputConfigParam,
     RedactedThinkingBlockParam,
@@ -97,7 +98,6 @@ from anthropic.types import (
     ToolUseBlockParam,
     URLImageSourceParam,
 )
-from anthropic.types.json_output_format_param import JSONOutputFormatParam
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
@@ -649,16 +649,14 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.parts:
         if part.kind == "text":
-            blocks.append(TextBlockParam(type="text", text=part.text))
+            blocks.append({"type": "text", "text": part.text})
         elif part.kind == "tool_call":
-            blocks.append(
-                ToolUseBlockParam(
-                    type="tool_use",
-                    id=part.id,
-                    name=part.name,
-                    input=json.loads(part.args_json),
-                )
-            )
+            blocks.append({
+                "type": "tool_use",
+                "id": part.id,
+                "name": part.name,
+                "input": json.loads(part.args_json),
+            })
         else:
             blocks.append(_replayed_block(part.raw))
     return blocks
@@ -703,15 +701,11 @@ def _wire_messages(
             A non-final tool part that sets `cache_breakpoint` also raises it.
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
     """
-    wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []
-    pending_tool_results: list[_ContentBlockParam] = []
+    wire: list[MessageParam] = []
     cache_breakpoint_blocks: list[TextBlockParam | ImageBlockParam | ToolResultBlockParam] = []
-
-    def flush_tool_results() -> None:
-        if pending_tool_results:
-            wire.append(("user", list(pending_tool_results)))
-            pending_tool_results.clear()
-
+    # The content of the latest wire message; consecutive tool messages append their tool_result blocks to it.
+    last_blocks: list[_ContentBlockParam] = []
+    previous_kind: str | None = None
     for message in messages:
         match message.kind:
             case "tool":
@@ -723,26 +717,26 @@ def _wire_messages(
                 }
                 if _tool_message_has_cache_breakpoint(message):
                     cache_breakpoint_blocks.append(tool_result_block)
-                pending_tool_results.append(tool_result_block)
+                if previous_kind != "tool":
+                    last_blocks = []
+                    wire.append({"role": "user", "content": last_blocks})
+                last_blocks.append(tool_result_block)
             case "user":
-                flush_tool_results()
-                blocks, part_cache_breakpoint_blocks = _user_content_blocks(message)
+                last_blocks, part_cache_breakpoint_blocks = _user_content_blocks(message)
                 cache_breakpoint_blocks.extend(part_cache_breakpoint_blocks)
-                wire.append(("user", blocks))
+                wire.append({"role": "user", "content": last_blocks})
             case "assistant":
-                flush_tool_results()
-                wire.append(("assistant", _assistant_content_blocks(message)))
-    flush_tool_results()
+                last_blocks = _assistant_content_blocks(message)
+                wire.append({"role": "assistant", "content": last_blocks})
+        previous_kind = message.kind
     if message_cache_breakpoint_budget > 0:
         for block in cache_breakpoint_blocks[-message_cache_breakpoint_budget:]:
             block["cache_control"] = _cache_control_param(cache_ttl)
-    if automatic_cache_breakpoints and wire:
-        last_blocks = wire[-1][1]
-        if last_blocks:
-            last_block = last_blocks[-1]
-            if last_block["type"] != "thinking" and last_block["type"] != "redacted_thinking":
-                last_block["cache_control"] = _cache_control_param(cache_ttl)
-    return [MessageParam(role=role, content=blocks) for role, blocks in wire]
+    if automatic_cache_breakpoints and last_blocks:
+        last_block = last_blocks[-1]
+        if last_block["type"] != "thinking" and last_block["type"] != "redacted_thinking":
+            last_block["cache_control"] = _cache_control_param(cache_ttl)
+    return wire
 
 
 def _request_messages(
@@ -1535,9 +1529,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         The merged value replaces the binding value in every request.
         """
         self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
-        output_format = JSONOutputFormatParam(
-            schema=transform_schema(self._output_type_adapter.json_schema()), type="json_schema"
-        )
+        output_format: JSONOutputFormatParam = {
+            "schema": transform_schema(self._output_type_adapter.json_schema()),
+            "type": "json_schema",
+        }
         bound_output_config = precomputed_fields.output_config
         output_config: OutputConfigParam = (
             {"format": output_format}

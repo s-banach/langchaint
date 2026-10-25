@@ -862,6 +862,12 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         _ = _adapter()._precompute_fields(_binding(extra_body={"stream": False}))
 
 
+def test_request_rejects_deprecated_functions_in_extra_body() -> None:
+    """The deprecated `functions` field would declare tools that the binding does not bind."""
+    with pytest.raises(ValueError, match="outside `tools`"):
+        _ = _adapter()._precompute_fields(_binding(extra_body={"functions": []}))
+
+
 def test_adapter_pins_sdk_retries_off() -> None:
     """The stored client copy carries max_retries=0 so only langchaint retries."""
     assert _adapter().client.max_retries == 0

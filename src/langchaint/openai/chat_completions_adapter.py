@@ -745,6 +745,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
             ValueError: `extra_body` contains a key in `_ADAPTER_POPULATED_WIRE_KEYS` or `web_search_options`.
+            ValueError: `extra_body` contains `functions`, which declares tools outside `tools`.
             ValueError: `provider_executed_tools` is nonempty.
         """
         if binding.provider_executed_tools:
@@ -756,6 +757,11 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             raise ValueError(
                 "OpenAIChatCompletionsAdapter cannot price web_search_options. "
                 "Use OpenAIResponsesAdapter for web search."
+            )
+        if binding.extra_body is not None and "functions" in binding.extra_body:
+            raise ValueError(
+                "extra_body key 'functions' declares tools outside `tools`. "
+                "Bind tools through `tools`, because result types follow the bound tools."
             )
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS

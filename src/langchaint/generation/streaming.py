@@ -17,6 +17,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     BoundAdapter,
+    ReasoningDelta,
     RejectedMessages,
     RequestParams,
     ResponseOutcome,
@@ -410,6 +411,10 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
             self._adapter_stream = opened
             self._items = self._adapter_stream.items()
 
+    @overload
+    async def __anext__(self: "StreamHandle[OutputT, Never]") -> str | ReasoningDelta: ...
+    @overload
+    async def __anext__(self) -> StreamItem: ...
     async def __anext__(self) -> StreamItem:
         """Return the next item.
 

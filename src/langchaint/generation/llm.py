@@ -409,6 +409,7 @@ class LLM:
             tool_choice: The provider-neutral tool choice.
             parallel_tool_calls: Whether the provider may request parallel tool calls.
             extra_body: Additional provider wire-body fields, or `None`.
+                Declare tools only through `tools`, because result types follow the bound tools.
             max_requests: The maximum number of requests sent for one input; i.e., max_requests = max_retries + 1.
             automatic_cache_breakpoints: The automatic cache setting, or `None` for the adapter default.
 
@@ -418,6 +419,7 @@ class LLM:
             ValueError: `system_prompt` is an empty sequence.
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `extra_body` contains `functions` on an `OpenAIChatCompletionsAdapter`.
             ValueError: `max_requests` is boolean or below one.
             ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
@@ -734,6 +736,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             reasoning_level: The replacement exact provider string, `None`, or `UNCHANGED`.
             temperature: The replacement sampling temperature, `None`, or `UNCHANGED`.
             extra_body: The replacement provider wire-body fields, `None`, or `UNCHANGED`.
+                Declare tools only through `tools`, because result types follow the bound tools.
             max_requests: The replacement request limit or `UNCHANGED`.
             automatic_cache_breakpoints: The replacement automatic cache setting or `UNCHANGED`.
 
@@ -743,6 +746,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             ValueError: `system_prompt` is an empty sequence.
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `extra_body` contains `functions` on an `OpenAIChatCompletionsAdapter`.
             ValueError: `max_requests` is boolean or below one.
             ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.

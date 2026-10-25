@@ -35,6 +35,7 @@ Both `automatic_cache_breakpoints` values produce the same request and cache-rea
 Gemini never bills a cache write.
 A system part with `cache_breakpoint=True` raises `ValueError`, and such a message part returns `RejectedMessages`.
 `extra_body={"cachedContent": ...}` selects an explicit cache resource.
+The cache resource must not declare tools, because result types follow the bound tools.
 
 Content mappings were verified against google-genai 2.17.0.
 - `ImagePart` and `AudioPart` become `Part.inline_data`.

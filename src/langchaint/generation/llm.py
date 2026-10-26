@@ -254,7 +254,7 @@ def _bind_adapter(
     The third overload accepts a `type[OutputT]` from inside `BoundLLM`, which matches neither of the first two.
 
     Raises:
-        TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
+        TypeError: `response_format` is a proper subclass of `str`.
     """
     if response_format is str:
         return adapter.bind_text(binding)
@@ -403,7 +403,6 @@ class LLM:
                 Without text, `PlainGeneration.output` is `""` and `ToolCallGeneration.output` is `None`.
                 To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
-                `AnthropicMessagesAdapter` requires a value because the Messages API requires `max_tokens`.
             reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
             temperature: The sampling temperature, or `None` for the provider default.
             tool_choice: The provider-neutral tool choice.
@@ -415,16 +414,15 @@ class LLM:
 
         Raises:
             ValueError: `tools` contains duplicate names.
-            ValueError: `tool_choice` contains a name absent from the bound tool schemas.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence.
-            ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
-            ValueError: `extra_body` contains `functions` on an `OpenAIChatCompletionsAdapter`.
             ValueError: `max_requests` is boolean or below one.
-            ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
-            ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
             TypeError: The adapter does not support `tool_choice`.
-            TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -732,7 +730,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             tool_choice: The replacement tool choice or `UNCHANGED`.
             parallel_tool_calls: The replacement parallel-tool setting or `UNCHANGED`.
             max_completion_tokens: The replacement token limit, `None` to omit the limit, or `UNCHANGED`.
-                `AnthropicMessagesAdapter` requires a value because the Messages API requires `max_tokens`.
             reasoning_level: The replacement exact provider string, `None`, or `UNCHANGED`.
             temperature: The replacement sampling temperature, `None`, or `UNCHANGED`.
             extra_body: The replacement provider wire-body fields, `None`, or `UNCHANGED`.
@@ -742,16 +739,15 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
         Raises:
             ValueError: `tools` contains duplicate names.
-            ValueError: `tool_choice` contains a name absent from the bound tool schemas.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence.
-            ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
-            ValueError: `extra_body` contains `functions` on an `OpenAIChatCompletionsAdapter`.
             ValueError: `max_requests` is boolean or below one.
-            ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
-            ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
             TypeError: The adapter does not support `tool_choice`.
-            TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """

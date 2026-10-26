@@ -173,6 +173,13 @@ class OpenAI:
         `service_tier` sets the requested OpenAI service tier.
         The reported service tier selects pricing.
 
+        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options` is false.
+        - A provider-executed tool's `type` is missing or unsupported.
+          The adapter supports specific versions of web search and file search.
+        - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
+        - File search is bound and `pricing.file_search_usd_per_invocation` is `None`.
+
         Raises:
             ValueError: An uncataloged model lacks required pricing or caching data.
                 Also raised when the SDK client contradicts the OpenAI provider.
@@ -357,6 +364,9 @@ class OpenAIBedrock:
         `reasoning_summary` requests readable reasoning summary text.
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
+        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options=False`.
+        - `provider_executed_tools` is nonempty.
         """
         adapter = OpenAIResponsesAdapter(
             client=self.client,

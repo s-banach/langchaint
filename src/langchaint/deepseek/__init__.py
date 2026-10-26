@@ -146,6 +146,12 @@ class DeepSeek:
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
 
+        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        - `automatic_cache_breakpoints=False`, because the adapter sends no `prompt_cache_options`.
+        - `provider_executed_tools` is nonempty.
+        - `extra_body` contains `web_search_options`, which langchaint cannot price.
+        - `extra_body` contains `functions`, which declares tools outside `tools`.
+
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when the SDK client contradicts the DeepSeek provider.

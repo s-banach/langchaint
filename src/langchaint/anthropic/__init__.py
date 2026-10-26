@@ -190,6 +190,17 @@ class Anthropic:
         `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
 
+        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        - `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
+        - The binding places more than four cache breakpoints.
+          System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
+          Provider-executed tools with `cache_control` also count.
+        - A provider-executed tool's `type` is missing or unsupported.
+          The adapter supports specific versions of web search, web fetch, tool search, and code execution.
+        - Code execution is bound without a web search or web fetch version from 20260209 or later.
+        - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
+        `bind` raises `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
         """
@@ -269,6 +280,13 @@ class AnthropicBedrock:
         Uncataloged models require `pricing` and a passed `client`.
         `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         Bedrock models accept no Anthropic `service_tier` parameter here.
+
+        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        - `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
+        - The binding places more than four cache breakpoints.
+          System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
+        - `provider_executed_tools` is nonempty.
+        `bind` raises `TypeError` when `tool_choice` is `AllowedToolsChoice`.
 
         Raises:
             anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.

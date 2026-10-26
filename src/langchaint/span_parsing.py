@@ -828,7 +828,7 @@ def bound_llm_from_otel[ModelT: BaseModel](
         OtelToLangchaintConversionError: Captured configuration differs from caller-supplied objects.
         OtelToLangchaintConversionError: A captured value has no lossless langchaint representation.
         TypeError: The adapter does not support the reconstructed binding.
-        TypeError: `response_format` is neither `str` nor a `pydantic.BaseModel` subclass.
+        TypeError: `response_format` is a proper subclass of `str`.
         pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool model has no JSON schema.
         pydantic.PydanticUserError: `response_format` or a tool model is not fully defined.
     """

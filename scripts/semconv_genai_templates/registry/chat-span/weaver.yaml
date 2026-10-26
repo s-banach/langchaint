@@ -79,7 +79,7 @@ templates:
         | if length == 1 then .[0].attributes
           else error("the resolved registry has \(length) spans of type \($type), expected 1")
           end;
-      [span_attributes("gen_ai.embeddings.client")[].key]
+      [span_attributes("gen_ai.client.embeddings")[].key]
       | sort
     application_mode: single
     file_name: embeddings-span-attribute-names.json

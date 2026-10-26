@@ -158,7 +158,7 @@ A refresh that produces identical data leaves this file unchanged.
 
 `{CHAT_SPAN_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.client.inference` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
 `{EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
-`{EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.embeddings.client` span.
+`{EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.client.embeddings` span.
 `src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 

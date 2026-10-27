@@ -1240,6 +1240,13 @@ class AnthropicMessagesAdapter(Adapter):
             # cast: `reasoning_level` deliberately exceeds the SDK effort literal.
             output_config = cast("OutputConfigParam", {"effort": binding.reasoning_level})
             thinking = {"type": "adaptive"}
+
+        # Default to older anthropic bedrock api for legacy models
+        extra_body = (
+            {"anthropic_version": "bedrock-2023-05-31", **(binding.extra_body or {})}
+            if isinstance(self.client, AsyncAnthropicBedrock)
+            else binding.extra_body
+        )
         return _AnthropicPrecomputedFields(
             model=self.model,
             max_tokens=binding.max_completion_tokens,
@@ -1261,7 +1268,7 @@ class AnthropicMessagesAdapter(Adapter):
             ),
             cache_ttl=self.cache_ttl,
             message_cache_breakpoint_budget=message_cache_breakpoint_budget,
-            extra_body=binding.extra_body,
+            extra_body=extra_body,
             provider_executed_tools=provider_executed_tools,
         )
 

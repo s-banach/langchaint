@@ -74,8 +74,9 @@ asyncio.run(main())
 
 The Pydantic model validates the provider response.
 
-`generate_many()` returns one outcome per input in input order.
-A terminal failure becomes that input's `GenerationError`, so sibling outcomes remain available.
+`generate_many()` returns generations in input order, or raises `GenerationError` after cancelling and awaiting unfinished inputs.
+`generate_many_records()` returns one normalized record per input, including generation failures.
+Pass `resume_path` to persist records and resume interrupted batches.
 
 ## Coordinate retries across a rate-limit quota
 

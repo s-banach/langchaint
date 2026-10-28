@@ -1111,9 +1111,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         except GenerationError as failure:
             return failure
 
-    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
-    # Typing the invariant `list` result with it keeps `OutputT` covariant.
-    # That is sound only because the caller holds the only reference to the returned `list`.
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, None]",
@@ -1121,7 +1118,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[PlainGeneration[CallOutputT] | GenerationError]: ...
+    ) -> list[PlainGeneration[CallOutputT]]: ...
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManager]",
@@ -1129,7 +1126,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[GenerationOutcome[CallOutputT]]: ...
+    ) -> list[Generation[CallOutputT]]: ...
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
@@ -1137,22 +1134,19 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> (
-        list[PlainGeneration[CallOutputT] | GenerationError] | list[GenerationOutcome[CallOutputT]]
-    ): ...
+    ) -> list[PlainGeneration[CallOutputT]] | list[Generation[CallOutputT]]: ...
     async def generate_many[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         max_working_seconds_per_input: float | None = None,
-    ) -> (
-        list[PlainGeneration[CallOutputT] | GenerationError] | list[GenerationOutcome[CallOutputT]]
-    ):
-        """Generate an input-aligned batch.
+    ) -> list[PlainGeneration[CallOutputT]] | list[Generation[CallOutputT]]:
+        """Generate an input-aligned batch, raising on failure.
 
         Each input retries transient failures as `generate_one` does.
-        Each `GenerationError` becomes that input's outcome and does not cancel sibling inputs.
+        A failure cancels and awaits unfinished inputs before propagating.
+        Failures observed together propagate by the lowest input index.
         `SharedBackoff.max_concurrent_requests` limits request starts and pending items.
         `max_working_seconds_per_input` excludes admission and shared-pause waits.
 
@@ -1162,17 +1156,13 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             max_working_seconds_per_input: The per-input working-time budget, or `None`.
 
         Raises:
+            GenerationError: Handling an input fails.
             asyncio.CancelledError: The caller cancels the batch.
             BaseException: An item raises a non-`Exception` value.
         """
 
-        async def run_one(generation_input: GenerationInput) -> GenerationOutcome[CallOutputT]:
-            """Run one batch item under a deadline of its own.
-
-            Raises:
-                BaseException: A non-`Exception` value interrupts handling the input.
-            """
-            return await self._generate_one_or_failure(
+        async def run_one(generation_input: GenerationInput) -> Generation[CallOutputT]:
+            return await self._generate_one_any_binding(
                 generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_input)
             )
 
@@ -1193,7 +1183,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self: "BoundLLM[CallOutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
-        resume_path: Path,
+        resume_path: Path | None = None,
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
@@ -1203,7 +1193,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self: "BoundLLM[CallOutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
-        resume_path: Path,
+        resume_path: Path | None = None,
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
@@ -1213,7 +1203,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
-        resume_path: Path,
+        resume_path: Path | None = None,
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
@@ -1225,7 +1215,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
-        resume_path: Path,
+        resume_path: Path | None = None,
         input_ids: SequenceNotStr[str] | None = None,
         warm_cache: bool = False,
         max_working_seconds_per_input: float | None = None,
@@ -1233,9 +1223,13 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[CallOutputT]]
     ):
-        """Restore reusable records and generate the remaining input records.
+        """Return an input-aligned batch of records, including generation failures.
+
+        With `resume_path=None`, generate every input without file I/O or fingerprinting.
+        With `resume_path` provided, restore reusable records and generate the remaining records.
 
         Each input retries transient failures as `generate_one` does.
+        Each `GenerationError` becomes that input's record and does not cancel sibling inputs.
         The JSON file stores one item per current input.
         It stores input fingerprints instead of `GenerationInput` values.
         It stores normalized records without live provider SDK objects.
@@ -1268,21 +1262,40 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
         Args:
             generation_inputs: The input-aligned text or message values.
-            resume_path: The JSON file whose parent directory already exists.
+            resume_path: The JSON file whose parent directory already exists, or `None` to disable persistence.
             input_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
+                Used only when `resume_path` is provided.
             warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
             max_working_seconds_per_input: The per-input working-time budget, or `None`.
 
         Raises:
-            ValueError: `input_ids` has the wrong length or contains a duplicate.
+            ValueError: `resume_path` is provided and `input_ids` has the wrong length or contains a duplicate.
             ValueError: `resume_path` contains malformed data or an unsupported format.
             ValueError: A generated outcome record cannot be serialized as resume JSON.
             RuntimeError: Another `generate_many_records` call in this process is using `resume_path`.
-            TypeError: The binding or an input has no deterministic fingerprint encoding.
+            TypeError: `resume_path` is provided and the binding or an input has no deterministic fingerprint encoding.
             OSError: The resume file cannot be read, written, or replaced.
             asyncio.CancelledError: The caller cancels the batch after started items settle.
             BaseException: An item raises a non-`Exception` value after started items settle.
         """
+        if resume_path is None:
+
+            async def run_record(
+                generation_input: GenerationInput,
+            ) -> GenerationOutcomeRecord[CallOutputT]:
+                generation_outcome = await self._generate_one_or_failure(
+                    generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_input)
+                )
+                return _generation_outcome_record(generation_outcome)
+
+            return await _run_many_with_warm_cache(
+                tuple(
+                    partial(run_record, generation_input) for generation_input in generation_inputs
+                ),
+                warm_cache=warm_cache,
+                max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
+            )
+
         input_snapshots = tuple(
             _snapshot_generation_input(generation_input) for generation_input in generation_inputs
         )

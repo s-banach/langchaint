@@ -136,7 +136,6 @@ See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `
 | structured, with `ToolManager` | `PlainGeneration[Model] \| ToolCallGeneration[Model \| None]` |
 
 `Generation[str]` and `Generation[Model]` name the unions `generate_one` returns.
-`GenerationOutcome` adds `GenerationError` for batch outcomes.
 A binding with `ToolManager` returns `ToolCallGeneration` whenever the kept assistant message has tool calls.
 
 ```python
@@ -246,8 +245,6 @@ outcomes = await bound.generate_many(
 )
 ```
 
-The first outcome may be a `GenerationError`.
-Remaining items still start afterward.
 See [`05_prompt_caching.py`](05_prompt_caching.py) for measured cache counters.
 
 ## Unmatched provider fields
@@ -281,7 +278,8 @@ bound = openai.llm("gpt-5.6-terra").bind(
 ```
 
 `generate_one` raises `GenerationError` for terminal generation failures.
-`generate_many` returns each `GenerationError` at its input index.
+`generate_many` raises `GenerationError` after cancelling and awaiting unfinished inputs.
+`generate_many_records` returns each generation failure's record at its input index.
 
 ```python
 from langchaint import GenerationError
@@ -291,10 +289,10 @@ try:
 except GenerationError:
     generation = await fallback.generate_one(messages, timeout_seconds=30)
 
-outcomes = await primary.generate_many(inputs)
+outcomes = await primary.generate_many_records(inputs)
 for index, outcome in enumerate(outcomes):
-    if isinstance(outcome, GenerationError):
-        outcomes[index] = await fallback.generate_one(inputs[index])
+    if outcome.kind != "plain":
+        outcomes[index] = (await fallback.generate_one(inputs[index])).record
 ```
 
 `GenerationError.usage` includes paid usage across settled requests.

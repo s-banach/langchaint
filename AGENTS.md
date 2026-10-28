@@ -78,7 +78,6 @@ Document every public parameter and cross-provider difference.
 - Validate a structured response against the caller's model while preserving the response and billing.
 - Map each failed request to a neutral `RequestFailure`, which decides the retry and the rate-limit quota pause.
 - Stop handling the input on a provider failure that is not transient.
-- Return one outcome per `GenerationInput` without letting one non-transient failure cancel a sibling.
 - Raise detectable binding defects before sending a request.
 - Preserve provider error text verbatim after a prefix that names the failure.
 - Keep generated content out of `error_text` and `__str__` because tracing records both without regard to `capture_message_content`.

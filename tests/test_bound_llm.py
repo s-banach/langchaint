@@ -1139,10 +1139,6 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         StreamHandle[_Answer, ToolCallGeneration[_Answer | None]],
     )
     assert_type(
-        await structured_with_tools.generate_many(["hi"]),
-        list[GenerationOutcome[_Answer]],
-    )
-    assert_type(
         await structured_with_tools.generate_many_records(
             ["hi"], resume_path=Path("records.json")
         ),
@@ -1159,7 +1155,6 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         await text_with_tools.generate_one("hi"),
         PlainGeneration[str] | ToolCallGeneration[str | None],
     )
-    assert_type(await text_with_tools.generate_many(["hi"]), list[GenerationOutcome[str]])
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
         list[GenerationOutcomeRecord[str]],
@@ -1179,10 +1174,6 @@ async def _pin_generic_request_method_return_types[
     OutputT: str | BaseModel,
     ToolManagerT: ToolManager | None,
 ](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
-    assert_type(
-        await bound_llm.generate_many(["hi"]),
-        list[PlainGeneration[OutputT] | GenerationError] | list[GenerationOutcome[OutputT]],
-    )
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
         list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
@@ -1648,7 +1639,36 @@ def test_bind_keeps_replaces_and_removes_provider_executed_tools() -> None:
     assert bound.bind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
-def test_generate_many_aligns_a_failure_among_generations() -> None:
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_generate_many_raises_on_failure(*, warm_cache: bool) -> None:
+    """Propagate a generation failure while another input would hang."""
+
+    async def scenario() -> None:
+        adapter = FakeAdapter(scripted_requests=[TransientError("x")], hang_from_open=2)
+        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(max_requests=1)
+        with pytest.raises(GenerationError) as failure:
+            await bound_llm.generate_many(["a", "b"], warm_cache=warm_cache)
+        assert failure.value.record.kind == "retries_exhausted_error"
+        if warm_cache:
+            assert adapter.bound_adapters[0].open_count == 1
+
+    run_with_timeout(scenario())
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_generate_many_returns_generations_in_input_order(*, warm_cache: bool) -> None:
+    """Return generations in input order, including an empty batch."""
+
+    async def scenario() -> None:
+        bound_llm = LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff()).bind()
+        assert await bound_llm.generate_many([], warm_cache=warm_cache) == []
+        generations = await bound_llm.generate_many(["a", "b"], warm_cache=warm_cache)
+        assert [generation.output for generation in generations] == ["a", "b"]
+
+    run_with_timeout(scenario())
+
+
+def test_generate_many_records_aligns_a_failure_among_generations() -> None:
     """A mixed batch keeps each outcome at its input index: the failure where it failed, generations elsewhere."""
 
     async def scenario() -> None:
@@ -1662,14 +1682,16 @@ def test_generate_many_aligns_a_failure_among_generations() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
             max_requests=1,
+            extra_body={"opaque": object()},
         )
-        results = await bound_llm.generate_many([
+        assert await bound_llm.generate_many_records([]) == []
+        results = await bound_llm.generate_many_records([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
             [UserMessage(content="c")],
         ])
         first, second, third = results
-        assert isinstance(first, GenerationError)
+        assert first.kind == "retries_exhausted_error"
         assert second.kind == "plain"
         assert second.output == "b"
         assert third.kind == "plain"
@@ -2052,8 +2074,8 @@ def test_generate_many_passes_warm_cache_to_the_batch() -> None:
     run_with_timeout(scenario())
 
 
-def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
-    """A first item ending in a GenerationError stays at its index and the siblings still run."""
+def test_generate_many_records_warm_cache_first_failure_still_admits_the_rest() -> None:
+    """A first error record stays at its index and the siblings still run."""
 
     async def scenario() -> None:
         """Fail the deterministic first request under a one-request budget. The other two generate."""
@@ -2061,12 +2083,12 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(
             max_requests=1,
         )
-        results = await bound_llm.generate_many(
+        results = await bound_llm.generate_many_records(
             [[UserMessage(content="a")], [UserMessage(content="b")], [UserMessage(content="c")]],
             warm_cache=True,
         )
         first, second, third = results
-        assert isinstance(first, GenerationError)
+        assert first.kind == "retries_exhausted_error"
         assert second.kind == "plain"
         assert second.output == "b"
         assert third.kind == "plain"
@@ -2088,30 +2110,19 @@ class _RequestFailureRaisesAdapter(FakeAdapter):
         raise RuntimeError("request_failure defect")
 
 
-def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> None:
-    """An Exception from langchaint's own machinery fails its item and no sibling.
-
-    generate_many returns the defect as one item without discarding settled siblings.
-    """
+def test_a_defect_raises_from_generate_many() -> None:
+    """Convert an escaped adapter defect to GenerationError and fail the batch."""
 
     async def scenario() -> None:
-        """Raise past the retry loop on the one item whose request fails, and let the other generate."""
         adapter = _RequestFailureRaisesAdapter(scripted_requests=[ValueError("defect")], echo=True)
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        results = await bound_llm.generate_many([
-            [UserMessage(content="a")],
-            [UserMessage(content="b")],
-        ])
-        failures = [result for result in results if isinstance(result, GenerationError)]
-        responses = [result for result in results if result.kind == "plain"]
-        assert len(failures) == 1
-        assert len(responses) == 1
-        failure = failures[0]
+        with pytest.raises(GenerationError) as raised:
+            await bound_llm.generate_many(["a", "b"])
+        failure = raised.value
         assert failure.record.kind == "unknown_exception_error"
         assert isinstance(failure.__cause__, RuntimeError)
         assert failure.error_text == "request_failure defect"
         assert failure.request_params is None
-        # The request was in flight when the defect escaped, so the record cuts it off.
         assert [request_record.kind for request_record in failure.request_history.records] == [
             "cut_off"
         ]
@@ -3430,12 +3441,12 @@ def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
             scripted_requests=[TransientError("try again")],
         )
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        results = await bound_llm.generate_many(
-            [[UserMessage(content="retries")]], max_working_seconds_per_input=0.05
-        )
-        assert isinstance(results[0], GenerationError)
-        assert results[0].record.kind == "timed_out_error"
-        assert len(results[0].request_history.records) == 2
+        with pytest.raises(GenerationError) as raised:
+            await bound_llm.generate_many(
+                [[UserMessage(content="retries")]], max_working_seconds_per_input=0.05
+            )
+        assert raised.value.record.kind == "timed_out_error"
+        assert len(raised.value.request_history.records) == 2
 
     run_with_timeout(scenario())
 

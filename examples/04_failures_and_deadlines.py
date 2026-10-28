@@ -1,11 +1,11 @@
 """Show request pacing, terminal errors, deadlines, and provider fallback."""
 
 from langchaint import (
-    GenerationError,
+    GenerationErrorRecord,
     GenerationInput,
     ImagePart,
     Message,
-    PlainGeneration,
+    PlainGenerationRecord,
     SharedBackoff,
     TextPart,
     UserMessage,
@@ -14,7 +14,9 @@ from langchaint.anthropic import Anthropic
 from langchaint.openai import OpenAI
 
 
-async def run_batch_and_handle_what_failed() -> list[PlainGeneration[str] | GenerationError]:
+async def run_batch_and_handle_what_failed() -> list[
+    PlainGenerationRecord[str] | GenerationErrorRecord
+]:
     """Run a batch and send failed items to a second provider.
 
     Raises:
@@ -47,15 +49,17 @@ async def run_batch_and_handle_what_failed() -> list[PlainGeneration[str] | Gene
     ]
 
     # Admission waits pause each input's clock.
-    outcomes = await summarizer.generate_many(documents, max_working_seconds_per_input=30)
+    outcomes = await summarizer.generate_many_records(documents, max_working_seconds_per_input=30)
 
     for index, outcome in enumerate(outcomes):
-        if not isinstance(outcome, GenerationError):
+        if outcome.kind == "plain":
             continue
 
-        print(f"item {index} failed with {type(outcome).__name__}: {outcome.error_text}")
+        print(f"item {index} failed with {outcome.kind}: {outcome.error_text}")
         print(f"item {index} billed {outcome.usage.cost_in_usd} USD before failing")
 
         # generate_one raises when fallback fails.
-        outcomes[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
+        outcomes[index] = (
+            await fallback.generate_one(documents[index], timeout_seconds=30)
+        ).record
     return outcomes

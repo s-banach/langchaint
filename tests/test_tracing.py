@@ -478,20 +478,20 @@ def test_retry_surfaces_as_a_request_failed_span_event() -> None:
     run_with_timeout(scenario())
 
 
-def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> None:
-    """generate_many emits one chat span per item."""
+def test_generate_many_records_emits_one_chat_span_per_item_and_none_for_the_batch() -> None:
+    """generate_many_records emits one chat span per item."""
 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
         adapter = FakeAdapter(echo=True, scripted_requests=[billed(REFUSAL)])
         llm, exporter = _traced(adapter, max_concurrent_requests=1)
-        results = await llm.bind().generate_many([
+        results = await llm.bind().generate_many_records([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
             [UserMessage(content="c")],
         ])
         first, *rest = results
-        assert isinstance(first, GenerationError)
+        assert first.kind == "refusal_error"
         assert all(result.kind == "plain" for result in rest)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3

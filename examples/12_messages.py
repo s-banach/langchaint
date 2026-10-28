@@ -16,12 +16,12 @@ def serialize_messages() -> str:
     """Serialize messages and verify the round trip."""
     messages: list[Message] = [
         UserMessage(
-            content=[
+            content=(
                 TextPart(text="Compare these inputs."),
                 ImagePart(data=b"local image bytes", media_type="image/png"),
                 ImageUrlPart(url="https://example.com/image.png", media_type="image/png"),
                 AudioPart(data=b"local audio bytes", media_type="audio/wav"),
-            ]
+            )
         )
     ]
     messages_json = messages_to_json(messages, indent=2)

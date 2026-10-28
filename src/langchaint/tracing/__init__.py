@@ -430,12 +430,14 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
 
 
 def _recorded_assistant_parts(
-    parts: tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
+    parts: str | tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
     """Filter an assistant message's parts and render the kept ones as the convention's parts array, in order.
 
     If every part is omitted or renders as None, the message renders as an empty parts array, not as a missing message.
     """
+    if isinstance(parts, str):
+        parts = (TextPart(text=parts),)
     kept = (_filtered_part(content_filter, attribute_name, part) for part in parts)
     rendered = (_assistant_part(part) for part in kept if part is not None)
     return [part for part in rendered if part is not None]
@@ -541,7 +543,9 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
 
 
 def _output_content_attributes(
-    parts: tuple[AssistantPart, ...], stop_reason: StopReason | None, content_filter: ContentFilter
+    parts: str | tuple[AssistantPart, ...],
+    stop_reason: StopReason | None,
+    content_filter: ContentFilter,
 ) -> dict[str, SpanAttributeValue]:
     """Build gen_ai.output.messages from one assistant message's parts.
 

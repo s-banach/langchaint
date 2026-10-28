@@ -646,6 +646,8 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
         _RejectedMessagesError: A stored block lacks a `type` key.
     """
+    if isinstance(assistant_message.parts, str):
+        return [{"type": "text", "text": assistant_message.parts}]
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.parts:
         if part.kind == "text":

@@ -1,4 +1,4 @@
-"""A pydantic base that rejects unknown keys during construction and `model_copy`.
+"""A strict pydantic base that rejects unknown keys during construction and `model_copy`.
 
 Subclasses must forbid extra keys and use pydantic's generated constructor.
 `model_construct` retains pydantic's unvalidated behavior.
@@ -7,7 +7,7 @@ Subclasses must forbid extra keys and use pydantic's generated constructor.
 from collections.abc import Mapping
 from typing import Self, override
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
@@ -24,7 +24,9 @@ def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
 
 
 class CheckedCopyModel(BaseModel):
-    """Reject unknown keys during construction and `model_copy`."""
+    """Validate fields strictly and reject unknown keys during construction and `model_copy`."""
+
+    model_config = ConfigDict(strict=True)
 
     @classmethod
     @override

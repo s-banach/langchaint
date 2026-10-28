@@ -253,15 +253,19 @@ def test_dispatch_wraps_success_in_a_tool_message() -> None:
     assert result.app_data is None
 
 
-def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+def test_dispatch_carries_content_parts_into_tool_message_content(*, explicit: bool) -> None:
     """Sequence[ContentPart] reaches ToolMessage.content as a tuple.
 
     A success path that dropped or stringified the result would fail this equality.
     """
 
-    async def _content_parts_function(args: _EchoArgs) -> Sequence[ContentPart]:
+    async def _content_parts_function(
+        args: _EchoArgs,
+    ) -> Sequence[ContentPart] | ToolReturnExplicit[None]:
         """Return ContentPart values built from validated text."""
-        return [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
+        content = [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
+        return ToolReturnExplicit(content=content, is_error=True) if explicit else content
 
     tool = PydanticTool(
         name="render",
@@ -277,7 +281,7 @@ def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
         ImagePart(data=b"png", media_type="image/png"),
     )
     assert isinstance(result.tool_message.content, tuple)
-    assert result.tool_message.is_error is False
+    assert result.tool_message.is_error is explicit
     assert result.app_data is None
 
 

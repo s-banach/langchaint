@@ -18,7 +18,7 @@ from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
 from langchaint.generation.response import GenerationOutcomeRecord
 
-_RESUME_FORMAT_VERSION = 4
+_RESUME_FORMAT_VERSION = 5
 """The resume file version that this code reads and writes.
 
 Restoring a file of this version gives the records that rerunning its binding and inputs would give.
@@ -65,7 +65,7 @@ class _PositionDocument[OutputT](CheckedCopyModel):
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[4] = 4
+    format_version: Literal[5] = 5
     config_fingerprint: str
     identity_mode: Literal["position"] = "position"
     items: tuple[_PositionItem[OutputT], ...]
@@ -76,7 +76,7 @@ class _InputIdDocument[OutputT](CheckedCopyModel):
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[4] = 4
+    format_version: Literal[5] = 5
     config_fingerprint: str
     identity_mode: Literal["input_id"] = "input_id"
     items: tuple[_InputIdItem[OutputT], ...]
@@ -94,7 +94,15 @@ type _ResumeDocument[OutputT] = Annotated[
     Field(discriminator="identity_mode"),
 ]
 
-_JSON_OBJECT_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
+
+class _ResumeVersion(CheckedCopyModel):
+    """Pydantic validates the resume format version before the complete document."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    format_version: int
+
+
 _BROAD_DOCUMENT_ADAPTER: TypeAdapter[_ResumeDocument[JsonValue]] = TypeAdapter(
     _ResumeDocument[JsonValue]
 )
@@ -282,14 +290,13 @@ def _load_document(resume_path: Path) -> _LoadedDocument | None:
     except FileNotFoundError:
         return None
     try:
-        document_object = _JSON_OBJECT_ADAPTER.validate_json(document_json)
+        resume_version = _ResumeVersion.model_validate_json(document_json, extra="ignore")
     except ValidationError as error:
-        raise ValueError(f"{resume_path} is not a valid resume JSON object") from error
-    format_version = document_object.get("format_version")
-    if type(format_version) is not int or format_version != _RESUME_FORMAT_VERSION:
+        raise ValueError(f"{resume_path} is not a valid resume document") from error
+    if resume_version.format_version != _RESUME_FORMAT_VERSION:
         raise ValueError(f"{resume_path} has an unsupported resume format_version")
     try:
-        document = _BROAD_DOCUMENT_ADAPTER.validate_python(document_object)
+        document = _BROAD_DOCUMENT_ADAPTER.validate_json(document_json)
     except ValidationError as error:
         raise ValueError(
             f"{resume_path} is not a valid version {_RESUME_FORMAT_VERSION} resume document"

@@ -387,6 +387,8 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
     The API validates another provider's unknown `type` key.
     """
+    if isinstance(assistant_message.parts, str):
+        return [{"role": "assistant", "content": assistant_message.parts}]
     items: list[ResponseInputItemParam] = []
     pending_texts: list[str] = []
 

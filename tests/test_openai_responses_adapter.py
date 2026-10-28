@@ -523,7 +523,9 @@ def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_with
 ) -> None:
     """Reasoning text prefers content, joins parts, and excludes empty text."""
     response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
-    reasoning_part = _assistant_message_from(response).parts[0]
+    parts = _assistant_message_from(response).parts
+    assert isinstance(parts, tuple)
+    reasoning_part = parts[0]
     assert reasoning_part.kind == "reasoning"
     assert reasoning_part.text == expected_text
 
@@ -1363,6 +1365,7 @@ def test_a_summary_part_boundary_streams_the_assembled_reasoning_part_separator(
         return streamed, _assistant_message_from(await adapter_stream.final())
 
     streamed, assistant_message = run_with_timeout(scenario())
+    assert isinstance(assistant_message.parts, tuple)
     reasoning_part = assistant_message.parts[0]
     assert reasoning_part.kind == "reasoning"
     assert streamed == reasoning_part.text == "First, water evaporates.\n\nThen it condenses."

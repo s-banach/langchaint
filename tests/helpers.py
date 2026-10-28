@@ -29,10 +29,10 @@ from langchaint import (
     AbandonedStreamRecord,
     AssistantMessage,
     Billing,
+    CutOffRequestRecord,
     DispatchOutcome,
     GenerationOutcome,
     RequestHistory,
-    RequestRecord,
     SettledRequestRecord,
     TokenRates,
     ToolCall,
@@ -128,7 +128,9 @@ def request_record(
     )
 
 
-def call_record(records: tuple[RequestRecord, ...], *, elapsed_seconds: float) -> RequestHistory:
+def call_record(
+    records: tuple[SettledRequestRecord | CutOffRequestRecord, ...], *, elapsed_seconds: float
+) -> RequestHistory:
     """Build a RequestHistory over the records under test. The identity fields are fixed filler."""
     return RequestHistory(
         model="fake-model",

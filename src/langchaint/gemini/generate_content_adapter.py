@@ -652,6 +652,8 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
         _RejectedMessagesError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
+    if isinstance(assistant_message.parts, str):
+        return [types.Part(text=assistant_message.parts)]
     wire_parts: list[types.Part] = []
     replayed_part_with_paired_payload: types.Part | None = None
     for part in assistant_message.parts:

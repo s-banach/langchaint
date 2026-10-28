@@ -19,7 +19,7 @@ import jsonschema.protocols
 import jsonschema.validators
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from langchaint.common.messages import MessageContent, ToolCall, ToolMessage
+from langchaint.common.messages import ContentPart, MessageContent, ToolCall, ToolMessage
 from langchaint.common.observed_operation import (
     UNOBSERVED_OPERATION,
     ObservedOperation,
@@ -33,6 +33,7 @@ class ToolReturnExplicit[AppDataT = None]:
     """Model-facing `content`, its error status, and application-only `app_data`.
 
     `dispatch` copies `is_error` to `ToolMessage.is_error` and returns `app_data` unchanged.
+    A sequence in `content` becomes a tuple in `ToolMessage.content`.
     A bare `MessageContent` means `is_error=False` and `app_data=None`.
     """
 
@@ -563,15 +564,23 @@ def _split_precomputed(
     return answered, to_dispatch
 
 
+def _tool_message_content(content: MessageContent) -> str | tuple[ContentPart, ...]:
+    return content if isinstance(content, str) else tuple(content)
+
+
 def _handled_outcome[AppDataT](
     tool_call: ToolCall, tool_return: ToolReturn[AppDataT]
 ) -> DispatchHandled[AppDataT]:
     if isinstance(tool_return, ToolReturnExplicit):
         tool_message = ToolMessage(
-            tool_call_id=tool_call.id, content=tool_return.content, is_error=tool_return.is_error
+            tool_call_id=tool_call.id,
+            content=_tool_message_content(tool_return.content),
+            is_error=tool_return.is_error,
         )
         return DispatchHandled[AppDataT](tool_message=tool_message, app_data=tool_return.app_data)
-    tool_message = ToolMessage(tool_call_id=tool_call.id, content=tool_return)
+    tool_message = ToolMessage(
+        tool_call_id=tool_call.id, content=_tool_message_content(tool_return)
+    )
     return DispatchHandled[AppDataT](tool_message=tool_message)
 
 

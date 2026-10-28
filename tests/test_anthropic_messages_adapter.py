@@ -33,6 +33,7 @@ from langchaint import (
     Billing,
     ImagePart,
     ImageUrlPart,
+    JsonValue,
     LongContextPricing,
     Message,
     PydanticTool,
@@ -581,8 +582,12 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
 
     A server tool block becomes RawPart and replays without the SDK model's unset fields.
     """
-    thinking_raw = {"type": "thinking", "thinking": "check first", "signature": "sig-1"}
-    server_tool_raw = {
+    thinking_raw: dict[str, JsonValue] = {
+        "type": "thinking",
+        "thinking": "check first",
+        "signature": "sig-1",
+    }
+    server_tool_raw: dict[str, JsonValue] = {
         "type": "server_tool_use",
         "id": "srvtoolu_1",
         "name": "web_search",
@@ -633,7 +638,7 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
     ],
 )
 def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
-    block: at.ContentBlock, expected_raw: dict[str, str]
+    block: at.ContentBlock, expected_raw: dict[str, JsonValue]
 ) -> None:
     """Empty and redacted thinking have text None, the one text-free value across adapters.
 
@@ -646,7 +651,7 @@ def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
-    raw = {"type": "reasoning", "id": "rs_1"}
+    raw: dict[str, JsonValue] = {"type": "reasoning", "id": "rs_1"}
     assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
         raw,

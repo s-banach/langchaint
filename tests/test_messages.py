@@ -25,12 +25,31 @@ from langchaint import (
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
-def test_string_parts_coercion() -> None:
-    """A bare string `parts` value coerces to one TextPart on every construction path."""
+def test_string_parts() -> None:
+    """Plain text stays a string on construction and validation."""
     assistant = AssistantMessage(parts="hey")
-    assert assistant.parts == (TextPart(text="hey"),)
-    assert assistant == AssistantMessage(parts=(TextPart(text="hey"),))
+    assert assistant.parts == "hey"
+    assert assistant.text == "hey"
+    assert assistant.tool_calls == ()
     assert AssistantMessage.model_validate({"kind": "assistant", "parts": "hey"}) == assistant
+    assert messages_from_json(messages_to_json([assistant])) == [assistant]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        UserMessage(content=(TextPart(text="hello"),)),
+        AssistantMessage(parts=(TextPart(text="hello"),)),
+        ToolMessage(tool_call_id="c1", content=(TextPart(text="hello"),)),
+    ],
+    ids=["user", "assistant", "tool"],
+)
+def test_message_tuple_fields_distinguish_json_arrays_from_python_lists(message: Message) -> None:
+    """JSON arrays restore tuples while Python lists fail strict message validation."""
+    message_json = message.model_dump_json()
+    assert type(message).model_validate_json(message_json) == message
+    with pytest.raises(ValidationError):
+        _ = type(message).model_validate(json.loads(message_json))
 
 
 def test_tool_message_error_binds_the_call_id_and_sets_is_error() -> None:
@@ -80,7 +99,7 @@ def test_assistant_message_rejects_a_text_part_cache_breakpoint() -> None:
     with pytest.raises(ValidationError, match="cache_breakpoint"):
         _ = AssistantMessage.model_validate({
             "kind": "assistant",
-            "parts": [{"kind": "text", "text": "hey", "cache_breakpoint": True}],
+            "parts": ({"kind": "text", "text": "hey", "cache_breakpoint": True},),
         })
 
 

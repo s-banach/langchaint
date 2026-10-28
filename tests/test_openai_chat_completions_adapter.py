@@ -112,7 +112,7 @@ _CUSTOM_TOOL_CALL_WIRE: dict[str, JsonValue] = {
 }
 """One custom tool call as the API returns it."""
 
-_FUNCTION_CALL_WIRE: dict[str, object] = {
+_FUNCTION_CALL_WIRE: dict[str, JsonValue] = {
     "name": "legacy_lookup",
     "arguments": "{}",
 }
@@ -428,7 +428,7 @@ def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
     ids=["plain", "extra_type_custom", "extra_type_future"],
 )
 def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
-    function_call: dict[str, object],
+    function_call: dict[str, JsonValue],
 ) -> None:
     """The function_call field lacks the id ToolCall requires.
 

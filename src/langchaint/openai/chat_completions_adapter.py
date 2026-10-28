@@ -363,6 +363,8 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     Raises:
         _RejectedMessagesError: RawPart.raw matches no supported shape, or repeats function_call.
     """
+    if isinstance(assistant_message.parts, str):
+        return {"role": "assistant", "content": assistant_message.parts}
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []

@@ -786,6 +786,7 @@ def test_output_without_text_matches_a_live_generation(
     })
     record = generation_record_from_otel(span)
     assert (record.kind, record.output) == expected
+    assert isinstance(record.assistant_message.parts, tuple)
     assert all(part.text for part in record.assistant_message.parts if part.kind == "text")
 
 

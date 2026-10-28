@@ -2,7 +2,7 @@
 
 A part is one ordered value in a message.
 `UserMessage.content` and `ToolMessage.content` hold `ContentPart` values.
-`AssistantMessage.parts` holds `AssistantPart` values.
+`AssistantMessage.parts` holds plain text or `AssistantPart` values.
 `TextPart` is the only part of both kinds.
 
 Adapters convert each complete `Sequence[Message]` to provider values.
@@ -218,16 +218,10 @@ An image a provider returns arrives as `RawPart`.
 """
 
 
-def _text_only_parts(parts: object) -> object:
-    if isinstance(parts, str):
-        return (TextPart(text=parts),)
-    return parts
-
-
 class AssistantMessage(CheckedCopyModel):
     """Pydantic selects each `AssistantPart` variant by `kind` in one assistant message.
 
-    A bare string becomes one `TextPart`.
+    `parts` accepts plain text or an ordered tuple of parts.
 
     Raises:
         pydantic.ValidationError: `parts` has an invalid value or a `TextPart` sets `cache_breakpoint`.
@@ -235,7 +229,7 @@ class AssistantMessage(CheckedCopyModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    parts: Annotated[tuple[AssistantPart, ...], BeforeValidator(_text_only_parts)]
+    parts: str | tuple[AssistantPart, ...]
     kind: Literal["assistant"] = "assistant"
 
     @model_validator(mode="after")
@@ -245,6 +239,8 @@ class AssistantMessage(CheckedCopyModel):
         Raises:
             ValueError: A `TextPart` in `parts` sets `cache_breakpoint`.
         """
+        if isinstance(self.parts, str):
+            return self
         if any(part.kind == "text" and part.cache_breakpoint for part in self.parts):
             raise ValueError(
                 "cache_breakpoint is not supported on assistant message text. "
@@ -255,15 +251,19 @@ class AssistantMessage(CheckedCopyModel):
 
     @property
     def text(self) -> str:
-        """Return the concatenated `TextPart.text` values from `parts`.
+        """Return plain text or the concatenated `TextPart.text` values from `parts`.
 
-        Return an empty string when `parts` contains no `TextPart`.
+        A tuple without a `TextPart` gives an empty string.
         """
+        if isinstance(self.parts, str):
+            return self.parts
         return "".join(part.text for part in self.parts if part.kind == "text")
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """Return the `ToolCall` values from `parts` in emission order."""
+        if isinstance(self.parts, str):
+            return ()
         return tuple(part for part in self.parts if part.kind == "tool_call")
 
 

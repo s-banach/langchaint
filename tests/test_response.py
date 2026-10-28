@@ -177,6 +177,23 @@ def test_usage_nonfinite_cost_round_trips(value: float) -> None:
         assert restored.output_tokens_cost_in_usd == value
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1.25"])
+def test_usage_rejects_string_costs_in_python_input(value: str) -> None:
+    """Python cost fields require numbers, including non-finite values."""
+    usage_data = ZERO_USAGE.model_dump()
+    usage_data["output_tokens_cost_in_usd"] = value
+    with pytest.raises(ValidationError, match="output_tokens_cost_in_usd"):
+        _ = Usage.model_validate(usage_data)
+
+
+def test_usage_rejects_a_finite_string_cost_in_json() -> None:
+    """JSON cost fields accept numeric values and the non-finite string encodings."""
+    usage_data = ZERO_USAGE.model_dump()
+    usage_data["output_tokens_cost_in_usd"] = "1.25"
+    with pytest.raises(ValidationError, match="output_tokens_cost_in_usd"):
+        _ = Usage.model_validate_json(json.dumps(usage_data))
+
+
 def test_request_rejects_first_item_after_its_end() -> None:
     """Reject first_item_after_seconds exceeding elapsed_seconds."""
     with pytest.raises(ValidationError):

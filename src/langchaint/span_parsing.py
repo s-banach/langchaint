@@ -111,7 +111,7 @@ type Draft7Schema = Annotated[JsonValue, AfterValidator(_validate_draft_07_schem
 class OtelModel(CheckedCopyModel):
     """Pydantic validates an OTel value without constructing a langchaint value."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class OtelStructuredModel(OtelModel):
@@ -940,7 +940,12 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
     """
     if _supported_output_type(output_type) == "text":
         return text_output(assistant_message)
-    first_text = next((part.text for part in assistant_message.parts if part.kind == "text"), "")
+    parts = assistant_message.parts
+    first_text = (
+        parts
+        if isinstance(parts, str)
+        else next((part.text for part in parts if part.kind == "text"), "")
+    )
     with contextlib.suppress(ValidationError):
         return _JSON_VALUE_ADAPTER.validate_json(first_text)
     try:

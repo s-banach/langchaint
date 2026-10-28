@@ -1943,9 +1943,23 @@ def test_generate_many_records_rejects_invalid_input_ids_before_requests(tmp_pat
     [
         "not json\n",
         '{"format_version": 999, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
+        '{"format_version": 4, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
         '{"unrelated": true}\n',
+        '{"format_version": "5"}\n',
+        '{"format_version": 5.0}\n',
+        '{"format_version": true}\n',
+        '{"format_version": 5, "config_fingerprint": "x", "identity_mode": "position", "items": [], "unknown": true}\n',
     ],
-    ids=["malformed", "unsupported-version", "unrelated-json"],
+    ids=[
+        "malformed",
+        "unsupported-version",
+        "version-4",
+        "unrelated-json",
+        "string-version",
+        "float-version",
+        "boolean-version",
+        "unknown-field",
+    ],
 )
 def test_generate_many_records_preserves_an_unrecognized_file(
     tmp_path: Path, resume_text: str

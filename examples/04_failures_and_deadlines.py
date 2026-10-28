@@ -36,10 +36,10 @@ async def run_batch_and_handle_what_failed() -> list[
 
     scanned_page: list[Message] = [
         UserMessage(
-            content=[
+            content=(
                 TextPart(text="Summarize the attached page."),
                 ImagePart(data=b"<scan bytes>", media_type="image/tiff"),
-            ]
+            )
         )
     ]
     documents: list[GenerationInput] = [

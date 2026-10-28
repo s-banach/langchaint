@@ -19,7 +19,10 @@ async def search_the_web() -> PlainGeneration[str]:
     )
     generation = await bound.generate_one("Find today's OpenAI developer news.")
 
-    raw_parts = [part.raw for part in generation.assistant_message.parts if part.kind == "raw"]
+    parts = generation.assistant_message.parts
+    raw_parts: list[object] = (
+        [] if isinstance(parts, str) else [part.raw for part in parts if part.kind == "raw"]
+    )
     print(f"provider output items: {raw_parts}")
     print(f"provider tool cost: {generation.usage.provider_executed_tool_cost_in_usd} USD")
     return generation

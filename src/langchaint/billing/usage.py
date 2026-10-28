@@ -7,7 +7,7 @@ import math
 from collections.abc import Iterable
 from typing import Annotated
 
-from pydantic import ConfigDict, NonNegativeInt, PlainSerializer
+from pydantic import BeforeValidator, ConfigDict, NonNegativeInt, PlainSerializer, ValidationInfo
 
 from langchaint.common.checked_copy import CheckedCopyModel
 
@@ -22,12 +22,29 @@ def _serialize_nonfinite_float(value: float) -> float | str:
     return value
 
 
+def _deserialize_nonfinite_float(value: object, info: ValidationInfo) -> object:
+    if info.mode != "json" or not isinstance(value, str):
+        return value
+    match value:
+        case "NaN":
+            return float("nan")
+        case "Infinity":
+            return float("inf")
+        case "-Infinity":
+            return float("-inf")
+        case _:
+            return value
+
+
 type JSONFloat = Annotated[
-    float, PlainSerializer(_serialize_nonfinite_float, return_type=float | str, when_used="json")
+    float,
+    BeforeValidator(_deserialize_nonfinite_float),
+    PlainSerializer(_serialize_nonfinite_float, return_type=float | str, when_used="json"),
 ]
 """A float that JSON serialization writes as "NaN", "Infinity", or "-Infinity" when it is not finite.
 
-Validation reads those strings back as the same float.
+JSON validation reads those strings back as the same float.
+Python validation requires a number.
 """
 
 

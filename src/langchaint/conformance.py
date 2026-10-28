@@ -286,6 +286,7 @@ class AdapterConformance(ABC):
         outcome = bound_adapter.interpret(self.response_with_reasoning())
         assert outcome.kind == "usable_response"
         parts = outcome.assistant_message.parts
+        assert isinstance(parts, tuple)
         ((index, reasoning_part),) = [
             (index, part) for index, part in enumerate(parts) if part.kind == "reasoning"
         ]
@@ -310,6 +311,7 @@ class AdapterConformance(ABC):
         outcome = bound_adapter.interpret(response)
         assert outcome.kind == "usable_response"
         parts = outcome.assistant_message.parts
+        assert isinstance(parts, tuple)
         assert any(part.kind == "raw" for part in parts)
         wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
@@ -351,6 +353,19 @@ class AdapterConformance(ABC):
             [UserMessage(content="hi"), AssistantMessage(parts=(TextPart(text=""),))],
         )
         assert len(wire_parts) == 1
+
+    def test_assistant_strings_and_text_parts_build_the_same_wire_request(self) -> None:
+        """A string and a tuple containing one TextPart have the same provider representation."""
+        bound_adapter = self._bound_adapter()
+        for text in ("", "hello"):
+            string_parts = self._assistant_wire_parts_of(
+                bound_adapter, [UserMessage(content="hi"), AssistantMessage(parts=text)]
+            )
+            tuple_parts = self._assistant_wire_parts_of(
+                bound_adapter,
+                [UserMessage(content="hi"), AssistantMessage(parts=(TextPart(text=text),))],
+            )
+            assert string_parts == tuple_parts
 
     def test_structured_output_may_inherit_the_unusable_response_base(self) -> None:
         """A validated instance is output in a `UsableResponse` even when its class inherits `_UnusableResponseBase`.

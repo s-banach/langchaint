@@ -204,13 +204,13 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         if turn.tool_calls:
             return UsableResponse(
                 output="",
-                assistant_message=AssistantMessage(parts=turn.tool_calls),
+                assistant_message=AssistantMessage(content=turn.tool_calls),
                 stop_reason="tool_call",
             )
         assert turn.text is not None
         return UsableResponse(
             output=turn.text,
-            assistant_message=AssistantMessage(parts=(TextPart(text=turn.text),)),
+            assistant_message=AssistantMessage(content=(TextPart(text=turn.text),)),
             stop_reason="stop",
         )
 

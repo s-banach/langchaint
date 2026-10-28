@@ -1235,21 +1235,21 @@ class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
 
 _STRUCTURED_TOOL_CALL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
     output=None,
-    assistant_message=AssistantMessage(parts=(FAKE_TOOL_CALL,)),
+    assistant_message=AssistantMessage(content=(FAKE_TOOL_CALL,)),
     stop_reason="tool_call",
 )
 """A structured assistant message of tool calls alone: nothing parsed, one tool call to dispatch."""
 
 _STRUCTURED_TOOL_CALL_RESPONSE_WITH_INSTANCE: UsableResponse[_Answer | None] = UsableResponse(
     output=_Answer(value=7),
-    assistant_message=AssistantMessage(parts=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
+    assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
     stop_reason="tool_call",
 )
 """A structured assistant message whose text validates beside a tool call."""
 
 _STRUCTURED_FINAL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
     output=_Answer(value=7),
-    assistant_message=AssistantMessage(parts=(TextPart(text='{"value":7}'),)),
+    assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'),)),
     stop_reason="stop",
 )
 """A structured assistant message without tool calls, whose output is the parsed `_Answer`."""
@@ -1363,7 +1363,7 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
         answer = _NonRoundTrippableAnswer(value=float("nan"))
         outcome: UsableResponse[_NonRoundTrippableAnswer] = UsableResponse(
             output=answer,
-            assistant_message=AssistantMessage(parts=(TextPart(text=answer.model_dump_json()),)),
+            assistant_message=AssistantMessage(content=(TextPart(text=answer.model_dump_json()),)),
             stop_reason="stop",
         )
         bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
@@ -1378,7 +1378,7 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
 
 _TEXT_TOOL_CALL_RESPONSE: UsableResponse[str | None] = UsableResponse(
     output=None,
-    assistant_message=AssistantMessage(parts=(FAKE_TOOL_CALL,)),
+    assistant_message=AssistantMessage(content=(FAKE_TOOL_CALL,)),
     stop_reason="tool_call",
 )
 

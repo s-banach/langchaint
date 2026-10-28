@@ -70,7 +70,7 @@ class _WeatherReportAlsoUnusableResponseBase(_WeatherReport, _UnusableResponseBa
     `_UnusableResponseBase` is the base of every `UnusableResponse` variant.
     """
 
-    assistant_message: AssistantMessage = AssistantMessage(parts=())
+    assistant_message: AssistantMessage = AssistantMessage(content=())
 
 
 def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
@@ -285,15 +285,15 @@ class AdapterConformance(ABC):
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
         assert outcome.kind == "usable_response"
-        parts = outcome.assistant_message.parts
-        assert isinstance(parts, tuple)
+        content = outcome.assistant_message.content
+        assert isinstance(content, tuple)
         ((index, reasoning_part),) = [
-            (index, part) for index, part in enumerate(parts) if part.kind == "reasoning"
+            (index, part) for index, part in enumerate(content) if part.kind == "reasoning"
         ]
         wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(wire_parts) == len(parts)
+        assert len(wire_parts) == len(content)
         assert wire_parts[index] == reasoning_part.raw
 
     def test_raw_part_round_trips_verbatim_in_position(self) -> None:
@@ -310,14 +310,14 @@ class AdapterConformance(ABC):
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(response)
         assert outcome.kind == "usable_response"
-        parts = outcome.assistant_message.parts
-        assert isinstance(parts, tuple)
-        assert any(part.kind == "raw" for part in parts)
+        content = outcome.assistant_message.content
+        assert isinstance(content, tuple)
+        assert any(part.kind == "raw" for part in content)
         wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(wire_parts) == len(parts)
-        for index, part in enumerate(parts):
+        assert len(wire_parts) == len(content)
+        for index, part in enumerate(content):
             if part.kind == "raw":
                 assert wire_parts[index] == part.raw
 
@@ -344,13 +344,13 @@ class AdapterConformance(ABC):
         outcome = self._bound_adapter().interpret(self.response_with_text(""))
         assert outcome.kind == "usable_response"
         assert outcome.output == ""
-        assert outcome.assistant_message.parts == ()
+        assert outcome.assistant_message.content == ()
 
     def test_an_empty_text_part_is_sent_as_given(self) -> None:
         """Replay sends every assistant `TextPart`, including one with empty text."""
         wire_parts = self._assistant_wire_parts_of(
             self._bound_adapter(),
-            [UserMessage(content="hi"), AssistantMessage(parts=(TextPart(text=""),))],
+            [UserMessage(content="hi"), AssistantMessage(content=(TextPart(text=""),))],
         )
         assert len(wire_parts) == 1
 
@@ -359,11 +359,11 @@ class AdapterConformance(ABC):
         bound_adapter = self._bound_adapter()
         for text in ("", "hello"):
             string_parts = self._assistant_wire_parts_of(
-                bound_adapter, [UserMessage(content="hi"), AssistantMessage(parts=text)]
+                bound_adapter, [UserMessage(content="hi"), AssistantMessage(content=text)]
             )
             tuple_parts = self._assistant_wire_parts_of(
                 bound_adapter,
-                [UserMessage(content="hi"), AssistantMessage(parts=(TextPart(text=text),))],
+                [UserMessage(content="hi"), AssistantMessage(content=(TextPart(text=text),))],
             )
             assert string_parts == tuple_parts
 

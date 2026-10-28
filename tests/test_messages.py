@@ -25,13 +25,13 @@ from langchaint import (
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
-def test_string_parts() -> None:
+def test_string_content() -> None:
     """Plain text stays a string on construction and validation."""
-    assistant = AssistantMessage(parts="hey")
-    assert assistant.parts == "hey"
+    assistant = AssistantMessage(content="hey")
+    assert assistant.content == "hey"
     assert assistant.text == "hey"
     assert assistant.tool_calls == ()
-    assert AssistantMessage.model_validate({"kind": "assistant", "parts": "hey"}) == assistant
+    assert AssistantMessage.model_validate({"kind": "assistant", "content": "hey"}) == assistant
     assert messages_from_json(messages_to_json([assistant])) == [assistant]
 
 
@@ -39,7 +39,7 @@ def test_string_parts() -> None:
     "message",
     [
         UserMessage(content=(TextPart(text="hello"),)),
-        AssistantMessage(parts=(TextPart(text="hello"),)),
+        AssistantMessage(content=(TextPart(text="hello"),)),
         ToolMessage(tool_call_id="c1", content=(TextPart(text="hello"),)),
     ],
     ids=["user", "assistant", "tool"],
@@ -95,18 +95,18 @@ def test_assistant_message_rejects_a_text_part_cache_breakpoint() -> None:
     """A TextPart with cache_breakpoint in an assistant message fails validation on every construction path."""
     breakpoint_part = TextPart(text="hey", cache_breakpoint=True)
     with pytest.raises(ValidationError, match="cache_breakpoint"):
-        _ = AssistantMessage(parts=(breakpoint_part,))
+        _ = AssistantMessage(content=(breakpoint_part,))
     with pytest.raises(ValidationError, match="cache_breakpoint"):
         _ = AssistantMessage.model_validate({
             "kind": "assistant",
-            "parts": ({"kind": "text", "text": "hey", "cache_breakpoint": True},),
+            "content": ({"kind": "text", "text": "hey", "cache_breakpoint": True},),
         })
 
 
 _PINNED_MESSAGES: tuple[Message, ...] = (
     UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
     AssistantMessage(
-        parts=(
+        content=(
             ReasoningPart(raw={"type": "thinking", "thinking": "hm", "signature": "s"}, text="hm"),
             TextPart(text="checking"),
             ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
@@ -134,7 +134,7 @@ def _one_of_each_message() -> list[Message]:
     return [
         *_PINNED_MESSAGES,
         AssistantMessage(
-            parts=(
+            content=(
                 RawPart(raw={"type": "web_search_call", "id": "ws_1"}),
                 TextPart(text="ok"),
             )
@@ -161,7 +161,7 @@ def test_messages_json_round_trip_restores_the_list() -> None:
     assert messages_from_json(messages_to_json(messages)) == messages
 
 
-_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"parts":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
+_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"content":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
 """One messages_to_json output, pasted rather than computed.
 
 This is the persisted-text format applications hold on disk.
@@ -243,11 +243,11 @@ def test_raw_parts_reject_nonfinite_recursive_json(
 def test_model_copy_rejects_a_derived_property_key() -> None:
     """model_copy(update={"tool_calls": ...}) raises instead of silently dropping the key.
 
-    pydantic's unvalidated copy would leave `parts` unchanged.
+    pydantic's unvalidated copy would leave `content` unchanged.
     The property would shadow the unused key.
     An app could then resend the unfiltered assistant message.
     """
-    message = AssistantMessage(parts=(ToolCall(id="c1", name="probe", args_json="{}"),))
+    message = AssistantMessage(content=(ToolCall(id="c1", name="probe", args_json="{}"),))
     with pytest.raises(TypeError, match="derived property of AssistantMessage"):
         _ = message.model_copy(update={"tool_calls": ()})
 

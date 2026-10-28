@@ -115,7 +115,7 @@ def billed(outcome: ResponseOutcome[str]) -> ScriptedResponse:
 
 
 REJECTED_ASSISTANT_MESSAGE: AssistantMessage = AssistantMessage(
-    parts=(TextPart(text="what the rejected 200 carried"),)
+    content=(TextPart(text="what the rejected 200 carried"),)
 )
 """The assistant message a 200 that produced no output still carried, which every such variant takes."""
 
@@ -130,7 +130,7 @@ def usable_text_response(content: str) -> UsableResponse[str]:
     """Build a text UsableResponse carrying the given content."""
     return UsableResponse(
         output=content,
-        assistant_message=AssistantMessage(parts=(TextPart(text=content),)),
+        assistant_message=AssistantMessage(content=(TextPart(text=content),)),
         stop_reason="stop",
     )
 

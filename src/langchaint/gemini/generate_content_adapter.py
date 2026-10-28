@@ -546,34 +546,38 @@ def _tool_call_from(function_call: types.FunctionCall) -> ToolCall:
     )
 
 
-def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
+def _assistant_message_from(provider_content: types.Content | None) -> AssistantMessage:
     """Build `AssistantMessage` from candidate parts in order.
 
     Thought or signed parts become replayable `ReasoningPart` values.
     Signed answer text and function calls also produce `TextPart` or `ToolCall`.
     Unmodeled parts become replayable `RawPart` values.
     A part holding only empty text produces nothing, as every adapter drops empty provider text.
-    Missing content or parts produces an `AssistantMessage` without parts.
+    Missing provider parts produce empty assistant content.
     """
-    wire_parts = content.parts if content is not None and content.parts is not None else []
-    parts: list[AssistantPart] = []
+    wire_parts = (
+        provider_content.parts
+        if provider_content is not None and provider_content.parts is not None
+        else []
+    )
+    content: list[AssistantPart] = []
     for part in wire_parts:
         carries_reasoning = part.thought or part.thought_signature is not None
         if carries_reasoning:
-            parts.append(
+            content.append(
                 ReasoningPart(
                     raw=part.model_dump(mode="json", exclude_none=True),
                     text=(part.text or None) if part.thought else None,
                 )
             )
         if part.function_call is not None:
-            parts.append(_tool_call_from(part.function_call))
+            content.append(_tool_call_from(part.function_call))
         elif part.text:
             if not part.thought:
-                parts.append(TextPart(text=part.text))
+                content.append(TextPart(text=part.text))
         elif not carries_reasoning and part.model_dump(exclude_none=True) != {"text": ""}:
-            parts.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(parts=tuple(parts))
+            content.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(content=tuple(content))
 
 
 def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
@@ -642,7 +646,7 @@ def _matches_replayed_part_payload(part: AssistantPart, replayed_part: types.Par
 
 
 def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Part]:
-    """Convert one AssistantMessage to wire parts in `parts` order.
+    """Convert one AssistantMessage to wire parts in `content` order.
 
     A ReasoningPart restores its source Part.
     A following AssistantPart with the same payload is skipped.
@@ -652,11 +656,11 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
         _RejectedMessagesError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
-    if isinstance(assistant_message.parts, str):
-        return [types.Part(text=assistant_message.parts)]
+    if isinstance(assistant_message.content, str):
+        return [types.Part(text=assistant_message.content)]
     wire_parts: list[types.Part] = []
     replayed_part_with_paired_payload: types.Part | None = None
-    for part in assistant_message.parts:
+    for part in assistant_message.content:
         if replayed_part_with_paired_payload is not None:
             replayed_part = replayed_part_with_paired_payload
             replayed_part_with_paired_payload = None
@@ -1586,10 +1590,10 @@ def _finished_message_or_unusable_response(
             response.prompt_feedback is not None
             and response.prompt_feedback.block_reason is not None
         ):
-            return Refusal(assistant_message=AssistantMessage(parts=()))
+            return Refusal(assistant_message=AssistantMessage(content=()))
         return UnfinishedAssistantMessage(
             error_text="gemini returned no candidates and no block reason, so there is no assistant message to read",
-            assistant_message=AssistantMessage(parts=()),
+            assistant_message=AssistantMessage(content=()),
         )
     candidate = candidates[0]
     assistant_message = _assistant_message_from(candidate.content)

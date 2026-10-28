@@ -767,7 +767,7 @@ def test_user_message_forms() -> None:
 def test_tool_results_group_and_recover_names() -> None:
     """Consecutive tool results share one user Content, each naming the call it answers."""
     assistant_message = AssistantMessage(
-        parts=(
+        content=(
             ToolCall(id="call-a", name="f", args_json='{"x": 1}'),
             ToolCall(id="g", name="g", args_json="{}"),
         )
@@ -797,7 +797,7 @@ def test_tool_results_group_and_recover_names() -> None:
 def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
     """ToolMessage maps ContentPart values to FunctionResponsePart fields."""
     request = _built_request([
-        AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{}"),)),
+        AssistantMessage(content=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(
             tool_call_id="c",
             content=(
@@ -837,7 +837,7 @@ def _cache_breakpoint_part_messages(
     if message_class is UserMessage:
         return (UserMessage(content=(part,)),)
     return (
-        AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{}"),)),
+        AssistantMessage(content=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(tool_call_id="c", content=(part,)),
     )
 
@@ -858,12 +858,12 @@ _INVALID_MESSAGES = [
     # The wire field holds the parsed arguments object, so text that is not JSON has nowhere to go.
     _InvalidMessages(
         "tool_call_args_not_json",
-        (AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{not json"),)),),
+        (AssistantMessage(content=(ToolCall(id="c", name="f", args_json="{not json"),)),),
         ("args_json",),
     ),
     _InvalidMessages(
         "tool_call_args_not_an_object",
-        (AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="[1]"),)),),
+        (AssistantMessage(content=(ToolCall(id="c", name="f", args_json="[1]"),)),),
         ("JSON object",),
     ),
     # A foreign ReasoningPart.raw cannot restore a Gemini Part.
@@ -871,7 +871,7 @@ _INVALID_MESSAGES = [
         "foreign_reasoning_part",
         (
             AssistantMessage(
-                parts=(
+                content=(
                     ReasoningPart(
                         raw={"type": "thinking", "thinking": "x", "signature": "s"}, text="x"
                     ),
@@ -939,7 +939,7 @@ _EMPTY_TEXT_BESIDE_CODE = types.Part(
 class _ReadPartsCase(NamedTuple):
     case_id: str
     wire_parts: tuple[types.Part, ...]
-    parts: tuple[AssistantPart, ...]
+    content: tuple[AssistantPart, ...]
 
 
 _READ_PARTS_CASES = [
@@ -982,9 +982,9 @@ _READ_PARTS_CASES = [
 def test_candidate_parts_read_into_the_assistant_message_and_replay_as_themselves(
     case: _ReadPartsCase,
 ) -> None:
-    """Each wire part becomes its assistant message parts, and the assistant message replays the original wire parts."""
+    """Provider parts become assistant content and replay as the original provider parts."""
     assistant_message = _interpreted_assistant_message(_response(case.wire_parts))
-    assert assistant_message.parts == case.parts
+    assert assistant_message.content == case.content
     request = _built_request([UserMessage(content="go"), assistant_message])
     assert request.contents[1].parts == list(case.wire_parts)
 
@@ -1039,7 +1039,7 @@ def test_text_binding_reads_stop_reasons() -> None:
 
 
 def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
-    """A candidate without a finish_reason is an unfinished assistant message that carries its partial parts."""
+    """A candidate without a finish_reason is an unfinished assistant message that carries its partial content."""
     response = _response([types.Part(text="par")], finish_reason=None)
     text_outcome = _adapter().bind_text(_binding()).interpret(response)
     assert text_outcome.kind == "unfinished_assistant_message"
@@ -1055,7 +1055,7 @@ def test_no_candidates_reads_the_block_reason() -> None:
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
     )
     assert blocked.kind == "refusal"
-    assert blocked.assistant_message.parts == ()
+    assert blocked.assistant_message.content == ()
     silent = bound.interpret(_response(None, finish_reason=None))
     assert silent.kind == "unfinished_assistant_message"
 

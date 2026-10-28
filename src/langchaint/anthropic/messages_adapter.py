@@ -11,7 +11,7 @@ The SDK reports no all-inclusive input total.
 The API requires an unchanged replay of the latest assistant message's thinking during tool use.
 The API filters earlier thinking blocks.
 The API rejects consecutive thinking blocks outside their original order.
-The adapter replays every `ReasoningPart` in `parts` order.
+The adapter replays every `ReasoningPart` in `content` order.
 
 `automatic_cache_breakpoints=True` places a cache breakpoint at the end of the frozen prefix.
 For `AsyncAnthropic` and `AsyncAnthropicBedrockMantle`, it also sends top-level `cache_control`.
@@ -637,7 +637,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
 
 
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
-    """Convert one AssistantMessage to wire blocks in `parts` order.
+    """Convert one AssistantMessage to wire blocks in `content` order.
 
     `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
     The API rejects modified thinking blocks and unknown `type` values.
@@ -646,10 +646,10 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
         _RejectedMessagesError: A stored block lacks a `type` key.
     """
-    if isinstance(assistant_message.parts, str):
-        return [{"type": "text", "text": assistant_message.parts}]
+    if isinstance(assistant_message.content, str):
+        return [{"type": "text", "text": assistant_message.content}]
     blocks: list[_ContentBlockParam] = []
-    for part in assistant_message.parts:
+    for part in assistant_message.content:
         if part.kind == "text":
             blocks.append({"type": "text", "text": part.text})
         elif part.kind == "tool_call":
@@ -909,25 +909,27 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     Redacted thinking has `text=None`.
     Unmodeled blocks become replayable `RawPart` values.
     """
-    parts: list[AssistantPart] = []
+    content: list[AssistantPart] = []
     for block in message.content:
         if block.type == "text":
             if block.text:
-                parts.append(TextPart(text=block.text))
+                content.append(TextPart(text=block.text))
         elif block.type == "tool_use":
-            parts.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
+            content.append(
+                ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
+            )
         elif block.type == "thinking":
-            parts.append(
+            content.append(
                 ReasoningPart(
                     raw=block.model_dump(mode="json", exclude_none=True),
                     text=block.thinking or None,
                 )
             )
         elif block.type == "redacted_thinking":
-            parts.append(ReasoningPart(raw=block.model_dump(mode="json", exclude_none=True)))
+            content.append(ReasoningPart(raw=block.model_dump(mode="json", exclude_none=True)))
         else:
-            parts.append(RawPart(raw=block.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(parts=tuple(parts))
+            content.append(RawPart(raw=block.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(content=tuple(content))
 
 
 def _priced_tier(

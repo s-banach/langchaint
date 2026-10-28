@@ -743,14 +743,14 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         else ()
     )
     assistant_message = AssistantMessage(
-        parts=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
+        content=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
         if response_format is str
         else (TextPart(text='{"value":1}'), *tool_calls)
     )
     generation_input = (
         _MULTIMODAL_USER_MESSAGE,
         AssistantMessage(
-            parts=(
+            content=(
                 TextPart(text="checking"),
                 ToolCall(id="call1", name="echo", args_json='{"text":"x"}'),
             )
@@ -1630,7 +1630,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         """Generate and dispatch under _scrub_marker, then scan every content attribute on both spans."""
         tracer_provider, exporter = _in_memory_tracer_provider()
         scripted_assistant_message = AssistantMessage(
-            parts=(
+            content=(
                 ReasoningPart(raw={"signature": "opaque"}, text=f"thinking {_MARKER}"),
                 TextPart(text=f"answer {_MARKER}"),
             )
@@ -1659,7 +1659,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
         await bound.generate_one([
             UserMessage(content=f"question {_MARKER}"),
-            AssistantMessage(parts=(tool_call,)),
+            AssistantMessage(content=(tool_call,)),
             ToolMessage(tool_call_id="call1", content=f"echoed {_MARKER}"),
         ])
         tool_manager = ToolManager([_echo_tool()], observer=observer)
@@ -1824,7 +1824,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
 
 
 @pytest.mark.parametrize(
-    ("parts", "stop_reason", "expected_parts", "expected_finish_reason"),
+    ("content", "stop_reason", "expected_parts", "expected_finish_reason"),
     [
         ((ReasoningPart(raw={"signature": "opaque"}),), "stop", [], "stop"),
         (
@@ -1846,7 +1846,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
             "stop",
         ),
         (
-            REJECTED_ASSISTANT_MESSAGE.parts,
+            REJECTED_ASSISTANT_MESSAGE.content,
             None,
             [{"type": "text", "content": "what the rejected 200 carried"}],
             "error",
@@ -1860,7 +1860,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
     ],
 )
 def test_output_messages_render_readable_text_and_never_the_reasoning_payload(
-    parts: tuple[AssistantPart, ...],
+    content: tuple[AssistantPart, ...],
     stop_reason: StopReason | None,
     expected_parts: list[object],
     expected_finish_reason: str,
@@ -1869,7 +1869,7 @@ def test_output_messages_render_readable_text_and_never_the_reasoning_payload(
 
     An assistant message without readable text still renders its message, with an empty parts array.
     """
-    attributes = _output_content_attributes(parts, stop_reason, _record_every_part)
+    attributes = _output_content_attributes(content, stop_reason, _record_every_part)
     output_messages = str(attributes["gen_ai.output.messages"])
     assert json.loads(output_messages) == [
         {"role": "assistant", "parts": expected_parts, "finish_reason": expected_finish_reason}
@@ -1953,7 +1953,7 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
         llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
         await llm.bind().generate_one([
             AssistantMessage(
-                parts=(
+                content=(
                     ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
                     ToolCall(id="call2", name="echo", args_json="{oops"),
                 )
@@ -1986,7 +1986,7 @@ def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_outp
     *, capture_message_content: bool
 ) -> None:
     """A failed input's assistant message reaches spans only through gated gen_ai.output.messages."""
-    assistant_message = AssistantMessage(parts=(TextPart(text=_CONTENT_SENTINEL),))
+    assistant_message = AssistantMessage(content=(TextPart(text=_CONTENT_SENTINEL),))
 
     async def scenario() -> None:
         """Fail two requests and inspect content channels."""

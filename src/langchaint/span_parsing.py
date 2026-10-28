@@ -649,9 +649,9 @@ def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessa
     _require_message_metadata(message)
     if message.role != "assistant":
         raise _unsupported(message, "output message role")
-    parts = map(_assistant_part_from_otel, message.parts)
+    content = map(_assistant_part_from_otel, message.parts)
     return AssistantMessage(
-        parts=tuple(part for part in parts if part.kind != "text" or part.text)
+        content=tuple(part for part in content if part.kind != "text" or part.text)
     )
 
 
@@ -940,11 +940,11 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
     """
     if _supported_output_type(output_type) == "text":
         return text_output(assistant_message)
-    parts = assistant_message.parts
+    content = assistant_message.content
     first_text = (
-        parts
-        if isinstance(parts, str)
-        else next((part.text for part in parts if part.kind == "text"), "")
+        content
+        if isinstance(content, str)
+        else next((part.text for part in content if part.kind == "text"), "")
     )
     with contextlib.suppress(ValidationError):
         return _JSON_VALUE_ADAPTER.validate_json(first_text)
@@ -981,7 +981,7 @@ def _message_from_otel(message: OtelInputMessage) -> Message:
         case "user":
             return UserMessage(content=_content_parts_from_otel(message.parts))
         case "assistant":
-            return AssistantMessage(parts=tuple(map(_assistant_part_from_otel, message.parts)))
+            return AssistantMessage(content=tuple(map(_assistant_part_from_otel, message.parts)))
         case "tool":
             return _tool_message_from_otel(message)
         case _:

@@ -379,7 +379,7 @@ def _replayed_item(raw: Mapping[str, object]) -> ResponseInputItemParam:
 
 
 def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
-    """Convert one AssistantMessage to its input items in `parts` order.
+    """Convert one AssistantMessage to its input items in `content` order.
 
     The API requires the original item order for replay under store=False.
     Adjacent `TextPart` values become one assistant message item.
@@ -387,8 +387,8 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
     The API validates another provider's unknown `type` key.
     """
-    if isinstance(assistant_message.parts, str):
-        return [{"role": "assistant", "content": assistant_message.parts}]
+    if isinstance(assistant_message.content, str):
+        return [{"role": "assistant", "content": assistant_message.content}]
     items: list[ResponseInputItemParam] = []
     pending_texts: list[str] = []
 
@@ -397,7 +397,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             items.append({"role": "assistant", "content": "".join(pending_texts)})
             pending_texts.clear()
 
-    for part in assistant_message.parts:
+    for part in assistant_message.content:
         if part.kind == "text":
             pending_texts.append(part.text)
         elif part.kind == "tool_call":
@@ -595,25 +595,25 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     Non-empty message content becomes ordered `TextPart` values, including refusals.
     Other items become replayable `RawPart` values.
     """
-    parts: list[AssistantPart] = []
+    content: list[AssistantPart] = []
     for item in response.output:
         if item.type == "reasoning":
-            parts.append(
+            content.append(
                 ReasoningPart(
                     raw=item.model_dump(mode="json", exclude_none=True),
                     text=_reasoning_text(item),
                 )
             )
         elif item.type == "function_call":
-            parts.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
+            content.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
         elif item.type == "message":
             texts = (
                 part.text if part.type == "output_text" else part.refusal for part in item.content
             )
-            parts.extend(TextPart(text=text) for text in texts if text)
+            content.extend(TextPart(text=text) for text in texts if text)
         else:
-            parts.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(parts=tuple(parts))
+            content.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(content=tuple(content))
 
 
 def _billing_from_response(

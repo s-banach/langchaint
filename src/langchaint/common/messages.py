@@ -1,8 +1,8 @@
 """Provider-neutral messages and their parts.
 
 A part is one ordered value in a message.
-`UserMessage.content` and `ToolMessage.content` hold `ContentPart` values.
-`AssistantMessage.parts` holds plain text or `AssistantPart` values.
+`UserMessage.content` and `ToolMessage.content` hold plain text or `ContentPart` values.
+`AssistantMessage.content` holds plain text or `AssistantPart` values.
 `TextPart` is the only part of both kinds.
 
 Adapters convert each complete `Sequence[Message]` to provider values.
@@ -196,7 +196,7 @@ class ReasoningPart(CheckedCopyModel):
 class RawPart(CheckedCopyModel):
     """Pydantic rejects unknown keys in one replayable provider fragment.
 
-    `AssistantMessage.parts` preserves `RawPart` response order.
+    `AssistantMessage.content` preserves `RawPart` response order.
     `raw` is the producing SDK `model_dump` fragment required for replay.
     The consuming adapter sends `raw` unchanged in its original wire position.
     Another adapter returns `RejectedMessages` or leaves validation to its provider.
@@ -212,7 +212,7 @@ class RawPart(CheckedCopyModel):
 type AssistantPart = Annotated[
     ReasoningPart | TextPart | ToolCall | RawPart, Field(discriminator="kind")
 ]
-"""One ordered value inside `AssistantMessage.parts`.
+"""One ordered value inside `AssistantMessage.content`.
 
 An image a provider returns arrives as `RawPart`.
 """
@@ -221,15 +221,15 @@ An image a provider returns arrives as `RawPart`.
 class AssistantMessage(CheckedCopyModel):
     """Pydantic selects each `AssistantPart` variant by `kind` in one assistant message.
 
-    `parts` accepts plain text or an ordered tuple of parts.
+    `content` accepts plain text or an ordered tuple of parts.
 
     Raises:
-        pydantic.ValidationError: `parts` has an invalid value or a `TextPart` sets `cache_breakpoint`.
+        pydantic.ValidationError: `content` has an invalid value or a `TextPart` sets `cache_breakpoint`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    parts: str | tuple[AssistantPart, ...]
+    content: str | tuple[AssistantPart, ...]
     kind: Literal["assistant"] = "assistant"
 
     @model_validator(mode="after")
@@ -237,11 +237,11 @@ class AssistantMessage(CheckedCopyModel):
         """Reject an assistant message whose `TextPart` sets `cache_breakpoint`.
 
         Raises:
-            ValueError: A `TextPart` in `parts` sets `cache_breakpoint`.
+            ValueError: A `TextPart` in `content` sets `cache_breakpoint`.
         """
-        if isinstance(self.parts, str):
+        if isinstance(self.content, str):
             return self
-        if any(part.kind == "text" and part.cache_breakpoint for part in self.parts):
+        if any(part.kind == "text" and part.cache_breakpoint for part in self.content):
             raise ValueError(
                 "cache_breakpoint is not supported on assistant message text. "
                 "openai has no breakpoint on assistant replay text. "
@@ -251,20 +251,20 @@ class AssistantMessage(CheckedCopyModel):
 
     @property
     def text(self) -> str:
-        """Return plain text or the concatenated `TextPart.text` values from `parts`.
+        """Return plain text or the concatenated `TextPart.text` values from `content`.
 
         A tuple without a `TextPart` gives an empty string.
         """
-        if isinstance(self.parts, str):
-            return self.parts
-        return "".join(part.text for part in self.parts if part.kind == "text")
+        if isinstance(self.content, str):
+            return self.content
+        return "".join(part.text for part in self.content if part.kind == "text")
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """Return the `ToolCall` values from `parts` in emission order."""
-        if isinstance(self.parts, str):
+        """Return the `ToolCall` values from `content` in emission order."""
+        if isinstance(self.content, str):
             return ()
-        return tuple(part for part in self.parts if part.kind == "tool_call")
+        return tuple(part for part in self.content if part.kind == "tool_call")
 
 
 class ToolMessage(CheckedCopyModel):

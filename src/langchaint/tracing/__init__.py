@@ -430,15 +430,15 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
 
 
 def _recorded_assistant_parts(
-    parts: str | tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
+    content: str | tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
-    """Filter an assistant message's parts and render the kept ones as the convention's parts array, in order.
+    """Filter assistant content and render its kept parts as the convention's parts array, in order.
 
     If every part is omitted or renders as None, the message renders as an empty parts array, not as a missing message.
     """
-    if isinstance(parts, str):
-        parts = (TextPart(text=parts),)
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in parts)
+    if isinstance(content, str):
+        content = (TextPart(text=content),)
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in content)
     rendered = (_assistant_part(part) for part in kept if part is not None)
     return [part for part in rendered if part is not None]
 
@@ -457,7 +457,7 @@ def _input_message(message: Message, content_filter: ContentFilter) -> dict[str,
             otel_parts = [_tool_call_response_part(message, content_filter, attribute_name)]
             return {"role": "tool", "parts": otel_parts}
         case "assistant":
-            otel_parts = _recorded_assistant_parts(message.parts, content_filter, attribute_name)
+            otel_parts = _recorded_assistant_parts(message.content, content_filter, attribute_name)
             return {"role": "assistant", "parts": otel_parts}
 
 
@@ -543,11 +543,11 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
 
 
 def _output_content_attributes(
-    parts: str | tuple[AssistantPart, ...],
+    content: str | tuple[AssistantPart, ...],
     stop_reason: StopReason | None,
     content_filter: ContentFilter,
 ) -> dict[str, SpanAttributeValue]:
-    """Build gen_ai.output.messages from one assistant message's parts.
+    """Build gen_ai.output.messages from assistant content.
 
     One function for the generation and the failure paths, so an assistant message renders the same from either.
     One key contains one message.
@@ -557,7 +557,7 @@ def _output_content_attributes(
             {
                 "role": "assistant",
                 "parts": _recorded_assistant_parts(
-                    parts, content_filter, "gen_ai.output.messages"
+                    content, content_filter, "gen_ai.output.messages"
                 ),
                 "finish_reason": (
                     _NO_STOP_REASON_FINISH_REASON
@@ -728,7 +728,7 @@ class _GenerationSpan(_SpanOperation[GenerationOutcome[object] | AbandonedStream
             stop_reason = outcome.stop_reason
             self.add_content_attribute_group(
                 lambda content_filter: _output_content_attributes(
-                    assistant_message.parts, stop_reason, content_filter
+                    assistant_message.content, stop_reason, content_filter
                 )
             )
         if isinstance(outcome, GenerationError):

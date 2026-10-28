@@ -395,7 +395,7 @@ def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool
         "tool_calls": [_TOOL_CALL_WIRE],
         "reasoning_content": "thought it over",
     })
-    assert _assistant_message_from(message).parts == (
+    assert _assistant_message_from(message).content == (
         ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
         TextPart(text="hey"),
         TextPart(text="but no more"),
@@ -411,7 +411,7 @@ def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.parts == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
+    assert assistant_message.content == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
@@ -439,7 +439,7 @@ def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
         "function_call": function_call,
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.parts == (RawPart(raw={"function_call": function_call}),)
+    assert assistant_message.content == (RawPart(raw={"function_call": function_call}),)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "function_call": function_call,
@@ -449,7 +449,7 @@ def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "content": "hi",
@@ -466,7 +466,7 @@ def test_wire_messages_converts_each_message_kind() -> None:
     wire = _wire_messages([
         UserMessage(content="q"),
         AssistantMessage(
-            parts=(
+            content=(
                 ReasoningPart(
                     raw={"reasoning_content": "thought it over"}, text="thought it over"
                 ),
@@ -552,7 +552,7 @@ def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() ->
         (
             [
                 AssistantMessage(
-                    parts=(
+                    content=(
                         RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
                         RawPart(raw={"function_call": {"name": "second", "arguments": "{}"}}),
                     )
@@ -563,7 +563,7 @@ def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() ->
         (
             [
                 AssistantMessage(
-                    parts=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
+                    content=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
                 )
             ],
             ("no Chat Completions wire form",),
@@ -973,7 +973,7 @@ def test_a_completion_with_no_choices_is_an_unfinished_assistant_message() -> No
     """No choices is a response langchaint cannot read an assistant message from, so the message has no parts."""
     outcome = _text_bound().interpret(_completion(usage=None, choices=[]))
     assert outcome.kind == "unfinished_assistant_message"
-    assert outcome.assistant_message.parts == ()
+    assert outcome.assistant_message.content == ()
 
 
 def test_a_choice_with_no_finish_reason_is_unfinished_and_keeps_the_partial_text() -> None:
@@ -1094,7 +1094,7 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
         "hey",
     ]
     usable = _assert_usable(_text_bound().interpret(final))
-    assert usable.assistant_message.parts[0] == ReasoningPart(
+    assert usable.assistant_message.content[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
 

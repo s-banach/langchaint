@@ -363,12 +363,12 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     Raises:
         _RejectedMessagesError: RawPart.raw matches no supported shape, or repeats function_call.
     """
-    if isinstance(assistant_message.parts, str):
-        return {"role": "assistant", "content": assistant_message.parts}
+    if isinstance(assistant_message.content, str):
+        return {"role": "assistant", "content": assistant_message.content}
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []
-    for part in assistant_message.parts:
+    for part in assistant_message.content:
         match part.kind:
             case "reasoning":
                 param.update(part.raw)
@@ -479,7 +479,7 @@ def _as_chat_completion(raw: BaseModel) -> ChatCompletion:
 
 
 def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
-    """Preserve replayable provider values inside AssistantMessage.parts.
+    """Preserve replayable provider values inside AssistantMessage.content.
 
     A non-empty reasoning_content becomes ReasoningPart first.
     message.content then becomes TextPart when non-empty.
@@ -492,25 +492,25 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     message.annotations and message.audio reach no AssistantPart.
     Read those fields from `Generation.raw`.
     """
-    parts: list[AssistantPart] = []
+    content: list[AssistantPart] = []
     reasoning_content = _reasoning_content_extra(message)
     if reasoning_content is not None:
-        parts.append(
+        content.append(
             ReasoningPart(raw={"reasoning_content": reasoning_content}, text=reasoning_content)
         )
     if message.content:
-        parts.append(TextPart(text=message.content))
+        content.append(TextPart(text=message.content))
     if message.refusal:
-        parts.append(TextPart(text=message.refusal))
+        content.append(TextPart(text=message.refusal))
     if message.function_call is not None:
-        parts.append(
+        content.append(
             RawPart(
                 raw=message.model_dump(mode="json", include={"function_call"}, exclude_none=True)
             )
         )
     for tool_call in message.tool_calls or ():
         if tool_call.type == "function":
-            parts.append(
+            content.append(
                 ToolCall(
                     id=tool_call.id,
                     name=tool_call.function.name,
@@ -518,8 +518,8 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
                 )
             )
         else:
-            parts.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(parts=tuple(parts))
+            content.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(content=tuple(content))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -542,7 +542,7 @@ def _finished_message_or_unfinished(
     if not completion.choices:
         return UnfinishedAssistantMessage(
             error_text="openai returned no choices, so there is no assistant message to read",
-            assistant_message=AssistantMessage(parts=()),
+            assistant_message=AssistantMessage(content=()),
         )
     choice = completion.choices[0]
     assistant_message = _assistant_message_from(choice.message)

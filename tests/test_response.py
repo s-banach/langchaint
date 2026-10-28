@@ -84,9 +84,9 @@ _BILLING = Billing(
     ),
 )
 
-_TEXT_ASSISTANT_MESSAGE = AssistantMessage(parts=(TextPart(text="done"),))
+_TEXT_ASSISTANT_MESSAGE = AssistantMessage(content=(TextPart(text="done"),))
 _TOOL_CALL_ASSISTANT_MESSAGE = AssistantMessage(
-    parts=(ToolCall(id="call-1", name="lookup", args_json="{}"),)
+    content=(ToolCall(id="call-1", name="lookup", args_json="{}"),)
 )
 
 

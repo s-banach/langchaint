@@ -642,8 +642,8 @@ def test_converts_every_output_message_without_span_identity_or_finish_reason() 
         })
     )
     assert output_messages_from_otel(parsed) == (
-        AssistantMessage(parts=(TextPart(text="one"),)),
-        AssistantMessage(parts=(TextPart(text="two"),)),
+        AssistantMessage(content=(TextPart(text="one"),)),
+        AssistantMessage(content=(TextPart(text="two"),)),
     )
 
 
@@ -786,8 +786,8 @@ def test_output_without_text_matches_a_live_generation(
     })
     record = generation_record_from_otel(span)
     assert (record.kind, record.output) == expected
-    assert isinstance(record.assistant_message.parts, tuple)
-    assert all(part.text for part in record.assistant_message.parts if part.kind == "text")
+    assert isinstance(record.assistant_message.content, tuple)
+    assert all(part.text for part in record.assistant_message.content if part.kind == "text")
 
 
 @pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])

@@ -608,7 +608,7 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
             ),
         ])
     )
-    assert assistant_message.parts == (
+    assert assistant_message.content == (
         ReasoningPart(raw=thinking_raw, text="check first"),
         TextPart(text="hello"),
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
@@ -645,14 +645,14 @@ def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
     The dump replays unchanged, and its type key routes it on the wire.
     """
     assistant_message = _assistant_message_from(_message_with_content([block]))
-    assert assistant_message.parts == (ReasoningPart(raw=expected_raw, text=None),)
+    assert assistant_message.content == (ReasoningPart(raw=expected_raw, text=None),)
     assert _assistant_content_blocks(assistant_message) == [expected_raw]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "reasoning", "id": "rs_1"}
-    assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
         raw,
         {"type": "text", "text": "hi"},
@@ -667,7 +667,7 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
     messages = [
         UserMessage(content="hi"),
         AssistantMessage(
-            parts=(
+            content=(
                 TextPart(text="checking"),
                 ToolCall(id="tu_1", name="t", args_json='{"a": 1}'),
                 ToolCall(id="tu_2", name="t", args_json='{"a": 2}'),
@@ -676,9 +676,9 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
         UserMessage(content="and then?"),
-        AssistantMessage(parts=(ToolCall(id="tu_3", name="t", args_json='{"a": 3}'),)),
+        AssistantMessage(content=(ToolCall(id="tu_3", name="t", args_json='{"a": 3}'),)),
         ToolMessage(tool_call_id="tu_3", content="r3"),
-        AssistantMessage(parts=(TextPart(text="done"),)),
+        AssistantMessage(content=(TextPart(text="done"),)),
     ]
     wire = _wire_messages(
         messages,
@@ -737,7 +737,7 @@ def _cache_breakpoint_texts(count: int) -> tuple[TextPart, ...]:
             _CacheBreakpointCase(
                 (
                     AssistantMessage(
-                        parts=(
+                        content=(
                             TextPart(text="t"),
                             ReasoningPart(
                                 raw={"type": "thinking", "thinking": "x", "signature": "s"}
@@ -979,7 +979,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         ),
         pytest.param(
             (
-                AssistantMessage(parts=(ToolCall(id="c1", name="f", args_json="not json"),)),
+                AssistantMessage(content=(ToolCall(id="c1", name="f", args_json="not json"),)),
                 ToolMessage(tool_call_id="c1", content="ok"),
             ),
             "args_json",
@@ -988,7 +988,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         pytest.param(
             (
                 UserMessage(content="q"),
-                AssistantMessage(parts=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
+                AssistantMessage(content=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
             ),
             "type key",
             id="stored_payload_naming_no_type",

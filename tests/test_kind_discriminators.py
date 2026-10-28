@@ -28,7 +28,7 @@ def _by_message_kind(message: Message) -> object:
         case "user":
             return message.content
         case "assistant":
-            return message.parts
+            return message.content
         case "tool":
             return message.tool_call_id
 

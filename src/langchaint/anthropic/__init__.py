@@ -3,14 +3,14 @@
 Importing this subpackage requires `anthropic`.
 `Anthropic.llm` sends the stated model identifier verbatim.
 `AnthropicBedrock.llm` sends the stated Bedrock identifier verbatim.
-`ANTHROPIC_BEDROCK_ROUTING` lists preferred identifiers and their `BedrockRouting` values.
+`AnthropicBedrock` selects its SDK client with `api` and defaults to the legacy API in `us-east-1`.
 
 Cataloged Anthropic models receive `ANTHROPIC_PRICING`.
 Cataloged Bedrock models receive `ANTHROPIC_BEDROCK_PRICING`.
 A Bedrock identifier with a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix resolves through the unprefixed identifier.
 `AnthropicBedrock` multiplies those token rates by the prefix multiplier unless `apply_cross_region_multiplier=False`.
 Uncataloged Anthropic models require `pricing`.
-Uncataloged Bedrock models also require a passed `client`.
+Uncataloged Bedrock models require `pricing`.
 Missing optional rates produce NaN token costs.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 `AnthropicBedrock` accepts `http_client` directly.
@@ -30,7 +30,6 @@ A cataloged model without a web-search rate requires `pricing` to bind the web s
 `AnthropicBedrock.llm(pricing=...)` accepts caller rates.
 """
 
-from dataclasses import dataclass
 from typing import Literal, overload
 
 try:
@@ -88,39 +87,8 @@ type AnthropicBedrockModelId = (
 
 Each identifier is sent verbatim.
 The literal values offer preferred endpoint-specific identifiers.
-A `BEDROCK_CROSS_REGION_MULTIPLIER` prefix on a literal value resolves the same routing and catalog pricing.
+A `BEDROCK_CROSS_REGION_MULTIPLIER` prefix on a literal value resolves the same catalog pricing.
 """
-
-
-@dataclass(frozen=True, kw_only=True)
-class BedrockRouting:
-    """The SDK client API for one Bedrock identifier."""
-
-    api: Literal["mantle", "legacy"]
-
-
-ANTHROPIC_BEDROCK_ROUTING: dict[AnthropicBedrockModelId, BedrockRouting] = {
-    "anthropic.claude-fable-5-1": BedrockRouting(api="mantle"),
-    "anthropic.claude-fable-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-opus-5-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-opus-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-opus-4-8": BedrockRouting(api="mantle"),
-    "anthropic.claude-opus-4-7": BedrockRouting(api="mantle"),
-    "anthropic.claude-sonnet-5-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-sonnet-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-haiku-5-5": BedrockRouting(api="mantle"),
-    "anthropic.claude-haiku-4-5": BedrockRouting(api="mantle"),
-    "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy"),
-    "us.anthropic.claude-sonnet-4-6": BedrockRouting(api="legacy"),
-}
-"""`BedrockRouting` for each preferred `AnthropicBedrockModelId` value."""
-
-_BEDROCK_CLIENT_CLASS: dict[
-    Literal["mantle", "legacy"], type[AsyncAnthropicBedrockMantle | AsyncAnthropicBedrock]
-] = {
-    "mantle": AsyncAnthropicBedrockMantle,
-    "legacy": AsyncAnthropicBedrock,
-}
 
 
 class Anthropic:
@@ -228,7 +196,8 @@ class AnthropicBedrock:
     def __init__(
         self,
         *,
-        aws_region: str | None = None,
+        api: Literal["legacy", "mantle"] = "legacy",
+        aws_region: str = "us-east-1",
         client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
         http_client: httpx2.AsyncClient | None = None,
         apply_cross_region_multiplier: bool = True,
@@ -237,7 +206,9 @@ class AnthropicBedrock:
     ) -> None:
         """Build `AnthropicBedrock` without sending a request.
 
-        `aws_region` selects the region for SDK clients created by `AnthropicBedrock`.
+        `api="legacy"` selects `AsyncAnthropicBedrock`; `api="mantle"` selects `AsyncAnthropicBedrockMantle`.
+        A passed `client` must match `api` and retains its region and transport.
+        `aws_region` selects the region for SDK clients created by `AnthropicBedrock`, defaulting to `us-east-1`.
         `http_client` applies to SDK clients created by `AnthropicBedrock`.
         `apply_cross_region_multiplier=False` leaves a prefixed identifier's catalog rates unmultiplied.
         `shared_backoff` admits every request of the created `LLM` values.
@@ -246,21 +217,24 @@ class AnthropicBedrock:
         `observer=None` follows none.
 
         Raises:
-            ValueError: `client` accompanies `aws_region` or `http_client`.
+            ValueError: `client` contradicts `api` or accompanies `http_client`.
         """
-        if client is not None and aws_region is not None:
-            raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None and http_client is not None:
             raise ValueError("Pass at most one of client= or http_client=")
+        client_class = AsyncAnthropicBedrock if api == "legacy" else AsyncAnthropicBedrockMantle
+        if client is not None and not isinstance(client, client_class):
+            raise ValueError(
+                f"api={api!r} requires a {client_class.__name__} client, "
+                f"but a {type(client).__name__} was passed."
+            )
         self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
-        self.aws_region: str | None = aws_region
-        self.http_client: httpx2.AsyncClient | None = http_client
         self.apply_cross_region_multiplier: bool = apply_cross_region_multiplier
-        self._passed_client = client_without_retries(client) if client is not None else None
-        self._clients_by_api: dict[
-            Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
-        ] = {}
+        self.client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle = (
+            client_without_retries(client)
+            if client is not None
+            else client_class(aws_region=aws_region, http_client=http_client, max_retries=0)
+        )
 
     def llm(
         self,
@@ -274,10 +248,8 @@ class AnthropicBedrock:
         `model` is sent verbatim.
         An exact catalog identifier selects pricing.
         Otherwise a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped before the catalog lookups.
-        A preferred Mantle identifier selects `AsyncAnthropicBedrockMantle`.
-        Other known identifiers select `AsyncAnthropicBedrock`.
         Stated `pricing` replaces catalog pricing.
-        Uncataloged models require `pricing` and a passed `client`.
+        Uncataloged models require `pricing`.
         `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
@@ -289,70 +261,21 @@ class AnthropicBedrock:
         `bind` raises `TypeError` when `tool_choice` is `AllowedToolsChoice`.
 
         Raises:
-            anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
-            ValueError: An uncataloged model lacks `pricing` or a passed `client`.
-                Also raised when a passed SDK client cannot serve `model`.
+            ValueError: An uncataloged model lacks `pricing`.
         """
         resolution = resolve_bedrock_catalog_id(
             model,
             catalog_ids=ANTHROPIC_BEDROCK_PRICING,
             cross_region_multipliers=BEDROCK_CROSS_REGION_MULTIPLIER,
         )
-        routing = ANTHROPIC_BEDROCK_ROUTING.get(resolution.catalog_id)
-        client = self._client_for(routing, model)
         adapter = AnthropicMessagesAdapter(
-            client=client,
+            client=self.client,
             model=model,
             pricing=pricing if pricing is not None else self._catalog_pricing(model, resolution),
             provider_name="aws.bedrock",
             cache_ttl=cache_ttl,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
-
-    def _client_for(
-        self, routing: BedrockRouting | None, model: str
-    ) -> AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle:
-        """Return the passed client after checking it serves `routing`, or the client `routing` selects.
-
-        Raises:
-            anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
-            ValueError: `routing` is `None` with no passed client, or the passed client cannot
-                serve `model`.
-        """
-        client = self._passed_client
-        if client is None:
-            return self._owned_client(routing, model)
-        if routing is not None and not isinstance(client, _BEDROCK_CLIENT_CLASS[routing.api]):
-            raise ValueError(
-                f"{model!r} is served by the {routing.api!r} Bedrock API, which requires a "
-                f"{_BEDROCK_CLIENT_CLASS[routing.api].__name__} client, but a "
-                f"{type(client).__name__} was passed."
-            )
-        return client
-
-    def _owned_client(
-        self, routing: BedrockRouting | None, model: str
-    ) -> AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle:
-        """Return the client `AnthropicBedrock` creates for `routing`, one per Bedrock API.
-
-        Raises:
-            anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
-            ValueError: `routing` is `None`.
-        """
-        if routing is None:
-            raise ValueError(
-                f"model {model!r} has no matching BedrockRouting; pass client= with its SDK client class"
-            )
-        cached_client = self._clients_by_api.get(routing.api)
-        if cached_client is not None:
-            return cached_client
-        created_client = _BEDROCK_CLIENT_CLASS[routing.api](
-            aws_region=self.aws_region,
-            http_client=self.http_client,
-            max_retries=0,
-        )
-        self._clients_by_api[routing.api] = created_client
-        return created_client
 
     def _catalog_pricing(
         self, model: str, resolution: BedrockCatalogResolution
@@ -376,7 +299,6 @@ class AnthropicBedrock:
 
 __all__ = [
     "ANTHROPIC_BEDROCK_PRICING",
-    "ANTHROPIC_BEDROCK_ROUTING",
     "ANTHROPIC_PRICING",
     "BEDROCK_CROSS_REGION_MULTIPLIER",
     "Anthropic",
@@ -387,6 +309,5 @@ __all__ = [
     "AnthropicPricingTable",
     "AnthropicRates",
     "AnthropicServiceTier",
-    "BedrockRouting",
     "CacheTTL",
 ]

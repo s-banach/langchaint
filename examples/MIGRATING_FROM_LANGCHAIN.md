@@ -71,7 +71,7 @@ gemini_llm = gemini.llm("gemini-3.6-flash")
 deepseek = DeepSeek()
 deepseek_llm = deepseek.llm("deepseek-v4-flash")
 
-anthropic_bedrock = AnthropicBedrock(aws_region="us-east-1")
+anthropic_bedrock = AnthropicBedrock(api="mantle")
 anthropic_bedrock_llm = anthropic_bedrock.llm("anthropic.claude-sonnet-5")
 
 openai_bedrock = OpenAIBedrock(aws_region="us-east-1")

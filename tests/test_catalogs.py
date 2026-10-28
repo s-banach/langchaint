@@ -6,6 +6,7 @@ These tests cover identifiers, pricing objects, overrides, and client routing.
 import math
 import pathlib
 from collections.abc import Callable
+from typing import Literal
 
 import httpx2
 import pytest
@@ -17,12 +18,9 @@ from pydantic import TypeAdapter
 from langchaint import LLM, JsonValue, SharedBackoff, TokenRates
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
-    ANTHROPIC_BEDROCK_PRICING,
-    ANTHROPIC_BEDROCK_ROUTING,
     ANTHROPIC_PRICING,
     Anthropic,
     AnthropicBedrock,
-    AnthropicBedrockModelId,
     AnthropicMessagesAdapter,
     AnthropicPricingTable,
     AnthropicRates,
@@ -118,11 +116,6 @@ def test_anthropic_llm_wires_model_and_pricing() -> None:
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing is ANTHROPIC_PRICING[model]
-
-
-def test_every_cataloged_bedrock_model_has_routing() -> None:
-    """Every `ANTHROPIC_BEDROCK_PRICING` identifier resolves a client without a passed `client`."""
-    assert ANTHROPIC_BEDROCK_PRICING.keys() <= ANTHROPIC_BEDROCK_ROUTING.keys()
 
 
 def test_gemini_llm_wires_model_and_pricing() -> None:
@@ -399,24 +392,18 @@ def test_adapter_client_never_retries_beneath_langchaint() -> None:
     assert adapter.client.api_key == client.api_key
 
 
-# One model per Bedrock API exercises both SDK client classes.
-@pytest.mark.parametrize("model", ["anthropic.claude-opus-4-8", "us.anthropic.claude-opus-4-6-v1"])
+@pytest.mark.parametrize(
+    ("api", "client_class"),
+    [("legacy", AsyncAnthropicBedrock), ("mantle", AsyncAnthropicBedrockMantle)],
+)
 def test_bedrock_http_client_survives_the_retry_suppression_copy(
-    model: AnthropicBedrockModelId,
+    api: Literal["legacy", "mantle"],
+    client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     """Preserve a passed Bedrock client's custom transport while disabling retries."""
     http_client = httpx2.AsyncClient()
-    if model == "anthropic.claude-opus-4-8":
-        client = AsyncAnthropicBedrockMantle(
-            aws_region="us-east-1",
-            http_client=http_client,
-        )
-    else:
-        client = AsyncAnthropicBedrock(
-            aws_region="us-east-1",
-            http_client=http_client,
-        )
-    llm = AnthropicBedrock(client=client).llm(model)
+    client = client_class(aws_region="us-east-1", http_client=http_client)
+    llm = AnthropicBedrock(api=api, client=client).llm("anthropic.claude-opus-4-8")
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert client.max_retries != 0
@@ -431,18 +418,14 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
     with pytest.raises(ValueError, match="http_client="):
         _ = AnthropicBedrock(
+            api="mantle",
             client=client,
             http_client=httpx2.AsyncClient(),
         )
 
 
-def test_both_bedrock_classes_raise_on_a_region_beside_a_client() -> None:
-    """Both Bedrock constructors reject `aws_region` beside `client`."""
-    with pytest.raises(ValueError, match="aws_region="):
-        _ = AnthropicBedrock(
-            aws_region="eu-west-1",
-            client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
-        )
+def test_openai_bedrock_rejects_a_region_beside_a_client() -> None:
+    """OpenAIBedrock rejects `aws_region` beside `client`."""
     with pytest.raises(ValueError, match="aws_region="):
         _ = OpenAIBedrock(
             aws_region="eu-west-1",

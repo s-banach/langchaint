@@ -1241,7 +1241,7 @@ class AnthropicMessagesAdapter(Adapter):
             output_config = cast("OutputConfigParam", {"effort": binding.reasoning_level})
             thinking = {"type": "adaptive"}
 
-        # Default to older anthropic bedrock api for legacy models
+        # Set the legacy Bedrock API version unless extra_body overrides it.
         extra_body = (
             {"anthropic_version": "bedrock-2023-05-31", **(binding.extra_body or {})}
             if isinstance(self.client, AsyncAnthropicBedrock)

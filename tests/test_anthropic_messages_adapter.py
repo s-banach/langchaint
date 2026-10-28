@@ -3,9 +3,9 @@
 import json
 import math
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import NamedTuple, TypeIs, override
+from typing import Literal, NamedTuple, TypeIs, override
 
 import anthropic
 import anthropic.types as at
@@ -65,7 +65,6 @@ from langchaint.anthropic import (
     BEDROCK_CROSS_REGION_MULTIPLIER,
     Anthropic,
     AnthropicBedrock,
-    AnthropicBedrockModelId,
     AnthropicMessagesAdapter,
     AnthropicPricingTable,
     AnthropicRates,
@@ -474,7 +473,7 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
     """Check the system cache breakpoint built through each backend factory."""
     for llm in (
         Anthropic(client=AsyncAnthropic(api_key="test")).llm("claude-sonnet-5", cache_ttl="1h"),
-        AnthropicBedrock(aws_region="us-east-1").llm("anthropic.claude-sonnet-5", cache_ttl="1h"),
+        AnthropicBedrock(api="mantle").llm("anthropic.claude-sonnet-5", cache_ttl="1h"),
     ):
         bound = llm.adapter.bind_text(
             _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
@@ -1699,25 +1698,31 @@ _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 
 
 @pytest.mark.parametrize(
-    ("client", "uses_top_level_cache_control"),
+    ("build_llm", "uses_top_level_cache_control"),
     [
-        (AsyncAnthropic(api_key="test"), True),
-        (AsyncAnthropicBedrockMantle(aws_region="us-east-1"), True),
-        (AsyncAnthropicBedrock(aws_region="us-east-1"), False),
+        (
+            lambda: Anthropic(client=AsyncAnthropic(api_key="test")).llm(
+                "claude-sonnet-5", cache_ttl="1h"
+            ),
+            True,
+        ),
+        (
+            lambda: AnthropicBedrock(api="mantle").llm(
+                "us.anthropic.claude-sonnet-4-6", cache_ttl="1h"
+            ),
+            True,
+        ),
+        (lambda: AnthropicBedrock().llm("anthropic.claude-sonnet-5", cache_ttl="1h"), False),
     ],
     ids=["anthropic", "bedrock_mantle", "bedrock_legacy"],
 )
-def test_automatic_cache_breakpoints_select_final_caching_by_client(
-    client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
+def test_automatic_cache_breakpoints_select_final_caching_by_api(
+    build_llm: Callable[[], LLM],
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
     """Direct and Mantle clients use top-level caching. Legacy Bedrock places a cache breakpoint on the final block."""
-    adapter = _adapter(
-        client=client,
-        provider_name=("anthropic" if isinstance(client, AsyncAnthropic) else "aws.bedrock"),
-        cache_ttl="1h",
-    )
+    adapter = _anthropic_adapter_of(build_llm())
     bound = adapter.bind_text(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
@@ -1735,8 +1740,10 @@ def test_automatic_cache_breakpoints_select_final_caching_by_client(
     ]
     if uses_top_level_cache_control:
         assert request.precomputed.cache_control == _CACHE_CONTROL_1H
+        assert request.precomputed.extra_body is None
     else:
         assert isinstance(request.precomputed.cache_control, anthropic.Omit)
+        assert request.precomputed.extra_body == {"anthropic_version": "bedrock-2023-05-31"}
 
 
 def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_id() -> None:
@@ -1973,30 +1980,6 @@ def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
     return adapter
 
 
-@pytest.mark.parametrize(
-    ("model", "expected_client_class"),
-    [
-        ("anthropic.claude-fable-5", AsyncAnthropicBedrockMantle),
-        ("anthropic.claude-opus-5", AsyncAnthropicBedrockMantle),
-        ("anthropic.claude-opus-4-8", AsyncAnthropicBedrockMantle),
-        ("anthropic.claude-haiku-4-5", AsyncAnthropicBedrockMantle),
-        ("us.anthropic.claude-opus-5", AsyncAnthropicBedrockMantle),
-        ("us-gov.anthropic.claude-sonnet-5", AsyncAnthropicBedrockMantle),
-        ("us.anthropic.claude-opus-4-6-v1", AsyncAnthropicBedrock),
-        ("us.anthropic.claude-sonnet-4-6", AsyncAnthropicBedrock),
-    ],
-)
-def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
-    model: AnthropicBedrockModelId,
-    expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
-) -> None:
-    """Each Bedrock wire model id reaches its API's client class unchanged, retries pinned off."""
-    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").llm(model))
-    assert adapter.model == model
-    assert isinstance(adapter.client, expected_client_class)
-    assert adapter.client.max_retries == 0
-
-
 def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> None:
     """A verbatim catalog entry already states its regional rates, so no multiplier applies.
 
@@ -2049,51 +2032,41 @@ def test_pricing_table_scaled_scales_every_tier_and_keeps_modifiers() -> None:
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     """Use a matching supplied client with SDK retries disabled."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).llm(
-            "anthropic.claude-opus-4-8"
-        )
+        AnthropicBedrock(
+            api="mantle", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
+        ).llm("anthropic.claude-opus-4-8")
     )
     assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
     assert adapter.model == "anthropic.claude-opus-4-8"
     assert adapter.client.max_retries == 0
-    # The distinctive region proves the supplied client reaches the adapter.
-    # `AnthropicBedrock.aws_region` is None.
     assert adapter.client.aws_region == "eu-west-1"
 
 
-def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_api() -> None:
-    """Reject a legacy client for a mantle model."""
-    legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
-    with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
-        _ = AnthropicBedrock(client=legacy_client).llm("anthropic.claude-sonnet-5")
-    assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
+@pytest.mark.parametrize(
+    ("api", "client_class"),
+    [("legacy", AsyncAnthropicBedrockMantle), ("mantle", AsyncAnthropicBedrock)],
+)
+def test_bedrock_rejects_a_client_that_contradicts_api(
+    api: Literal["legacy", "mantle"],
+    client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
+) -> None:
+    """Reject an SDK client for the other API during construction."""
+    with pytest.raises(ValueError, match=re.escape(f"api={api!r} requires")):
+        _ = AnthropicBedrock(api=api, client=client_class(aws_region="us-east-1"))
 
 
-def test_bedrock_model_accepts_custom_pricing_and_a_passed_client() -> None:
-    """A passed client serves an uncataloged model with stated pricing."""
+@pytest.mark.parametrize("api", ["legacy", "mantle"])
+def test_bedrock_model_accepts_custom_pricing(api: Literal["legacy", "mantle"]) -> None:
+    """Explicit pricing lets an uncataloged model use either API."""
     model = "us.anthropic.claude-next"
-    adapter = _anthropic_adapter_of(
-        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1")).llm(
-            model,
-            pricing=_PRICING,
-        )
-    )
+    adapter = _anthropic_adapter_of(AnthropicBedrock(api=api).llm(model, pricing=_PRICING))
     assert adapter.model == model
     assert adapter.pricing is _PRICING
 
 
-def test_uncataloged_bedrock_model_requires_a_passed_client() -> None:
-    """An uncataloged model cannot select `api`."""
-    with pytest.raises(ValueError, match="pass client="):
-        _ = AnthropicBedrock(aws_region="us-east-1").llm(
-            "us.anthropic.claude-next",
-            pricing=_PRICING,
-        )
-
-
 def test_uncataloged_bedrock_model_requires_pricing() -> None:
     """An uncataloged model has no default pricing."""
-    bedrock = AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"))
+    bedrock = AnthropicBedrock(api="mantle")
     with pytest.raises(ValueError, match="pass pricing="):
         _ = bedrock.llm("us.anthropic.claude-next")
 

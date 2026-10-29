@@ -108,17 +108,16 @@ type Draft7Schema = Annotated[JsonValue, AfterValidator(_validate_draft_07_schem
 
 
 class OtelModel(CheckedCopyModel):
-    """Pydantic validates an OTel value without constructing a langchaint value."""
+    """An OTel value before conversion to langchaint."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class OtelStructuredModel(OtelModel):
-    """Pydantic validates declared fields and retains permitted additional JSON properties.
+    """An OTel object with undeclared JSON properties retained in `additional_properties`.
 
-    Every dictionary input is a raw OTel object, so a raw property named `additional_properties`
-    is retained as an additional property.
-    Strict validation of `additional_properties` rejects a non-string key.
+    Raw properties named `additional_properties` remain inside `additional_properties`.
+    Property names must be strings.
     """
 
     additional_properties: dict[str, JsonValue] = Field(default_factory=dict)
@@ -144,14 +143,14 @@ class OtelStructuredModel(OtelModel):
 
 
 class OtelTextPart(OtelStructuredModel):
-    """Pydantic validates the declared text-part fields and retains additional properties."""
+    """An OTel text part."""
 
     type: Literal["text"]
     content: str
 
 
 class OtelBlobPart(OtelStructuredModel):
-    """Pydantic validates the declared blob-part fields and retains additional properties."""
+    """An OTel blob part."""
 
     type: Literal["blob"]
     modality: str
@@ -160,7 +159,7 @@ class OtelBlobPart(OtelStructuredModel):
 
 
 class OtelFilePart(OtelStructuredModel):
-    """Pydantic validates the declared file-part fields and retains additional properties."""
+    """An OTel file part."""
 
     type: Literal["file"]
     modality: str
@@ -169,7 +168,7 @@ class OtelFilePart(OtelStructuredModel):
 
 
 class OtelUriPart(OtelStructuredModel):
-    """Pydantic validates the declared URI-part fields and retains additional properties."""
+    """An OTel URI part."""
 
     type: Literal["uri"]
     modality: str
@@ -178,14 +177,14 @@ class OtelUriPart(OtelStructuredModel):
 
 
 class OtelReasoningPart(OtelStructuredModel):
-    """Pydantic validates the declared reasoning-part fields and retains additional properties."""
+    """An OTel reasoning part."""
 
     type: Literal["reasoning"]
     content: str
 
 
 class OtelCompactionPart(OtelStructuredModel):
-    """Pydantic validates the declared compaction-part fields and retains additional properties."""
+    """An OTel compaction part."""
 
     type: Literal["compaction"]
     id: str | None = None
@@ -193,7 +192,7 @@ class OtelCompactionPart(OtelStructuredModel):
 
 
 class OtelToolCallPart(OtelStructuredModel):
-    """Pydantic validates the declared tool-call fields and retains additional properties."""
+    """An OTel tool call part."""
 
     type: Literal["tool_call"]
     name: str
@@ -202,7 +201,7 @@ class OtelToolCallPart(OtelStructuredModel):
 
 
 class OtelToolCallResponsePart(OtelStructuredModel):
-    """Pydantic validates the declared tool-response fields and retains additional properties.
+    """An OTel tool response part.
 
     `is_error` is langchaint's extension that records `ToolMessage.is_error`.
     A part whose `is_error` is not a boolean validates as `OtelGenericObject` instead.
@@ -215,17 +214,16 @@ class OtelToolCallResponsePart(OtelStructuredModel):
 
 
 class OtelGenericObject(OtelStructuredModel):
-    """Pydantic requires a type and retains every other property of an OTel object.
+    """An OTel object for provider-defined data and structured-value fallback.
 
-    `OtelGenericObject` is the fallback for a message part, a system instruction part, and the
-    provider-defined objects nested in server tool call parts.
+    The fallback covers message parts, system instruction parts, and objects nested in server tool call parts.
     """
 
     type: str
 
 
 class OtelServerToolCallPart(OtelStructuredModel):
-    """Pydantic validates the declared server-tool-call fields and retains additional properties."""
+    """An OTel server tool call part."""
 
     type: Literal["server_tool_call"]
     name: str
@@ -234,7 +232,7 @@ class OtelServerToolCallPart(OtelStructuredModel):
 
 
 class OtelServerToolCallResponsePart(OtelStructuredModel):
-    """Pydantic validates server-tool-response fields and retains additional properties."""
+    """An OTel server tool response part."""
 
     type: Literal["server_tool_call_response"]
     server_tool_call_response: OtelGenericObject
@@ -262,7 +260,7 @@ type OtelSystemInstructionPart = Annotated[
 
 
 class OtelInputMessage(OtelStructuredModel):
-    """Pydantic validates one input message while accepting provider-defined roles."""
+    """An OTel input message that accepts provider-defined roles."""
 
     role: str
     parts: Annotated[tuple[OtelMessagePart, ...], Field(strict=False)]
@@ -270,7 +268,7 @@ class OtelInputMessage(OtelStructuredModel):
 
 
 class OtelOutputMessage(OtelStructuredModel):
-    """Pydantic validates one output message while accepting provider-defined values."""
+    """An OTel output message that accepts provider-defined roles and finish reasons."""
 
     role: str
     parts: Annotated[tuple[OtelMessagePart, ...], Field(strict=False)]
@@ -279,7 +277,7 @@ class OtelOutputMessage(OtelStructuredModel):
 
 
 class OtelFunctionTool(OtelStructuredModel):
-    """Pydantic validates one function definition and its optional JSON Schema."""
+    """An OTel function definition with optional draft-07 JSON Schema parameters."""
 
     type: Literal["function"] = "function"
     name: str
@@ -288,7 +286,7 @@ class OtelFunctionTool(OtelStructuredModel):
 
 
 class OtelGenericTool(OtelStructuredModel):
-    """Pydantic requires tool identity fields and retains properties for schema fallback."""
+    """A fallback OTel tool definition."""
 
     type: str
     name: str
@@ -307,7 +305,7 @@ _MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
 
 
 class OtelChatSpan(OtelModel):
-    """Pydantic validates chat attributes against the committed OTel convention snapshot."""
+    """Chat attributes from the committed OTel convention snapshot."""
 
     operation_name: Literal["chat"] = Field(alias=OPERATION_NAME)
     error_type: str | None = Field(default=None, alias="error.type")
@@ -453,12 +451,12 @@ type OtelToolCallResult = Annotated[
 
 
 class OtelExecuteToolSpan(OtelModel):
-    """Pydantic validates the execute_tool attributes that the committed OTel convention snapshot names.
+    """Execute-tool attributes from the committed OTel convention snapshot.
 
     `tool_call_arguments` and `tool_call_result` accept any JSON value, not only the object the snapshot declares.
     `OtelObserver` records arguments that are not an object, such as argument text that is not JSON.
-    `tool_call_arguments` and `tool_call_result` default to `None`.
-    `model_fields_set` distinguishes an absent attribute from a recorded JSON `null`.
+    `model_fields_set` distinguishes an absent attribute from recorded JSON text `"null"`, which parses as `None`.
+    A raw `None` attribute is invalid.
     """
 
     operation_name: Literal["execute_tool"] = Field(alias=OPERATION_NAME)
@@ -558,10 +556,8 @@ def _split_system_prompt(
 ) -> tuple[tuple[TextPart, ...] | None, tuple[OtelInputMessage, ...]]:
     """Convert the system prompt and return it with the input messages that remain."""
     input_messages = otel_chat_span.input_messages or ()
-    system_message_indexes = [
-        index for index, message in enumerate(input_messages) if message.role == "system"
-    ]
-    if not system_message_indexes:
+    system_message_count = sum(message.role == "system" for message in input_messages)
+    if system_message_count == 0:
         if otel_chat_span.system_instructions:
             return _system_prompt_from_parts(otel_chat_span.system_instructions), input_messages
         return None, input_messages
@@ -570,11 +566,11 @@ def _split_system_prompt(
             f"{SYSTEM_INSTRUCTIONS} and an {INPUT_MESSAGES} role='system' message both provide "
             "the system prompt"
         )
-    if len(system_message_indexes) > 1:
+    if system_message_count > 1:
         raise _attribute_conversion_error(
             INPUT_MESSAGES, "contains multiple role='system' messages"
         )
-    if system_message_indexes[0] != 0:
+    if input_messages[0].role != "system":
         raise _attribute_conversion_error(
             INPUT_MESSAGES, "contains a role='system' message after the first message"
         )
@@ -920,16 +916,6 @@ def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
 
 
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
-    """Return the output `assistant_message` gives under `output_type`.
-
-    Under `"text"`, the output is `text_output(assistant_message)`.
-    Under `"json"`, the final complete text part must validate as JSON.
-    Application tool calls give output `None`.
-
-    Raises:
-        OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
-        OtelToLangchaintConversionError: Under `"json"`, a message without tool calls has no valid JSON text.
-    """
     supported_output_type = _supported_output_type(output_type)
     text = text_output(assistant_message)
     if text is None or supported_output_type == "text":

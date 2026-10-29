@@ -1,58 +1,4 @@
-"""Implement the OpenAI Responses API through the official openai SDK.
-
-The following SDK facts were verified against openai 2.45.0.
-A structured binding builds `text.format` with `type_to_text_format_param` and validates response text itself.
-SDK parsing may reject text before the terminal response exposes its billing.
-`type_to_text_format_param` is a private SDK function that may move between SDK versions.
-`responses.stream` yields typed events and assembles the response.
-Usage and status arrive with `response.completed`, `response.incomplete`, or `response.failed`.
-`get_final_response()` raises unless the terminal event is `response.completed`.
-
-`prompt_cache_options` supports gpt-5.6 and later.
-`{"mode": "explicit"}` without breakpoints disables caching.
-Implicit mode writes through the latest three breakpoints.
-Explicit mode writes through the latest four breakpoints.
-Older breakpoints remain available for matching.
-`ttl` accepts only `"30m"`.
-`automatic_cache_breakpoints=False` sends explicit mode and requires `prompt_cache_options` support.
-`automatic_cache_breakpoints=True` sends no `prompt_cache_options` and preserves implicit caching.
-Every part with `cache_breakpoint=True` sends `prompt_cache_breakpoint: {"mode": "explicit"}`.
-The adapter sends every breakpoint and lets the API enforce its write limits.
-Parts with `cache_breakpoint=True` re-enable caching under `automatic_cache_breakpoints=False`.
-
-The API stores responses by default.
-The adapter sends `store=False` because `GenerationInput` contains the complete state.
-Every request includes `reasoning.encrypted_content` so reasoning can replay under `store=False`.
-`reasoning.summary` accepts `"auto"`, `"concise"`, or `"detailed"`.
-The deprecated `generate_summary` accepts the same values, so the adapter sends only `reasoning.summary`.
-The adapter omits unset `reasoning.effort` and `reasoning.summary` keys.
-
-Content mappings were verified against openai 2.53.0.
-- `ImagePart` becomes a data URL in `image_url`.
-- `ImageUrlPart.url` becomes `image_url` unchanged.
-- `AudioPart` returns `RejectedMessages` inside `UserMessage` and `ToolMessage`.
-- Web search and file search produce distinct output item types.
-
-Request and response mappings:
-- A string `system_prompt` becomes `instructions`.
-- A parts `system_prompt` becomes the first developer-role input message because only parts support breakpoints.
-- `AssistantMessage` replays `AssistantPart` values in emission order under `store=False`.
-- `ReasoningPart` and `RawPart` replay their stored items unchanged.
-- `ToolCall` becomes `function_call`, and each `TextPart` becomes one assistant message.
-- `ToolMessage` becomes `function_call_output` keyed by `tool_call_id`.
-- The API has no `is_error` field, so `ToolMessage.content` carries the error signal.
-- `ResponseOutputRefusal` becomes `TextPart` and maps to `stop_reason="refusal"`.
-- Anthropic 0.120.0 represents refusals as text with the same `stop_reason`.
-- A `function_call` output item maps to `stop_reason="tool_call"`.
-- Status `"completed"` maps to `"stop"`.
-- Status `"incomplete"` maps `"max_output_tokens"` to `"max_completion_tokens"`.
-  Status `"incomplete"` maps `"content_filter"` to `"refusal"`.
-  OpenAI 3.8.0 incomplete reasons `"max_messages"` and `"steered"` map to `"other"`.
-- Other outcomes map to `"other"`.
-- Status `"failed"` returns `_provider_failure` with billing, even when emitted text validates.
-- Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one `ToolCall` per completed item.
-- `final()` supplies usage, cost, and stop reason.
-"""
+"""Implement the OpenAI Responses API through the official openai SDK."""
 
 from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -200,13 +146,7 @@ def _wire_reasoning(effort: str | None, summary: ReasoningSummary | None) -> Rea
 
 @dataclass(frozen=True, kw_only=True)
 class _OpenAIResponsesPrecomputedFields:
-    """The typed request fields one binding precomputes.
-
-    The SDK `omit` sentinel preserves provider defaults.
-    Explicit keywords preserve SDK overload resolution.
-    tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
-    `include` always contains `"reasoning.encrypted_content"` for later replay.
-    """
+    """Request fields shared by every input under one binding."""
 
     model: str
     instructions: str | None
@@ -222,7 +162,7 @@ class _OpenAIResponsesPrecomputedFields:
     service_tier: OpenAIResponsesServiceTier | Omit
     include: list[ResponseIncludable]
     text: ResponseTextConfigParam | Omit
-    """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
+    """The structured binding's JSON schema, omitted by the text binding."""
 
     extra_body: Mapping[str, object] | None
     charged_provider_executed_tools: bool
@@ -322,16 +262,9 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
 def _function_call_output(
     content: str | tuple[ContentPart, ...],
 ) -> str | ResponseFunctionCallOutputItemListParam:
-    """Convert one ToolMessage's content to the function_call_output output field.
+    """Preserve tool-result content order and explicit cache breakpoints.
 
-    The output field accepts str or ResponseFunctionCallOutputItemListParam.
-    ResponseFunctionCallOutputItemListParam accepts text and image content.
-    A bare string passes through.
-    A sequence of parts becomes that structured content list.
-    The image content param differs from the user-message input_image param.
-    This function builds the output image dict and shares only the data URI encoding.
-    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part.
-    The latest-N server rule in `_user_item` also applies here.
+    A string passes through; parts become text and image output content.
 
     Raises:
         _RejectedMessagesError: content holds AudioPart.
@@ -432,6 +365,7 @@ def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
     """Convert messages to input items.
 
     The system prompt is separate.
+    Tool-result content must carry error signals because openai 3.41.0 has no `is_error` field.
 
     Raises:
         _RejectedMessagesError: A ContentPart has no Responses wire form.
@@ -652,32 +586,25 @@ def _billing_from_response(
     )
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = float("nan")
-    if usage_raw is None:
-        return ProviderBilling(
-            billing=billing_at_rates(
-                rates,
-                service_tier=service_tier,
-                input_tokens_cache_read=0,
-                input_tokens_cache_write=0,
-                input_tokens_cache_none=0,
-                output_tokens=0,
-                output_tokens_reasoning=0,
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
-            ),
-            usage_raw=None,
-        )
-    details = usage_raw.input_tokens_details
+    input_tokens_cache_read = (
+        0 if usage_raw is None else usage_raw.input_tokens_details.cached_tokens
+    )
+    input_tokens_cache_write = (
+        0 if usage_raw is None else usage_raw.input_tokens_details.cache_write_tokens
+    )
     return ProviderBilling(
         billing=billing_at_rates(
             rates,
             service_tier=service_tier,
-            input_tokens_cache_read=details.cached_tokens,
-            input_tokens_cache_write=details.cache_write_tokens,
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write,
             input_tokens_cache_none=(
-                usage_raw.input_tokens - details.cached_tokens - details.cache_write_tokens
+                input_tokens_total - input_tokens_cache_read - input_tokens_cache_write
             ),
-            output_tokens=usage_raw.output_tokens,
-            output_tokens_reasoning=usage_raw.output_tokens_details.reasoning_tokens,
+            output_tokens=0 if usage_raw is None else usage_raw.output_tokens,
+            output_tokens_reasoning=(
+                0 if usage_raw is None else usage_raw.output_tokens_details.reasoning_tokens
+            ),
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
         usage_raw=usage_raw,
@@ -718,6 +645,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         """Store request and pricing configuration without sending a request.
 
         The stored client disables SDK retries.
+        Requests set `store=False` and include encrypted reasoning for replay.
         `reasoning_summary` requests readable reasoning text.
         `None` preserves the provider default, and a requested summary may still be absent.
         `provider_name` identifies OpenAI, Bedrock, or Azure.
@@ -757,6 +685,10 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIResponsesPrecomputedFields:
         """Precompute the typed request fields the binding determines.
+
+        A string system prompt uses `instructions`; parts form the first developer-role input message.
+        `automatic_cache_breakpoints=False` sends explicit caching mode; True preserves implicit caching.
+        Parts retain explicit cache breakpoints under either mode, and the API enforces its write limits.
 
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
@@ -1028,7 +960,7 @@ class _OpenAIResponsesStream(AdapterStream):
 
 
 class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
-    """What both openai bindings share: the request path, and what a response says about itself."""
+    """Share request execution, billing, and response identity between output bindings."""
 
     def __init__(
         self,

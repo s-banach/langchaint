@@ -1,65 +1,9 @@
 """Implement Chat Completions through the official openai SDK.
 
-Streaming behavior was verified against openai 2.51.0.
-
 OpenAI-compatible providers serve Chat Completions through `AsyncOpenAI.base_url`.
 `langchaint.deepseek` configures this adapter for DeepSeek.
 
-`create(stream=True)` sends the request and returns `AsyncStream[ChatCompletionChunk]`.
-`chat.completions.stream()` rejects any input tool whose `strict` is not `True`.
-`ToolManager` produces non-strict schemas, so this adapter uses `create(stream=True)`.
-`ChatCompletionStreamState` assembles chunks for `final()`.
-Without `input_tools` or `response_format`, `handle_chunk` preserves length and content-filter responses.
-`get_final_completion` raises on those responses, so this adapter does not call it.
-The structured binding sends `"strict": False` and validates response text after assembly.
-
-`handle_chunk` returns assembled events.
-`content.delta` carries answer text.
-`tool_calls.function.arguments.done` carries the name, arguments, and index.
-The adapter reads the call id from `current_completion_snapshot` at that index.
-A sparse or out-of-order index makes `handle_chunk` raise `IndexError`.
-`ChatCompletionStreamState` replaces `usage` with every chunk and takes other fields from the first chunk.
-The adapter preserves the last reported `usage` when a trailing chunk resets it.
-`stream_options={"include_usage": True}` requests the final usage chunk.
-
-The SDK preserves extra fields through `model_dump` and stream assembly.
-String extras concatenate across deltas.
-This preserves `reasoning_content` on `ChatCompletionMessage` and `ChoiceDelta`.
-A mid-stream SSE `error` makes the iterator raise `openai.APIError`.
-Only `openai._streaming` constructs that exact type in openai 2.51.0.
-`items()` converts that error to `APIStatusError` on the live response for `openai_request_failure`.
-Subclasses of `openai.APIError` propagate unchanged.
-An unclosed stream may produce `Choice.finish_reason=None` despite its required `Literal` type.
-The required `choices` list may be empty.
-
-`CompletionUsage` requires `prompt_tokens`, `completion_tokens`, and `total_tokens`.
-Its optional details contain cached, cache-write, and reasoning counters.
-`ChatCompletionToolMessageParam.content` accepts only text.
 Cache parameters match the Responses API values and follow `Binding.automatic_cache_breakpoints`.
-
-Content mappings were verified against openai 2.53.0.
-- `ImagePart` becomes a data URL in `image_url.url`.
-- `ImageUrlPart.url` becomes `image_url.url` unchanged.
-- `AudioPart` accepts `audio/wav` and `audio/mpeg` inside `UserMessage`.
-- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `RejectedMessages`.
-- `ChatCompletionMessage.audio` remains available through `Generation.raw`.
-
-Request and response mappings:
-- A string `system_prompt` becomes the first system-role message.
-- A parts `system_prompt` becomes one system-role message.
-- `AssistantMessage` becomes one assistant message parameter.
-- Its texts fill `content`, each `ToolCall` fills `tool_calls`, and `ReasoningPart.raw` supplies extra fields.
-- DeepSeek requires replayed `reasoning_content` during a tool loop.
-- Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
-- `message.refusal` becomes `TextPart` and sets `stop_reason="refusal"`, including with `finish_reason="stop"`.
-- `finish_reason="stop"` maps by tool calls to `"stop"` or `"tool_call"`.
-- `"tool_calls"`, `"length"`, and `"content_filter"` map to `"tool_call"`, `"max_completion_tokens"`, and `"refusal"`.
-- `"function_call"` and unknown values map to `"other"`.
-- Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one complete `ToolCall`.
-- The adapter delays fragments until their call id exists and prepends them to the next emitted fragment.
-- OpenAI-compatible providers may omit ids on early fragments.
-- `reasoning_content` forms one string without separators.
-- `final()` supplies usage, cost, and stop reason.
 """
 
 import base64
@@ -338,11 +282,7 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
         match part.kind:
             case "text":
                 wire_parts.append(_text_part_param(part))
-            case "image":
-                raise _text_only_tool_message_error(part)
-            case "image_url":
-                raise _text_only_tool_message_error(part)
-            case "audio":
+            case "image" | "image_url" | "audio":
                 raise _text_only_tool_message_error(part)
     return {
         "role": "tool",
@@ -360,6 +300,8 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     These tool_calls entries retain their emission order.
     Each ReasoningPart.raw merges into the message fields.
     This matches openai 2.51.0's ChatCompletionAssistantMessageParam variants.
+    DeepSeek requires replayed `reasoning_content` during a tool loop.
+    Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
 
     Raises:
         _RejectedMessagesError: RawPart.raw matches no supported shape, or repeats function_call.
@@ -560,12 +502,7 @@ def _finished_message_or_unfinished(
 
 
 def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
-    """Map the finish reason to the neutral vocabulary.
-
-    The module docstring states each mapping.
-
-    The refusal field is tested ahead of the rows, as the module docstring states.
-    """
+    """Map the finish reason, with a populated refusal field taking precedence."""
     if finished_message.message.refusal:
         return "refusal"
     match finished_message.finish_reason:
@@ -630,23 +567,11 @@ def _billing_from_chat_completion(
     provider_executed_tool_cost_in_usd = (
         float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
-    if usage_raw is None:
-        return ProviderBilling(
-            billing=billing_at_rates(
-                rates,
-                service_tier=service_tier,
-                input_tokens_cache_read=0,
-                input_tokens_cache_write=0,
-                input_tokens_cache_none=0,
-                output_tokens=0,
-                output_tokens_reasoning=0,
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
-            ),
-            usage_raw=None,
-        )
-    prompt_details = usage_raw.prompt_tokens_details
-    completion_details = usage_raw.completion_tokens_details
-    input_tokens_cache_read = input_tokens_cache_read_from_usage(usage_raw)
+    prompt_details = usage_raw.prompt_tokens_details if usage_raw is not None else None
+    completion_details = usage_raw.completion_tokens_details if usage_raw is not None else None
+    input_tokens_cache_read = (
+        input_tokens_cache_read_from_usage(usage_raw) if usage_raw is not None else 0
+    )
     input_tokens_cache_write = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
@@ -656,10 +581,10 @@ def _billing_from_chat_completion(
             service_tier=service_tier,
             input_tokens_cache_read=input_tokens_cache_read,
             input_tokens_cache_write=input_tokens_cache_write,
-            input_tokens_cache_none=usage_raw.prompt_tokens
+            input_tokens_cache_none=input_tokens_total
             - input_tokens_cache_read
             - input_tokens_cache_write,
-            output_tokens=usage_raw.completion_tokens,
+            output_tokens=usage_raw.completion_tokens if usage_raw is not None else 0,
             output_tokens_reasoning=(
                 completion_details.reasoning_tokens or 0 if completion_details is not None else 0
             ),
@@ -905,6 +830,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         SDK events carry answer deltas and completed tool calls.
         Each chunk supplies `reasoning_content` before its SDK events.
         The stream tracks the last non-`None` usage because SDK accumulation may reset it.
+        Argument fragments wait for their call id, then precede the next emitted fragment.
 
         Yields:
             Stream items. SDK events that langchaint does not model are dropped.
@@ -968,6 +894,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
 
         The adapter preserves the lenient SDK snapshot without revalidation.
         Revalidation could reject partial output and billing.
+        `get_final_completion` raises on length and content-filter responses (openai 2.51.0).
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so there is nothing assembled.

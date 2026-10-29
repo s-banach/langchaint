@@ -103,7 +103,6 @@ def test_architecture_rejects_cycles(
 def test_architecture_rejects_common_importing_generation(
     tmp_path: Path, relative_path: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Reject imports out of common, including package entrypoints and new descendants."""
     result = _check_dependencies(
         tmp_path,
         {relative_path: "import langchaint.generation.llm\n", "generation/llm.py": ""},
@@ -132,7 +131,6 @@ def test_architecture_accepts_one_way_dependencies_without_executing_source(
 def test_architecture_rejects_common_importing_public_exports(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Reject a dependency through the top-level application exports."""
     result = _check_dependencies(
         tmp_path,
         {
@@ -149,7 +147,6 @@ def test_architecture_rejects_common_importing_public_exports(
 def test_architecture_rejects_package_cycles_without_file_cycles(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Reject reciprocal package dependencies assembled from separate file pairs."""
     result = _check_dependencies(
         tmp_path,
         {
@@ -185,7 +182,6 @@ def test_architecture_rejects_invalid_source(
 def test_architecture_ignores_external_imports(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Do not require third-party dependencies to be installed."""
     result = _check_dependencies(
         tmp_path,
         {"common/a.py": "import unavailable_sdk\nfrom langchaint_extra import Symbol\n"},
@@ -232,7 +228,6 @@ _NEW_A_EXCLUDES_NUMPY = (LoadTimeExclusion(entry="langchaint.new_a", excluded=("
 def test_architecture_rejects_excluded_modules_loaded_at_import(
     tmp_path: Path, files: Mapping[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Reject an excluded module that importing the entry module loads through any chain of top-level imports."""
     result = _check_dependencies(tmp_path, files, load_time_exclusions=_NEW_A_EXCLUDES_NUMPY)
     output = capsys.readouterr()
     assert result != 0, output.out + output.err

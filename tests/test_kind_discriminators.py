@@ -110,7 +110,6 @@ def _by_dispatch_many_outcome_kind_missing_a_variant(outcome: DispatchManyItemOu
 
 
 def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
-    """Exercise an exhaustive match on ResponseOutcome."""
     match outcome.kind:
         case "usable_response":
             return outcome.output
@@ -143,7 +142,6 @@ class _Answer(BaseModel):
 
 
 def _by_generation_kind(generation: Generation[_Answer]) -> object:
-    """Verify that kind narrows a structured Generation.output."""
     match generation.kind:
         case "plain":
             assert_type(generation.output, _Answer)
@@ -162,7 +160,6 @@ def _by_generation_kind_missing_a_variant(generation: Generation[str]) -> object
 def _by_generation_error_record_kind(
     record: GenerationErrorRecord,
 ) -> object:
-    """Verify that `kind` separates `SchemaViolationErrorRecord` from `PlainErrorRecord`."""
     match record.kind:
         case "schema_violation_error":
             assert_type(record, SchemaViolationErrorRecord)
@@ -173,7 +170,6 @@ def _by_generation_error_record_kind(
 
 
 def _by_stream_item_kind(item: StreamItem) -> object:
-    """Exercise an exhaustive match on StreamItem."""
     if isinstance(item, str):
         return item
     match item.kind:

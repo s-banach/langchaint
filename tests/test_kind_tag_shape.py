@@ -12,7 +12,6 @@ from tests.helpers import package_modules
 
 
 def _flatten_union(annotation: object) -> list[type]:
-    """Return concrete classes from an annotation."""
     aliased = getattr(annotation, "__value__", None)
     if aliased is not None:
         return _flatten_union(aliased)
@@ -30,7 +29,6 @@ def _flatten_union(annotation: object) -> list[type]:
 
 
 def _tagged_unions() -> dict[str, tuple[type, ...]]:
-    """Map each tagged type alias to its variants."""
     found: dict[str, tuple[type, ...]] = {}
     for module in package_modules():
         for attribute_name, value in vars(module).items():
@@ -45,7 +43,6 @@ def _tagged_unions() -> dict[str, tuple[type, ...]]:
 
 
 def _tags_of(variant: type) -> tuple[str, ...]:
-    """Return the strings in a variant's kind Literal, which a type alias may name."""
     annotation = inspect.get_annotations(variant)["kind"]
     if isinstance(annotation, TypeAliasType):
         annotation = annotation.__value__
@@ -61,7 +58,6 @@ _TAGGED_UNIONS = _tagged_unions()
 
 
 def test_no_union_gives_two_variants_the_same_tag() -> None:
-    """Each kind value identifies one variant of a tagged union."""
     assert _TAGGED_UNIONS
     collisions = {}
     for union_name, variants in _TAGGED_UNIONS.items():

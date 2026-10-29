@@ -1,8 +1,3 @@
-"""Test OpenAI Chat Completions with constructed SDK objects.
-
-Tests cover Usage, assistant messages, stop reasons, streams, errors, and requests.
-"""
-
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -100,27 +95,22 @@ _TOOL_CALL_WIRE: dict[str, object] = {
     "type": "function",
     "function": {"name": "lookup", "arguments": '{"q": 1}'},
 }
-"""One function tool call as the API returns it on an assistant message."""
 
 _TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": 1}')
-"""The ToolCall that _TOOL_CALL_WIRE converts to."""
 
 _CUSTOM_TOOL_CALL_WIRE: dict[str, JsonValue] = {
     "id": "c9",
     "type": "custom",
     "custom": {"name": "n", "input": "i"},
 }
-"""One custom tool call as the API returns it."""
 
 _FUNCTION_CALL_WIRE: dict[str, JsonValue] = {
     "name": "legacy_lookup",
     "arguments": "{}",
 }
-"""One deprecated function_call as the API returns it."""
 
 
 def _assert_usable[OutputT](outcome: ResponseOutcome[OutputT]) -> UsableResponse[OutputT]:
-    """Narrow a ResponseOutcome to its UsableResponse variant, failing the test on any other variant."""
     assert outcome.kind == "usable_response"
     return outcome
 
@@ -129,7 +119,6 @@ def _usage(
     prompt_tokens_details: Mapping[str, int] | None = None,
     completion_tokens_details: Mapping[str, int] | None = None,
 ) -> CompletionUsage:
-    """Return usage of 1000 prompt tokens and 40 completion tokens with the given details."""
     return CompletionUsage.model_validate({
         "prompt_tokens": 1000,
         "completion_tokens": 40,
@@ -140,7 +129,6 @@ def _usage(
 
 
 def _usage_with_cache() -> CompletionUsage:
-    """Return usage whose prompt_tokens includes both cache counters."""
     return _usage(
         prompt_tokens_details={"cached_tokens": 600, "cache_write_tokens": 100},
         completion_tokens_details={"reasoning_tokens": 0},
@@ -224,7 +212,6 @@ def _provider_billing(
         [CompletionUsage], int
     ] = input_tokens_cache_read_from_usage_openai,
 ) -> ProviderBilling:
-    """Price one completion, with the openai cache-read reader unless another is given."""
     return _billing_from_chat_completion(
         completion,
         pricing=pricing,
@@ -233,7 +220,6 @@ def _provider_billing(
 
 
 def _billing(completion: ChatCompletion, pricing: OpenAIPricingTable = _PRICING) -> Billing:
-    """Price one completion with the openai cache-read reader, the adapter's default."""
     return _provider_billing(completion, pricing).billing
 
 
@@ -263,12 +249,7 @@ def test_billing_partitions_prompt_tokens_by_the_cache_read_reader(
     input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int],
     expected_counters: tuple[int, int, int, int],
 ) -> None:
-    """The uncached counter is prompt_tokens minus the cache-read and cache-write counters.
-
-    input_tokens_cache_read_from_usage prevents treating DeepSeek's cache hits as uncached tokens.
-    An absent details object reads as zero.
-    expected_counters lists the cache-read, cache-write, and uncached input counters, then reasoning.
-    """
+    """expected_counters lists cache-read, cache-write, uncached input, then reasoning tokens."""
     usage = _provider_billing(
         _completion(usage=usage_raw),
         input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage,
@@ -282,7 +263,6 @@ def test_billing_partitions_prompt_tokens_by_the_cache_read_reader(
 
 
 def test_billing_carries_the_sdk_usage_object_itself() -> None:
-    """usage_raw is the completion's own CompletionUsage by reference, and None where it reported none."""
     raw = _completion(usage=_usage_with_cache())
     assert _provider_billing(raw).usage_raw is raw.usage
     assert _provider_billing(_completion(usage=None)).usage_raw is None
@@ -309,18 +289,15 @@ def test_search_annotations_produce_unknown_provider_executed_tool_cost() -> Non
 
 
 def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
-    """A completion missing usage still stores the rates the tier that served it would have spent."""
     billing = _billing(_completion(usage=None))
     assert billing.usd_per_million_tokens.output_tokens == 10.0
     assert billing.service_tier == "default"
 
 
 def test_the_reported_tier_selects_the_rates() -> None:
-    """Priority rates price a priority response. "auto" and no tier both price at default."""
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
 
     def cost_at(service_tier: str | None) -> float:
-        """Price the cached usage as served at service_tier."""
         completion = _completion(usage=_usage_with_cache(), service_tier=service_tier)
         return _billing(completion, pricing).usage.cost_in_usd
 
@@ -377,17 +354,12 @@ def test_stop_reason_mapping(
     expected: StopReason,
     expected_output: str | None,
 ) -> None:
-    """Check translated stop reasons alongside the preserved output.
-
-    Under the text binding, a refusal's sentences are the output and the stop reason names the refusal.
-    """
     usable = _assert_usable(_text_bound().interpret(build_completion()))
     assert usable.stop_reason == expected
     assert usable.output == expected_output
 
 
 def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
-    """One message decomposes into the assistant message, reasoning_content read off the extra fields."""
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
         "content": "hey",
@@ -447,7 +419,6 @@ def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
 
 
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
-    """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
     assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_message_param(assistant_message) == {
@@ -458,11 +429,6 @@ def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
 
 
 def test_wire_messages_converts_each_message_kind() -> None:
-    """User, assistant, and tool messages each map to their message param.
-
-    The assistant message becomes one param whose texts join into content.
-    ToolCall values and ReasoningPart.raw keep their fields.
-    """
     wire = _wire_messages([
         UserMessage(content="q"),
         AssistantMessage(
@@ -490,10 +456,6 @@ def test_wire_messages_converts_each_message_kind() -> None:
 
 
 def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() -> None:
-    """Each content part maps to its wire part, and a cache breakpoint part carries prompt_cache_breakpoint.
-
-    AudioPart.media_type "audio/wav" and "audio/mpeg" map to input_audio.format "wav" and "mp3".
-    """
     breakpoint_field = {"prompt_cache_breakpoint": {"mode": "explicit"}}
     wire = _wire_messages([
         UserMessage(
@@ -596,10 +558,6 @@ def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() ->
 def test_build_request_reports_unsendable_messages_as_rejected_messages(
     messages: list[Message], reason_fragments: tuple[str, ...]
 ) -> None:
-    """A message with no Chat Completions wire form returns RejectedMessages before sending.
-
-    One assistant message has one function_call field, and the tool message param's content is text-only.
-    """
     request = _adapter().bind_text(_binding()).build_request_params(messages)
     assert isinstance(request, RejectedMessages)
     for reason_fragment in reason_fragments:
@@ -631,12 +589,6 @@ def test_build_request_reports_unsendable_messages_as_rejected_messages(
     ids=["string", "specific_tool", "allowed_tools_auto", "allowed_tools_required"],
 )
 def test_wire_tool_choice(tool_choice: ToolChoice, expected: object) -> None:
-    """Map the neutral tool choice to the Chat Completions tool_choice form.
-
-    Neutral strings pass through unchanged.
-    SpecificToolChoice becomes the function form.
-    AllowedToolsChoice becomes the allowed_tools form listing function names in order.
-    """
     assert _wire_tool_choice(tool_choice) == expected
 
 
@@ -661,7 +613,6 @@ def _adapter(
 
 
 def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
-    """Fingerprint data includes constructor request settings and excludes billing settings."""
     adapter = _adapter(supports_prompt_cache_options=False, service_tier="priority")
     assert adapter.config_fingerprint_data() == {
         "service_tier": "priority",
@@ -681,7 +632,6 @@ def _binding(
     temperature: float | None = None,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
-    """Assemble a binding with the fields these request tests vary."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
@@ -696,20 +646,23 @@ def _binding(
     )
 
 
-def test_provider_executed_tools_raise_with_the_responses_interface() -> None:
-    """Chat Completions directs provider-executed tools to Responses."""
-    with pytest.raises(ValueError, match="OpenAIResponsesAdapter"):
-        _ = _adapter().bind_text(_binding(provider_executed_tools=({"type": "web_search"},)))
-
-
-def test_web_search_options_raise_with_the_responses_interface() -> None:
-    """Chat Completions rejects web search because its billing evidence is incomplete."""
-    with pytest.raises(ValueError, match="OpenAIResponsesAdapter"):
-        _ = _adapter().bind_text(_binding(extra_body={"web_search_options": {}}))
+@pytest.mark.parametrize(
+    ("binding", "error_match"),
+    [
+        (_binding(provider_executed_tools=({"type": "web_search"},)), "OpenAIResponsesAdapter"),
+        (_binding(extra_body={"web_search_options": {}}), "OpenAIResponsesAdapter"),
+        (_binding(extra_body={"temperature": 0.5}), "temperature"),
+        (_binding(extra_body={"stream": False}), "stream"),
+        (_binding(extra_body={"functions": []}), "outside `tools`"),
+    ],
+    ids=["provider_executed_tools", "web_search_options", "temperature", "stream", "functions"],
+)
+def test_bind_rejects_unsupported_configuration(binding: Binding, error_match: str) -> None:
+    with pytest.raises(ValueError, match=error_match):
+        _ = _adapter().bind_text(binding)
 
 
 def test_request_system_parts_become_one_system_message_with_their_cache_breakpoints() -> None:
-    """A parts system_prompt travels as one system message, and its cache breakpoints carry prompt_cache_breakpoint."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -734,7 +687,6 @@ def test_request_system_parts_become_one_system_message_with_their_cache_breakpo
 
 
 def test_request_maps_generation_fields_and_omits_the_unset() -> None:
-    """Each set parameter lands on its wire field. Unset ones leave the omit sentinel."""
     fields_set = _adapter()._precompute_fields(
         _binding(max_completion_tokens=5, temperature=0.2, reasoning_level="high")
     )
@@ -748,7 +700,6 @@ def test_request_maps_generation_fields_and_omits_the_unset() -> None:
 
 
 def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them() -> None:
-    """Tools bring tool_choice and parallel_tool_calls with them. Toolless bindings send none."""
     toolless = _adapter()._precompute_fields(_binding())
     assert isinstance(toolless.tools, openai.Omit)
     assert isinstance(toolless.tool_choice, openai.Omit)
@@ -779,7 +730,6 @@ def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them()
 
 
 def test_tool_without_description_omits_the_description_key() -> None:
-    """`description=None` sends the function without a description."""
     precomputed = _adapter()._precompute_fields(
         _binding(tool_schemas=(ToolSchema(name="lookup", args_schema={"type": "object"}),))
     )
@@ -789,7 +739,6 @@ def test_tool_without_description_omits_the_description_key() -> None:
 
 
 def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions() -> None:
-    """AllowedToolsChoice changes tool_choice without removing tools."""
     schemas = (
         ToolSchema(name="first", description="First.", args_schema={"type": "object"}),
         ToolSchema(name="second", description="Second.", args_schema={"type": "object"}),
@@ -822,11 +771,6 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
     supports_prompt_cache_options: bool,
     automatic_cache_breakpoints: bool,
 ) -> None:
-    """Explicit mode with no breakpoints is the one prompt_cache_options value langchaint sends.
-
-    `automatic_cache_breakpoints=True` leaves the omit sentinel.
-    `automatic_cache_breakpoints=False` without parameter support raises before building fields.
-    """
     precomputed_fields = _adapter(
         supports_prompt_cache_options=supports_prompt_cache_options
     )._precompute_fields(_binding(automatic_cache_breakpoints=automatic_cache_breakpoints))
@@ -837,7 +781,6 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
 
 
 def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises() -> None:
-    """`automatic_cache_breakpoints=False` requires `prompt_cache_options`."""
     with pytest.raises(ValueError, match="supports_prompt_cache_options"):
         _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
             _binding(automatic_cache_breakpoints=False)
@@ -845,53 +788,29 @@ def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises(
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
-    """A stated service_tier lands on the request. None leaves the omit sentinel."""
     assert isinstance(_adapter()._precompute_fields(_binding()).service_tier, openai.Omit)
     stated = _adapter(service_tier="flex")._precompute_fields(_binding())
     assert stated.service_tier == "flex"
 
 
-def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
-    """An extra_body key that open_stream passes as its own keyword raises at bind time.
-
-    extra_body cannot override stream.
-    """
-    with pytest.raises(ValueError, match="temperature"):
-        _ = _adapter()._precompute_fields(_binding(extra_body={"temperature": 0.5}))
-    with pytest.raises(ValueError, match="stream"):
-        _ = _adapter()._precompute_fields(_binding(extra_body={"stream": False}))
-
-
-def test_request_rejects_deprecated_functions_in_extra_body() -> None:
-    """The deprecated `functions` field would declare tools that the binding does not bind."""
-    with pytest.raises(ValueError, match="outside `tools`"):
-        _ = _adapter()._precompute_fields(_binding(extra_body={"functions": []}))
-
-
 def test_adapter_pins_sdk_retries_off() -> None:
-    """The stored client copy carries max_retries=0 so only langchaint retries."""
     assert _adapter().client.max_retries == 0
 
 
 def _text_bound() -> BoundAdapter[str | None]:
-    """Bind a keyless adapter for text. No request is sent."""
     return _adapter().bind_text(_binding())
 
 
 class _StructuredReport(BaseModel):
-    """The response_format the structured bind path parses into."""
-
     city: str
     celsius: int
 
 
 def _structured_bound() -> BoundAdapter[_StructuredReport | None]:
-    """Bind a keyless adapter for _StructuredReport. No request is sent."""
     return _adapter().bind_structured(_binding(), _StructuredReport)
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
-"""Text that validates into _StructuredReport."""
 
 
 def _structured_completion(
@@ -901,7 +820,6 @@ def _structured_completion(
     finish_reason: str = "stop",
     tool_call: bool = False,
 ) -> ChatCompletion:
-    """Build a completion whose assistant message carries the given content, refusal, and tool call."""
     message: dict[str, object] = {"content": text, "refusal": refusal}
     if tool_call:
         message["tool_calls"] = [_TOOL_CALL_WIRE]
@@ -909,7 +827,6 @@ def _structured_completion(
 
 
 def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() -> None:
-    """Text that validates against the schema remains commentary beside an application tool call."""
     outcome = _assert_usable(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
     )
@@ -958,33 +875,28 @@ def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() 
 def test_structured_bind_reports_why_an_assistant_message_produced_no_instance(
     completion: ChatCompletion, expected_kind: str
 ) -> None:
-    """Every outcome carries the converted assistant message, including tool calls langchaint cannot dispatch.
-
-    A refusal is the model declining, so its sentences never enter validation.
-    A length finish is the truncation, never a dispatchable assistant message, even with tool calls.
-    An assistant message with tool calls parses no instance and returns a UsableResponse whose output is None.
-    """
     outcome = _structured_bound().interpret(completion)
     assert outcome.kind == expected_kind
     assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
 
 
-def test_a_completion_with_no_choices_is_an_unfinished_assistant_message() -> None:
-    """No choices is a response langchaint cannot read an assistant message from, so the message has no parts."""
-    outcome = _text_bound().interpret(_completion(usage=None, choices=[]))
+@pytest.mark.parametrize(
+    ("completion", "expected_content"),
+    [
+        (_completion(usage=None, choices=[]), ()),
+        (_lenient_completion(None), (TextPart(text="hey"),)),
+    ],
+    ids=["no_choices", "no_finish_reason"],
+)
+def test_an_unfinished_completion_keeps_available_content(
+    completion: ChatCompletion, expected_content: tuple[TextPart, ...]
+) -> None:
+    outcome = _text_bound().interpret(completion)
     assert outcome.kind == "unfinished_assistant_message"
-    assert outcome.assistant_message.content == ()
-
-
-def test_a_choice_with_no_finish_reason_is_unfinished_and_keeps_the_partial_text() -> None:
-    """finish_reason reads None at runtime on a lenient snapshot, which leaves the assistant message unfinished."""
-    outcome = _text_bound().interpret(_lenient_completion(None))
-    assert outcome.kind == "unfinished_assistant_message"
-    assert outcome.assistant_message.content == (TextPart(text="hey"),)
+    assert outcome.assistant_message.content == expected_content
 
 
 def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
-    """ResponseIdentity combines response fields with AdapterStream.request_id()."""
     identity = _text_bound().identity_from_raw(
         _completion(usage=None, model="m-2026-01-01"), request_id="req-chat"
     )
@@ -1023,7 +935,6 @@ class _FakeSDKStream(AsyncStream[ChatCompletionChunk]):
 def _stream(
     replay: Sequence[ChatCompletionChunk | Exception], headers: dict[str, str] | None = None
 ) -> _OpenAIChatCompletionsStream:
-    """Build an adapter stream over replayed chunks, reading headers off a constructed response."""
     return _OpenAIChatCompletionsStream(
         sdk_stream=_FakeSDKStream(replay, headers),
         pricing=_PRICING,
@@ -1052,7 +963,6 @@ def _chunk(
 
 
 def _collected_items(replay: Sequence[ChatCompletionChunk | Exception]) -> list[StreamItem]:
-    """Drain the translated items into a list."""
 
     async def scenario() -> list[StreamItem]:
         return [item async for item in _stream(replay).items()]
@@ -1061,7 +971,6 @@ def _collected_items(replay: Sequence[ChatCompletionChunk | Exception]) -> list[
 
 
 def _text_stream_chunks() -> list[ChatCompletionChunk]:
-    """Chunks in the provider's order: role and text deltas, the finish, then the usage-only chunk."""
     return [
         _chunk(delta={"role": "assistant", "content": "he"}),
         _chunk(delta={"content": "y"}),
@@ -1071,12 +980,10 @@ def _text_stream_chunks() -> list[ChatCompletionChunk]:
 
 
 def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
-    """Answer text streams as the SDK's own delta strings, and the terminal chunks add no items."""
     assert _collected_items(_text_stream_chunks()) == ["he", "y"]
 
 
 def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -> None:
-    """Each reasoning_content delta streams as one ReasoningDelta and the snapshot joins them."""
     stream = _stream([
         _chunk(delta={"role": "assistant", "reasoning_content": "part a"}),
         _chunk(delta={"reasoning_content": " part b", "content": "hey"}),
@@ -1123,7 +1030,6 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
 def test_stream_yields_argument_fragments_then_one_complete_tool_call(
     id_carrying_fragment_index: int, expected_deltas: list[ToolCallDelta]
 ) -> None:
-    """Tool-call fragments yield deltas and one assembled ToolCall."""
     fragments: list[dict[str, object]] = [
         {"index": 0, "type": "function", "function": {"name": "lookup", "arguments": '{"q"'}},
         {"index": 0, "function": {"arguments": ": 1"}},
@@ -1163,7 +1069,6 @@ def test_a_sparse_tool_call_fragment_index_is_a_stream_protocol_error() -> None:
 
 
 def test_provider_billing_is_none_until_the_usage_chunk_arrives() -> None:
-    """A stream cut off before the usage-bearing chunk reports None, and the full drain reports it."""
     stream = _stream(_text_stream_chunks())
 
     async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
@@ -1191,22 +1096,17 @@ def test_final_patches_the_tracked_usage_over_a_trailing_chunks_reset() -> None:
 
 
 def test_final_before_items_are_exhausted_raises() -> None:
-    """final() without a drained stream has nothing assembled to return."""
     with pytest.raises(StreamProtocolError, match="items"):
         _ = run_with_timeout(_stream(_text_stream_chunks()).final())
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
-    """Read a streamed request ID from the stream response."""
     assert _stream([], {"x-request-id": "req_stream"}).request_id() == "req_stream"
     assert _stream([]).request_id() is None
 
 
 def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_response() -> None:
-    """The rewrap carries the 200 status and the error's code, so `openai_request_failure` places it.
-
-    server_error is a transient code, so the mid-stream failure retries rather than failing the item.
-    """
+    """A 200 SSE error retains its provider code for request failure classification."""
     bare_api_error = openai.APIError(
         "provider mid-stream error",
         httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
@@ -1236,10 +1136,7 @@ def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_respo
     ids=["connection_error", "response_validation_error"],
 )
 def test_an_api_error_subclass_raised_mid_stream_propagates_untouched(error: Exception) -> None:
-    """Only the bare APIError is the SSE error payload. Every subclass keeps its own meaning.
-
-    APIResponseValidationError carries a 200 response like the rewrapped bare error, and still passes through.
-    """
+    """APIResponseValidationError carries a 200 response and must preserve its exception type."""
     with pytest.raises(type(error)) as raised:
         _ = _collected_items([_chunk(delta={"role": "assistant"}), error])
     assert raised.value is error
@@ -1248,7 +1145,6 @@ def test_an_api_error_subclass_raised_mid_stream_propagates_untouched(error: Exc
 def _request_body_sent[OutputT](
     bind: Callable[[OpenAIChatCompletionsAdapter], BoundAdapter[OutputT]],
 ) -> object:
-    """Open one stream through an offline transport and return the JSON body the SDK sent."""
     bodies: list[bytes] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -1269,10 +1165,6 @@ def _request_body_sent[OutputT](
 
 
 def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> None:
-    """stream=True is the request path and stream_options is what produces the trailing usage.
-
-    The request carries the binding's extra_body as it is when sent, and a text binding sends no response_format.
-    """
     extra_body = {"safety_identifier": "user-7"}
 
     def bind_then_edit_extra_body(
@@ -1292,7 +1184,6 @@ def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> N
 
 
 def test_structured_request_sends_the_non_strict_json_schema_response_format() -> None:
-    """The structured binding asks for the caller's model schema and validates the text itself."""
     assert _request_body_sent(
         lambda adapter: adapter.bind_structured(_binding(), _StructuredReport)
     ) == {
@@ -1312,10 +1203,6 @@ def test_structured_request_sends_the_non_strict_json_schema_response_format() -
 
 
 def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_field() -> None:
-    """as_json holds the binding's precomputed fields and this input's messages after the prefix.
-
-    An unstated temperature is absent from the request.
-    """
     request = (
         _adapter()
         .bind_text(_binding(system_prompt="sys"))
@@ -1331,42 +1218,28 @@ def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_fi
 
 
 def _conformance_message() -> dict[str, object]:
-    """Return an assistant message whose reasoning_content is the key the installed SDK does not name.
-
-    Replay preserves the extra reasoning_content key byte-for-byte.
-    """
     return {"content": "hey", "reasoning_content": "thought it over"}
 
 
 class TestOpenAIChatCompletionsConformance(AdapterConformance):
-    """The neutral invariants, over the Chat Completions adapter's own SDK objects."""
-
     @override
     def make_adapter(self) -> Adapter:
-        """Build the adapter these invariants run against, priced for the default tier alone."""
         return _adapter()
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a response whose prompt_tokens carries both a cache read and a cache write."""
         return _completion(usage=_usage_with_cache())
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a response whose usage field is absent, the runtime state a cut-off stream leaves."""
         return _completion(usage=None)
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at flex, which _PRICING states no rates for."""
         return _completion(usage=_usage_with_cache(), service_tier="flex")
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a response whose cache counters sum past prompt_tokens.
-
-        Excess cache counters make the derived uncached counter negative.
-        """
         return _completion(
             usage=_usage(prompt_tokens_details={"cached_tokens": 900, "cache_write_tokens": 200})
         )
@@ -1385,15 +1258,10 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return a response carrying reasoning_content beside its one text part."""
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
 
     @override
     def response_with_raw_part(self) -> BaseModel:
-        """Return message.content beside one custom message.tool_calls entry.
-
-        openai 3.0.0 defines both fields on ChatCompletionMessage.
-        """
         return _completion(
             usage=_usage_with_cache(),
             message={"content": "hello", "tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
@@ -1421,7 +1289,6 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return the same response as the snapshot ChatCompletionStreamState assembles and whole."""
         whole = _completion(usage=_usage_with_cache(), message=_conformance_message())
         state = ChatCompletionStreamState()
         for chunk in (
@@ -1440,10 +1307,8 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def stream_without_its_terminal_event(self) -> AdapterStream:
-        """Return a stream whose chunks end before any finish_reason."""
         return _stream([_chunk(delta={"role": "assistant", "content": "he"})])
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Return the shared OpenAI `RequestFailure` table."""
         return openai_sdk_errors_and_request_failures()

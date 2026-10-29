@@ -1,5 +1,3 @@
-"""Cover provider-neutral embedding execution, accounting, and output invariants."""
-
 import asyncio
 import logging
 import time
@@ -30,15 +28,14 @@ _COST_PER_REQUEST = _TOKENS_PER_REQUEST * _USD_PER_MILLION_TOKENS / 1_000_000
 
 
 class _ProviderError(Exception):
-    """Identify a transient provider failure."""
+    pass
 
 
 class _TransportError(Exception):
-    """Identify a transient transport failure."""
+    pass
 
 
 def _place_provider_and_transport_errors(error: Exception) -> RequestFailure:
-    """Place `_ProviderError` and `_TransportError` as transient, and every other exception as unknown_exception."""
     if isinstance(error, (_ProviderError, _TransportError)):
         return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
     return RequestFailure(kind="unknown_exception", pauses_quota=False, retry_after_seconds=None)
@@ -82,7 +79,7 @@ class _StubEmbeddingAdapter:
     ) -> tuple[tuple[str, ...], ...]:
         del task
         self.partition_calls += 1
-        return (tuple(inputs),)
+        return (inputs,)
 
     async def embed_batch(
         self,
@@ -115,7 +112,6 @@ class _PartitioningEmbeddingAdapter:
         fail_terminally: frozenset[str] = frozenset(),
         retry_after_seconds: float | None = None,
     ) -> None:
-        """Create one start and release event per input."""
         self.started = {input_text: asyncio.Event() for input_text in inputs}
         self.release = {input_text: asyncio.Event() for input_text in inputs}
         self.fail_once = fail_once
@@ -124,7 +120,6 @@ class _PartitioningEmbeddingAdapter:
         self.requests: Counter[str] = Counter()
 
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Retry every `_ProviderError` and `_TransportError` after `retry_after_seconds`."""
         request_failure = _place_provider_and_transport_errors(error)
         return RequestFailure(
             kind=request_failure.kind,
@@ -133,7 +128,7 @@ class _PartitioningEmbeddingAdapter:
         )
 
     async def prepare(self) -> None:
-        """Complete preparation without work."""
+        pass
 
     async def partition_inputs(
         self,
@@ -141,7 +136,6 @@ class _PartitioningEmbeddingAdapter:
         *,
         task: EmbeddingTask,
     ) -> tuple[tuple[str, ...], ...]:
-        """Return one ordered request batch per input."""
         del task
         return tuple((input_text,) for input_text in inputs)
 
@@ -151,7 +145,6 @@ class _PartitioningEmbeddingAdapter:
         *,
         task: EmbeddingTask,
     ) -> _EmbeddingBatchResponse:
-        """Wait for release, then fail as scripted or return the input's row."""
         del task
         input_text = inputs[0]
         self.requests[input_text] += 1
@@ -195,14 +188,12 @@ def _model(
 
 
 def _embedding_error(model: EmbeddingModel, inputs: list[str]) -> EmbeddingError:
-    """Return the `EmbeddingError` that embedding `inputs` raises."""
     with pytest.raises(EmbeddingError) as caught:
         _ = run_with_timeout(model.embed(inputs, task="classification"))
     return caught.value
 
 
 def test_embed_returns_owned_float32_rows_and_priced_usage() -> None:
-    """Output preserves row order and owns writable storage, and its request is priced."""
     adapter = _StubEmbeddingAdapter([np.array([[0.6, 0.8], [0.0, 1.0]], dtype=np.float32)])
 
     embeddings = run_with_timeout(_model(adapter).embed(["first", "second"], task="clustering"))
@@ -224,7 +215,6 @@ def test_embed_returns_owned_float32_rows_and_priced_usage() -> None:
 
 
 def test_empty_input_returns_without_adapter_work() -> None:
-    """Empty input returns the required empty matrix and zero usage immediately."""
     adapter = _StubEmbeddingAdapter([])
 
     embeddings = run_with_timeout(_model(adapter).embed([], task="retrieval_document"))
@@ -240,7 +230,6 @@ def test_empty_input_returns_without_adapter_work() -> None:
 
 @pytest.mark.parametrize("max_requests", [True, False, 0, -1])
 def test_embedding_model_rejects_invalid_max_requests(max_requests: int) -> None:
-    """Invalid retry budgets fail during model construction."""
     with pytest.raises(ValueError, match="max_requests"):
         _ = _model(_StubEmbeddingAdapter([]), max_requests=max_requests)
 
@@ -259,14 +248,12 @@ def test_embedding_model_rejects_invalid_max_requests(max_requests: int) -> None
 def test_output_validation_rejects_invalid_matrices(
     values: Sequence[Sequence[float]],
 ) -> None:
-    """Invalid provider matrices raise one output exception type that keeps the reported token count."""
     with pytest.raises(EmbeddingOutputError) as caught:
         _ = _validated_embeddings(values, expected_rows=2, dimension=2, input_tokens_total=5)
     assert caught.value.input_tokens_total == 5
 
 
 def test_a_transient_failure_retries_and_records_both_requests() -> None:
-    """A failure the adapter places as transient retries, and the failed request stays in the history."""
     adapter = _StubEmbeddingAdapter([
         _ProviderError("provider"),
         np.array([[1.0, 0.0]], dtype=np.float32),
@@ -289,7 +276,6 @@ def test_a_transient_failure_retries_and_records_both_requests() -> None:
 def test_an_observer_that_raises_never_changes_what_embed_returns(
     *, raise_at_start: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """langchaint logs every observer failure, and `embed` retries and returns as it does unobserved."""
     adapter = _StubEmbeddingAdapter([
         _ProviderError("provider"),
         np.array([[1.0, 0.0]], dtype=np.float32),
@@ -349,7 +335,6 @@ def test_a_retry_after_sets_the_minimum_private_wait() -> None:
 def test_a_terminal_failure_raises_its_kind_without_a_retry(
     request_failure: RequestFailure, error_kind: str
 ) -> None:
-    """A failure that is not transient ends `embed` after one request, with the provider exception as the cause."""
     failure = _ProviderError("provider text")
     adapter = _StubEmbeddingAdapter([failure], request_failure=lambda _error: request_failure)
 
@@ -366,7 +351,6 @@ def test_a_terminal_failure_raises_its_kind_without_a_retry(
 
 
 def test_exhausted_retries_keep_the_final_exception() -> None:
-    """Retry exhaustion raises `retries_exhausted_error` caused by the final exception."""
     final = _TransportError("final")
     adapter = _StubEmbeddingAdapter([_TransportError("first"), final])
 
@@ -378,7 +362,6 @@ def test_exhausted_retries_keep_the_final_exception() -> None:
 
 
 def test_invalid_output_keeps_the_billed_token_count() -> None:
-    """A response with unusable vectors ends `embed` without a retry, and its reported tokens stay billed."""
     failure = EmbeddingOutputError("bad vectors", input_tokens_total=_TOKENS_PER_REQUEST)
     adapter = _StubEmbeddingAdapter([failure, np.array([[1.0, 0.0]], dtype=np.float32)])
 
@@ -393,10 +376,7 @@ def test_invalid_output_keeps_the_billed_token_count() -> None:
 
 
 def test_a_failed_batch_lets_sent_requests_finish_and_starts_no_more() -> None:
-    """After one batch fails, a sibling already sent keeps its billing, and an unsent batch never starts.
-
-    The `SharedBackoff` admits two requests at once, so the third batch waits for a permit.
-    """
+    """The `SharedBackoff` admits two requests at once, so the third batch waits for a permit."""
 
     async def scenario() -> EmbeddingError:
         adapter = _PartitioningEmbeddingAdapter(
@@ -425,10 +405,7 @@ def test_a_failed_batch_lets_sent_requests_finish_and_starts_no_more() -> None:
 
 
 def test_a_failed_batch_ends_a_sibling_retry_wait() -> None:
-    """A batch waiting to retry stops waiting when a sibling fails, so `embed` raises without the full wait.
-
-    The 60-second retry wait exceeds the test timeout, so the test fails if the wait runs out.
-    """
+    """The 60-second retry wait exceeds the test timeout, so the test fails if the wait runs out."""
 
     async def scenario() -> EmbeddingError:
         adapter = _PartitioningEmbeddingAdapter(
@@ -457,8 +434,6 @@ def test_a_failed_batch_ends_a_sibling_retry_wait() -> None:
 
 
 def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
-    """Concurrent completion order cannot change returned row order."""
-
     async def scenario() -> None:
         adapter = _PartitioningEmbeddingAdapter(["first", "second"])
         embed_task = asyncio.create_task(
@@ -477,8 +452,6 @@ def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
 
 
 def test_retrying_one_request_batch_does_not_repeat_its_sibling() -> None:
-    """Only the failed request batch sends another request."""
-
     async def scenario() -> None:
         adapter = _PartitioningEmbeddingAdapter(
             ["first", "second"], fail_once=frozenset({"first"})

@@ -89,23 +89,18 @@ OPENAI_EMBEDDING_LITELLM_KEYS = (
     "text-embedding-3-large",
     "text-embedding-ada-002",
 )
-"""LiteLLM keys of the cataloged OpenAI embedding models, each equal to its model id.
-
-The generator emits `OpenAIEmbeddingModelId` from them.
-"""
+"""Cataloged OpenAI embedding model ids, which match their LiteLLM keys."""
 COHERE_BEDROCK_EMBED_V4_LITELLM_KEYS = ("cohere.embed-v4:0",)
-"""LiteLLM keys of the cataloged Cohere Embed v4 models on Bedrock, each equal to its model id.
+"""Cataloged Cohere Embed v4 model ids on Bedrock, which match their LiteLLM keys.
 
-The generator emits `CohereEmbedV4ModelId` from them.
 These models accept `dimension`.
 """
 COHERE_BEDROCK_EMBED_V3_LITELLM_KEYS = (
     "cohere.embed-english-v3",
     "cohere.embed-multilingual-v3",
 )
-"""LiteLLM keys of the cataloged Cohere Embed v3 models on Bedrock, each equal to its model id.
+"""Cataloged Cohere Embed v3 model ids on Bedrock, which match their LiteLLM keys.
 
-The generator emits `CohereEmbedV3ModelId` from them.
 These models accept no `dimension`.
 """
 _PRICE_FIELD = re.compile(r"cost|multiplier")
@@ -196,8 +191,7 @@ class _SearchContextCost(BaseModel):
     """LiteLLM's web search prices per call, one per search context size.
 
     Validation rejects a listed price that is not a finite nonnegative number.
-    Unknown fields are kept so the snapshot reproduces the upstream entry, which is why this model
-    does not inherit `CheckedCopyModel`.
+    Keep unknown fields so the snapshot reproduces the upstream entry.
     """
 
     model_config = ConfigDict(extra="allow", frozen=True)
@@ -210,11 +204,9 @@ class _SearchContextCost(BaseModel):
 class _LiteLLMEntry(BaseModel):
     """One selected LiteLLM model entry.
 
-    Validation rejects a listed rate that is not a finite nonnegative number, and a listed
-    multiplier that is not finite and positive, before any module renders it.
+    Validation requires finite nonnegative rates and finite positive multipliers before rendering.
     A value that is absent or `null` upstream is unlisted.
-    Unknown fields are kept so the snapshot reproduces the upstream entry, which is why this model
-    does not inherit `CheckedCopyModel`.
+    Keep unknown fields so the snapshot reproduces the upstream entry.
     """
 
     model_config = ConfigDict(extra="allow", frozen=True)
@@ -376,53 +368,37 @@ class _LiteLLMEntry(BaseModel):
         """Collect the OpenAI token rates of one tier without requiring any of them."""
         match tier:
             case "default":
-                return _OpenAIRateFields(
-                    input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token),
-                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token),
-                    input_tokens_cache_read_usd_per_token=_decimal(
-                        self.cache_read_input_token_cost
-                    ),
-                    input_tokens_cache_write_usd_per_token=_decimal(
-                        self.cache_creation_input_token_cost
-                    ),
-                )
+                input_tokens_cache_none_usd_per_token = self.input_cost_per_token
+                output_tokens_usd_per_token = self.output_cost_per_token
+                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost
+                input_tokens_cache_write_usd_per_token = self.cache_creation_input_token_cost
             case "flex":
-                return _OpenAIRateFields(
-                    input_tokens_cache_none_usd_per_token=_decimal(self.input_cost_per_token_flex),
-                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_flex),
-                    input_tokens_cache_read_usd_per_token=_decimal(
-                        self.cache_read_input_token_cost_flex
-                    ),
-                    input_tokens_cache_write_usd_per_token=_decimal(
-                        self.cache_creation_input_token_cost_flex
-                    ),
-                )
+                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_flex
+                output_tokens_usd_per_token = self.output_cost_per_token_flex
+                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_flex
+                input_tokens_cache_write_usd_per_token = self.cache_creation_input_token_cost_flex
             case "priority":
-                return _OpenAIRateFields(
-                    input_tokens_cache_none_usd_per_token=_decimal(
-                        self.input_cost_per_token_priority
-                    ),
-                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_priority),
-                    input_tokens_cache_read_usd_per_token=_decimal(
-                        self.cache_read_input_token_cost_priority
-                    ),
-                    input_tokens_cache_write_usd_per_token=_decimal(
-                        self.cache_creation_input_token_cost_priority
-                    ),
+                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_priority
+                output_tokens_usd_per_token = self.output_cost_per_token_priority
+                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_priority
+                input_tokens_cache_write_usd_per_token = (
+                    self.cache_creation_input_token_cost_priority
                 )
             case "ultrafast":
-                return _OpenAIRateFields(
-                    input_tokens_cache_none_usd_per_token=_decimal(
-                        self.input_cost_per_token_ultrafast
-                    ),
-                    output_tokens_usd_per_token=_decimal(self.output_cost_per_token_ultrafast),
-                    input_tokens_cache_read_usd_per_token=_decimal(
-                        self.cache_read_input_token_cost_ultrafast
-                    ),
-                    input_tokens_cache_write_usd_per_token=_decimal(
-                        self.cache_creation_input_token_cost_ultrafast
-                    ),
+                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_ultrafast
+                output_tokens_usd_per_token = self.output_cost_per_token_ultrafast
+                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_ultrafast
+                input_tokens_cache_write_usd_per_token = (
+                    self.cache_creation_input_token_cost_ultrafast
                 )
+        return _OpenAIRateFields(
+            input_tokens_cache_none_usd_per_token=_decimal(input_tokens_cache_none_usd_per_token),
+            output_tokens_usd_per_token=_decimal(output_tokens_usd_per_token),
+            input_tokens_cache_read_usd_per_token=_decimal(input_tokens_cache_read_usd_per_token),
+            input_tokens_cache_write_usd_per_token=_decimal(
+                input_tokens_cache_write_usd_per_token
+            ),
+        )
 
     def long_context_fields(self, rendered_tiers: frozenset[str]) -> _LongContextFields | None:
         """Read the long-context pricing of the default tier and `rendered_tiers`.
@@ -476,11 +452,7 @@ class _LiteLLMEntry(BaseModel):
 
 
 class _MetadataValue(CheckedCopyModel):
-    """The source of one provider-documented value.
-
-    Validation rejects a source that is not https and a verification date that is not a calendar
-    date.
-    """
+    """The HTTPS source URL and verification date of one provider-documented value."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -489,13 +461,13 @@ class _MetadataValue(CheckedCopyModel):
 
 
 class _MetadataRate(_MetadataValue):
-    """One provider-documented rate; validation rejects a value that is not finite and nonnegative."""
+    """One provider-documented finite nonnegative rate."""
 
-    value: Annotated[StrictInt | StrictFloat, Field(ge=0, allow_inf_nan=False)]
+    value: _Rate
 
 
 class _MetadataMultiplier(_MetadataValue):
-    """One provider-documented multiplier; validation rejects a value that is not finite and positive."""
+    """One provider-documented finite positive multiplier."""
 
     value: _Multiplier
 
@@ -517,11 +489,7 @@ class _OpenAIMetadata(CheckedCopyModel):
 
 
 class _ProviderMetadata(CheckedCopyModel):
-    """The vendored provider documentation values.
-
-    Validation rejects a missing or misspelled value so a generated module never silently omits
-    one.
-    """
+    """The vendored provider documentation values required by the generated modules."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -530,11 +498,7 @@ class _ProviderMetadata(CheckedCopyModel):
 
 
 class _GitHubCommit(BaseModel):
-    """The GitHub commit response field the refresh reads.
-
-    The response carries many other fields, so this model ignores extras and does not inherit
-    `CheckedCopyModel`.
-    """
+    """The GitHub commit SHA used to fetch one revision of the pricing data."""
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -542,11 +506,7 @@ class _GitHubCommit(BaseModel):
 
 
 class _LiteLLMModelKind(BaseModel):
-    """The LiteLLM entry fields that, with the entry's key, decide whether new-model detection reports an entry.
-
-    Entries carry many other fields, so this model ignores extras and does not inherit
-    `CheckedCopyModel`.
-    """
+    """The provider and mode used to report untracked LiteLLM model keys."""
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -1029,7 +989,8 @@ def _cross_region_multiplier(
         return float("nan")
     if len(ratios) != 1:
         raise ValueError(f"{prefix} has no single cross-region multiplier: {sorted(ratios)}")
-    return float(ratios.pop())
+    (ratio,) = ratios
+    return float(ratio)
 
 
 def _cross_region_multiplier_lines(

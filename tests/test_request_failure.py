@@ -40,7 +40,6 @@ _CASES = {
 
 @pytest.mark.parametrize("case", _CASES.values(), ids=_CASES.keys())
 def test_request_failure_of(case: _Case) -> None:
-    """The neutral exceptions state their own failure, and the adapter maps every other exception."""
     mapped: list[Exception] = []
 
     def adapter_request_failure(error: Exception) -> RequestFailure:

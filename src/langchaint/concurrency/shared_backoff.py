@@ -1,9 +1,4 @@
-"""Paced request admission for one rate-limit quota.
-
-`SharedBackoff.admitted` applies concurrency, request-rate, queue-order, and shared-pause constraints.
-The caller maps each failed request to a `RequestFailure` and passes it to `Admission.record`.
-A `RequestFailure` with `pauses_quota` pauses the quota, and any other leaves shared state unchanged.
-"""
+"""Paced request admission for one rate-limit quota."""
 
 import asyncio
 import logging
@@ -28,12 +23,11 @@ _NEVER = float("-inf")
 
 
 def _random_up_to(ceiling: float, draw: float) -> float:
-    """Map `draw` from `[0, 1)` to a wait greater than zero and no larger than ceiling.
+    """Map `draw` from `[0, 1)` to a wait between the smallest positive float and `ceiling`.
 
-    Callers pass `random.random()` as `draw`.
-    `1 - draw` lies in `(0, 1]`, so the wait is never zero.
+    Callers pass `random.random()` as `draw` and a positive finite `ceiling`.
     """
-    return ceiling * (1.0 - draw)
+    return max(math.ulp(0.0), ceiling * (1.0 - draw))
 
 
 def _validated_positive_float(name: str, value: float) -> float:
@@ -126,6 +120,7 @@ class Admission:
 class SharedBackoff:
     """Coordinate request starts for one rate-limit quota.
 
+    Apply concurrency, request-start rate, and shared-pause constraints in queue order.
     Run each complete provider request inside `admitted`.
     Pass each failed request's `RequestFailure` to `Admission.record` inside that block.
     Provider pushback then updates shared state.
@@ -143,21 +138,18 @@ class SharedBackoff:
         quiet_seconds_per_decay_step: float = 60.0,
         max_request_starts_per_second: float = 50.0,
     ) -> None:
-        """Validate configuration. Initialize an unpaused `SharedBackoff`.
-
-        `max_concurrent_requests=None` applies no concurrency limit.
-        `max_wait_seconds` caps generated waits and `retry_after_seconds`.
+        """Validate configuration and initialize an unpaused quota.
 
         Args:
-            max_concurrent_requests: The request concurrency limit, or `None`.
-            min_wait_ceiling_seconds: The minimum private wait ceiling in seconds.
+            max_concurrent_requests: The request concurrency limit, or `None` for no limit.
+            min_wait_ceiling_seconds: The minimum wait ceiling in seconds.
             max_wait_seconds: The maximum generated or provider-specified wait in seconds.
             wait_multiplier: The factor that grows or shrinks the wait ceiling.
             quiet_seconds_per_decay_step: The quiet interval that shrinks the wait ceiling once.
             max_request_starts_per_second: The request-start rate limit.
 
         Raises:
-            ValueError: A numeric setting is boolean, non-finite, or non-positive.
+            ValueError: A numeric setting is boolean, non-finite, non-positive, or cannot convert to float.
             ValueError: `1 / max_request_starts_per_second` is non-finite.
             ValueError: `max_wait_seconds / min_wait_ceiling_seconds` is non-finite.
             ValueError: `wait_multiplier` is at most one.
@@ -207,11 +199,9 @@ class SharedBackoff:
             )
         self._max_concurrent_requests = max_concurrent_requests
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
-        """Quiet steps after which the ceiling has reached the floor, whatever it started at.
+        """Quiet steps that reduce every valid ceiling to min_wait_ceiling_seconds.
 
-        This bounds the decay exponent because the ceiling never exceeds max_wait_seconds.
-        Afterward, the answer is min_wait_ceiling_seconds.
-        For fewer steps, wait_multiplier ** steps cannot exceed the checked ceiling ratio.
+        For fewer quiet steps, wait_multiplier ** steps cannot exceed the checked ceiling ratio.
         """
         self._pause_until = _NEVER
         self._pause_started_at = _NEVER
@@ -244,10 +234,7 @@ class SharedBackoff:
 
     @property
     def max_concurrent_requests(self) -> int | None:
-        """The number of requests allowed inside admitted() blocks at once, or None for no bound.
-
-        `__init__` validates and fixes this value, so the property is read-only.
-        """
+        """The number of requests allowed inside admitted() blocks at once, or None for no bound."""
         return self._max_concurrent_requests
 
     def admitted(self, *, budget_seconds: float | None = None) -> Admission:
@@ -260,7 +247,7 @@ class SharedBackoff:
             budget_seconds: The admission wait budget in seconds, or `None`.
 
         Raises:
-            ValueError: `budget_seconds` is boolean, non-finite, or non-positive.
+            ValueError: `budget_seconds` is boolean, non-finite, non-positive, or cannot convert to float.
         """
         validated_budget_seconds = (
             None
@@ -361,52 +348,33 @@ class SharedBackoff:
         `Admission.record` calls this inside its block.
         `StreamHandle` also calls it for a failure that may arrive after its drained stream returned the permit.
         """
-        normalized = self._normalized(request_failure)
-        self._record(normalized)
-        return normalized
-
-    def _normalized(self, request_failure: RequestFailure) -> RequestFailure:
-        """Return the failure with retry_after_seconds validated and capped at max_wait_seconds.
-
-        Runs before `_record` or the retry loop reads the failure.
-        Both therefore use the same normalized value.
-        A negative `retry_after_seconds` creates a past pause end.
-        A NaN bypasses the cap and corrupts quiet-step arithmetic.
-        """
-        if request_failure.retry_after_seconds is None:
-            return request_failure
-        return replace(
-            request_failure,
-            retry_after_seconds=self._normalized_retry_after_seconds(
-                request_failure.retry_after_seconds
-            ),
-        )
+        if request_failure.retry_after_seconds is not None:
+            request_failure = replace(
+                request_failure,
+                retry_after_seconds=self._normalized_retry_after_seconds(
+                    request_failure.retry_after_seconds
+                ),
+            )
+        self._record(request_failure)
+        return request_failure
 
     def _normalized_retry_after_seconds(self, stated: float) -> float | None:
         """Return a valid `retry_after_seconds` capped at `max_wait_seconds`, or None.
 
         Accept exactly `int` or `float`, excluding `bool`.
-        Count other values and return `None`.
-        Check integers before `math.isfinite` so huge integers cap without `OverflowError`.
+        Check finiteness only for floats so huge integers cap without `OverflowError`.
         """
-        if type(stated) is int:
-            if stated <= 0:
-                self._count_correction("retry_after_invalid")
-                return None
-            if stated > self.max_wait_seconds:
-                self._count_correction("retry_after_over_cap")
-                return self.max_wait_seconds
-            return float(stated)
-        if type(stated) is float:
-            if not math.isfinite(stated) or stated <= 0.0:
-                self._count_correction("retry_after_invalid")
-                return None
-            if stated > self.max_wait_seconds:
-                self._count_correction("retry_after_over_cap")
-                return self.max_wait_seconds
-            return stated
-        self._count_correction("retry_after_invalid")
-        return None
+        if (
+            type(stated) not in (int, float)
+            or stated <= 0
+            or (type(stated) is float and not math.isfinite(stated))
+        ):
+            self._count_correction("retry_after_invalid")
+            return None
+        if stated > self.max_wait_seconds:
+            self._count_correction("retry_after_over_cap")
+            return self.max_wait_seconds
+        return float(stated)
 
     def _count_correction(self, tag: str) -> None:
         """Count and log one wrapper correction."""
@@ -455,10 +423,7 @@ class SharedBackoff:
         )
 
     def _chosen_wait(self, request_failure: RequestFailure) -> float:
-        """Return how long this report proposes to pause.
-
-        Test `is None` because `retry_after_seconds` presence determines the branch.
-        """
+        """Return the provider-specified wait or draw under the current ceiling."""
         if request_failure.retry_after_seconds is not None:
             return request_failure.retry_after_seconds
         return _random_up_to(self._wait_ceiling, random.random())

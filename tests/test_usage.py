@@ -24,7 +24,6 @@ def _usage(
     output_cost: float = 0.0,
     provider_executed_tool_cost: float = 0.0,
 ) -> Usage:
-    """Build a Usage from the fields a test cares about, defaulting the rest to zero."""
     return Usage(
         input_tokens_cache_read=cache_read,
         input_tokens_cache_write=cache_write,
@@ -40,7 +39,6 @@ def _usage(
 
 
 def test_a_sum_containing_a_nan_cost_is_nan() -> None:
-    """One unpriceable response makes the batch total NaN, not a silently low number."""
     total = Usage.sum_of([
         _usage(output=40, output_cost=0.25),
         _usage(output=10, output_cost=float("nan")),
@@ -50,7 +48,6 @@ def test_a_sum_containing_a_nan_cost_is_nan() -> None:
 
 
 def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
-    """Every counter and every category cost folds on its own, over a batch of more than two."""
     first = _usage(
         cache_read=1,
         cache_write=2,
@@ -102,5 +99,4 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
 
 
 def test_sum_of_empty_is_zero_usage() -> None:
-    """Usage.sum_of over an empty iterable returns ZERO_USAGE."""
     assert Usage.sum_of([]) == ZERO_USAGE

@@ -7,7 +7,6 @@ from langchaint.common.checked_copy import CheckedCopyModel
 
 
 def test_a_subclass_defining_its_own_init_is_rejected() -> None:
-    """CheckedCopyModel rejects subclasses with a custom __init__."""
     with pytest.raises(TypeError, match="custom_init"):
 
         class CustomInitModel(CheckedCopyModel):
@@ -28,7 +27,6 @@ def test_a_subclass_defining_its_own_init_is_rejected() -> None:
 
 
 def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> None:
-    """CheckedCopyModel rejects extra="allow"."""
     with pytest.raises(TypeError, match="extra='allow'"):
 
         class ExtraAllowModel(CheckedCopyModel):
@@ -36,7 +34,6 @@ def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> Non
 
 
 def test_a_subclass_leaving_extra_unset_is_rejected_at_class_definition() -> None:
-    """CheckedCopyModel rejects pydantic's default extra behavior."""
     with pytest.raises(TypeError, match="no extra"):
 
         class DefaultExtraModel(CheckedCopyModel):
@@ -44,7 +41,6 @@ def test_a_subclass_leaving_extra_unset_is_rejected_at_class_definition() -> Non
 
 
 def test_a_subclass_setting_extra_ignore_is_rejected_at_class_definition() -> None:
-    """CheckedCopyModel rejects extra="ignore"."""
     with pytest.raises(TypeError, match="extra='ignore'"):
 
         class ExtraIgnoreModel(CheckedCopyModel):
@@ -52,7 +48,6 @@ def test_a_subclass_setting_extra_ignore_is_rejected_at_class_definition() -> No
 
 
 def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it() -> None:
-    """A subclass may inherit extra="forbid" from its base."""
 
     class Base(CheckedCopyModel):
         model_config = ConfigDict(extra="forbid")

@@ -1,9 +1,4 @@
-"""Provider-neutral `LLM` construction and binding.
-
-`LLM.bind` freezes a prompt prefix and returns `BoundLLM`.
-Each request runs inside `SharedBackoff.admitted`.
-A failed request's `RequestFailure` decides whether it retries and whether its rate-limit quota pauses.
-"""
+"""Provider-neutral LLM binding, request admission, retries, and batch generation."""
 
 import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -98,10 +93,9 @@ type GenerationInput = str | Sequence[Message]
 
 
 class Deadline(Protocol):
-    """The scope one input's requests run inside, told when a request waits to be admitted and when it is.
+    """Control whether request admission waits consume an input's deadline.
 
     Admission waits include the `SharedBackoff` permit and admission queue.
-    Implementations differ only in whether that wait counts against the input.
     """
 
     @property
@@ -110,24 +104,19 @@ class Deadline(Protocol):
         ...
 
     def suspend_until_admitted(self) -> None:
-        """Answer a request about to wait for admission."""
+        """Pause the deadline before waiting for admission, if admission time is excluded."""
         ...
 
     def resume_on_admission(self) -> None:
-        """Answer a request now admitted, free to be sent."""
+        """Resume the deadline upon admission."""
         ...
 
 
 class WallClockDeadline:
-    """A deadline that runs from construction to the outcome, whatever the input waits on.
-
-    `timeout_seconds` includes admission waits.
-    """
+    """Run the deadline from construction through the outcome, including admission waits."""
 
     def __init__(self, timeout_seconds: float | None) -> None:
-        """Create the scope.
-
-        `None` disables expiration.
+        """Set the wall-clock budget.
 
         Args:
             timeout_seconds: The wall-clock budget in seconds, or `None`.
@@ -142,10 +131,7 @@ class WallClockDeadline:
 
 
 class WorkingTimeDeadline:
-    """A deadline that stops while a request waits to be admitted and runs the rest of the time.
-
-    `max_working_seconds_per_input` selects this deadline.
-    """
+    """Run the deadline from first admission, excluding subsequent admission waits."""
 
     def __init__(self, max_working_seconds: float | None) -> None:
         """Create a scope without expiration.
@@ -157,7 +143,7 @@ class WorkingTimeDeadline:
         self._seconds_left = max_working_seconds
 
     def suspend_until_admitted(self) -> None:
-        """Stop the clock, banking what is left for the resume that follows."""
+        """Preserve the remaining budget while admission waits."""
         if self._seconds_left is None:
             return
         expires_at = self.scope.when()
@@ -166,7 +152,7 @@ class WorkingTimeDeadline:
         self.scope.reschedule(None)
 
     def resume_on_admission(self) -> None:
-        """Start the clock again with what is banked, which on the first request is the budget."""
+        """Resume the remaining budget upon admission."""
         if self._seconds_left is None:
             return
         self.scope.reschedule(asyncio.get_running_loop().time() + self._seconds_left)
@@ -208,12 +194,6 @@ def _build_binding(
     automatic_cache_breakpoints: bool,
     extra_body: Mapping[str, object] | None,
 ) -> Binding:
-    """Convert bind arguments to the frozen Binding.
-
-    Raises:
-        ValueError: system_prompt is an empty sequence of parts; pass None to bind no system prompt.
-        ValueError: `tool_choice` contains a name absent from `tool_schemas`.
-    """
     if system_prompt is not None and not isinstance(system_prompt, str):
         if not system_prompt:
             raise ValueError(
@@ -249,13 +229,6 @@ def _bind_adapter(
 def _bind_adapter(
     adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
 ) -> BoundAdapter[str | None] | BoundAdapter[BaseModel | None]:
-    """Bind `adapter` to `binding` for `response_format` output.
-
-    The third overload accepts a `type[OutputT]` from inside `BoundLLM`, which matches neither of the first two.
-
-    Raises:
-        TypeError: `response_format` is a proper subclass of `str`.
-    """
     if response_format is str:
         return adapter.bind_text(binding)
     if not issubclass(response_format, BaseModel):
@@ -268,11 +241,6 @@ def _bind_adapter(
 def _resolve_tool_manager(
     tools: ToolManager | ToolSequence | None, *, observer: Observer | None
 ) -> ToolManager | None:
-    """Build a `ToolManager` with `observer` from a tool sequence, and return any other value unchanged.
-
-    Raises:
-        ValueError: A `tools` sequence contains duplicate names.
-    """
     if isinstance(tools, ToolManager) or tools is None:
         return tools
     return ToolManager(tools, observer=observer)
@@ -288,15 +256,13 @@ class LLM:
         shared_backoff: SharedBackoff | None = None,
         observer: Observer | None = None,
     ) -> None:
-        """Store the shared pieces.
+        """Store the adapter, request admission state, and observer.
 
-        `shared_backoff=None` creates a `SharedBackoff` with its defaults.
-        Pass one instance to every `LLM` sharing a rate-limit quota.
-        Every binding and stream of this `LLM` reports to `observer`.
+        Share `shared_backoff` across every `LLM` using one rate-limit quota.
 
         Args:
             adapter: The provider SDK adapter.
-            shared_backoff: The request admission state, or `None` to create one.
+            shared_backoff: The request admission state, or `None` to create one with default settings.
             observer: The observer that follows every input and tool dispatch, or `None` to follow none.
         """
         self.adapter: Adapter = adapter
@@ -459,10 +425,9 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     """A frozen prompt prefix with generation and streaming methods.
 
     `OutputT` is the `response_format` type: `str`, or the pydantic model that validates structured output.
-    `BoundLLM` is covariant in both type parameters.
-    So a `BoundLLM[Answer, ToolManager]` is also a `BoundLLM[BaseModel, ToolManager | None]`.
-    A binding with `ToolManager` returns `ToolCallGeneration` when the kept assistant message has tool calls.
-    A `ToolCallGeneration` has `OutputT | None` output, `None` when its kept assistant message gives no output.
+    Both type parameters are covariant.
+    `BoundLLM[Answer, ToolManager]` satisfies `BoundLLM[BaseModel, ToolManager | None]`.
+    With a `ToolManager`, tool calls produce `ToolCallGeneration` whose output is `None` when no output exists.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
@@ -495,9 +460,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         """
         if isinstance(max_requests, bool) or max_requests < 1:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
-        # Every attribute is `Final`, so a `BoundLLM` keeps the configuration it was bound with.
-        # `Final` also keeps `BoundLLM` sound when widened, as in `BoundLLM[BaseModel]`.
-        # Without it, a widened view could assign a wider value to an attribute typed with a type parameter.
+        # Final attributes keep both type parameters covariant.
         self.adapter: Final[Adapter] = adapter
         self.binding: Final[Binding] = binding
         self.response_format: Final[type[OutputT]] = response_format
@@ -519,12 +482,11 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     def config_fingerprint(self) -> str:
         """Return a SHA-256 fingerprint of the current stored request configuration.
 
-        The fingerprint captures adapter and response-format configuration during binding.
-        The fingerprint includes the binding.
-        The fingerprint excludes per-input messages, retry configuration, and admission configuration.
-        The fingerprint excludes pricing, credentials, SDK client state, and tool functions.
-        It identifies stored configuration, not semantic or provider-wire equivalence.
-        Each fingerprint reads current values referenced by `Binding`.
+        `BoundLLM` captures adapter and response-format configuration during binding.
+        Each call reads current `Binding` values.
+        It excludes per-input messages, retry and admission configuration, pricing, and credentials.
+        It also excludes SDK client state and tool functions.
+        It identifies stored configuration without establishing semantic or provider-wire equivalence.
 
         Mapping insertion order does not affect the fingerprint. Sequence order and container types do.
         Class identity uses `__module__` and `__qualname__`.
@@ -847,11 +809,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     def _staged_interpretation(
         self, raw: BaseModel, *, request_id: str | None, ledger: _RequestLedger
     ) -> ResponseOutcome[OutputT | None]:
-        """Stage an arrived response with its billing, then read what it produced.
-
-        Raises:
-            Exception: whatever interpret raises, for `Adapter.request_failure` to place.
-        """
         ledger.stage_response(
             raw=raw,
             provider_billing=self._bound_adapter.billing_from_raw(raw),
@@ -866,16 +823,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         ledger: _RequestLedger,
         deadline: Deadline,
     ) -> Generation[OutputT]:
-        """Send requests for one input under `deadline` and record each outcome.
-
-        Raises:
-            GenerationError: The adapter returns `RejectedMessages`.
-                The provider declares a terminal failure.
-                The adapter cannot place an exception.
-                The completed response is not usable and is not retried.
-                Transient failures consume `max_requests`.
-                `deadline` expires.
-        """
         timeout_scope = deadline.scope
         try:
             async with timeout_scope:
@@ -892,11 +839,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     async def _request_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _RequestLedger, deadline: Deadline
     ) -> Generation[OutputT]:
-        """Retry transient failures until a request ends otherwise or `max_requests` is reached.
-
-        Raises:
-            GenerationError: Handling the input reaches a terminal failure.
-        """
         request_params = self._request_params_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
         last_failure: Exception | None = None
@@ -986,11 +928,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     def _request_params_for_messages(
         self, messages: Sequence[Message], *, ledger: _RequestLedger
     ) -> RequestParams:
-        """Build the request params for `messages`.
-
-        Raises:
-            GenerationError: The adapter returns `RejectedMessages`, so no request is sent.
-        """
         built = self._bound_adapter.build_request_params(messages)
         if isinstance(built, RejectedMessages):
             raise GenerationError(
@@ -1040,12 +977,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     async def _generate_one_any_binding(
         self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> Generation[OutputT]:
-        """Handle one observed input at the widest output type and record escaped `Exception` values.
-
-        Raises:
-            GenerationError: Generation fails or an escaped `Exception` becomes `GenerationError`.
-            BaseException: A non-`Exception` value interrupts handling the input.
-        """
         messages = _as_messages(generation_input)
         operation = self._generation_started(messages, stream=False)
         try:
@@ -1065,12 +996,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     async def _generate_with_escapes_recorded(
         self, messages: Sequence[Message], *, deadline: Deadline
     ) -> Generation[OutputT]:
-        """Handle one input and convert an escaped `Exception` to `GenerationError`.
-
-        Raises:
-            GenerationError: Generation fails or an escaped `Exception` becomes `GenerationError`.
-            BaseException: A non-`Exception` value interrupts handling the input.
-        """
         ledger = _RequestLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
             return await self._generate_with_retries(messages, ledger=ledger, deadline=deadline)
@@ -1082,10 +1007,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     def _generation_started(
         self, messages: Sequence[Message], *, stream: bool
     ) -> ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]:
-        """Start following one input with the observer, or return a handle that records nothing.
-
-        The returned handle logs the observer's failures, so none reaches the caller.
-        """
         if self.observer is None:
             return UNOBSERVED_OPERATION
         start = GenerationStart(
@@ -1101,11 +1022,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     async def _generate_one_or_failure(
         self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> GenerationOutcome[OutputT]:
-        """Return one batch item as a `Generation` or `GenerationError`.
-
-        Raises:
-            BaseException: A non-`Exception` value interrupts handling the input.
-        """
         try:
             return await self._generate_one_any_binding(generation_input, deadline=deadline)
         except GenerationError as failure:

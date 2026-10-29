@@ -172,8 +172,6 @@ class _EchoArgs(BaseModel):
 
 
 def _tool_schemas() -> tuple[ToolSchema, ...]:
-    """Return the schemas of one tool named get_weather."""
-
     async def function(args: _EchoArgs) -> str:
         """Return the city unchanged. Never called in these tests."""
         return args.city
@@ -225,7 +223,6 @@ def _binding(
     extra_body: Mapping[str, object] | None = None,
     temperature: float | None = None,
 ) -> Binding:
-    """Assemble a binding with the fields these request tests vary."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
@@ -255,7 +252,6 @@ _UNSET_BINDING = Binding(
 
 
 def _precomputed_with_provider_executed_tools(*tool_types: str) -> _AnthropicProviderExecutedTools:
-    """Validate provider-executed tools of the given types under the default adapter."""
     return (
         _adapter()
         ._precompute_fields(
@@ -271,7 +267,6 @@ def _precomputed_with_provider_executed_tools(*tool_types: str) -> _AnthropicPro
 
 
 def test_billing_partitions_and_prices_complete_usage() -> None:
-    """Expose one complete SDK usage object's neutral counters, costs, tier, and applied rates."""
     usage_raw = _usage_with_cache_split()
     billing = _billing_from_sdk_usage(usage_raw, _PRICING)
     usage = billing.usage
@@ -291,7 +286,6 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
 
 
 def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
-    """A response served at a tier without rates still reports what it billed and who served it."""
     billing = _billing_from_sdk_usage(
         at.Usage(input_tokens=100, output_tokens=50, service_tier="priority"), _PRICING
     )
@@ -301,7 +295,6 @@ def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
 
 
 def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
-    """The SDK passes through tier strings its types do not list, and their rates are unknown."""
     usage_raw = at.Usage(input_tokens=100, output_tokens=50).model_copy(
         update={"service_tier": "flex"}
     )
@@ -390,7 +383,6 @@ def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
 
 
 def test_a_bound_anthropic_web_search_requires_its_price() -> None:
-    """Binding web search whose price is None fails before any request."""
     adapter = _adapter(pricing=replace(_PRICING, web_search_usd_per_invocation=None))
     with pytest.raises(ValueError, match="is None"):
         _ = adapter._precompute_fields(
@@ -404,7 +396,6 @@ def test_a_bound_anthropic_web_search_requires_its_price() -> None:
 
 
 def test_billing_reads_reasoning_tokens_and_defaults_to_zero() -> None:
-    """output_tokens_reasoning reads thinking_tokens, and is zero when output_tokens_details is absent."""
     with_details = _billing_from_sdk_usage(
         at.Usage(
             input_tokens=1,
@@ -421,7 +412,6 @@ def test_billing_reads_reasoning_tokens_and_defaults_to_zero() -> None:
 
 
 def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> None:
-    """With cache_creation absent, cache_creation_input_tokens bills as 5-minute writes."""
     usage = at.Usage(
         input_tokens=100,
         output_tokens=0,
@@ -433,14 +423,12 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
 
 
 def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> None:
-    """With nothing written there is nothing to blend, so the write price is the default TTL's rate."""
     billing = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
     assert billing.usage.input_tokens_cache_write == 0
     assert billing.usd_per_million_tokens.input_tokens_cache_write == 3.75
 
 
 def test_the_reported_tier_selects_the_rates() -> None:
-    """Priority rates price a priority response, standard rates a response reporting no tier."""
     pricing = AnthropicPricingTable(
         standard=_STANDARD_RATES,
         priority=_PRIORITY_RATES,
@@ -457,7 +445,6 @@ def test_the_reported_tier_selects_the_rates() -> None:
 
 
 def test_cache_reads_and_writes_count_toward_the_long_context_threshold() -> None:
-    """Uncached input alone is under the threshold, and cache reads and writes put the request over it."""
     usage_raw = _usage_with_cache_split()
     long_context = LongContextPricing(
         prompt_tokens_above=329, input_multiplier=5.0, output_multiplier=5.0
@@ -471,7 +458,6 @@ def test_cache_reads_and_writes_count_toward_the_long_context_threshold() -> Non
 
 
 def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
-    """Check the system cache breakpoint built through each backend factory."""
     for llm in (
         Anthropic(client=AsyncAnthropic(api_key="test")).llm("claude-sonnet-5", cache_ttl="1h"),
         AnthropicBedrock(api="mantle").llm("anthropic.claude-sonnet-5", cache_ttl="1h"),
@@ -498,7 +484,6 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
     ],
 )
 def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
-    """Check translated stop reasons alongside the preserved partial text."""
     message = _message_snapshot(raw, [at.TextBlock(type="text", text="partial text")])
     outcome = (
         _adapter()
@@ -511,7 +496,6 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
 
 
 def test_text_output_selects_the_final_text_block() -> None:
-    """The text binding selects the final complete block and preserves preceding commentary."""
     message = _message_with_content([
         at.TextBlock(type="text", text="hello "),
         at.TextBlock(type="text", text="world"),
@@ -525,23 +509,6 @@ def test_text_output_selects_the_final_text_block() -> None:
     assert outcome.output == "world"
     assert outcome.assistant_message.content == (TextPart(text="hello "), TextPart(text="world"))
     assert outcome.stop_reason == "tool_call"
-
-
-def test_a_text_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens() -> None:
-    """A max_tokens stop can leave an incomplete tool_use block, so the text binding reports the cap."""
-    message = _message_with_content(
-        [
-            at.TextBlock(type="text", text="let me look"),
-            at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={}),
-        ],
-        stop_reason="max_tokens",
-    )
-    outcome = (
-        _adapter()
-        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
-        .interpret(message)
-    )
-    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_a_text_tool_call_before_a_cut_off_block_is_usable() -> None:
@@ -563,10 +530,9 @@ def test_a_text_tool_call_before_a_cut_off_block_is_usable() -> None:
 
 def _message_with_content(
     content: list[at.ContentBlock],
-    stop_reason: at.StopReason = "tool_use",
+    stop_reason: at.StopReason | None = "tool_use",
     usage: at.Usage | None = None,
 ) -> at.Message:
-    """Build an SDK message carrying the given content blocks."""
     return at.Message(
         id="msg_1",
         content=content,
@@ -579,10 +545,6 @@ def _message_with_content(
 
 
 def test_assistant_blocks_convert_to_parts_and_back() -> None:
-    """Each SDK block becomes one AssistantPart in order, and each AssistantPart converts back to its wire block.
-
-    A server tool block becomes RawPart and replays without the SDK model's unset fields.
-    """
     thinking_raw: dict[str, JsonValue] = {
         "type": "thinking",
         "thinking": "check first",
@@ -641,17 +603,12 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
 def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
     block: at.ContentBlock, expected_raw: dict[str, JsonValue]
 ) -> None:
-    """Empty and redacted thinking have text None, the one text-free value across adapters.
-
-    The dump replays unchanged, and its type key routes it on the wire.
-    """
     assistant_message = _assistant_message_from(_message_with_content([block]))
     assert assistant_message.content == (ReasoningPart(raw=expected_raw, text=None),)
     assert _assistant_content_blocks(assistant_message) == [expected_raw]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
-    """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "reasoning", "id": "rs_1"}
     assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
@@ -661,10 +618,6 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
 
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:
-    """Consecutive ToolMessages collapse into one user message of tool_result blocks.
-
-    The group goes out before the next user or assistant message, so each tool_use is answered next.
-    """
     messages = [
         UserMessage(content="hi"),
         AssistantMessage(
@@ -715,7 +668,6 @@ class _CacheBreakpointCase(NamedTuple):
 
 
 def _cache_breakpoint_texts(count: int) -> tuple[TextPart, ...]:
-    """Return text parts that each set cache_breakpoint."""
     return tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(count))
 
 
@@ -860,11 +812,6 @@ def _cache_breakpoint_texts(count: int) -> tuple[TextPart, ...]:
     ],
 )
 def test_wire_messages_places_cache_breakpoints(case: _CacheBreakpointCase) -> None:
-    """The automatic and latest explicit cache breakpoints within message_cache_breakpoint_budget carry cache_control.
-
-    A user part's cache breakpoint goes on its own block, and a ToolMessage last part's on its tool_result block.
-    The automatic cache breakpoint goes on the last block unless that block is thinking, which carries no cache_control.
-    """
     wire = _wire_messages(
         case.messages,
         automatic_cache_breakpoints=case.automatic_cache_breakpoints,
@@ -875,10 +822,6 @@ def test_wire_messages_places_cache_breakpoints(case: _CacheBreakpointCase) -> N
 
 
 def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> None:
-    """A ToolMessage carrying parts becomes a tool_result whose content is the text and image blocks.
-
-    A dropped part or a mis-encoded image would change this exact block list.
-    """
     messages = [
         ToolMessage(
             tool_call_id="tu_1",
@@ -907,7 +850,6 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
 
 
 def test_wire_messages_sends_image_url_part_unchanged() -> None:
-    """ImageUrlPart uses URLImageSourceParam in UserMessage and ToolMessage."""
     image_url = ImageUrlPart(
         url="https://example.com/image.png",
         media_type="image/png",
@@ -999,11 +941,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
 def test_build_request_reports_an_unsendable_sequence_as_rejected_messages(
     messages: tuple[Message, ...], reason_fragment: str
 ) -> None:
-    """An unsendable Sequence[Message] reaches build_request_params's caller as the RejectedMessages variant.
-
-    Nothing is sent: the retry loop takes this answer before its first request.
-    A non-last ToolMessage part with cache_breakpoint=True is rejected, since sending it would move the cache boundary.
-    """
+    """A non-final tool part's cache breakpoint would move to the enclosing block's end."""
     request = _structured_bound().build_request_params(messages)
     assert isinstance(request, RejectedMessages)
     assert reason_fragment in request.error_text
@@ -1025,10 +963,6 @@ def test_wire_tool_choice_carries_the_inverted_parallel_flag(
     *,
     parallel_tool_calls: bool,
 ) -> None:
-    """Neutral required maps to any, and every form carrying the flag inverts it.
-
-    disable_parallel_tool_use inverts parallel_tool_calls.
-    """
     assert _wire_tool_choice(tool_choice, parallel_tool_calls=parallel_tool_calls) == {
         **expected_without_parallel_flag,
         "disable_parallel_tool_use": not parallel_tool_calls,
@@ -1039,12 +973,10 @@ def test_wire_tool_choice_carries_the_inverted_parallel_flag(
 def test_wire_tool_choice_none_forbids_calls_and_carries_no_parallel_flag(
     *, parallel_tool_calls: bool
 ) -> None:
-    """Neutral none maps to the none form, which takes no parallel flag at either binding."""
     assert _wire_tool_choice("none", parallel_tool_calls=parallel_tool_calls) == {"type": "none"}
 
 
 def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
-    """Fingerprint data includes constructor request settings and excludes billing settings."""
     adapter = AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test"),
         model="m",
@@ -1063,7 +995,6 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
 
 
 def test_unset_binding_fields_stay_at_the_omit_sentinel() -> None:
-    """An unstated optional field keeps the SDK's omit sentinel, which leaves the provider default."""
     precomputed_fields = _adapter()._precompute_fields(_UNSET_BINDING)
     for field_value in (
         precomputed_fields.system,
@@ -1080,13 +1011,11 @@ def test_unset_binding_fields_stay_at_the_omit_sentinel() -> None:
 
 
 def test_binding_without_max_completion_tokens_is_rejected() -> None:
-    """The Messages API requires `max_tokens`, so binding without a limit raises before any request."""
     with pytest.raises(ValueError, match="max_completion_tokens"):
         _ = _adapter().bind_text(replace(_UNSET_BINDING, max_completion_tokens=None))
 
 
 def test_request_passes_reasoning_level_through() -> None:
-    """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
     precomputed_fields = _adapter()._precompute_fields(
         replace(_UNSET_BINDING, reasoning_level="minimal")
     )
@@ -1095,10 +1024,7 @@ def test_request_passes_reasoning_level_through() -> None:
 
 
 def test_open_stream_sends_the_built_request() -> None:
-    """The request body holds the adapter's settings, the binding's precomputed fields, and the messages.
-
-    A bound temperature travels in extra_body because the SDK stream takes it there.
-    """
+    """The SDK stream accepts a bound temperature through `extra_body`."""
     sent_bodies: list[object] = []
 
     def reject_after_recording(request: httpx2.Request) -> httpx2.Response:
@@ -1150,7 +1076,6 @@ def test_open_stream_sends_the_built_request() -> None:
 
 
 def test_extra_body_keeps_caller_fields_by_reference_beside_a_temperature() -> None:
-    """Without a temperature the caller's mapping is sent itself, and with one it is read through."""
     caller_fields: dict[str, object] = {"top_k": 5}
 
     def extra_body_bound_with(temperature: float | None) -> Mapping[str, object] | None:
@@ -1176,7 +1101,6 @@ def test_extra_body_keeps_caller_fields_by_reference_beside_a_temperature() -> N
 
 
 def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
-    """AnthropicMessagesAdapter rejects AllowedToolsChoice during text binding."""
     with pytest.raises(TypeError, match="does not support AllowedToolsChoice"):
         _ = _adapter().bind_text(
             _binding(
@@ -1189,7 +1113,6 @@ def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
 
 
 def test_provider_executed_tools_follow_function_tools_and_receive_automatic_caching() -> None:
-    """Provider-executed tools keep order and can carry the automatic cache breakpoint."""
     provider_executed_tool: dict[str, object] = {
         "type": "web_search_20250305",
         "name": "web_search",
@@ -1211,7 +1134,6 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
 
 
 def test_tool_without_description_omits_the_description_key() -> None:
-    """`description=None` sends the tool without a description."""
     precomputed = _adapter()._precompute_fields(
         _binding(
             system_prompt="system",
@@ -1225,7 +1147,6 @@ def test_tool_without_description_omits_the_description_key() -> None:
 
 
 def test_provider_executed_tool_binds_without_function_tools() -> None:
-    """A provider-executed tool does not require an application function."""
     precomputed = _adapter()._precompute_fields(
         _binding(
             system_prompt="system",
@@ -1256,7 +1177,6 @@ def test_provider_executed_tool_binds_without_function_tools() -> None:
     ],
 )
 def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
-    """Each reviewed Anthropic provider-executed `type` reaches Messages unchanged."""
     provider_executed_tool: dict[str, object] = {"type": tool_type}
     precomputed = _adapter()._precompute_fields(
         _binding(
@@ -1285,7 +1205,6 @@ def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
 def test_supported_code_execution_requires_a_qualifying_web_tool(
     code_execution_type: str, web_tool_type: str
 ) -> None:
-    """Every reviewed code-execution type is free beside each qualifying web family."""
     provider_executed_tools = _precomputed_with_provider_executed_tools(
         web_tool_type, code_execution_type
     )
@@ -1316,7 +1235,6 @@ def test_supported_code_execution_requires_a_qualifying_web_tool(
 def test_every_unlisted_anthropic_provider_type_is_rejected(
     provider_executed_tool: Mapping[str, object],
 ) -> None:
-    """Messages rejects every reviewed client-executed or unaudited `type`, and a missing or non-string one."""
     with pytest.raises(ValueError, match="supported string type"):
         _ = _adapter()._precompute_fields(
             _binding(
@@ -1332,13 +1250,11 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(
     "code_execution_type", ["code_execution_20260120", "code_execution_20260521"]
 )
 def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: str) -> None:
-    """Standalone code execution lacks exact response billing evidence."""
     with pytest.raises(ValueError, match="qualifying web tool"):
         _ = _precomputed_with_provider_executed_tools(code_execution_type)
 
 
 def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
-    """Anthropic pricing does not establish Bedrock provider-executed tool billing."""
     adapter = _adapter(
         client=AsyncAnthropicBedrock(aws_region="us-east-1"), provider_name="aws.bedrock"
     )
@@ -1354,7 +1270,6 @@ def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
 
 
 def test_provider_executed_tool_cache_breakpoints_reduce_the_message_budget() -> None:
-    """Provider-executed tool cache breakpoints count toward Anthropic's request limit."""
     provider_executed_tools = tuple(
         {
             "type": "web_search_20250305",
@@ -1375,7 +1290,6 @@ def test_provider_executed_tool_cache_breakpoints_reduce_the_message_budget() ->
 
 
 def test_the_system_block_cache_breakpoint_follows_automatic_cache_breakpoints() -> None:
-    """The automatic system and message cache breakpoints are two of the four per request."""
     cached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
@@ -1389,7 +1303,6 @@ def test_the_system_block_cache_breakpoint_follows_automatic_cache_breakpoints()
 
 
 def test_request_places_a_cache_breakpoint_on_the_last_tool_only_without_a_system_prompt() -> None:
-    """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
     adapter = _adapter(cache_ttl="1h")
     without_system = adapter._precompute_fields(
@@ -1472,7 +1385,6 @@ def _anthropic_stream(
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
-    """Read a streamed request ID from the stream response."""
     snapshot = _message_snapshot("end_turn")
     with_header = _anthropic_stream([], snapshot, {"request-id": "req_stream"})
     assert with_header.request_id() == "req_stream"
@@ -1480,7 +1392,6 @@ def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> No
 
 
 def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
-    """Build one raw text-delta event."""
     return at.RawContentBlockDeltaEvent(
         type="content_block_delta",
         index=index,
@@ -1489,7 +1400,6 @@ def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
 
 
 def _thinking_delta_event(thinking: str, index: int) -> at.RawContentBlockDeltaEvent:
-    """Build one thinking-delta event, belonging to the numbered thinking block."""
     return at.RawContentBlockDeltaEvent(
         type="content_block_delta",
         index=index,
@@ -1498,7 +1408,6 @@ def _thinking_delta_event(thinking: str, index: int) -> at.RawContentBlockDeltaE
 
 
 def _thinking_block_stop_event(thinking: str, index: int) -> ParsedContentBlockStopEvent:
-    """Build the stop event closing the numbered thinking block."""
     return ParsedContentBlockStopEvent(
         type="content_block_stop",
         index=index,
@@ -1531,8 +1440,6 @@ def _collected_items(
 
 
 def test_stream_yields_bare_text_argument_fragments_and_one_complete_tool_call() -> None:
-    """Stream text, argument fragments, and completed ToolCall values."""
-
     def args_fragment(partial_json: str) -> at.RawContentBlockDeltaEvent:
         return at.RawContentBlockDeltaEvent(
             type="content_block_delta",
@@ -1695,7 +1602,6 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
 
 
 def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport | None]:
-    """Run the structured binding's parse over one message, with the assistant message read from it."""
     return _structured_bound()._parsed_outcome(message, _assistant_message_from(message))
 
 
@@ -1727,7 +1633,6 @@ def test_automatic_cache_breakpoints_select_final_caching_by_api(
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
-    """Direct and Mantle clients use top-level caching. Legacy Bedrock places a cache breakpoint on the final block."""
     adapter = _anthropic_adapter_of(build_llm())
     bound = adapter.bind_text(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
@@ -1753,7 +1658,6 @@ def test_automatic_cache_breakpoints_select_final_caching_by_api(
 
 
 def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_id() -> None:
-    """The message supplies its id and served model, and the AdapterStream supplies the request id."""
     identity = _structured_bound().identity_from_raw(
         _message_with_content([]), request_id="req_anthropic"
     )
@@ -1778,19 +1682,10 @@ def _structured_message(
     tool_use_blocks: list[at.ContentBlock] = (
         [at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={})] if tool_use else []
     )
-    return at.Message(
-        id="msg_1",
-        content=text_blocks + tool_use_blocks,
-        model="claude-sonnet-5",
-        role="assistant",
-        stop_reason=stop_reason,
-        type="message",
-        usage=at.Usage(input_tokens=1, output_tokens=1),
-    )
+    return _message_with_content(text_blocks + tool_use_blocks, stop_reason=stop_reason)
 
 
 def test_the_structured_request_merges_the_schema_into_the_output_config() -> None:
-    """The response_format's JSON schema, as anthropic's SDK transforms it, joins the binding's effort."""
     request = _structured_bound().build_request_params([UserMessage(content="q")])
     assert isinstance(request, _AnthropicRequestParams)
     assert request.precomputed.output_config == {
@@ -1813,10 +1708,6 @@ def test_the_structured_request_merges_the_schema_into_the_output_config() -> No
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
-    """An extra_body key that open_stream passes as its own keyword raises at bind time.
-
-    Rejecting the duplicate key prevents extra_body from overriding the binding.
-    """
     with pytest.raises(ValueError, match="max_tokens"):
         _ = _adapter()._precompute_fields(
             _binding(
@@ -1884,11 +1775,6 @@ def test_structured_outcome_by_text_and_stop_reason(
     expected_kind: str,
     expected_output: _StructuredReport | None,
 ) -> None:
-    """Valid text validates into the instance, and otherwise the stop reason names the outcome.
-
-    A null stop reason or pause_turn leaves the assistant message unfinished, even when text failed validation.
-    A tool_use stop without a tool call is not a tool-call message.
-    """
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind
     if outcome.kind == "usable_response":
@@ -1901,33 +1787,35 @@ def test_structured_outcome_by_text_and_stop_reason(
     ids=["alone", "with_prose", "with_valid_json"],
 )
 def test_a_structured_tool_call_message_has_none_output(text: str | None) -> None:
-    """A tool call parses no instance and nothing went wrong, so its output is None even beside prose."""
     outcome = _structured_parse(_structured_message(text, stop_reason="tool_use", tool_use=True))
     assert outcome.kind == "usable_response"
     assert outcome.output is None
 
 
-@pytest.mark.parametrize("text", [None, _REPORT_JSON], ids=["alone", "after_valid_text"])
-def test_a_structured_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(
-    text: str | None,
+@pytest.mark.parametrize(
+    ("text", "structured"),
+    [
+        pytest.param("let me look", False, id="text_after_prose"),
+        pytest.param(None, True, id="structured_alone"),
+        pytest.param(_REPORT_JSON, True, id="structured_after_valid_text"),
+    ],
+)
+def test_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(
+    text: str | None, *, structured: bool
 ) -> None:
-    """A max_tokens stop at a last tool_use block exceeds the cap, even after text that validates."""
+    """The SDK can parse a partial tool input into a complete-looking object."""
     message = _structured_message(text, stop_reason="max_tokens", tool_use=True)
-    assert _structured_bound().interpret(message).kind == "max_completion_tokens_exceeded"
+    bound = _structured_bound() if structured else _adapter().bind_text(_UNSET_BINDING)
+    assert bound.interpret(message).kind == "max_completion_tokens_exceeded"
 
 
 def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> None:
-    """The reason quotes anthropic's own stop reason."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
     assert outcome.kind == "unfinished_assistant_message"
     assert "pause_turn" in outcome.error_text
 
 
 def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -> None:
-    """An unlisted status lands one tagged count, even when its error type picks the `RequestFailure`.
-
-    A listed status leaves the counter alone.
-    """
     before = dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS)
     _ = anthropic_request_failure(_status_error(anthropic.RateLimitError, 429))
     _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 408))
@@ -1944,11 +1832,6 @@ def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
-    """The override reports the header the SDK read off the error response, None for any other error.
-
-    Anthropic sends the request ID in request-id.
-    Missing headers return None.
-    """
     adapter = _adapter()
     with_header = _status_error(anthropic.RateLimitError, 429, {"request-id": "req_429"})
     assert adapter.request_id_from_error(with_header) == "req_429"
@@ -1984,17 +1867,12 @@ def _connection_error() -> anthropic.APIConnectionError:
 
 
 def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
-    """Narrow an LLM to its concrete adapter so tests read its client/model/pricing."""
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     return adapter
 
 
 def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> None:
-    """A verbatim catalog entry already states its regional rates, so no multiplier applies.
-
-    The Bedrock catalog remains independent from direct Anthropic pricing.
-    """
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1").llm("us.anthropic.claude-opus-4-6-v1")
     )
@@ -2003,7 +1881,6 @@ def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> N
 
 @pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
 def test_prefixed_bedrock_model_applies_its_multiplier_by_default(prefix: str) -> None:
-    """Every cross-region prefix multiplies the unprefixed token rates by its multiplier."""
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1").llm(f"{prefix}.anthropic.claude-sonnet-5")
     )
@@ -2016,7 +1893,6 @@ def test_prefixed_bedrock_model_applies_its_multiplier_by_default(prefix: str) -
 def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled(
     prefix: str,
 ) -> None:
-    """`apply_cross_region_multiplier=False` resolves to the unprefixed catalog table itself."""
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1", apply_cross_region_multiplier=False).llm(
             f"{prefix}.anthropic.claude-sonnet-5"
@@ -2026,7 +1902,6 @@ def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled
 
 
 def test_pricing_table_scaled_scales_every_tier_and_keeps_modifiers() -> None:
-    """`scaled` scales standard, priority, and batch rates and preserves the other fields."""
     table = AnthropicPricingTable(
         standard=_PRICING.standard,
         priority=_PRICING.standard,
@@ -2040,7 +1915,6 @@ def test_pricing_table_scaled_scales_every_tier_and_keeps_modifiers() -> None:
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
-    """Use a matching supplied client with SDK retries disabled."""
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(
             api="mantle", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
@@ -2060,14 +1934,12 @@ def test_bedrock_rejects_a_client_that_contradicts_api(
     api: Literal["legacy", "mantle"],
     client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
-    """Reject an SDK client for the other API during construction."""
     with pytest.raises(ValueError, match=re.escape(f"api={api!r} requires")):
         _ = AnthropicBedrock(api=api, client=client_class(aws_region="us-east-1"))
 
 
 @pytest.mark.parametrize("api", ["legacy", "mantle"])
 def test_bedrock_model_accepts_custom_pricing(api: Literal["legacy", "mantle"]) -> None:
-    """Explicit pricing lets an uncataloged model use either API."""
     model = "us.anthropic.claude-next"
     adapter = _anthropic_adapter_of(AnthropicBedrock(api=api).llm(model, pricing=_PRICING))
     assert adapter.model == model
@@ -2075,17 +1947,12 @@ def test_bedrock_model_accepts_custom_pricing(api: Literal["legacy", "mantle"]) 
 
 
 def test_uncataloged_bedrock_model_requires_pricing() -> None:
-    """An uncataloged model has no default pricing."""
     bedrock = AnthropicBedrock(api="mantle")
     with pytest.raises(ValueError, match="pass pricing="):
         _ = bedrock.llm("us.anthropic.claude-next")
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
-    """as_json holds the binding's precomputed fields and this input's converted messages.
-
-    An unstated temperature is absent from the request.
-    """
     request = _structured_bound().build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _AnthropicRequestParams)
     rendered = json.loads(request.as_json())
@@ -2095,7 +1962,6 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
 
 
 def test_request_renders_system_part_cache_breakpoints_and_the_automatic_last_block_one() -> None:
-    """A parts system_prompt is one block per part. Its cache breakpoints and the automatic one carry cache_control."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -2114,7 +1980,6 @@ def test_request_renders_system_part_cache_breakpoints_and_the_automatic_last_bl
 
 
 def test_request_system_parts_without_automatic_cache_breakpoints_carry_only_their_own() -> None:
-    """With `automatic_cache_breakpoints=False`, only `cache_breakpoint` writes cache_control."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -2133,7 +1998,6 @@ def test_request_system_parts_without_automatic_cache_breakpoints_carry_only_the
 
 
 def test_request_rejects_a_binding_whose_cache_breakpoints_exceed_the_request_limit() -> None:
-    """Four system part cache breakpoints plus the automatic ones exceed the limit of four."""
     with pytest.raises(ValueError, match="limit"):
         _ = _adapter()._precompute_fields(
             _binding(
@@ -2147,7 +2011,7 @@ def test_request_rejects_a_binding_whose_cache_breakpoints_exceed_the_request_li
 
 
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
-    """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
+    """An empty parts tuple can reach the adapter through a directly constructed Binding."""
     with pytest.raises(ValueError, match="empty tuple"):
         _ = _adapter()._precompute_fields(
             _binding(system_prompt=(), tool_schemas=(), automatic_cache_breakpoints=True)
@@ -2155,8 +2019,6 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
 
 
 def test_provider_billing_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
-    """provider_billing returns None before the first event and Billing after it."""
-
     async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
         """Read billing before and after one stream item."""
         adapter_stream = _anthropic_stream(
@@ -2195,7 +2057,6 @@ def _assistant_message_content() -> list[at.ContentBlock]:
 
 
 def _finished_message(usage: at.Usage) -> at.Message:
-    """Build a finished message of _assistant_message_content's blocks, billing the given usage."""
     return _message_with_content(_assistant_message_content(), stop_reason="end_turn", usage=usage)
 
 
@@ -2204,7 +2065,6 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def make_adapter(self) -> Adapter:
-        """Build the adapter these invariants run against, priced for the standard tier alone."""
         return _adapter()
 
     @override
@@ -2218,7 +2078,6 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at priority, which _PRICING states no rates for."""
         return _finished_message(
             at.Usage(
                 input_tokens=100,
@@ -2231,7 +2090,6 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a response reporting a negative output counter."""
         return _finished_message(at.Usage(input_tokens=1, output_tokens=-1))
 
     @override
@@ -2258,29 +2116,24 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return a response whose thinking block carries the unnamed key."""
         return _finished_message(_usage_with_cache_split())
 
     @override
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return the response whose middle block is a server tool call."""
         return _finished_message(_usage_with_cache_split())
 
     @override
     def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
-        """Read the content blocks of the assistant message this request ends with."""
         assert isinstance(request_params, _AnthropicRequestParams)
         return _content_blocks(request_params.messages[-1])
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return the same response as the ParsedMessage a stream assembles into and as a Message."""
         whole = _finished_message(_usage_with_cache_split())
         return ParsedMessage[None].model_validate(whole.model_dump()), whole
 
     @override
     def stream_without_its_terminal_event(self) -> AdapterStream:
-        """Return a stream whose accumulated message ends with no stop reason."""
         return _anthropic_stream([_text_delta_event("he", 0)], _message_snapshot(None))
 
     @override

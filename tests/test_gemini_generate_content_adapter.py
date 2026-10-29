@@ -160,7 +160,6 @@ def _binding(
     automatic_cache_breakpoints: bool = False,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
-    """Build a Binding with every field stated, defaults naming the plainest choice."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
@@ -178,7 +177,6 @@ def _binding(
 def _bound_config(
     binding: Binding, adapter: GeminiGenerateContentAdapter | None = None
 ) -> types.GenerateContentConfig:
-    """Bind for text and read the config the binding produced."""
     bound = (adapter or _adapter()).bind_text(binding)
     request = bound.build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
@@ -297,7 +295,6 @@ def _search_candidates_response(
 
 
 def _gemini_stream(chunks: Sequence[types.GenerateContentResponse]) -> _GeminiStream:
-    """Wrap constructed chunks in the adapter stream."""
 
     async def chunk_iterator() -> AsyncIterator[types.GenerateContentResponse]:
         for chunk in chunks:
@@ -307,7 +304,6 @@ def _gemini_stream(chunks: Sequence[types.GenerateContentResponse]) -> _GeminiSt
 
 
 def _drained(stream: AdapterStream) -> list[StreamItem]:
-    """Drain a stream to its item list."""
 
     async def drain() -> list[StreamItem]:
         return [item async for item in stream.items()]
@@ -339,8 +335,6 @@ def _api_error(
 
 
 class _Answer(BaseModel):
-    """The structured-output model under test."""
-
     value: int
 
 
@@ -470,7 +464,6 @@ _CONFIG_CASES = [
 
 @pytest.mark.parametrize("case", _CONFIG_CASES, ids=[case.case_id for case in _CONFIG_CASES])
 def test_binding_fields_build_the_config(case: _ConfigCase) -> None:
-    """Each binding field lands on its GenerateContentConfig field, and an unset field sends nothing."""
     assert _bound_config(case.binding) == case.config
 
 
@@ -690,7 +683,6 @@ def test_an_unsendable_binding_raises_at_bind(defect: _BindDefect) -> None:
 
 
 def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
-    """The exact provider value "XHIGH" reaches the wire unchanged."""
     with pytest.warns(UserWarning, match="XHIGH"):
         config = _bound_config(_binding(reasoning_level="XHIGH"))
     assert config.thinking_config is not None
@@ -700,7 +692,6 @@ def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
 
 
 def test_structured_bind_sends_the_response_schema() -> None:
-    """The structured binding sends response_json_schema with the JSON mime type."""
     request = (
         _adapter()
         .bind_structured(_binding(), _Answer)
@@ -765,7 +756,6 @@ def test_user_message_forms() -> None:
 
 
 def test_tool_results_group_and_recover_names() -> None:
-    """Consecutive tool results share one user Content, each naming the call it answers."""
     assistant_message = AssistantMessage(
         content=(
             ToolCall(id="call-a", name="f", args_json='{"x": 1}'),
@@ -795,7 +785,6 @@ def test_tool_results_group_and_recover_names() -> None:
 
 
 def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
-    """ToolMessage maps ContentPart values to FunctionResponsePart fields."""
     request = _built_request([
         AssistantMessage(content=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(
@@ -833,7 +822,6 @@ def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
 def _cache_breakpoint_part_messages(
     part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
 ) -> tuple[Message, ...]:
-    """Carry one ContentPart with cache_breakpoint=True in a message of message_class."""
     if message_class is UserMessage:
         return (UserMessage(content=(part,)),)
     return (
@@ -912,14 +900,12 @@ def test_unsendable_messages_build_rejected_messages(case: _InvalidMessages) -> 
 
 
 def _interpreted_assistant_message(response: types.GenerateContentResponse) -> AssistantMessage:
-    """Interpret under the text binding and return the assistant message."""
     outcome = _adapter().bind_text(_binding()).interpret(response)
     assert outcome.kind == "usable_response"
     return outcome.assistant_message
 
 
 def _dump(part: types.Part) -> dict[str, JsonValue]:
-    """Dump a Part as the adapter stores it in ReasoningPart.raw and RawPart.raw."""
     return part.model_dump(mode="json", exclude_none=True)
 
 
@@ -982,7 +968,6 @@ _READ_PARTS_CASES = [
 def test_candidate_parts_read_into_the_assistant_message_and_replay_as_themselves(
     case: _ReadPartsCase,
 ) -> None:
-    """Provider parts become assistant content and replay as the original provider parts."""
     assistant_message = _interpreted_assistant_message(_response(case.wire_parts))
     assert assistant_message.content == case.content
     request = _built_request([UserMessage(content="go"), assistant_message])
@@ -993,7 +978,6 @@ def test_candidate_parts_read_into_the_assistant_message_and_replay_as_themselve
 
 
 def test_as_json_holds_the_request_without_transport_config() -> None:
-    """The archive cell carries model, contents, config, and extra_body. http_options stays out."""
     request = _built_request(
         [UserMessage(content="hi")],
         _binding(
@@ -1013,7 +997,6 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 
 
 def test_text_binding_reads_stop_reasons() -> None:
-    """STOP is stop or tool_call by the assistant message's tool calls. MAX_TOKENS and SAFETY name themselves."""
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
     assert ended.kind == "usable_response"
@@ -1049,7 +1032,6 @@ def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
 
 
 def test_no_candidates_reads_the_block_reason() -> None:
-    """A blocked prompt is a Refusal with an empty assistant message. No candidates and no block is unfinished."""
     bound = _adapter().bind_text(_binding())
     blocked = bound.interpret(
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
@@ -1061,7 +1043,6 @@ def test_no_candidates_reads_the_block_reason() -> None:
 
 
 def test_structured_binding_outcomes() -> None:
-    """The structured matrix: instance, tool-call None, refusal, truncation, violation, empty, unfinished."""
     bound = _adapter().bind_structured(_binding(), _Answer)
     parsed = bound.interpret(_response([types.Part(text='{"value": 3}')]))
     assert parsed.kind == "usable_response"
@@ -1104,7 +1085,6 @@ def test_a_structured_binding_ignores_thought_text_when_validating() -> None:
 
 
 def test_identity_reads_the_response_fields() -> None:
-    """model_version and response_id report as-is, absent ones as the empty string."""
     bound = _adapter().bind_text(_binding())
     identity = bound.identity_from_raw(_response([types.Part(text="hi")]), request_id="req-gemini")
     assert (identity.model_served, identity.response_id, identity.request_id) == (
@@ -1120,7 +1100,6 @@ def test_identity_reads_the_response_fields() -> None:
 
 
 def test_the_usage_partition() -> None:
-    """cache_read is the cached counter, cache_none the remainder plus tool-use, output includes thoughts."""
     billing = _billing_from_usage(
         _usage_metadata(), _PRICING, provider_executed_tool_cost_in_usd=0.0
     )
@@ -1138,7 +1117,6 @@ def test_the_usage_partition() -> None:
 
 
 def _search_call(queries: object) -> list[types.Part]:
-    """Build one matched Google Search call and response pair."""
     return _provider_call_parts(
         tool_call_id="search-1", tool_type=types.ToolType.GOOGLE_SEARCH_WEB, queries=queries
     )
@@ -1264,7 +1242,6 @@ _TOOL_COSTS = [
 
 @pytest.mark.parametrize("case", _TOOL_COSTS, ids=[case.case_id for case in _TOOL_COSTS])
 def test_provider_executed_tool_cost(case: _ToolCost) -> None:
-    """Search and Maps queries cost their per-query rate, and evidence that cannot prove a count costs NaN."""
     usage = _billing_from_response(
         case.response,
         case.pricing,
@@ -1275,7 +1252,6 @@ def test_provider_executed_tool_cost(case: _ToolCost) -> None:
 
 
 def test_tool_execution_input_does_not_cross_the_long_context_threshold() -> None:
-    """The threshold reads prompt_token_count, which excludes the tool-execution input priced beside it."""
     billing = _billing_from_usage(
         _usage_metadata(prompt_token_count=200, tool_use_prompt_token_count=50),
         _LONG_PROMPT_TABLE,
@@ -1286,14 +1262,12 @@ def test_tool_execution_input_does_not_cross_the_long_context_threshold() -> Non
 
 
 def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
-    """The SDK's open enum constructs traffic types its types do not list, and their rates are unknown."""
     assert (
         _PRICING.rates_for(service_tier="NEW_TIER", prompt_token_count=0) is UNPRICED_TOKEN_RATES
     )
 
 
 def test_traffic_type_selects_the_rates() -> None:
-    """A reported tier prices at its own rates. UNSPECIFIED and None price at ON_DEMAND."""
     pricing = replace(
         _PRICING,
         on_demand_flex=GeminiRates(
@@ -1361,8 +1335,34 @@ def test_items_translate_parts_with_reasoning_separators() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("separator_part", "shares_chunk"),
+    [
+        (types.Part(text="answer"), False),
+        (types.Part(function_call=types.FunctionCall(name="f", args={})), False),
+        (types.Part(thought=True, text=""), True),
+        (types.Part(thought=True, text="", thought_signature=b"s"), False),
+    ],
+)
+def test_reasoning_separators_follow_assembled_part_boundaries(
+    separator_part: types.Part, *, shares_chunk: bool
+) -> None:
+    first = types.Part(thought=True, text="first")
+    second = types.Part(thought=True, text="second")
+    parts_by_chunk = (
+        ([first, separator_part], [second])
+        if shares_chunk
+        else ([first], [separator_part], [second])
+    )
+    stream = _gemini_stream([
+        *(_response(parts, finish_reason=None) for parts in parts_by_chunk),
+        _response([]),
+    ])
+    reasoning = [item.text for item in _drained(stream) if isinstance(item, ReasoningDelta)]
+    assert reasoning == ["first", REASONING_PART_SEPARATOR, "second"]
+
+
 def test_assembly_merges_text_slices_and_signatures_end_parts() -> None:
-    """final() reads the same assistant message a whole response would carry."""
     chunks = [
         _response([types.Part(thought=True, text="think a")], finish_reason=None),
         _response(
@@ -1388,7 +1388,6 @@ def test_assembly_merges_text_slices_and_signatures_end_parts() -> None:
 
 
 def test_a_mid_stream_error_propagates_from_items() -> None:
-    """The SDK iterator's APIError reaches the retry loop unchanged."""
 
     async def failing_iterator() -> AsyncIterator[types.GenerateContentResponse]:
         yield _response([types.Part(text="he")], finish_reason=None)
@@ -1400,7 +1399,6 @@ def test_a_mid_stream_error_propagates_from_items() -> None:
 
 
 def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> None:
-    """A block_reason is a terminal event: no protocol error, and the final response is a Refusal."""
     stream = _gemini_stream([
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
     ])
@@ -1439,7 +1437,6 @@ def test_provider_billing_follows_usage_arrival() -> None:
 
 
 def test_cutoff_gemini_provider_executed_tool_billing_is_nan() -> None:
-    """A charged query cannot report zero before terminal usage arrives."""
 
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
         responses: tuple[types.GenerateContentResponse, ...] = ()
@@ -1467,7 +1464,6 @@ def test_cutoff_gemini_provider_executed_tool_billing_is_nan() -> None:
 
 
 def test_stream_billing_collects_every_candidate_provider_query() -> None:
-    """Stream billing collects Search queries from every candidate."""
 
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
         yield _search_candidates_response([["first"], ["second"]])
@@ -1508,7 +1504,6 @@ def test_close_closes_the_sdk_iterator() -> None:
 
 
 def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str | None]:
-    """Bind for text over a client whose HTTP requests go to http_client."""
     client = genai.Client(
         api_key="offline",
         vertexai=False,
@@ -1578,7 +1573,6 @@ def _executable_code_part() -> types.Part:
 def _reasoning_response(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
 ) -> types.GenerateContentResponse:
-    """Build reasoning, executable-code, and text parts."""
     return _response(
         [
             types.Part(thought=True, text="check first", thought_signature=b"\x00\x01sig"),
@@ -1590,11 +1584,8 @@ def _reasoning_response(
 
 
 class TestGeminiGenerateContentConformance(AdapterConformance):
-    """The neutral invariants, over the Gemini generateContent adapter's own SDK objects."""
-
     @override
     def make_adapter(self) -> Adapter:
-        """Build the adapter these invariants run against, priced for on-demand alone."""
         return _adapter()
 
     @override
@@ -1604,7 +1595,6 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a response carrying no usage_metadata at all."""
         return _reasoning_response(None)
 
     @override
@@ -1650,17 +1640,14 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return the reasoning response with signature bytes as the payload."""
         return _reasoning_response(_usage_metadata())
 
     @override
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return the response whose middle part carries executable_code."""
         return _reasoning_response(_usage_metadata())
 
     @override
     def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
-        """Read the parts of the model Content this request ends with, as their JSON dumps."""
         assert isinstance(request_params, _GeminiRequestParams)
         parts = request_params.contents[-1].parts
         assert parts is not None
@@ -1696,7 +1683,6 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Return Gemini `RequestFailure` cases."""
         return {
             httpx.ConnectError("no route"): transient(pauses_quota=False),
             httpx.ReadTimeout("slow"): transient(pauses_quota=False),

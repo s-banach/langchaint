@@ -1,65 +1,18 @@
 """Implement the Anthropic Messages API through the official anthropic SDK.
 
-The following SDK facts were verified against anthropic 1.0.0.
-A structured binding sends the same `output_config.format` as `messages.parse(output_format=Model)`.
-Its schema uses `transform_schema(TypeAdapter(Model).json_schema())` and type `"json_schema"`.
-The adapter validates response text after the SDK exposes the complete message and billing.
-SDK parsing may reject text before final output and cache counters arrive.
-`messages.stream` assembles deltas, and `get_final_message()` returns the message.
-The SDK reports no all-inclusive input total.
-
 The API requires an unchanged replay of the latest assistant message's thinking during tool use.
 The API filters earlier thinking blocks.
 The API rejects consecutive thinking blocks outside their original order.
-The adapter replays every `ReasoningPart` in `content` order.
-
-`automatic_cache_breakpoints=True` places a cache breakpoint at the end of the frozen prefix.
-For `AsyncAnthropic` and `AsyncAnthropicBedrockMantle`, it also sends top-level `cache_control`.
-Top-level `cache_control` selects the final cacheable block.
-For `AsyncAnthropicBedrock`, it instead places a cache breakpoint on the last message block.
-The frozen prefix ends at the system prompt or at the last tool when no system prompt exists.
-`automatic_cache_breakpoints=False` places no automatic cache breakpoint.
-A user part with `cache_breakpoint=True` adds `cache_control` to its text or image block.
-A final `ToolMessage` part with `cache_breakpoint=True` adds `cache_control` to its enclosing `tool_result` block.
-A non-final `ToolMessage` part with `cache_breakpoint=True` returns `RejectedMessages` because the boundary would move.
-A parts `system_prompt` produces one system block per part and preserves its cache breakpoints.
 
 The API accepts at most four cache breakpoints per request.
 Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-07-25.
-Top-level `cache_control` and the binding's cache breakpoints reduce `message_cache_breakpoint_budget`.
-Binding fails with `ValueError` when its cache breakpoints exceed the limit.
-The adapter sends only the latest message cache breakpoints that fit `message_cache_breakpoint_budget`.
 Keeping only the latest cache breakpoints rarely costs a cache hit, because the latest prefix includes the earlier ones.
-An older cache breakpoint matters only when the latest one finds nothing in the cache.
-That happens when this conversation's entries have expired but a shared prefix is still cached.
+An older cache breakpoint can find a shared prefix after this conversation's cache entries expire.
 
 To find an earlier request's cache entry, each cache breakpoint checks its own block and at most 19 blocks before it.
 On the Claude API, consecutive `tool_use` blocks count as one block, and so do consecutive `tool_result` blocks.
 A request adding 20 or more blocks misses the previous request's cache unless a cache breakpoint is in its first 19.
 Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-09-24.
-
-Top-level `cache_control` and each cache breakpoint use `cache_ttl`.
-The default `"5m"` omits the API-default `ttl` key.
-`"1h"` sends `ttl="1h"` and uses the `input_tokens_cache_write_1h` rate.
-
-Content mappings were verified against anthropic 0.121.0.
-- `ImagePart` becomes `Base64ImageSourceParam`.
-- `ImageUrlPart` becomes `URLImageSourceParam`.
-- `AudioPart` returns `RejectedMessages` inside `UserMessage` and `ToolMessage`.
-- `Usage.server_tool_use` reports web-search invocation counts.
-
-Request and response mappings:
-- `ToolMessage` becomes `tool_result` inside a user message.
-- Consecutive `ToolMessage` values share one user message because the API requires alternating roles.
-- `stop_reason` `end_turn`, `tool_use`, and `max_tokens` map to `"stop"`, `"tool_call"`, and `"max_completion_tokens"`.
-- `refusal` maps to `"refusal"`, and `model_context_window_exceeded` maps to `"context_window_exceeded"`.
-- Other `stop_reason` values map to `"other"`.
-- `reasoning_level` sends `output_config.effort` with `thinking={"type": "adaptive"}`.
-- The adapter sends neither field alone because effort applies only to adaptive thinking.
-- `reasoning_level` accepts values wider than the SDK literal and sends each value unchanged.
-- The provider reports unsupported values through its own error.
-- The adapter never sends `thinking.display`.
-- The SDK default `"summarized"` returns thinking text, while `"omitted"` redacts it.
 """
 
 import base64
@@ -673,17 +626,12 @@ def _tool_message_has_cache_breakpoint(tool_message: ToolMessage) -> bool:
     """
     if isinstance(tool_message.content, str):
         return False
-    cache_breakpoint_indexes = [
-        index for index, part in enumerate(tool_message.content) if part.cache_breakpoint
-    ]
-    if not cache_breakpoint_indexes:
-        return False
-    if cache_breakpoint_indexes != [len(tool_message.content) - 1]:
+    if any(part.cache_breakpoint for part in tool_message.content[:-1]):
         raise _RejectedMessagesError(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
             "the cache breakpoint goes on the enclosing tool_result block, whose span ends at the last part"
         )
-    return True
+    return bool(tool_message.content and tool_message.content[-1].cache_breakpoint)
 
 
 def _wire_messages(
@@ -745,12 +693,7 @@ def _wire_messages(
 def _request_messages(
     messages: Sequence[Message], precomputed_fields: _AnthropicPrecomputedFields
 ) -> list[MessageParam] | RejectedMessages:
-    """Convert messages under the binding's caching parameters, or report them unsendable.
-
-    The one place a Sequence[Message] this adapter will not put on the wire becomes RejectedMessages.
-    The wire block holds parsed `tool_call.args_json`.
-    Text that is not JSON has no wire block.
-    """
+    """Convert messages under the binding's caching parameters, or return `RejectedMessages`."""
     try:
         return _wire_messages(
             messages,
@@ -1151,7 +1094,10 @@ class AnthropicMessagesAdapter(Adapter):
         A string `system_prompt` becomes one system block.
         A parts `system_prompt` becomes one block per part and preserves its cache breakpoints.
         `automatic_cache_breakpoints` places a cache breakpoint on the last system block or the last tool.
+        Direct and Mantle clients also send top-level `cache_control` for the final cacheable message block.
+        Legacy Bedrock places that cache breakpoint on the last message block.
         Binding cache breakpoints count toward the limit of four before message cache breakpoints.
+        `reasoning_level` sends `output_config.effort` with adaptive thinking and preserves the given string.
 
         Raises:
             ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
@@ -1412,7 +1358,7 @@ class _AnthropicStream(AdapterStream):
 
 
 class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
-    """What both anthropic bindings share: the request path, and what a response says about itself."""
+    """Share request execution, billing, and response identity between text and structured bindings."""
 
     def __init__(
         self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
@@ -1523,9 +1469,8 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
     ) -> None:
         """Precompute the request's output_config, the JSON-schema format merged into the binding's.
 
-        The format matches `messages.parse(output_format=...)`.
-        The merge is what keeps a reasoning effort the binding set: output_config carries both keys.
-        The merged value replaces the binding value in every request.
+        The format matches `messages.parse(output_format=...)` in anthropic 2.3.0.
+        The merge preserves the binding's reasoning effort.
         """
         self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
         output_format: JSONOutputFormatParam = {

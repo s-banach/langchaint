@@ -1,7 +1,4 @@
-"""Fake adapters, streams, and scripted responses shared by the generation test modules.
-
-The fakes implement the adapter contract without an SDK, so tests drive BoundLLM, StreamHandle, and tracing offline.
-"""
+"""Drive generation and tracing tests without an SDK."""
 
 import asyncio
 import json
@@ -55,15 +52,14 @@ USAGE: Usage = Usage(
 
 
 USAGE_BILLED: Usage = USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.25})
-"""The billing a 200 that produced no output (a refusal or truncation) carries."""
+"""Billing for a refusal or truncation."""
 
 
 USAGE_STREAM: Usage = USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.001})
-"""The stream final()'s assembled usage, distinct so a stream cost is visible."""
+"""Distinct stream billing makes a stream's cost visible in assertions."""
 
 
 _UNKNOWN_EXCEPTION = terminal("unknown_exception")
-"""The `RequestFailure` a `FakeAdapter` returns unless the test states one."""
 
 
 def fast_shared_backoff(
@@ -72,10 +68,7 @@ def fast_shared_backoff(
     max_wait_seconds: float = 0.002,
     max_request_starts_per_second: float = 10_000.0,
 ) -> SharedBackoff:
-    """Build a fresh near-zero-wait `SharedBackoff`.
-
-    One instance serves one event loop.
-    """
+    """Create one SharedBackoff per event loop with millisecond waits."""
     return SharedBackoff(
         max_concurrent_requests=max_concurrent_requests,
         min_wait_ceiling_seconds=0.001,
@@ -85,18 +78,11 @@ def fast_shared_backoff(
 
 
 class FakeRawResponse(BaseModel):
-    """Identify one fake raw response and its optional request ID."""
-
     id: str
     request_id: str | None = None
 
 
 def as_fake_raw(raw: BaseModel) -> FakeRawResponse:
-    """Narrow a raw response to the fake one.
-
-    Raises:
-        TypeError: raw is not a FakeRawResponse, which the real adapters raise for the same reason.
-    """
     if not isinstance(raw, FakeRawResponse):
         raise TypeError(f"expected a FakeRawResponse, got {type(raw).__name__}")
     return raw
@@ -104,21 +90,18 @@ def as_fake_raw(raw: BaseModel) -> FakeRawResponse:
 
 @dataclass(frozen=True, kw_only=True)
 class ScriptedResponse:
-    """One response the fake hands back: what interpret reads off it, and what it billed."""
-
     outcome: ResponseOutcome[str | None]
     usage: Usage
 
 
 def billed(outcome: ResponseOutcome[str | None]) -> ScriptedResponse:
-    """Script one 200 the provider billed, whatever interpret goes on to make of it."""
     return ScriptedResponse(outcome=outcome, usage=USAGE_BILLED)
 
 
 REJECTED_ASSISTANT_MESSAGE: AssistantMessage = AssistantMessage(
     content=(TextPart(text="what the rejected 200 carried"),)
 )
-"""The assistant message a 200 that produced no output still carried, which every such variant takes."""
+"""Recoverable content on billed refusals and truncations."""
 
 
 REFUSAL: Refusal = Refusal(assistant_message=REJECTED_ASSISTANT_MESSAGE)
@@ -128,7 +111,6 @@ MAX_COMPLETION_TOKENS_EXCEEDED: MaxCompletionTokensExceeded = MaxCompletionToken
 
 
 def usable_text_response(content: str) -> UsableResponse[str]:
-    """Build a text UsableResponse carrying the given content."""
     return UsableResponse(
         output=content,
         assistant_message=AssistantMessage(content=(TextPart(text=content),)),
@@ -140,30 +122,24 @@ FAKE_TOOL_CALL: ToolCall = ToolCall(id="call1", name="lookup", args_json='{"q": 
 
 
 class FakeStream(AdapterStream):
-    """Provide fixed stream items and an assembled response."""
-
     def __init__(self, *, outcome: ResponseOutcome[str | None] | None = None) -> None:
-        """Script the assembled outcome, defaulting to a usable response whose output is "ab"."""
         self.closed: bool = False
         self.raw: FakeRawResponse = FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
-        """What provider_billing wraps; None stands for an adapter with no such channel."""
+        """None represents unavailable provider_billing."""
         self._outcome = outcome
 
     @override
     def provider_billing(self) -> ProviderBilling | None:
-        """Wrap whatever the test set, defaulting to the None an openai stream returns."""
         return (
             None if self._usage_reported is None else stated_provider_billing(self._usage_reported)
         )
 
     @override
     def request_id(self) -> str | None:
-        """Report a fixed header, standing in for the response headers a real SDK stream reads."""
         return "req-fake-stream"
 
     def scripted_response(self) -> ScriptedResponse:
-        """Return the assembled response the SDK would produce, and what the stream billed."""
         if self._outcome is not None:
             return billed(self._outcome)
         return ScriptedResponse(outcome=usable_text_response("ab"), usage=USAGE_STREAM)
@@ -176,7 +152,6 @@ class FakeStream(AdapterStream):
 
     @override
     async def final(self) -> BaseModel:
-        """Return the response the stream's events assembled into."""
         return self.raw
 
     @override
@@ -189,35 +164,21 @@ class HangsAfterFirstItemStream(FakeStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Yield one item, then wait on an event that never fires.
-
-        Yields:
-            One item, and nothing after it.
-        """
         yield "a"
         await asyncio.Event().wait()
 
 
 type ScriptedRequest = Exception | ScriptedResponse
-"""One open_stream exception or assembled response."""
 
 
 class ScriptedRequestStream(FakeStream):
-    """Stream one scripted response.
-
-    Each request has a fresh raw response and request ID.
-    A stream with content yields it and FAKE_TOOL_CALL.
-    """
-
     def __init__(self, *, raw: FakeRawResponse, content: str | None) -> None:
-        """Store final output and optional streamed content."""
         super().__init__()
         self.raw: FakeRawResponse = raw
         self._content = content
 
     @override
     def request_id(self) -> str | None:
-        """Derive the request ID from raw.id."""
         return f"req-{self.raw.id}"
 
     @override
@@ -229,35 +190,23 @@ class ScriptedRequestStream(FakeStream):
 
 @dataclass(frozen=True, kw_only=True)
 class FakeRequestParams(RequestParams):
-    """Store messages for fake request params."""
-
     messages: tuple[Message, ...]
 
     @override
     def as_json(self) -> str:
-        """Serialize messages as JSON."""
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
 def as_fake_request_params(request_params: RequestParams) -> FakeRequestParams:
-    """Narrow request params to the fake ones.
-
-    Raises:
-        TypeError: request_params is not a FakeRequestParams, which the real adapters raise for the same reason.
-    """
     if not isinstance(request_params, FakeRequestParams):
         raise TypeError(f"expected a FakeRequestParams, got {type(request_params).__name__}")
     return request_params
 
 
 class FakeBoundAdapter(BoundAdapter[str | None]):
-    """A bound adapter whose open_stream follows the behavior its FakeAdapter was given.
-
-    Each bound adapter consumes its own copy of the adapter's scripts and keeps its own counters.
-    """
+    """Consume scripts and count requests independently for each binding."""
 
     def __init__(self, adapter: "FakeAdapter") -> None:
-        """Copy the adapter's scripts so this binding consumes them independently."""
         self._adapter = adapter
         self._scripted_requests = list(adapter.scripted_requests)
         self._rejected_messages = list(adapter.rejected_messages)
@@ -271,12 +220,10 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
-        """Return what the response under this raw was scripted to have billed."""
         return stated_provider_billing(self._scripted_by_raw_id[as_fake_raw(raw).id].usage)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Name the fake model, take the response id from the raw's own, and the request id as it came."""
         fake_raw = as_fake_raw(raw)
         return ResponseIdentity(
             model_served="fake-model-served",
@@ -286,14 +233,12 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
-        """Return what the response under this raw was scripted to produce."""
         return self._scripted_by_raw_id[as_fake_raw(raw).id].outcome
 
     @override
     def build_request_params(
         self, messages: Sequence[Message]
     ) -> RequestParams | RejectedMessages:
-        """Return the next scripted `RejectedMessages`, else carry messages into the request params."""
         if self._rejected_messages:
             return self._rejected_messages.pop(0)
         self.build_count += 1
@@ -302,7 +247,6 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
     def _request_stream(
         self, scripted_response: ScriptedResponse, *, content: str | None
     ) -> ScriptedRequestStream:
-        """Register the scripted response under a fresh raw and wrap it in this request's stream."""
         raw = FakeRawResponse(id=f"fake-response-{self.open_count}")
         self._scripted_by_raw_id[raw.id] = scripted_response
         self.final_raws.append(raw)
@@ -310,12 +254,6 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
 
     @override
     async def open_stream(self, request_params: RequestParams) -> AdapterStream:
-        """Count the request, suspend, then raise or return the next scripted request's stream.
-
-        Raises:
-            TypeError: request_params is not a FakeRequestParams.
-            Exception: the next scripted failure.
-        """
         messages = as_fake_request_params(request_params).messages
         self.open_count += 1
         open_call = self.open_count
@@ -348,16 +286,9 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
 
 
 class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None]):
-    """A structured bound adapter that sends, bills, and identifies requests as `text_bound_adapter` does.
-
-    interpret validates a usable response's assistant message text into `response_format`.
-    Text that fails validation becomes a `SchemaViolation`.
-    """
-
     def __init__(
         self, text_bound_adapter: FakeBoundAdapter, response_format: type[ModelT]
     ) -> None:
-        """Store the text bound adapter that handles every request and the model to validate into."""
         self._text_bound_adapter = text_bound_adapter
         self._response_format = response_format
 
@@ -371,7 +302,6 @@ class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None])
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
-        """Validate the assistant message text of a usable response, and return any other outcome unchanged."""
         outcome = self._text_bound_adapter.interpret(raw)
         if outcome.kind != "usable_response":
             return outcome
@@ -397,40 +327,23 @@ class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None])
 
     @override
     async def open_stream(self, request_params: RequestParams) -> AdapterStream:
-        """Open the request as the text bound adapter does.
-
-        Raises:
-            Exception: whatever FakeBoundAdapter.open_stream raises.
-        """
         return await self._text_bound_adapter.open_stream(request_params)
 
 
 class RequestIdError(RuntimeError):
-    """An error carrying the request-id header its response had, as both SDKs' APIStatusError does."""
-
     def __init__(self, message: str, request_id: str) -> None:
-        """Store the message and the request id."""
         super().__init__(message)
         self.request_id: str = request_id
 
 
 class TransientRequestIdError(TransientError):
-    """The same id, on the class an adapter raises to retry a request without going through `request_failure`."""
-
     def __init__(self, message: str, request_id: str) -> None:
-        """Store the message and the request id."""
         super().__init__(message)
         self.request_id: str = request_id
 
 
 class FakeAdapter(Adapter):
-    """An adapter whose bind_text and bind_structured hand out fake bound adapters.
-
-    `bound_adapters` lists the bound adapter of every text binding.
-    """
-
     _bound_adapter_class: ClassVar[type[FakeBoundAdapter]] = FakeBoundAdapter
-    """The class bind_text hands out; a subclass names its own to vary what interpret does."""
 
     def __init__(
         self,
@@ -446,18 +359,13 @@ class FakeAdapter(Adapter):
         open_barrier_from_call: int = 1,
         automatic_cache_breakpoints_default: bool = False,
     ) -> None:
-        """Store the behavior every bound adapter reads and the `RequestFailure` of every failure the adapter maps.
+        """Wait at open_barrier starting with call open_barrier_from_call.
 
-        From call number open_barrier_from_call on, open_stream first waits at open_barrier.
-        From call number hang_from_open on, it then suspends until cancelled.
-        It then sleeps open_seconds, and raises or streams the next of scripted_requests.
-        With none left, it returns stream.
-        Without a stream, it streams a usable response whose output is "ok".
-        With echo set and a first message that is a user message with str content, the output is that content.
-        build_request_params returns the next of rejected_messages while any remain.
+        open_stream then suspends starting with call hang_from_open; otherwise it waits open_seconds.
+        Requests consume scripted_requests, then use stream, then produce "ok".
+        With echo=True, the default response echoes the first message when it is a user message with string content.
+        build_request_params consumes rejected_messages before constructing request params.
         """
-        # This adapter reaches no SDK, so it passes client=None.
-        # The empty provider_name_by_client_class preserves the stated "fake" provider_name.
         super().__init__(
             client=None,
             model="fake-model",
@@ -478,7 +386,6 @@ class FakeAdapter(Adapter):
 
     @override
     def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return the fake adapter's stored request configuration."""
         return {"automatic_cache_breakpoints_default": self.automatic_cache_breakpoints_default}
 
     @override
@@ -491,18 +398,15 @@ class FakeAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Build a structured bound adapter over a new text bound adapter, and count the call."""
         self.structured_bind_count += 1
         return FakeStructuredBoundAdapter(self._bound_adapter_class(self), response_format)
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Return the `RequestFailure` passed to the constructor."""
         return self._request_failure
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:
-        """Read the request id off the errors that carry one, as each SDK's adapter does."""
         if isinstance(error, (RequestIdError, TransientRequestIdError)):
             return error.request_id
         return None

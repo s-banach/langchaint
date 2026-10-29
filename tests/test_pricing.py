@@ -51,13 +51,11 @@ def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:
 
 @pytest.mark.parametrize("invocation_count", [-1, True])
 def test_invocation_cost_rejects_invalid_counts(invocation_count: int) -> None:
-    """Negative and boolean counts cannot produce costs."""
     with pytest.raises(ValueError, match="nonnegative int"):
         _ = invocation_cost_in_usd(invocation_count, usd_per_invocation=0.01)
 
 
 def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
-    """Cover negative, NaN, and zero cache savings."""
     for billing, expected in (
         (
             stated_billing(
@@ -89,7 +87,6 @@ def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
 
 
 def test_long_context_rates_start_above_the_threshold() -> None:
-    """A prompt at the threshold pays the base rates, and a longer one pays input and output multipliers apart."""
     rates = TokenRates(
         input_tokens_cache_read=1.0,
         input_tokens_cache_write=12.5,

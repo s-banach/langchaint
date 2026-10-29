@@ -1,9 +1,7 @@
-"""Test normalized generation records, live wrappers, outcome normalization, and tables."""
-
 import json
 import math
 from collections.abc import Callable
-from typing import override
+from typing import Literal, override
 
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -16,7 +14,6 @@ from langchaint import (
     Billing,
     CutOffRequestRecord,
     GenerationError,
-    GenerationErrorKind,
     GenerationErrorRecord,
     GenerationOutcomeRecord,
     PlainErrorRecord,
@@ -43,23 +40,16 @@ from tests.helpers import StubRaw
 
 
 class Report(BaseModel):
-    """One caller-supplied structured output."""
-
     value: int
 
 
 class ProviderUsage(BaseModel):
-    """One provider-specific usage value."""
-
     billed_units: int
 
 
 class StubRequestParams(RequestParams):
-    """One live-only request for table tests."""
-
     @override
     def as_json(self) -> str:
-        """Return fixed request JSON."""
         return '{"prompt":"hi"}'
 
 
@@ -158,7 +148,6 @@ def _request_provider_data(raw: BaseModel | None = None) -> tuple[RequestProvide
 
 
 def test_usage_and_billing_nonfinite_values_round_trip_as_strings() -> None:
-    """Normalized non-finite floats serialize as reconstructible strings."""
     billing_json = _BILLING.model_dump_json()
     assert '"NaN"' in billing_json
     assert '"Infinity"' in billing_json
@@ -171,7 +160,6 @@ def test_usage_and_billing_nonfinite_values_round_trip_as_strings() -> None:
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_usage_nonfinite_cost_round_trips(value: float) -> None:
-    """Each supported non-finite usage cost reconstructs its float value."""
     usage = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": value})
     restored = Usage.model_validate_json(usage.model_dump_json())
     if math.isnan(value):
@@ -182,7 +170,6 @@ def test_usage_nonfinite_cost_round_trips(value: float) -> None:
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1.25"])
 def test_usage_rejects_string_costs_in_python_input(value: str) -> None:
-    """Python cost fields require numbers, including non-finite values."""
     usage_data = ZERO_USAGE.model_dump()
     usage_data["output_tokens_cost_in_usd"] = value
     with pytest.raises(ValidationError, match="output_tokens_cost_in_usd"):
@@ -190,7 +177,6 @@ def test_usage_rejects_string_costs_in_python_input(value: str) -> None:
 
 
 def test_usage_rejects_a_finite_string_cost_in_json() -> None:
-    """JSON cost fields accept numeric values and the non-finite string encodings."""
     usage_data = ZERO_USAGE.model_dump()
     usage_data["output_tokens_cost_in_usd"] = "1.25"
     with pytest.raises(ValidationError, match="output_tokens_cost_in_usd"):
@@ -198,7 +184,6 @@ def test_usage_rejects_a_finite_string_cost_in_json() -> None:
 
 
 def test_request_rejects_first_item_after_its_end() -> None:
-    """Reject first_item_after_seconds exceeding elapsed_seconds."""
     with pytest.raises(ValidationError):
         _ = SettledRequestRecord(
             started_after_seconds=0.0,
@@ -214,44 +199,45 @@ def test_request_rejects_first_item_after_its_end() -> None:
 
 
 def test_less_than_or_ulp_close_accepts_the_documented_rounding_boundary() -> None:
-    """The timing comparison accepts four ULPs and rejects five ULPs."""
     right = 1.0
     assert _less_than_or_ulp_close(right + 4 * math.ulp(right), right)
     assert not _less_than_or_ulp_close(right + 5 * math.ulp(right), right)
 
 
-def test_request_history_rejects_overlap_out_of_bounds_and_cut_off_placement() -> None:
-    """Request history validation enforces ordering, bounds, and final cut-off placement."""
-    first = _settled(elapsed_seconds=1.0)
-    overlap = _settled(started_after_seconds=0.5, elapsed_seconds=0.5)
-    with pytest.raises(ValidationError, match="overlap"):
-        _ = RequestHistory(
-            model="m",
-            provider_name="p",
-            records=(first, overlap),
-            elapsed_seconds=1.0,
-        )
-    with pytest.raises(ValidationError, match="within the request history"):
-        _ = RequestHistory(
-            model="m",
-            provider_name="p",
-            records=(first,),
-            elapsed_seconds=0.5,
-        )
-    with pytest.raises(ValidationError, match="must be final"):
-        _ = RequestHistory(
-            model="m",
-            provider_name="p",
-            records=(
+@pytest.mark.parametrize(
+    ("records", "elapsed_seconds", "match"),
+    [
+        (
+            (_settled(), _settled(started_after_seconds=0.5, elapsed_seconds=0.5)),
+            1.0,
+            "overlap",
+        ),
+        ((_settled(),), 0.5, "within the request history"),
+        (
+            (
                 CutOffRequestRecord(started_after_seconds=0.0, billing=None),
                 _settled(started_after_seconds=1.0),
             ),
-            elapsed_seconds=2.0,
+            2.0,
+            "must be final",
+        ),
+    ],
+)
+def test_request_history_rejects_overlap_out_of_bounds_and_cut_off_placement(
+    records: tuple[SettledRequestRecord | CutOffRequestRecord, ...],
+    elapsed_seconds: float,
+    match: str,
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        _ = RequestHistory(
+            model="m",
+            provider_name="p",
+            records=records,
+            elapsed_seconds=elapsed_seconds,
         )
 
 
 def test_response_record_round_trips_with_concrete_output_type() -> None:
-    """A concrete caller model reconstructs through `PlainGenerationRecord` JSON."""
     record = PlainGenerationRecord(
         output=Report(value=3),
         request_history=_completed_request_history(),
@@ -263,26 +249,25 @@ def test_response_record_round_trips_with_concrete_output_type() -> None:
     assert isinstance(restored.output, Report)
 
 
-def test_generation_record_rejects_invalid_request_shapes() -> None:
-    """Reject generation records with missing billing or a cut-off request."""
-    with pytest.raises(ValidationError, match="final request must contain billing"):
+@pytest.mark.parametrize(
+    ("request_record", "match"),
+    [
+        (_settled(billing=None), "final request must contain billing"),
+        (CutOffRequestRecord(started_after_seconds=0.0, billing=None), "cut-off"),
+    ],
+)
+def test_generation_record_rejects_invalid_request_shapes(
+    request_record: SettledRequestRecord | CutOffRequestRecord, match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
         _ = PlainGenerationRecord(
             output=1,
-            request_history=_request_history(_settled(billing=None)),
-            stop_reason="stop",
-        )
-    with pytest.raises(ValidationError, match="cut-off"):
-        _ = PlainGenerationRecord(
-            output=1,
-            request_history=_request_history(
-                CutOffRequestRecord(started_after_seconds=0.0, billing=None)
-            ),
+            request_history=_request_history(request_record),
             stop_reason="stop",
         )
 
 
 def test_tool_call_generation_record_requires_a_tool_call() -> None:
-    """A `ToolCallGenerationRecord` requires a tool call in its kept assistant message."""
     with pytest.raises(ValidationError, match="tool call"):
         _ = ToolCallGenerationRecord(
             output=None, request_history=_completed_request_history(), stop_reason="tool_call"
@@ -332,7 +317,6 @@ def test_tool_call_generation_record_requires_a_tool_call() -> None:
 def test_generation_commentary_is_computed_from_preserved_content(
     content: str | tuple[AssistantPart, ...], commentary: str | None
 ) -> None:
-    """Live and restored generations expose commentary without duplicating it in serialized records."""
     assistant_message = AssistantMessage(content=content)
     history = _completed_request_history(assistant_message=assistant_message)
     if assistant_message.tool_calls:
@@ -353,7 +337,6 @@ def test_generation_commentary_is_computed_from_preserved_content(
 
 
 def test_live_generation_preserves_provider_data_and_requires_alignment() -> None:
-    """Preserve raw provider data and reject misaligned request_provider_data."""
     record = PlainGenerationRecord(
         output=Report(value=5),
         request_history=_completed_request_history(),
@@ -367,7 +350,6 @@ def test_live_generation_preserves_provider_data_and_requires_alignment() -> Non
 
 
 def test_live_generation_requires_provider_data_from_the_final_request() -> None:
-    """A live generation rejects an earlier provider response when its final request has none."""
     failed_request = _settled(
         elapsed_seconds=0.5,
         error=TransientErrorRecord(error_text="retry"),
@@ -389,7 +371,6 @@ def test_live_generation_requires_provider_data_from_the_final_request() -> None
 
 
 def test_generation_variant_constructs_one_normalized_record() -> None:
-    """`_generation_variant` stores one normalized tool-call record by reference."""
     request_history = _completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE)
     generation = _generation_variant(
         splits_on_tool_calls=True,
@@ -403,7 +384,7 @@ def test_generation_variant_constructs_one_normalized_record() -> None:
     assert generation.record.request_history is request_history
 
 
-def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKind, str]]:
+def _error_record_cases() -> list[tuple[GenerationErrorRecord, str]]:
     completed = _completed_request_history()
     failed = _failed_request_history()
     multiline_failed = _request_history(
@@ -426,39 +407,32 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
     return [
         (
             PlainErrorRecord(kind="retries_exhausted_error", request_history=multiline_failed),
-            "retries_exhausted_error",
             "request 1: connection\n  reset\nrequest 2: ",
         ),
         (
             PlainErrorRecord(kind="retry_unavailable_error", request_history=failed),
-            "retry_unavailable_error",
             "retry",
         ),
         (
             PlainErrorRecord(kind="refusal_error", request_history=completed),
-            "refusal_error",
             "",
         ),
         (
             PlainErrorRecord(
                 kind="max_completion_tokens_exceeded_error", request_history=completed
             ),
-            "max_completion_tokens_exceeded_error",
             "",
         ),
         (
             PlainErrorRecord(kind="empty_assistant_message_error", request_history=completed),
-            "empty_assistant_message_error",
             "",
         ),
         (
             SchemaViolationErrorRecord(request_history=completed, validation_error_json="[]"),
-            "schema_violation_error",
             "",
         ),
         (
             PlainErrorRecord(kind="context_window_exceeded_error", request_history=completed),
-            "context_window_exceeded_error",
             "",
         ),
         (
@@ -467,7 +441,6 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
                 request_history=completed,
                 error_text="unfinished",
             ),
-            "unfinished_assistant_message_error",
             "unfinished",
         ),
         (
@@ -476,7 +449,6 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
                 request_history=completed,
                 error_text="failed",
             ),
-            "provider_failed_terminally_error",
             "failed",
         ),
         (
@@ -485,12 +457,10 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
                 request_history=terminal,
                 error_text="terminal",
             ),
-            "provider_failed_terminally_error",
             "terminal",
         ),
         (
             PlainErrorRecord(kind="auth_error", request_history=terminal, error_text="auth"),
-            "auth_error",
             "auth",
         ),
         (
@@ -504,7 +474,6 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
                 ),
                 error_text="invalid",
             ),
-            "rejected_error",
             "invalid",
         ),
         (
@@ -518,42 +487,39 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
                 ),
                 error_text="unknown",
             ),
-            "unknown_exception_error",
             "unknown",
         ),
         (
             PlainErrorRecord(
                 kind="unknown_exception_error", request_history=cut_off, error_text="escaped"
             ),
-            "unknown_exception_error",
             "escaped",
         ),
         (
             PlainErrorRecord(kind="timed_out_error", request_history=cut_off),
-            "timed_out_error",
             "",
         ),
     ]
 
 
-def test_every_error_record_round_trips_through_the_closed_union() -> None:
-    """The closed error union reconstructs each built-in error record."""
+@pytest.mark.parametrize(("record", "error_text"), _error_record_cases())
+def test_every_error_record_round_trips_through_the_closed_union(
+    record: GenerationErrorRecord, error_text: str
+) -> None:
     adapter = TypeAdapter(GenerationErrorRecord)
-    for record, expected_kind, expected_error_text in _error_record_cases():
-        assert record.error_text == expected_error_text
-        record_json_text = record.model_dump_json()
-        assert json.loads(record_json_text)["error_text"] == expected_error_text
-        record_json_bytes = adapter.dump_json(record)
-        restored = adapter.validate_json(record_json_bytes)
-        assert type(restored) is type(record)
-        assert adapter.dump_json(restored) == record_json_bytes
-        assert restored.kind == expected_kind
-        assert restored.error_text == expected_error_text
-        assert str(restored) == restored.error_text
+    assert record.error_text == error_text
+    record_json_text = record.model_dump_json()
+    assert json.loads(record_json_text)["error_text"] == error_text
+    record_json_bytes = adapter.dump_json(record)
+    restored = adapter.validate_json(record_json_bytes)
+    assert type(restored) is type(record)
+    assert adapter.dump_json(restored) == record_json_bytes
+    assert restored.kind == record.kind
+    assert restored.error_text == error_text
+    assert str(restored) == restored.error_text
 
 
 def test_error_record_properties_and_error_text() -> None:
-    """Error records retain normalized properties and error_text."""
     exhausted = PlainErrorRecord(
         kind="retries_exhausted_error", request_history=_failed_request_history()
     )
@@ -566,27 +532,16 @@ def test_error_record_properties_and_error_text() -> None:
     assert refusal.usage == _USAGE
 
 
-@pytest.mark.parametrize(
-    "factory",
-    [
-        lambda: PlainErrorRecord(
-            kind="retries_exhausted_error",
-            request_history=_failed_request_history(),
-            error_text="different text",
-        ),
-        lambda: PlainErrorRecord(
-            kind="retry_unavailable_error",
-            request_history=_failed_request_history(),
-            error_text="different text",
-        ),
-    ],
-)
+@pytest.mark.parametrize("kind", ["retries_exhausted_error", "retry_unavailable_error"])
 def test_retry_error_records_reject_error_text_that_disagrees_with_request_history(
-    factory: Callable[[], PlainErrorRecord],
+    kind: Literal["retries_exhausted_error", "retry_unavailable_error"],
 ) -> None:
-    """Retry records derive error_text from the request history."""
     with pytest.raises(ValidationError, match="error_text must match"):
-        _ = factory()
+        _ = PlainErrorRecord(
+            kind=kind,
+            request_history=_failed_request_history(),
+            error_text="different text",
+        )
 
 
 @pytest.mark.parametrize(
@@ -626,20 +581,17 @@ def test_retry_error_records_reject_error_text_that_disagrees_with_request_histo
 def test_error_records_reject_invalid_request_history_shapes(
     factory: Callable[[], PlainErrorRecord], match: str
 ) -> None:
-    """Each constrained error group rejects a request history shape outside its contract."""
     with pytest.raises(ValidationError, match=match):
         _ = factory()
 
 
 def test_generation_error_requires_provider_request_alignment() -> None:
-    """Reject request_provider_data that do not align with the record."""
     record = PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history())
     with pytest.raises(ValueError, match="align"):
         _ = GenerationError(record=record, request_params=None, request_provider_data=())
 
 
 def test_mixed_normalized_outcome_list_round_trips() -> None:
-    """A mixed normalized outcome list reconstructs through its concrete output type."""
     records: list[GenerationOutcomeRecord[Report]] = [
         PlainGenerationRecord(
             output=Report(value=9),
@@ -656,7 +608,6 @@ def test_mixed_normalized_outcome_list_round_trips() -> None:
 
 
 def test_to_tables_reads_live_only_request_params_and_provider_usage() -> None:
-    """Tables read request params and provider usage only from live outcomes."""
     record = PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history())
     live = GenerationError(
         record=record,
@@ -683,7 +634,6 @@ def test_to_tables_reads_live_only_request_params_and_provider_usage() -> None:
 
 
 def test_to_tables_emits_one_row_for_a_cut_off_request() -> None:
-    """A cut-off request produces one request row with no fabricated ending."""
     record = PlainErrorRecord(
         kind="timed_out_error",
         request_history=_request_history(
@@ -700,7 +650,6 @@ def test_to_tables_emits_one_row_for_a_cut_off_request() -> None:
 
 
 def test_to_tables_writes_an_abandoned_stream_without_output_error_text_or_kept_request() -> None:
-    """An abandoned stream row has neither output nor error_text, and no kept request."""
     tables = to_tables(AbandonedStreamRecord(request_history=_failed_request_history()))
     assert (tables.outcomes[0]["output"], tables.outcomes[0]["error_text"]) == (None, None)
     assert [request_record["kept"] for request_record in tables.requests] == [False]
@@ -713,7 +662,6 @@ class _TickingClock:
         self._ticks = 0
 
     def monotonic(self) -> float:
-        """Return the number of earlier calls as seconds."""
         seconds = float(self._ticks)
         self._ticks += 1
         return seconds
@@ -740,7 +688,6 @@ def test_the_ledger_stamps_the_first_item_and_not_a_later_one(
 
 
 def test_timed_out_error_appends_one_cut_off_request_with_live_usage() -> None:
-    """A live timeout aligns its cut-off record with provider usage."""
     ledger = _RequestLedger(model="model", provider_name="provider")
     ledger.start_request()
     provider_billing = ProviderBilling(billing=_BILLING, usage_raw=ProviderUsage(billed_units=23))

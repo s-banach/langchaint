@@ -17,13 +17,11 @@ class _RunManyFailure(BaseException):
 
 @pytest.mark.parametrize("invalid", [True, False, 0, -1])
 def test_max_pending_for_requests_rejects_invalid_concurrency(invalid: int) -> None:
-    """Reject values that cannot represent request concurrency."""
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         _ = max_pending_for_requests(invalid)
 
 
 def test_run_many_validates_max_pending_before_running_run_ones() -> None:
-    """Invalid max_pending starts no run_one task."""
 
     async def scenario() -> None:
         """Try every invalid max_pending."""
@@ -68,7 +66,6 @@ def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
 
 
 def test_run_many_empty_run_ones_start_no_task() -> None:
-    """Empty run_ones return an empty result after max_pending validation."""
 
     async def scenario() -> None:
         """Run an empty run_ones sequence."""
@@ -78,7 +75,6 @@ def test_run_many_empty_run_ones_start_no_task() -> None:
 
 
 def test_run_many_snapshots_run_ones_before_starting_tasks() -> None:
-    """Mutating run_ones cannot change the run_ones still to start."""
 
     async def scenario() -> None:
         """Clear run_ones from its first run_one call."""
@@ -224,7 +220,6 @@ def test_run_many_repeated_cancellation_still_settles_started_tasks() -> None:
 
 
 def test_run_many_base_exception_settles_sibling_and_skips_unstarted_run_one() -> None:
-    """A BaseException settles its started sibling and starts no further run_one."""
 
     async def scenario() -> None:
         """Raise after two inputs start."""
@@ -261,7 +256,6 @@ def test_run_many_base_exception_settles_sibling_and_skips_unstarted_run_one() -
 
 
 def test_run_many_selects_the_lowest_run_one_failure_from_one_wait() -> None:
-    """Simultaneous failures propagate the lowest run_one index's failure."""
 
     async def scenario() -> None:
         """Fail every initial task before run_many resumes."""

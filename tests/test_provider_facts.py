@@ -65,7 +65,6 @@ def _field_annotation(model: type[BaseModel], name: str) -> object:
 
 
 def test_bedrock_body_limit_matches_the_partition_limit() -> None:
-    """Compare the partition limit with the SDK service model's body limit."""
     service = botocore.session.get_session().get_service_model("bedrock-runtime")
     input_shape = service.operation_model("InvokeModel").input_shape
     assert input_shape is not None
@@ -73,7 +72,6 @@ def test_bedrock_body_limit_matches_the_partition_limit() -> None:
 
 
 def test_bedrock_invoke_model_error_statuses_match_retry_parsing() -> None:
-    """Pin the retryable statuses parsed by the Cohere adapter."""
     service = botocore.session.get_session().get_service_model("bedrock-runtime")
     operation = service.operation_model("InvokeModel")
     status_by_error = {
@@ -93,7 +91,6 @@ def test_bedrock_invoke_model_error_statuses_match_retry_parsing() -> None:
 
 
 def test_bedrock_modeled_exceptions_remain_client_errors() -> None:
-    """Pin the exception type caught by the Cohere adapter."""
     service = botocore.session.get_session().get_service_model("bedrock-runtime")
     operation = service.operation_model("InvokeModel")
     client = boto3.client(
@@ -111,7 +108,6 @@ def test_bedrock_modeled_exceptions_remain_client_errors() -> None:
 
 
 def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
-    """A value the provider adds fails here. _normalized_stop_reason would map it to "other" unnoticed."""
     annotation = _field_annotation(AnthropicMessage, "stop_reason")
     assert set(typing.get_args(typing.get_args(annotation)[0])) == {
         "end_turn",
@@ -125,7 +121,6 @@ def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
 
 
 def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
-    """Response.status values the adapter branches on: completed, failed, and incomplete."""
     annotation = _field_annotation(OpenAIResponse, "status")
     assert set(typing.get_args(typing.get_args(annotation)[0])) == {
         "completed",
@@ -145,14 +140,12 @@ def test_openai_incomplete_reasons_have_dispositions() -> None:
 
 
 def test_every_openai_error_code_has_a_disposition() -> None:
-    """_DISPOSITION_BY_ERROR_CODE covers each ResponseError.code value."""
     annotation = _field_annotation(ResponseError, "code")
     codes = set(typing.get_args(annotation))
     assert codes <= set(openai_shared._DISPOSITION_BY_ERROR_CODE)
 
 
 def test_anthropic_reported_service_tier_values_match_the_sdk() -> None:
-    """The SDK response tiers match `_AnthropicReportedServiceTier`."""
     annotation = _field_annotation(AnthropicUsage, "service_tier")
     reported = typing.get_args(typing.get_args(annotation)[0])
     assert set(reported) == set(
@@ -236,7 +229,6 @@ def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
 
 
 def test_every_status_a_supported_client_names_is_in_one_of_the_status_tables() -> None:
-    """The status tables cover each client-specific status class."""
     clients_and_listed_statuses = (
         (AsyncAnthropic(api_key="k"), _ANTHROPIC_LISTED_STATUSES),
         (
@@ -263,7 +255,6 @@ def test_every_status_a_supported_client_names_is_in_one_of_the_status_tables() 
 
 
 def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
-    """Gemini retry tables cover the SDK retryable statuses."""
     assert set(_api_client._RETRY_HTTP_STATUS_CODES) <= (
         generate_content_adapter._PAUSE_STATUSES
         | generate_content_adapter._RETRY_THIS_ONE_STATUSES

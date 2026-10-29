@@ -115,7 +115,7 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
         """
         del task
         response = await self.client.embeddings.create(
-            input=tuple(inputs),
+            input=inputs,
             model=self.model,
             dimensions=(omit if self.model == "text-embedding-ada-002" else self.dimension),
             encoding_format="float",
@@ -144,7 +144,7 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
                     input_tokens_total=input_tokens_total,
                 )
             vectors_by_index[index] = embedding.embedding
-        if set(vectors_by_index) != set(range(len(inputs))):
+        if len(vectors_by_index) != len(inputs):
             raise EmbeddingOutputError(
                 "OpenAI returned invalid embedding indexes", input_tokens_total=input_tokens_total
             )
@@ -161,5 +161,4 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Delegate to `openai_request_failure`."""
         return openai_request_failure(error)

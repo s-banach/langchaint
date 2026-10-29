@@ -109,7 +109,7 @@ Document every public parameter and cross-provider difference.
 ## Types and imports
 
 - Use pydantic for a langchaint model only when serialization and validation justify it.
-- State the validation benefit in each langchaint pydantic model docstring.
+- Document shared pydantic validation behavior on `CheckedCopyModel` and model-specific validation constraints on each model.
 - Derive every langchaint pydantic model from `CheckedCopyModel`.
 - Use a frozen dataclass or `NamedTuple` otherwise.
 - Use runtime checks only for invalid values that a correctly typed argument can contain.
@@ -142,6 +142,8 @@ Run `scripts/CI.sh` until it reports zero errors.
 Keep tests offline.
 Use constructed SDK objects and stub adapters.
 Never use API keys in tests.
+Keep test docstrings only when they explain unusual setup, timing constraints, or regression conditions beyond the test name and assertions.
+Start code searches with the relevant modules and exclude `_generated_pricing.py` unless pricing data is relevant.
 
 ## Releases
 

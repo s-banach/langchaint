@@ -269,26 +269,23 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             ValueError: One input exceeds InvokeModel's body limit.
         """
         batches: list[tuple[str, ...]] = []
-        current: list[str] = []
+        current: tuple[str, ...] = ()
         target_bytes = (
             _COHERE_V4_BODY_TARGET_BYTES if self.is_embed_v4 else _INVOKE_MODEL_MAX_BODY_BYTES
         )
         for input_text in inputs:
-            current.append(input_text)
-            candidate_bytes = len(self._request_body(current, task=task))
-            if len(current) == 1:
-                if candidate_bytes > _INVOKE_MODEL_MAX_BODY_BYTES:
-                    raise ValueError("A Cohere input exceeds InvokeModel's body limit")
-                continue
-            if len(current) > _COHERE_MAX_INPUTS or candidate_bytes > target_bytes:
-                next_input = current.pop()
-                batches.append(tuple(current))
-                current = [next_input]
-                singleton_bytes = len(self._request_body(current, task=task))
-                if singleton_bytes > _INVOKE_MODEL_MAX_BODY_BYTES:
-                    raise ValueError("A Cohere input exceeds InvokeModel's body limit")
+            candidate = (*current, input_text)
+            body_size_bytes = len(self._request_body(candidate, task=task))
+            if current and (len(candidate) > _COHERE_MAX_INPUTS or body_size_bytes > target_bytes):
+                batches.append(current)
+                current = (input_text,)
+                body_size_bytes = len(self._request_body(current, task=task))
+            else:
+                current = candidate
+            if len(current) == 1 and body_size_bytes > _INVOKE_MODEL_MAX_BODY_BYTES:
+                raise ValueError("A Cohere input exceeds InvokeModel's body limit")
         if current:
-            batches.append(tuple(current))
+            batches.append(current)
         return tuple(batches)
 
     @override

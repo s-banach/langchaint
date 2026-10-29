@@ -1,67 +1,4 @@
-"""Implement Gemini `generateContent` through the google-genai SDK.
-
-The following SDK facts were verified against google-genai 2.16.0.
-`retry_args(None)` permits one request.
-Every request sets `HttpRetryOptions(attempts=1)` through per-request `http_options`.
-The per-request value replaces the client value and preserves `max_requests` for passed clients.
-`generate_content_stream` yields `GenerateContentResponse` chunks without assembling them.
-`assembled_response` assembles the chunks.
-A mid-stream error raises `errors.APIError` with the response body code.
-`errors.APIError` has `code`, `status`, `message`, `details`, and an optional `httpx.Response`.
-It has no request-id attribute, and its response has no request-id field.
-
-`usage_metadata.prompt_token_count` includes `cached_content_token_count`.
-`total_token_count` sums prompt, candidate, tool-use prompt, and thought tokens.
-Gemini reports no cache-write counter and bills no cache writes.
-Implicit cache reads appear in `cached_content_token_count`.
-Source: https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03.
-
-`Part.thought` marks reasoning, and `Part.thought_signature` contains bytes.
-JSON-mode SDK dumps encode bytes as base64 and validate them back.
-`ReasoningPart.raw` stores that JSON-mode dump.
-SDK models reject unknown keys, so another provider's dump returns `RejectedMessages`.
-SDK enums preserve unknown effort and tier values as synthetic enum values with `UserWarning`.
-`FunctionResponse.response` uses `"output"` and `"error"` for `ToolMessage.content` and `ToolMessage.is_error`.
-
-Thought signatures require exact replay on thought and built-in tool steps.
-Source: https://ai.google.dev/gemini-api/docs/thinking, read 2026-08-03.
-The adapter emits `ReasoningPart` for each part with `thought` or `thought_signature`.
-`Part.model_validate_json` restores each part unchanged.
-A signed part may also emit `TextPart` or `ToolCall` for its answer text or function call.
-Replay skips a matching following `AssistantPart` because `ReasoningPart.raw` already contains its data.
-
-`generateContent` has no request field for implicit caching.
-Both `automatic_cache_breakpoints` values produce the same request and cache-read billing.
-Gemini never bills a cache write.
-A system part with `cache_breakpoint=True` raises `ValueError`, and such a message part returns `RejectedMessages`.
-`extra_body={"cachedContent": ...}` selects an explicit cache resource.
-The cache resource must not declare tools, because result types follow the bound tools.
-
-Content mappings were verified against google-genai 2.17.0.
-- `ImagePart` and `AudioPart` become `Part.inline_data`.
-- `ImageUrlPart` becomes `Part.file_data`.
-- Inside `ToolMessage`, `ImagePart` and `AudioPart` become `FunctionResponsePart.inline_data`.
-- Inside `ToolMessage`, `ImageUrlPart` becomes `FunctionResponsePart.file_data`.
-- `Part.tool_call` and `Part.tool_response` carry provider-executed tool evidence.
-
-Request and response mappings:
-- `ToolMessage` becomes `function_response` inside user-role `Content`.
-- Consecutive `ToolMessage` values share one `Content`.
-- `FunctionResponse.name` comes from the earlier `ToolCall` matching `tool_call_id`.
-- A missing match returns `RejectedMessages`.
-- `FunctionCall.id` is optional, while `ToolCall.id` is required.
-- The adapter uses the function name when the provider omits the id.
-- Replay sends the id only when it differs from the function name.
-- Same-name calls without provider ids share an id and match results by order.
-- `reasoning_level` sends the exact `thinking_level` string with `include_thoughts=True`.
-- The provider reports unsupported values through its own error.
-- `parallel_tool_calls=False` raises at bind because Gemini has no disabling field.
-- `MAX_TOKENS` maps to `"max_completion_tokens"`, and refusal reasons map to `"refusal"`.
-- `STOP` maps by `ToolCall` presence to `"tool_call"` or `"stop"`.
-- Other finish reasons map to `"other"`.
-- Gemini reports terminal conditions through statuses or stream errors instead of a completed 200 failure body.
-- The adapter does not construct `ContextWindowExceeded`, `ProviderFailedTransiently`, or `ProviderFailedTerminally`.
-"""
+"""Implement Gemini `generateContent` through the google-genai SDK."""
 
 import json
 from abc import ABC
@@ -364,24 +301,11 @@ def _billing_from_usage(
     Raises:
         pydantic.ValidationError: the counters leave a category negative.
     """
-    if usage_metadata is None:
-        return ProviderBilling(
-            billing=billing_at_rates(
-                pricing.rates_for(service_tier=_ON_DEMAND_TIER, prompt_token_count=0),
-                service_tier=_ON_DEMAND_TIER,
-                input_tokens_cache_read=0,
-                input_tokens_cache_write=0,
-                input_tokens_cache_none=0,
-                output_tokens=0,
-                output_tokens_reasoning=0,
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
-            ),
-            usage_raw=None,
-        )
-    service_tier = _priced_tier(usage_metadata.traffic_type)
-    prompt_token_count = usage_metadata.prompt_token_count or 0
-    input_tokens_cache_read = usage_metadata.cached_content_token_count or 0
-    output_tokens_reasoning = usage_metadata.thoughts_token_count or 0
+    counters = usage_metadata or types.GenerateContentResponseUsageMetadata()
+    service_tier = _priced_tier(counters.traffic_type)
+    prompt_token_count = counters.prompt_token_count or 0
+    input_tokens_cache_read = counters.cached_content_token_count or 0
+    output_tokens_reasoning = counters.thoughts_token_count or 0
     return ProviderBilling(
         billing=billing_at_rates(
             pricing.rates_for(service_tier=service_tier, prompt_token_count=prompt_token_count),
@@ -390,8 +314,8 @@ def _billing_from_usage(
             input_tokens_cache_write=0,
             input_tokens_cache_none=prompt_token_count
             - input_tokens_cache_read
-            + (usage_metadata.tool_use_prompt_token_count or 0),
-            output_tokens=(usage_metadata.candidates_token_count or 0) + output_tokens_reasoning,
+            + (counters.tool_use_prompt_token_count or 0),
+            output_tokens=(counters.candidates_token_count or 0) + output_tokens_reasoning,
             output_tokens_reasoning=output_tokens_reasoning,
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
@@ -446,33 +370,23 @@ def _provider_executed_tool_cost_in_usd(
         and provider_executed_tool_fields & _CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS
     ):
         return float("nan")
-    tool_calls: list[types.ToolCall] = []
-    tool_responses: list[types.ToolResponse] = []
-    for part in provider_executed_tool_parts:
-        if part.tool_call is not None:
-            tool_calls.append(part.tool_call)
-        if part.tool_response is not None:
-            tool_responses.append(part.tool_response)
-
     call_keys: Counter[tuple[str, types.ToolType]] = Counter()
     response_keys: Counter[tuple[str, types.ToolType]] = Counter()
-    typed_tool_calls: list[tuple[types.ToolCall, types.ToolType]] = []
-    for tool_call in tool_calls:
+    search_queries: set[str] = set()
+    maps_query_count = 0
+    for part in provider_executed_tool_parts:
+        tool_response = part.tool_response
+        if tool_response is not None:
+            if tool_response.id is None or tool_response.tool_type is None:
+                return float("nan")
+            response_keys[(tool_response.id, tool_response.tool_type)] += 1
+        tool_call = part.tool_call
+        if tool_call is None:
+            continue
         tool_type = tool_call.tool_type
         if tool_call.id is None or tool_type is None:
             return float("nan")
         call_keys[(tool_call.id, tool_type)] += 1
-        typed_tool_calls.append((tool_call, tool_type))
-    for tool_response in tool_responses:
-        if tool_response.id is None or tool_response.tool_type is None:
-            return float("nan")
-        response_keys[(tool_response.id, tool_response.tool_type)] += 1
-    if call_keys != response_keys:
-        return float("nan")
-
-    search_queries: set[str] = set()
-    maps_query_count = 0
-    for tool_call, tool_type in typed_tool_calls:
         provider_field = _PROVIDER_FIELD_BY_TOOL_TYPE.get(tool_type)
         if provider_field is None or provider_field not in provider_executed_tool_fields:
             return float("nan")
@@ -487,6 +401,8 @@ def _provider_executed_tool_cost_in_usd(
                 return float("nan")
             maps_query_count += len(queries)
 
+    if call_keys != response_keys:
+        return float("nan")
     return invocation_cost_in_usd(
         len(search_queries),
         usd_per_invocation=pricing.google_search_usd_per_query,
@@ -720,7 +636,7 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
         match part.kind:
             case "text":
                 wire_parts.append(types.Part(text=part.text))
-            case "image":
+            case "image" | "audio":
                 wire_parts.append(_inline_part(part.data, part.media_type))
             case "image_url":
                 wire_parts.append(
@@ -731,8 +647,6 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
                         )
                     )
                 )
-            case "audio":
-                wire_parts.append(_inline_part(part.data, part.media_type))
     return wire_parts
 
 
@@ -770,7 +684,7 @@ def _function_response_part(
             match part.kind:
                 case "text":
                     texts.append(part.text)
-                case "image":
+                case "image" | "audio":
                     function_response_parts.append(
                         _inline_function_response_part(part.data, part.media_type)
                     )
@@ -782,10 +696,6 @@ def _function_response_part(
                                 mime_type=part.media_type,
                             )
                         )
-                    )
-                case "audio":
-                    function_response_parts.append(
-                        _inline_function_response_part(part.data, part.media_type)
                     )
         text = "".join(texts)
     return types.Part(
@@ -1141,6 +1051,8 @@ class GeminiGenerateContentAdapter(Adapter):
 
         Every config disables SDK retries.
         Structured configs send `response_json_schema` with `response_mime_type="application/json"`.
+        Caches selected through `extra_body["cachedContent"]` must not declare tools.
+        Bound tools determine output types.
 
         Raises:
             pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
@@ -1204,7 +1116,6 @@ class GeminiGenerateContentAdapter(Adapter):
                     ]
                 )
             ]
-            tool_config = _wire_tool_config(binding.tool_choice)
         if binding.provider_executed_tools:
             if tools is None:
                 tools = []
@@ -1217,6 +1128,8 @@ class GeminiGenerateContentAdapter(Adapter):
                 ),
                 include_server_side_tool_invocations=True,
             )
+        elif binding.tool_schemas:
+            tool_config = _wire_tool_config(binding.tool_choice)
         thinking_config: types.ThinkingConfig | None = None
         if binding.reasoning_level is not None:
             thinking_level = types.ThinkingLevel(binding.reasoning_level)
@@ -1485,10 +1398,14 @@ class _GeminiStream(AdapterStream):
         """
         reasoning_delta_yielded = False
         separator_pending = False
+        previous_part: types.Part | None = None
         async for chunk in self._first_then_rest():
             self._accumulator.add(chunk)
             wire_parts = _candidate_parts(chunk)
             for index, part in enumerate(wire_parts):
+                if index != 0 or previous_part is None or not _continues_text(previous_part, part):
+                    separator_pending = reasoning_delta_yielded
+                previous_part = part
                 if part.function_call is not None:
                     yield _tool_call_from(part.function_call)
                 if part.text:
@@ -1500,9 +1417,6 @@ class _GeminiStream(AdapterStream):
                         yield ReasoningDelta(text=part.text)
                     else:
                         yield part.text
-                part_ended = part.thought_signature is not None or index < len(wire_parts) - 1
-                if part.thought and part_ended:
-                    separator_pending = reasoning_delta_yielded
         if self._accumulator.finish_reason is None and not self._accumulator.blocked():
             raise StreamProtocolError("stream ended without a finish reason or a block reason")
         self._billing_complete = True
@@ -1607,10 +1521,7 @@ def _finished_message_or_unusable_response(
 
 
 def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
-    """Map the finish reason to the neutral vocabulary.
-
-    The module docstring states each mapping.
-    """
+    """Map the finish reason to the neutral vocabulary."""
     finish_reason = finished_message.finish_reason
     if finish_reason == types.FinishReason.MAX_TOKENS:
         return "max_completion_tokens"

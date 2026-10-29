@@ -42,9 +42,7 @@ dev = [
     "numpy>=2.5.0",
     "openai>=3.0.0",
     "opentelemetry-api>=1.30.0",
-    # opentelemetry-sdk is needed only by the tracing tests' in-memory exporter
-    # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper
-    # itself imports only opentelemetry-api.
+    # The in-memory tracing exporter requires the SDK only in tests.
     "opentelemetry-sdk>=1.30.0",
     "pytest>=9.0.2",
     "pyrefly>=1.3.0",
@@ -60,23 +58,15 @@ dev = [
 
 [tool.pyrefly]
 preset = "all"
-# project-includes bounds type checking to these paths.
-# search-path separately configures import resolution.
-# src is the langchaint import root.
-# tests/test_tracing.py imports scripts.refresh_semconv_genai to verify the map from each attribute to its schema.
 project-includes = ["src", "tests", "examples", "scripts"]
-# The repository root resolves cross-module test imports as pytest resolves them at runtime.
-# examples/full_app resolves bare imports from example modules and tests/test_full_app.py.
+# Tests import across modules; the example app uses bare imports.
 search-path = ["src", ".", "examples/full_app"]
 
 [tool.pyrefly.errors]
 implicit-bool = false
 
 [tool.pytest.ini_options]
-# tests/test_full_app.py verifies the example app's documented behavior.
 testpaths = ["tests"]
-# Example modules import each other by bare name.
-# tests/test_full_app.py imports task_stream through the same path.
 pythonpath = ["examples/full_app"]
 filterwarnings = [
     "error",
@@ -101,10 +91,7 @@ format.preview = true
 lint.preview = true
 lint.explicit-preview-rules = true
 lint.select = [
-    # A context manager held across a yield in an async generator stays open while the consumer runs,
-    # because an async generator has no context of its own: an asyncio.timeout then measures the
-    # consumer's pace and cancels into the consumer's frame, and a current span is adopted by whatever
-    # the consumer opens next. Preview-only, so selecting the ASYNC group alone does not enable it.
+    # Contexts held across async yields can time or trace consumer work.
     "yield-in-context-manager-in-async-generator",
     "ANN",
     "BLE",
@@ -136,17 +123,7 @@ lint.select = [
     "RUF",
     "TRY",
     "doc-line-too-long",  # capped by pycodestyle.max-doc-length below
-    # Docstrings, selected individually with no pydocstyle convention.
-    # A convention is an ignore-overlay whose removals the code satisfies
-    # anyway, and the google convention ignores D401, which this project
-    # enforces. Deliberately absent:
-    # D203 and D213, which conflict with D211 and D212; D405-D414 and
-    # D416, which enforce underlined rst/numpy section headers instead of
-    # the Args:/Raises:/Yields: prose sections used here; and the preview
-    # rules D420 (incorrect-section-order) and D421
-    # (property-docstring-starts-with-verb), not opted into: D421 flags a
-    # verb-first property docstring, which the imperative mood used
-    # everywhere here (D401) would otherwise produce.
+    # Select compatible rules for imperative summaries and Args:/Raises:/Yields: sections.
     "undocumented-public-module",
     "undocumented-public-class",
     "undocumented-public-method",
@@ -183,14 +160,7 @@ lint.select = [
     "docstring-extraneous-returns",
     "docstring-missing-yields",
     "docstring-extraneous-yields",
-    # DOC501 (raised exception missing) and DOC502 (documents an exception not
-    # raised) are deliberately absent. Both resolve a raise only for the literal
-    # `raise SomeError(...)` / `raise SomeError` shapes; they cannot see through
-    # `raise Class.factory(...)` (they read the last attribute, `factory`, as the
-    # exception name), which langchaint uses. Under them a correctly documented
-    # raise reports as extraneous and a real raise reports as missing, so
-    # documenting raises is an AGENTS.md convention (see "Document each exception
-    # relevant to the public interface") checked in review instead.
+    # DOC501/DOC502 misread exceptions raised through class factories; review Raises: manually.
 ]
 lint.ignore = [
     "any-type",
@@ -206,15 +176,13 @@ lint.ignore = [
 lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 
-# The retry loops match ResponseOutcome one case per variant, so these three counts track the union's
-# size rather than any nesting.
-# The design rule that gives each outcome its own type is what sets that size, so capping the counts
-# at a default would be capping the union.
+# Retry loops need one branch per ResponseOutcome variant.
 lint.pylint.max-returns = 10
 lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
+lint.per-file-ignores."tests/*" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
 
 [tool.typos.default.extend-words]

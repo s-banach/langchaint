@@ -1,5 +1,3 @@
-"""Test tool validation, dispatch, app_data, and function errors."""
-
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, assert_type
@@ -44,13 +42,10 @@ _WEATHER_SCHEMA: Mapping[str, object] = {
 
 
 class _EchoArgs(BaseModel):
-    """Arguments of the echo tool."""
-
     text: str
 
 
 async def _echo_function(args: _EchoArgs) -> str:
-    """Return the validated text unchanged."""
     return args.text
 
 
@@ -61,8 +56,6 @@ async def _decorated_echo(args: "_EchoArgs") -> str:
 
 
 class _EchoRecord(BaseModel):
-    """Application data produced beside an echo result."""
-
     text: str
 
 
@@ -75,14 +68,11 @@ async def _decorated_later_return(
 
 
 class _LaterEchoRecord(BaseModel):
-    """Application data defined after its producing function."""
-
     text: str
 
 
 @tool(description="Echo the text and record it.", name="record_echo")
 async def _decorated_record_echo(args: _EchoArgs) -> ToolReturnExplicit[_EchoRecord]:
-    """Return model content and application data."""
     return ToolReturnExplicit(content=args.text, app_data=_EchoRecord(text=args.text))
 
 
@@ -105,7 +95,6 @@ def _echo_tool() -> PydanticTool[_EchoArgs]:
 
 
 def test_schema_converts_name_description_and_args_schema() -> None:
-    """PydanticTool.schema carries the name, description, and the args JSON schema."""
     schema = _echo_tool().schema()
     assert schema.name == "echo"
     assert schema.description == "Echo the text back."
@@ -115,7 +104,6 @@ def test_schema_converts_name_description_and_args_schema() -> None:
 
 
 def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
-    """Verify tool reads the parameter annotation, function name, and explicit description."""
     assert_type(_decorated_echo, PydanticTool[_EchoArgs, None])
     assert_type(_decorated_record_echo, PydanticTool[_EchoArgs, _EchoRecord])
     assert_type(_decorated_later_return, PydanticTool[_EchoArgs, _LaterEchoRecord])
@@ -135,11 +123,7 @@ def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
 
 
 def test_tool_decorator_resolves_quoted_local_args_model() -> None:
-    """Verify tool resolves its parameter annotation from the decorator's local namespace."""
-
     class _LocalArgs(BaseModel):
-        """Arguments defined in the decorator's local namespace."""
-
         text: str
 
     @tool(description="Echo locally defined arguments.")
@@ -151,8 +135,6 @@ def test_tool_decorator_resolves_quoted_local_args_model() -> None:
 
 
 def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
-    """Verify tool rejects an annotation that does not resolve to a BaseModel subclass at runtime."""
-
     async def _plain_annotation(args: str) -> str:
         return args
 
@@ -167,8 +149,6 @@ def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
 
 
 def test_tool_decorator_rejects_a_callable_instance() -> None:
-    """@tool requires a Python function before reading its signature."""
-
     class CallableTool:
         async def __call__(self, args: _EchoArgs) -> str:
             return args.text
@@ -179,13 +159,11 @@ def test_tool_decorator_rejects_a_callable_instance() -> None:
 
 
 def test_validate_and_run_returns_the_function_result() -> None:
-    """Valid args_json reaches the function as the validated model."""
     result = run_with_timeout(_echo_tool().validate_and_run('{"text": "tide"}'))
     assert result == "tide"
 
 
 def test_invalid_tool_args_holds_the_validation_error() -> None:
-    """InvalidToolArgsError preserves ValidationError and readable text."""
     with pytest.raises(InvalidToolArgsError) as caught:
         _ = run_with_timeout(_echo_tool().validate_and_run('{"wrong": "key"}'))
     error = caught.value
@@ -195,16 +173,10 @@ def test_invalid_tool_args_holds_the_validation_error() -> None:
 
 
 def test_details_from_pydantic_preserve_paths_and_messages() -> None:
-    """Convert nested Pydantic error paths and preserve their messages."""
-
     class _Recipient(BaseModel):
-        """One recipient with a required email."""
-
         email: str
 
     class _SendArgs(BaseModel):
-        """Send arguments with a recipient list and a non-empty subject."""
-
         to: list[_Recipient]
         subject: str = Field(min_length=1)
 
@@ -222,7 +194,6 @@ def test_details_from_pydantic_preserve_paths_and_messages() -> None:
 
 
 def test_render_invalid_tool_args_formats_neutral_details() -> None:
-    """render_invalid_tool_args preserves detail order and paths."""
     details = [
         InvalidToolArgsDetail(path=(), error_text="'name' is a required property"),
         InvalidToolArgsDetail(path=("items", 0, "id"), error_text="'x' is not of type 'integer'"),
@@ -237,13 +208,11 @@ def test_render_invalid_tool_args_formats_neutral_details() -> None:
 
 
 def test_render_invalid_tool_args_rejects_empty_details() -> None:
-    """Empty details raise ValueError: claiming invalid arguments with no listed failure would mislead the model."""
     with pytest.raises(ValueError, match="no details to render"):
         _ = render_invalid_tool_args("search", [])
 
 
 def test_dispatch_wraps_success_in_a_tool_message() -> None:
-    """A valid call comes back as a DispatchHandled non-error ToolMessage with the call id."""
     call = ToolCall(id="call1", name="echo", args_json='{"text": "tide"}')
     result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     assert result.kind == "handled"
@@ -255,15 +224,9 @@ def test_dispatch_wraps_success_in_a_tool_message() -> None:
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_dispatch_carries_content_parts_into_tool_message_content(*, explicit: bool) -> None:
-    """Sequence[ContentPart] reaches ToolMessage.content as a tuple.
-
-    A success path that dropped or stringified the result would fail this equality.
-    """
-
     async def _content_parts_function(
         args: _EchoArgs,
     ) -> Sequence[ContentPart] | ToolReturnExplicit[None]:
-        """Return ContentPart values built from validated text."""
         content = [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
         return ToolReturnExplicit(content=content, is_error=True) if explicit else content
 
@@ -286,26 +249,16 @@ def test_dispatch_carries_content_parts_into_tool_message_content(*, explicit: b
 
 
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
-    """PydanticTool renders and stores converted validation details."""
     args_json = '{"wrong": "key"}'
     call = ToolCall(id="call1", name="echo", args_json=args_json)
     result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
-    match result:
-        case DispatchInvalidToolArgs():
-            assert result.tool_message.is_error is True
-            assert (
-                result.tool_message.content
-                == "invalid arguments for echo:\n  text: Field required"
-            )
-            assert result.details == (
-                InvalidToolArgsDetail(path=("text",), error_text="Field required"),
-            )
-        case DispatchHandled() | DispatchUnknownTool():
-            pytest.fail("invalid args must return DispatchInvalidToolArgs")
+    assert result.kind == "invalid_tool_args"
+    assert result.tool_message.is_error is True
+    assert result.tool_message.content == "invalid arguments for echo:\n  text: Field required"
+    assert result.details == (InvalidToolArgsDetail(path=("text",), error_text="Field required"),)
 
 
 def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
-    """An unknown tool name returns DispatchUnknownTool."""
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     assert result.kind == "unknown_tool"
@@ -316,7 +269,6 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
 
 
 def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
-    """render_unknown_tool names the off-list tool and held_names, rendering (none) for an empty set."""
     assert render_unknown_tool(tool_name="x", held_names=("a", "b")) == (
         "unknown tool 'x'; available tools: a, b"
     )
@@ -326,7 +278,6 @@ def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
 
 
 def test_function_validation_error_propagates_as_a_defect() -> None:
-    """A ValidationError raised inside the function is not treated as bad args."""
     tool = PydanticTool(
         name="broken",
         description="Raises from its own pydantic use.",
@@ -339,10 +290,7 @@ def test_function_validation_error_propagates_as_a_defect() -> None:
 
 
 def test_dispatch_carries_a_returned_is_error_result() -> None:
-    """A function returning ToolReturnExplicit(is_error=True) becomes an is_error ToolMessage."""
-
     async def _returned_error_function(args: _EchoArgs) -> ToolReturnExplicit:
-        """Report a model-visible failure by returning, not raising."""
         return ToolReturnExplicit(
             content=f"cannot echo {args.text!r}: try a shorter value", is_error=True
         )
@@ -363,23 +311,17 @@ def test_dispatch_carries_a_returned_is_error_result() -> None:
 
 
 class _Cites(BaseModel):
-    """A pydantic app_data payload naming its own field."""
-
     citations: list[str]
 
 
 class _Receipt(BaseModel):
-    """A pydantic app_data payload for a record the function persisted before failing."""
-
     record_id: str
 
 
 def test_dispatch_preserves_mapping_app_data_identity() -> None:
-    """Mapping app_data passes through ToolManager unchanged."""
     mapping = {"citations": ["doc-1"]}
 
     async def _mapping_function(args: _EchoArgs) -> ToolReturnExplicit[Mapping[str, object]]:
-        """Return content plus mapping app_data."""
         return ToolReturnExplicit(content=f"declined {args.text}", is_error=True, app_data=mapping)
 
     mapping_tool = PydanticTool(
@@ -407,14 +349,7 @@ async def _pin_tool_dispatch_app_data_type(
 
 
 def test_plain_function_exception_propagates_as_a_defect() -> None:
-    """Any non-validation function exception propagates unchanged."""
-
     async def _failing_function(args: _EchoArgs) -> str:
-        """Fail with an ordinary user-code exception.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError(f"function broke on {args.text}")
 
     tool = PydanticTool(
@@ -429,14 +364,7 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
 
 
 def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
-    """A function-raised InvalidToolArgsError propagates as a defect."""
-
     async def _nested_validation_function(args: _EchoArgs) -> str:
-        """Validate a payload of the function's own and fail on it.
-
-        Raises:
-            InvalidToolArgsError: always. The nested payload lacks the required text field.
-        """
         try:
             _ = _EchoArgs.model_validate({"wrong": args.text})
         except ValidationError as exc:
@@ -457,18 +385,15 @@ def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> N
 
 
 def test_duplicate_tool_names_are_rejected() -> None:
-    """Two tools sharing a name raise ValueError at construction."""
     with pytest.raises(ValueError, match="duplicate tool name"):
         _ = ToolManager([_echo_tool(), _echo_tool()])
 
 
 async def _weather_function(args: dict[str, object]) -> str:
-    """Return weather from parsed JSONSchemaTool arguments."""
     return f"sunny in {args['city']}"
 
 
 def _weather_tool() -> JSONSchemaTool:
-    """Build a JSONSchemaTool from a raw JSON schema, the shape an MCP tool arrives in."""
     return JSONSchemaTool(
         name="weather",
         description="Report the weather.",
@@ -478,7 +403,6 @@ def _weather_tool() -> JSONSchemaTool:
 
 
 def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> None:
-    """JSONSchemaTool.schema preserves args_schema by identity."""
     schema = _weather_tool().schema()
     assert schema.name == "weather"
     assert schema.description == "Report the weather."
@@ -486,7 +410,6 @@ def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> No
 
 
 def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> None:
-    """Schema violations return converted jsonschema errors."""
     call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo"}')
     result = run_with_timeout(_weather_tool().dispatch(call))
     assert result.kind == "invalid_tool_args"
@@ -505,10 +428,7 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
 
 
 def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
-    """Build the weather JSONSchemaTool with a function recording each run in calls."""
-
     async def _recording_function(args: dict[str, object]) -> str:
-        """Record the run, then report the weather."""
         calls.append("function")
         return f"sunny in {args['city']}"
 
@@ -521,7 +441,6 @@ def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
 
 
 def test_schema_tool_valid_args_run_the_function() -> None:
-    """Arguments satisfying args_schema reach the function: validation passed, a DispatchHandled."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
     result = run_with_timeout(
@@ -540,7 +459,6 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     ids=["schema_violation", "non_object_json", "malformed_json"],
 )
 def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_json: str) -> None:
-    """Bad JSONSchemaTool arguments return DispatchInvalidToolArgs without execution."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
     result = run_with_timeout(
@@ -555,7 +473,6 @@ def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_
 
 
 def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None:
-    """An invalid args_schema raises jsonschema's exception."""
     tool = JSONSchemaTool(
         name="bad",
         description="Malformed schema.",
@@ -569,17 +486,12 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
-    """JSONSchemaTool.dispatch preserves ToolReturnExplicit app_data type."""
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
     async def _mcp_function(
         args: Mapping[str, object],
     ) -> ToolReturnExplicit[Mapping[str, object]]:
-        """Return model-visible content plus the raw MCP result the model never sees.
-
-        Contravariance lets Mapping[str, object] satisfy the dict[str, object] parameter.
-        The annotation keeps that wider type checked.
-        """
+        """Use Mapping[str, object] to check contravariant acceptance of dict arguments."""
         return ToolReturnExplicit(content=f"weather for {args['city']}", app_data=raw_result)
 
     tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
@@ -597,10 +509,6 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
 
 
 def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
-    """One ToolManager routes to a PydanticTool and a JSONSchemaTool side by side.
-
-    ToolManager emits and dispatches both tool forms uniformly.
-    """
     manager = ToolManager([_echo_tool(), _weather_tool()])
     names = {schema.name for schema in manager.schemas()}
     assert names == {"echo", "weather"}
@@ -618,14 +526,7 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
 
 
 def _raiser_tool() -> PydanticTool[_EchoArgs]:
-    """Build a tool whose function raises immediately, the user-code defect of the dispatch_many tests."""
-
     async def _raiser_function(args: _EchoArgs) -> str:
-        """Fail with an ordinary user-code exception naming the call's text.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError(f"broke on {args.text}")
 
     return PydanticTool(
@@ -637,18 +538,14 @@ def _raiser_tool() -> PydanticTool[_EchoArgs]:
 
 
 def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
-    """dispatch_many runs calls concurrently and preserves call order."""
-
     async def _run() -> tuple[DispatchManyItemOutcome, ...]:
         gate = asyncio.Event()
 
         async def _waiter_function(args: _EchoArgs) -> str:
-            """Block until the sibling call opens the gate, then echo."""
             await gate.wait()
             return f"waited {args.text}"
 
         async def _setter_function(args: _EchoArgs) -> str:
-            """Open the gate the sibling call blocks on, then echo."""
             gate.set()
             return f"set {args.text}"
 
@@ -675,7 +572,6 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
 
 
 def test_dispatch_many_returns_every_variant_in_call_order() -> None:
-    """A handled call, bad args, and an off-list name land as their outcome variants, in call order, no raise."""
     tool_calls = [
         ToolCall(id="c1", name="echo", args_json='{"text": "hi"}'),
         ToolCall(id="c2", name="echo", args_json='{"wrong": "key"}'),
@@ -691,15 +587,11 @@ def test_dispatch_many_returns_every_variant_in_call_order() -> None:
 
 
 def test_dispatch_many_of_no_calls_returns_empty() -> None:
-    """An empty tool_calls returns an empty outcome tuple."""
     assert run_with_timeout(ToolManager([_echo_tool()]).dispatch_many([])) == ()
 
 
 def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
-    """Build an echo tool that appends each call's text to ran_texts, recording which calls executed."""
-
     async def _recording_function(args: _EchoArgs) -> str:
-        """Record the text, then echo it."""
         ran_texts.append(args.text)
         return args.text
 
@@ -712,7 +604,6 @@ def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
 
 
 def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None:
-    """Precomputed preserves ToolMessage identity and call order without dispatch."""
     supplied_message = ToolMessage(
         tool_call_id="c2", content="skipped: duplicate call", is_error=True
     )
@@ -740,7 +631,6 @@ def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None
 
 
 def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> None:
-    """Precomputed rejects a mismatched tool_call_id before dispatch."""
     tool_calls = [
         ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
@@ -759,7 +649,6 @@ def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> N
 
 
 def test_dispatch_many_precomputed_raising_propagates_before_any_dispatch() -> None:
-    """A precomputed that raises is a user-code defect: the exception propagates ungrouped and no tool ran."""
     tool_calls = [
         ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
@@ -776,7 +665,6 @@ def test_dispatch_many_precomputed_raising_propagates_before_any_dispatch() -> N
 
 
 def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
-    """A batch that raises still carries a precomputed-answered call in completed_outcomes, at its position."""
     supplied_message = ToolMessage(
         tool_call_id="c1", content="skipped: over the call limit", is_error=True
     )
@@ -806,7 +694,6 @@ def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
 
 
 def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
-    """DispatchExceptionGroup preserves settled sibling outcomes and app_data."""
     receipt = _Receipt(record_id="rec-7")
 
     async def _spender_function(args: _EchoArgs) -> ToolReturnExplicit[_Receipt]:
@@ -839,7 +726,6 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
 
 
 def test_dispatch_many_collects_every_defect_in_call_order() -> None:
-    """Two raising functions land together in exceptions, ordered by call position, siblings settled."""
     tool_calls = [
         ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
@@ -854,10 +740,6 @@ def test_dispatch_many_collects_every_defect_in_call_order() -> None:
 
 
 def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes() -> None:
-    """except* catches the group, and the derived subgroup still carries completed_outcomes.
-
-    derive preserves completed_outcomes on an except* subgroup.
-    """
     tool_calls = [
         ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
@@ -874,46 +756,12 @@ def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes(
     assert [outcome.tool_message.tool_call_id for outcome in caught.completed_outcomes] == ["c2"]
 
 
-def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
-    """A tool-raised CancelledError propagates without grouping."""
-
+@pytest.mark.parametrize("with_defect", [False, True])
+def test_dispatch_many_propagates_cancelled_error_with_sibling_defects_as_its_cause(
+    *, with_defect: bool
+) -> None:
     async def _self_cancelling_function(args: _EchoArgs) -> str:
-        """Produce a CancelledError without anyone cancelling the enclosing task.
-
-        Raises:
-            asyncio.CancelledError: always.
-        """
-        raise asyncio.CancelledError(args.text)
-
-    manager = ToolManager([
-        PydanticTool(
-            name="self_cancel",
-            description="Produces a CancelledError.",
-            args_model=_EchoArgs,
-            function=_self_cancelling_function,
-        ),
-        _echo_tool(),
-    ])
-    tool_calls = [
-        ToolCall(id="c1", name="self_cancel", args_json='{"text": "a"}'),
-        ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
-    ]
-    with pytest.raises(asyncio.CancelledError):
-        _ = run_with_timeout(manager.dispatch_many(tool_calls))
-
-
-def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
-    """Defects co-occurring with a sibling's CancelledError chain as its __cause__, not vanish.
-
-    Cancellation chains sibling defects and settled outcomes in DispatchExceptionGroup.
-    """
-
-    async def _self_cancelling_function(args: _EchoArgs) -> str:
-        """Produce a CancelledError without anyone cancelling the enclosing task.
-
-        Raises:
-            asyncio.CancelledError: always.
-        """
+        """Produce a CancelledError without anyone cancelling the enclosing task."""
         raise asyncio.CancelledError(args.text)
 
     manager = ToolManager([
@@ -927,24 +775,26 @@ def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
         _echo_tool(),
     ])
     tool_calls = [
-        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="self_cancel", args_json='{"text": "b"}'),
         ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
     ]
+    if with_defect:
+        tool_calls.insert(0, ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'))
     with pytest.raises(asyncio.CancelledError) as caught:
         _ = run_with_timeout(manager.dispatch_many(tool_calls))
     cause = caught.value.__cause__
+    if not with_defect:
+        assert cause is None
+        return
     assert isinstance(cause, DispatchExceptionGroup)
     assert [str(error) for error in cause.exceptions] == ["broke on a"]
     assert [outcome.tool_message.tool_call_id for outcome in cause.completed_outcomes] == ["c3"]
 
 
 def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
-    """dispatch_many waits for sibling cancellation before propagating CancelledError."""
     unwound: list[str] = []
 
     async def _hanging_function(args: _EchoArgs) -> str:
-        """Hang until cancelled, recording the unwind in finally."""
         try:
             await asyncio.Event().wait()
         finally:
@@ -973,8 +823,6 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
 
 
 class _CapturedAnswer(BaseModel):
-    """The captured model of the CaptureTool tests."""
-
     answer: str
 
 
@@ -988,7 +836,6 @@ def _answer_capture_tool() -> CaptureTool[_CapturedAnswer]:
 
 
 def test_capture_tool_schema_converts_name_description_and_args_schema() -> None:
-    """CaptureTool.schema carries the name, description, and args_model's JSON schema, like PydanticTool."""
     schema = _answer_capture_tool().schema()
     assert schema.name == "final_response"
     assert schema.description == "Submit the final answer."
@@ -1014,7 +861,6 @@ def test_capture_tool_schema_converts_name_description_and_args_schema() -> None
 def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
     build_tool: Callable[[], CaptureTool[_CapturedAnswer]], expected_acknowledgement: str
 ) -> None:
-    """A valid CaptureTool call returns typed output and acknowledgement."""
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
     outcome = run_with_timeout(build_tool().capture(call))
     assert outcome.kind == "captured"
@@ -1025,11 +871,6 @@ def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
 
 
 def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
-    """An invalid call returns the same DispatchInvalidToolArgs any tool form produces.
-
-    The content and details use the shared Pydantic conversion and rendering.
-    CaptureTool and PydanticTool return identical field-level corrections.
-    """
     args_json = '{"wrong": "key"}'
     call = ToolCall(id="call1", name="final_response", args_json=args_json)
     outcome = run_with_timeout(_answer_capture_tool().capture(call))
@@ -1045,19 +886,19 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     )
 
 
-def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant() -> None:
-    """Malformed and non-object JSON return DispatchInvalidToolArgs."""
-    for args_json in ("not json", '"scalar"'):
-        call = ToolCall(id="call1", name="final_response", args_json=args_json)
-        outcome = run_with_timeout(_answer_capture_tool().capture(call))
-        assert outcome.kind == "invalid_tool_args"
-        assert outcome.tool_message.is_error is True
-        assert "invalid arguments for final_response" in outcome.tool_message.content
-        assert len(outcome.details) >= 1
+@pytest.mark.parametrize("args_json", ["not json", '"scalar"'])
+def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant(
+    args_json: str,
+) -> None:
+    call = ToolCall(id="call1", name="final_response", args_json=args_json)
+    outcome = run_with_timeout(_answer_capture_tool().capture(call))
+    assert outcome.kind == "invalid_tool_args"
+    assert outcome.tool_message.is_error is True
+    assert "invalid arguments for final_response" in outcome.tool_message.content
+    assert len(outcome.details) >= 1
 
 
 def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
-    """ToolManager dispatches CaptureTool to DispatchHandled with captured app_data."""
     manager = ToolManager([_echo_tool(), _answer_capture_tool()])
     assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
@@ -1069,7 +910,6 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
 
 
 def test_capture_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
-    """A manager-routed invalid call comes back as the same DispatchInvalidToolArgs capture returns."""
     call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
     result = run_with_timeout(ToolManager([_answer_capture_tool()]).dispatch(call))
     assert result.kind == "invalid_tool_args"

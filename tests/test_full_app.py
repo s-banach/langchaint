@@ -1,10 +1,3 @@
-"""Verify task_stream.py behavior.
-
-Timed-out inputs remain in turn_log, and their runs continue.
-GuiEmitter routes tool progress to the dispatching run's on_event.
-Sync tests use asyncio.run for async behavior.
-"""
-
 import asyncio
 from collections.abc import Callable
 from dataclasses import replace
@@ -43,7 +36,7 @@ from tests.helpers import ValidatingSpanExporter, run_with_timeout
 
 
 def _discard(event: Event) -> None:
-    """Discard one event."""
+    pass
 
 
 def _timed_out_count(app: App) -> int:
@@ -55,7 +48,6 @@ def _timed_out_count(app: App) -> int:
 
 
 def _total_cost(app: App) -> float:
-    """Sum each run's own cost."""
     return sum(run.own_usage.cost_in_usd for run in app.runs.values())
 
 
@@ -110,7 +102,6 @@ async def _expire_after_second_requests_start(
 
 
 def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableSpan | None:
-    """Return span's parent or None for a root span."""
     if span.parent is None:
         return None
     parent_id = span.parent.span_id
@@ -125,20 +116,17 @@ def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableS
 
 
 def _named(spans: tuple[ReadableSpan, ...], name: str) -> ReadableSpan:
-    """Return the unique finished span named name."""
     matches = [span for span in spans if span.name == name]
     assert len(matches) == 1, f"expected exactly one {name!r} span, got {len(matches)}"
     return matches[0]
 
 
 def _attribute(span: ReadableSpan, key: str) -> object:
-    """Return one finished span attribute."""
     assert span.attributes is not None
     return span.attributes.get(key)
 
 
 def test_one_on_event_receives_the_whole_tree() -> None:
-    """One on_event receives every run's events."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
     run_with_timeout(app.run())
@@ -157,7 +145,6 @@ def test_one_on_event_receives_the_whole_tree() -> None:
 
 
 def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() -> None:
-    """ToolProgress carries the dispatching run's agent_path."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
     run_with_timeout(app.run())
@@ -167,7 +154,6 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
 
 
 def test_application_span_groups_generation_and_tool_spans() -> None:
-    """Run the application under an OpenTelemetry span and inspect its children."""
     exporter = ValidatingSpanExporter()
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -194,7 +180,6 @@ def test_application_span_groups_generation_and_tool_spans() -> None:
 
 
 def test_a_timed_out_input_is_recorded_and_the_run_answers_anyway() -> None:
-    """A timed-out input is recorded before the next turn."""
     app = _build_app("input_timeout")
     run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
@@ -221,14 +206,12 @@ def test_the_app_deadline_leaves_every_settled_entry_readable_in_the_except() ->
 
 
 def test_a_cost_limit_rejects_unknown_cost() -> None:
-    """max_cost_in_usd rejects NaN cost."""
     unknown_cost = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": float("nan")})
     with pytest.raises(RuntimeError, match="cost_in_usd is NaN"):
         _check_cost_limit(unknown_cost, 1.0)
 
 
 def test_agent_config_rejects_a_nan_cost_limit() -> None:
-    """max_cost_in_usd must be finite."""
     with pytest.raises(ValueError, match="positive and finite"):
         _ = AgentConfig(
             name="limited",
@@ -239,7 +222,6 @@ def test_agent_config_rejects_a_nan_cost_limit() -> None:
 
 
 def test_tool_call_budget_uses_call_positions() -> None:
-    """max_tool_calls dispatches the first position and declines the second."""
     app = _build_app("happy", climate_max_tool_calls=1)
     run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
@@ -255,7 +237,6 @@ def test_tool_call_budget_uses_call_positions() -> None:
 
 
 def test_duplicate_tool_call_ids_are_rejected() -> None:
-    """Positional budget handling rejects duplicate ToolCall.id values."""
     tool_calls = (
         ToolCall(id="duplicate", name="search", args_json='{"query":"one"}'),
         ToolCall(id="duplicate", name="search", args_json='{"query":"two"}'),
@@ -265,20 +246,11 @@ def test_duplicate_tool_call_ids_are_rejected() -> None:
 
 
 def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Delegate propagates DispatchExceptionGroup from a sub-agent tool."""
-
     class BrokenSearchArgs(BaseModel):
-        """Define broken_search arguments."""
-
         query: str
 
     @tool(description="Raise a scripted defect.", name="search")
     async def broken_search(args: BrokenSearchArgs) -> str:
-        """Raise a scripted defect.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError(f"search defect for {args.query}")
 
     monkeypatch.setattr(task_stream, "search_tool", broken_search)
@@ -305,18 +277,9 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
 
 
 def test_settle_node_propagates_a_tool_function_defect() -> None:
-    """_settle_node propagates DispatchExceptionGroup."""
-
     class DefectRun(AgentRun):
-        """Raise a tool function defect from run."""
-
         @override
         async def run(self) -> str:
-            """Raise one DispatchExceptionGroup.
-
-            Raises:
-                DispatchExceptionGroup: always.
-            """
             raise DispatchExceptionGroup(
                 "tool function failed",
                 [RuntimeError("defect")],
@@ -380,7 +343,6 @@ def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
-    """A failed sub-agent returns an error ToolMessage and preserves its spend."""
     events: list[Event] = []
     app = _build_app("subagent_error", on_event=events.append)
     run_with_timeout(app.run())
@@ -397,7 +359,6 @@ def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers(
 
 
 def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
-    """Each delegate call registers a distinct spawn-indexed run."""
     registry: dict[str, AgentRun] = {}
     # The shared script provides one turn to each spawn.
     specialist_prompt = "Answer the question."
@@ -423,14 +384,9 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
 
 
 def test_a_second_run_under_one_agent_path_is_rejected() -> None:
-    """Registering a duplicate agent_path raises ValueError."""
-
     class NoOpRun(AgentRun):
-        """Provide a concrete AgentRun for registration."""
-
         @override
         async def run(self) -> str:
-            """Return an unused constant."""
             return "unused"
 
     registry: dict[str, AgentRun] = {}

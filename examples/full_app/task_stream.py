@@ -86,8 +86,7 @@ type TurnLogEntry = GenerationEntry | GenerationErrorEntry | DispatchEntry
 """One entry in a run's ordered turn_log."""
 
 
-def _spend_of(entry: TurnLogEntry) -> Usage:
-    """Return one entry's reported Usage."""
+def _usage_of(entry: TurnLogEntry) -> Usage:
     match entry:
         case GenerationEntry():
             return entry.generation.usage
@@ -156,7 +155,7 @@ class AgentRun(ABC):
     @property
     def own_usage(self) -> Usage:
         """Sum this run's turn_log Usage."""
-        return Usage.sum_of(_spend_of(entry) for entry in self.turn_log)
+        return Usage.sum_of(_usage_of(entry) for entry in self.turn_log)
 
     @property
     def usage(self) -> Usage:
@@ -359,9 +358,7 @@ class ReActAgent(AgentRun):
             self._settle_outcomes(tool_calls, group.completed_outcomes)
             raise
         self._settle_outcomes(tool_calls, outcomes)
-        # Preserve call order and answer declined calls.
-        for outcome in outcomes:
-            self.messages.append(outcome.tool_message)
+        self.messages.extend(outcome.tool_message for outcome in outcomes)
 
     def _settle_outcomes(
         self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
@@ -377,7 +374,8 @@ class ReActAgent(AgentRun):
         call_of_id = {tool_call.id: tool_call for tool_call in tool_calls}
         settled_ids: set[str] = set()
         for outcome in outcomes:
-            tool_call_id = outcome.tool_message.tool_call_id
+            tool_message = outcome.tool_message
+            tool_call_id = tool_message.tool_call_id
             if tool_call_id in settled_ids:
                 raise RuntimeError(f"dispatch_many returned tool_call_id {tool_call_id!r} twice")
             settled_ids.add(tool_call_id)
@@ -398,7 +396,7 @@ class ReActAgent(AgentRun):
                 DispatchEntry(
                     turn_number=self.turn_number,
                     tool_name=tool_call.name,
-                    tool_message=outcome.tool_message,
+                    tool_message=tool_message,
                     reported_usage=reported_usage,
                 )
             )
@@ -406,10 +404,10 @@ class ReActAgent(AgentRun):
                 ToolDispatched(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    tool_call_id=outcome.tool_message.tool_call_id,
+                    tool_call_id=tool_call_id,
                     tool_name=tool_call.name,
-                    content=content_text(outcome.tool_message),
-                    is_error=outcome.tool_message.is_error,
+                    content=content_text(tool_message),
+                    is_error=tool_message.is_error,
                     reported_usage=reported_usage,
                     usage_so_far=self.usage,
                 )
@@ -469,7 +467,6 @@ def build_delegate_tool(
         except DispatchExceptionGroup:
             raise
         except Exception as error:
-            # Return sub-agent failures to the parent model.
             return ToolReturnExplicit(
                 content=f"The specialist failed: {describe_error(error)}. Answer without it.",
                 app_data=None,
@@ -526,7 +523,6 @@ class App:
         tools: ToolSequence,
         prompt: str,
     ) -> ReActAgent:
-        """Build and register one graph node."""
         config = self._configs[name]
         return ReActAgent(
             agent_path=top_level_path(name),

@@ -72,10 +72,7 @@ type JsonValue = Annotated[_JsonValue, BeforeValidator(_require_json_runtime_sha
 
 
 class TextPart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one text part.
-
-    `cache_breakpoint=True` ends a reusable prompt prefix after this part.
-    """
+    """End a reusable prompt prefix after this text with `cache_breakpoint=True`."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -85,13 +82,10 @@ class TextPart(CheckedCopyModel):
 
 
 class ImagePart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one inline image part.
+    """Inline image bytes encoded as URL-safe base64 in JSON.
 
     `media_type` is an IANA media type such as `"image/png"`.
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
-
-    In JSON, `data` is URL-safe base64 text.
-    Pydantic's default UTF-8 byte encoding fails on ordinary image bytes.
     """
 
     model_config = ConfigDict(
@@ -105,10 +99,8 @@ class ImagePart(CheckedCopyModel):
 
 
 class ImageUrlPart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one image URL part.
+    """An image URL sent unchanged without fetching it.
 
-    langchaint sends `url` unchanged.
-    langchaint never fetches `url`.
     `media_type` is an optional IANA media type.
     Gemini receives `media_type` when present.
     Other adapters receive `url` without `media_type`.
@@ -124,10 +116,9 @@ class ImageUrlPart(CheckedCopyModel):
 
 
 class AudioPart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one inline audio part.
+    """Inline audio bytes encoded as URL-safe base64 in JSON.
 
     `media_type` is an IANA media type, such as `"audio/wav"`.
-    JSON stores `data` as URL-safe base64 text.
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
@@ -149,9 +140,8 @@ type MessageContent = str | Sequence[ContentPart]
 
 
 class ToolCall(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one model-requested tool call.
+    """A model-requested tool call with unvalidated argument JSON.
 
-    `args_json` holds argument JSON text before validation.
     Adapters serialize decoded provider arguments to this shared form.
     """
 
@@ -177,7 +167,7 @@ class UserMessage(CheckedCopyModel):
 
 
 class ReasoningPart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one provider reasoning value preserved for replay.
+    """Provider reasoning preserved for replay.
 
     The producing adapter stores an SDK dump in `raw`.
     The same adapter replays `raw` unchanged.
@@ -194,11 +184,10 @@ class ReasoningPart(CheckedCopyModel):
 
 
 class RawPart(CheckedCopyModel):
-    """Pydantic rejects unknown keys in one replayable provider fragment.
+    """A provider fragment preserved for replay in its original position.
 
-    `AssistantMessage.content` preserves `RawPart` response order.
     `raw` is the producing SDK `model_dump` fragment required for replay.
-    The consuming adapter sends `raw` unchanged in its original wire position.
+    The consuming adapter sends `raw` unchanged.
     Another adapter returns `RejectedMessages` or leaves validation to its provider.
     Applications inspect `Generation.raw` for the complete SDK response.
     """

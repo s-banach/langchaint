@@ -62,7 +62,6 @@ def test_thread_work_settles_before_cancellation_propagates() -> None:
 
 
 def test_thread_failure_propagates() -> None:
-    """A synchronous failure reaches the caller unchanged."""
 
     class FailureError(Exception):
         """Identify the expected failure."""

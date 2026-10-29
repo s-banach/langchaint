@@ -26,7 +26,6 @@ _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Mes
 
 
 def test_string_content() -> None:
-    """Plain text stays a string on construction and validation."""
     assistant = AssistantMessage(content="hey")
     assert assistant.content == "hey"
     assert assistant.tool_calls == ()
@@ -52,7 +51,6 @@ def test_message_tuple_fields_distinguish_json_arrays_from_python_lists(message:
 
 
 def test_tool_message_error_binds_the_call_id_and_sets_is_error() -> None:
-    """ToolMessage.error equals the keyword construction with tool_call_id from the call and is_error True."""
     tool_call = ToolCall(id="c1", name="lookup", args_json="{}")
     message = ToolMessage.error(tool_call, "boom")
     assert message == ToolMessage(tool_call_id="c1", content="boom", is_error=True)
@@ -65,7 +63,6 @@ def test_image_bytes_serialize_as_url_safe_base64_text() -> None:
 
 
 def test_audio_bytes_round_trip_as_url_safe_base64() -> None:
-    """AudioPart JSON stores data as URL-safe base64 text."""
     audio = AudioPart(data=b"\xfb\xff", media_type="audio/wav")
     audio_json = audio.model_dump_json()
     assert json.loads(audio_json)["data"] == "-_8="
@@ -91,7 +88,6 @@ def test_cache_breakpoint_round_trips() -> None:
 
 
 def test_assistant_message_rejects_a_text_part_cache_breakpoint() -> None:
-    """A TextPart with cache_breakpoint in an assistant message fails validation on every construction path."""
     breakpoint_part = TextPart(text="hey", cache_breakpoint=True)
     with pytest.raises(ValidationError, match="cache_breakpoint"):
         _ = AssistantMessage(content=(breakpoint_part,))
@@ -155,7 +151,6 @@ def _one_of_each_message() -> list[Message]:
 
 
 def test_messages_json_round_trip_restores_the_list() -> None:
-    """messages_from_json returns the list messages_to_json serialized, every type intact."""
     messages = _one_of_each_message()
     assert messages_from_json(messages_to_json(messages)) == messages
 
@@ -177,7 +172,6 @@ def test_a_pinned_serialization_still_loads() -> None:
 
 
 def test_messages_to_json_is_compact_and_indent_passes_through() -> None:
-    """The default output holds no newlines. indent produces the same messages pretty-printed."""
     messages = _one_of_each_message()
     compact = messages_to_json(messages)
     pretty = messages_to_json(messages, indent=2)
@@ -187,21 +181,18 @@ def test_messages_to_json_is_compact_and_indent_passes_through() -> None:
 
 
 def test_reasoning_part_rejects_a_raw_value_json_cannot_represent() -> None:
-    """A non-JSON value fails before its `ReasoningPart` enters a message."""
     with pytest.raises(ValidationError):
         _ = TypeAdapter(ReasoningPart).validate_python({"raw": {"payload": object()}})
 
 
 @pytest.mark.parametrize("value", [(1, 2), {1, 2}])
 def test_reasoning_part_rejects_a_non_json_container(value: object) -> None:
-    """A tuple or set fails before its `ReasoningPart` enters a message."""
     with pytest.raises(ValidationError):
         _ = TypeAdapter(ReasoningPart).validate_python({"raw": {"payload": value}})
 
 
 @pytest.mark.parametrize("container_kind", ["list", "dict"])
 def test_reasoning_part_rejects_a_cyclic_container(container_kind: str) -> None:
-    """A cyclic list or dict fails before its `ReasoningPart` enters a message."""
     if container_kind == "list":
         list_value: list[object] = []
         list_value.append(list_value)
@@ -215,7 +206,6 @@ def test_reasoning_part_rejects_a_cyclic_container(container_kind: str) -> None:
 
 
 def test_raw_parts_accept_finite_recursive_json() -> None:
-    """Finite recursive JSON reconstructs through both provider replay parts."""
     raw: dict[str, JsonValue] = {
         "none": None,
         "flag": True,
@@ -234,7 +224,6 @@ def test_raw_parts_accept_finite_recursive_json() -> None:
 def test_raw_parts_reject_nonfinite_recursive_json(
     value: float, part_type: type[ReasoningPart] | type[RawPart]
 ) -> None:
-    """A non-finite nested float fails before provider replay data enters a message."""
     with pytest.raises(ValidationError):
         _ = TypeAdapter(part_type).validate_python({"raw": {"nested": [value]}})
 
@@ -252,6 +241,5 @@ def test_model_copy_rejects_a_derived_property_key() -> None:
 
 
 def test_model_copy_rejects_a_key_that_is_not_a_field() -> None:
-    """A typo key raises and the message lists the model's fields."""
     with pytest.raises(TypeError, match="not a field of UserMessage"):
         _ = UserMessage(content="hi").model_copy(update={"contnet": "bye"})

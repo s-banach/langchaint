@@ -27,7 +27,6 @@ def _is_tool_forms_example(value: object) -> TypeIs[_ToolFormsExample]:
 
 
 def test_tool_approval_paths() -> None:
-    """Dispatch approved calls and precompute denied calls."""
     example_module = importlib.import_module("examples.10_tool_forms_and_approval")
     assert _is_tool_forms_example(example_module)
     transfer_call = ToolCall(
@@ -56,7 +55,6 @@ def test_tool_approval_paths() -> None:
 
 
 def test_tool_defect_records_completed_app_data(capsys: pytest.CaptureFixture[str]) -> None:
-    """Record settled `app_data` before propagating a tool defect."""
     example_module = importlib.import_module("examples.10_tool_forms_and_approval")
     assert _is_tool_forms_example(example_module)
     transfer_call = ToolCall(

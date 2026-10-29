@@ -50,19 +50,6 @@ def _sample_openai_rates(multiplier: float = 1.0) -> TokenRates:
     )
 
 
-def _openai_table() -> OpenAIPricingTable:
-    return OpenAIPricingTable(
-        default=_sample_openai_rates(),
-        flex=_sample_openai_rates(0.5),
-        fast=_sample_openai_rates(2.0),
-        long_context=LongContextPricing(
-            prompt_tokens_above=272_000,
-            input_multiplier=2.0,
-            output_multiplier=1.5,
-        ),
-    )
-
-
 def test_openai_ultrafast_rates_are_selected() -> None:
     """Keep pricing coverage independent of the installed openai SDK types."""
     ultrafast = _sample_openai_rates(3.0)
@@ -76,7 +63,6 @@ def test_openai_ultrafast_rates_are_selected() -> None:
 def test_openai_missing_optional_tier_rates_produce_nan(
     service_tier: Literal["scale", "ultrafast"],
 ) -> None:
-    """Missing optional tier rates produce NaN."""
     rates = OpenAIPricingTable(default=_sample_openai_rates()).rates_for(
         service_tier=service_tier, input_tokens_total=1
     )
@@ -111,7 +97,6 @@ def _anthropic_rates_for(
 
 
 def test_anthropic_geo_and_service_tier_select_rates() -> None:
-    """US pricing multiplies the selected service-tier rates."""
     table = AnthropicPricingTable(
         standard=_anthropic_rates(),
         batch=_anthropic_rates().scaled(0.5),
@@ -125,7 +110,6 @@ def test_anthropic_geo_and_service_tier_select_rates() -> None:
 
 
 def test_anthropic_long_context_applies_above_threshold_before_geo() -> None:
-    """Long-context multipliers apply above the threshold, and the US multiplier stacks on them."""
     table = AnthropicPricingTable(
         standard=_anthropic_rates(),
         long_context=LongContextPricing(
@@ -145,7 +129,6 @@ def test_anthropic_long_context_applies_above_threshold_before_geo() -> None:
 
 
 def test_anthropic_cache_write_rate_is_the_written_shares_mean() -> None:
-    """One written share reports its own rate, and both shares report their token-weighted mean."""
     rates = _anthropic_rates()
     only_1h = rates.token_rates(input_tokens_cache_write_5m=0, input_tokens_cache_write_1h=7)
     assert only_1h.input_tokens_cache_write == 20.0
@@ -154,7 +137,6 @@ def test_anthropic_cache_write_rate_is_the_written_shares_mean() -> None:
 
 
 def test_anthropic_missing_modifier_rates_produce_nan() -> None:
-    """Missing priority and US rates produce NaN."""
     table = AnthropicPricingTable(standard=_anthropic_rates())
     priority = _anthropic_rates_for(table, service_tier="priority", inference_geo="global")
     assert math.isnan(priority.output_tokens)
@@ -163,7 +145,6 @@ def test_anthropic_missing_modifier_rates_produce_nan() -> None:
 
 
 def test_vendored_inputs_reproduce_generated_modules() -> None:
-    """Vendored inputs reproduce the snapshot and every generated module offline."""
     entries = _selected_entries(_LITELLM_FILE.validate_json(SNAPSHOT_PATH.read_bytes()))
     metadata = _ProviderMetadata.model_validate_json(METADATA_PATH.read_bytes())
     assert _snapshot_json(entries) == SNAPSHOT_PATH.read_text()
@@ -173,11 +154,6 @@ def test_vendored_inputs_reproduce_generated_modules() -> None:
 
 
 def test_untracked_model_keys_report_only_new_models_of_reported_kinds() -> None:
-    """Detection reports new text and embedding models.
-
-    It skips generated, aliased, ignored, and unreported-kind entries.
-    It also skips a cross-region key whose unprefixed key is generated or ignored.
-    """
     raw_entries = _LITELLM_FILE.validate_python({
         "untracked-openai-responses-model": {"litellm_provider": "openai", "mode": "responses"},
         "untracked-anthropic-chat-model": {"litellm_provider": "anthropic", "mode": "chat"},
@@ -227,7 +203,6 @@ def _bedrock_embedding_entry(usd_per_token: float) -> _LiteLLMEntry:
 
 
 def test_cross_region_multiplier_is_the_listed_ratio_or_nan() -> None:
-    """A listed prefixed entry gives its rate ratio, and an unlisted prefix gives NaN."""
     entries = {
         "cohere.embed-v4:0": _bedrock_embedding_entry(1e-7),
         "eu.cohere.embed-v4:0": _bedrock_embedding_entry(1.1e-7),
@@ -238,7 +213,6 @@ def test_cross_region_multiplier_is_the_listed_ratio_or_nan() -> None:
 
 
 def test_cross_region_multiplier_rejects_differing_ratios() -> None:
-    """Prefixed entries whose ratios differ across models have no single multiplier."""
     entries = {
         "cohere.embed-v4:0": _bedrock_embedding_entry(1e-7),
         "eu.cohere.embed-v4:0": _bedrock_embedding_entry(1.1e-7),
@@ -251,7 +225,6 @@ def test_cross_region_multiplier_rejects_differing_ratios() -> None:
 
 
 def test_litellm_rates_accept_zero() -> None:
-    """LiteLLM rates accept free pricing categories."""
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", "input_cost_per_token": 0})
     assert (
         _million_rate(entry.openai_rate_fields("default").input_tokens_cache_none_usd_per_token)
@@ -270,14 +243,12 @@ def test_litellm_rates_accept_zero() -> None:
     ],
 )
 def test_embedding_rate_rejects_unrendered_prices(rates: dict[str, float]) -> None:
-    """An embedding entry lists an input rate, a zero output rate at most, and no other price except batch rates."""
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **rates})
     with pytest.raises(ValueError, match="LiteLLM lists"):
         _ = entry.embedding_input_tokens_usd_per_token()
 
 
 def test_anthropic_batch_rates_follow_listed_batch_rates() -> None:
-    """Listed batch rates are used, and the 1-hour write takes the 5-minute write's discount."""
     entry = _LiteLLMEntry.model_validate({
         "litellm_provider": "anthropic",
         "cache_creation_input_token_cost": 2.5e-06,
@@ -292,7 +263,6 @@ def test_anthropic_batch_rates_follow_listed_batch_rates() -> None:
 
 
 def test_rates_for_an_unknown_tier_are_rejected() -> None:
-    """A tier the generated tables do not render fails the refresh instead of pricing as NaN."""
     entry = _LiteLLMEntry.model_validate({
         "litellm_provider": "openai",
         "input_cost_per_token_above_272k_tokens_scale": 1e-05,
@@ -302,7 +272,6 @@ def test_rates_for_an_unknown_tier_are_rejected() -> None:
 
 
 def test_partially_listed_tier_is_rejected() -> None:
-    """A tier with some rates unlisted fails the refresh instead of pricing as NaN."""
     fields = _LiteLLMEntry.model_validate({
         "litellm_provider": "openai",
         "input_cost_per_token_flex": 1e-06,
@@ -312,7 +281,6 @@ def test_partially_listed_tier_is_rejected() -> None:
 
 
 def test_tier_long_context_rates_must_follow_the_default_multipliers() -> None:
-    """A tier whose long-context markup differs from the default tier's fails the refresh."""
     entry = _LiteLLMEntry.model_validate({
         "litellm_provider": "openai",
         "input_cost_per_token": 1e-06,
@@ -327,10 +295,6 @@ def test_tier_long_context_rates_must_follow_the_default_multipliers() -> None:
 
 
 def test_long_context_multipliers_cover_cache_rates_and_rendered_tiers() -> None:
-    """Every input-side rate, including the one-hour cache write, shares one input multiplier across rendered tiers.
-
-    An unrendered tier is skipped.
-    """
     entry = _LiteLLMEntry.model_validate({
         "litellm_provider": "anthropic",
         "input_cost_per_token": 1e-07,
@@ -368,7 +332,6 @@ def test_long_context_multipliers_cover_cache_rates_and_rendered_tiers() -> None
 def test_web_search_price_requires_one_price_for_every_context_size(
     prices: dict[str, float],
 ) -> None:
-    """A partially listed or size-dependent price cannot fill the table's single price."""
     entry = _LiteLLMEntry.model_validate({
         "litellm_provider": "anthropic",
         "search_context_cost_per_query": prices,
@@ -391,7 +354,6 @@ def test_web_search_price_requires_one_price_for_every_context_size(
 def test_openai_regional_multiplier_requires_one_listed_value(
     multipliers: dict[str, float],
 ) -> None:
-    """An unlisted or region-dependent multiplier cannot fill the model's single multiplier."""
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **multipliers})
     with pytest.raises(ValueError, match="regional processing multipliers"):
         _ = entry.regional_processing_multiplier()

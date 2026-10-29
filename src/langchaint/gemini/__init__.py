@@ -19,7 +19,6 @@ Recheck the sources before relying on a table.
 `GEMINI_PRICING` carries text, image, and video rates.
 Catalog tool rates estimate post-quota list prices.
 `Gemini.llm(pricing=...)` replaces cataloged estimates.
-langchaint sends no audio.
 Explicit cache-resource storage charges have no request `Usage` field.
 """
 

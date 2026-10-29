@@ -76,7 +76,6 @@ def _generation_chat_span(
 
 
 async def _return_tool_arguments(arguments: dict[str, object]) -> str:
-    """Return the arguments as stable JSON text."""
     return json.dumps(arguments, sort_keys=True)
 
 
@@ -109,8 +108,6 @@ def _captured_tool_definition(
 
 
 class _StructuredResponse(BaseModel):
-    """Provide a concrete structured response type for binding tests."""
-
     answer: str
 
 
@@ -164,10 +161,6 @@ def _assert_scalar_attributes_parse(
 
 
 def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
-    """Parser validation matches scalar types in the committed declaration.
-
-    Structured schema paths match ATTRIBUTE_SCHEMA_FILES.
-    """
     manifest: dict[str, JsonValue] = json.loads(
         (SEMCONV_DIRECTORY / "chat-span-attributes.json").read_text()
     )
@@ -223,13 +216,11 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
 
 
 def test_present_scalar_attribute_cannot_be_null() -> None:
-    """A present scalar alias cannot use the absent-value default."""
     with pytest.raises(ValidationError):
         _ = parse_otel_chat(_chat_span({"gen_ai.request.seed": None}))
 
 
 def test_known_message_type_can_use_the_generic_schema_variant() -> None:
-    """OtelGenericObject accepts a known part type when the dedicated model does not match."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -245,7 +236,6 @@ def test_known_message_type_can_use_the_generic_schema_variant() -> None:
 
 
 def test_known_system_type_can_use_the_generic_schema_variant() -> None:
-    """OtelGenericObject accepts a system text part when OtelTextPart does not match."""
     parsed = parse_otel_chat(
         _chat_span({"gen_ai.system_instructions": [{"type": "text", "provider_value": 1}]})
     )
@@ -257,7 +247,6 @@ def test_known_system_type_can_use_the_generic_schema_variant() -> None:
 
 
 def test_known_tool_type_can_use_the_generic_schema_variant() -> None:
-    """OtelGenericTool accepts function when OtelFunctionTool does not match."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.tool.definitions": [{"type": "function", "name": "lookup", "description": 42}]
@@ -271,7 +260,6 @@ def test_known_tool_type_can_use_the_generic_schema_variant() -> None:
 
 
 def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
-    """Structured attributes accept JSON text and its decoded JSON value."""
     value: list[JsonValue] = [{"type": "text", "content": "Follow the rules."}]
     from_text = parse_otel_chat(_chat_span({"gen_ai.system_instructions": json.dumps(value)}))
     from_value = parse_otel_chat(_chat_span({"gen_ai.system_instructions": value}))
@@ -282,7 +270,6 @@ def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
 
 
 def test_decodes_structured_unused_attributes_and_preserves_unrecognized_text() -> None:
-    """Compare recognized structured data and unrecognized text in unused_attributes."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.tool.call.arguments": '{"query":"x"}',
@@ -296,7 +283,6 @@ def test_decodes_structured_unused_attributes_and_preserves_unrecognized_text() 
 
 
 def test_preserves_json_text_for_a_scalar_attribute() -> None:
-    """A scalar semantic-convention attribute remains text when its value is valid JSON."""
     encoded_value = '{"provider": "custom"}'
     parsed = parse_otel_chat(_chat_span({"gen_ai.provider.name": encoded_value}))
     assert parsed.provider_name == encoded_value
@@ -304,13 +290,11 @@ def test_preserves_json_text_for_a_scalar_attribute() -> None:
 
 @pytest.mark.parametrize("encoded_value", ["NaN", "Infinity", "-Infinity"])
 def test_rejects_non_json_constants_in_structured_attributes(encoded_value: str) -> None:
-    """Reject non-JSON constants in structured semantic-convention attributes."""
     with pytest.raises(ValidationError, match="must be finite"):
         _ = parse_otel_chat(_chat_span({"gen_ai.input.messages": encoded_value}))
 
 
 def test_preserves_known_and_generic_additional_properties() -> None:
-    """Known and generic part models retain properties outside their declared fields."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -333,7 +317,6 @@ def test_preserves_known_and_generic_additional_properties() -> None:
 
 
 def test_preserves_a_raw_additional_properties_property() -> None:
-    """A raw property named additional_properties remains an additional property."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -357,7 +340,6 @@ def test_preserves_a_raw_additional_properties_property() -> None:
 
 
 def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
-    """Typed attributes and prompt variables stay outside unused_attributes."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.provider.name": "openai",
@@ -371,7 +353,6 @@ def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
 
 
 def test_rejects_malformed_structured_attribute_json() -> None:
-    """Pass malformed captured JSON through the public parser."""
     with pytest.raises(ValidationError):
         _ = parse_otel_chat(_chat_span({"gen_ai.input.messages": "not JSON"}))
 
@@ -394,7 +375,6 @@ def test_rejects_non_object_structured_values(
     *,
     encode_as_json: bool,
 ) -> None:
-    """parse_otel_chat raises ValidationError for a non-object structured value."""
     attribute_value = (
         json.dumps(decoded_attribute_value) if encode_as_json else decoded_attribute_value
     )
@@ -403,13 +383,11 @@ def test_rejects_non_object_structured_values(
 
 
 def test_rejects_a_malformed_function_parameters_schema() -> None:
-    """OtelFunctionTool validates parameters as a draft-07 schema."""
     with pytest.raises(ValidationError, match="JSON Schema draft-07"):
         _ = OtelFunctionTool(type="function", name="lookup", parameters={"type": 42})
 
 
 def test_parses_boolean_draft_07_schema_before_conversion_fails() -> None:
-    """A boolean draft-07 schema parses before ToolSchema conversion reports unsupported data."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.tool.definitions": [
@@ -428,7 +406,6 @@ def test_parses_boolean_draft_07_schema_before_conversion_fails() -> None:
 
 
 def test_parsing_succeeds_before_unsupported_conversion_fails() -> None:
-    """A valid reasoning part parses before langchaint conversion reports unsupported data."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -446,7 +423,6 @@ def test_parsing_succeeds_before_unsupported_conversion_fails() -> None:
 
 
 def test_tool_response_conversion_wraps_malformed_nested_parts() -> None:
-    """A valid arbitrary response value fails through OtelToLangchaintConversionError."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -463,7 +439,6 @@ def test_tool_response_conversion_wraps_malformed_nested_parts() -> None:
 
 
 def test_converts_a_string_tool_response_to_string_content() -> None:
-    """A tool_call_response whose response is a string converts to str `ToolMessage` content."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -482,7 +457,6 @@ def test_converts_a_string_tool_response_to_string_content() -> None:
 
 
 def test_non_boolean_is_error_parses_generically_and_fails_conversion() -> None:
-    """A tool response with a non-boolean is_error is an OtelGenericObject without conversion."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -510,7 +484,6 @@ def test_non_boolean_is_error_parses_generically_and_fails_conversion() -> None:
 def test_leading_system_message_supplies_the_binding_system_prompt(
     *, empty_system_instructions: bool
 ) -> None:
-    """A leading system message supplies the binding and stays outside GenerationInput."""
     attributes: dict[str, JsonValue] = {
         "gen_ai.provider.name": "fake",
         "gen_ai.request.model": "fake-model",
@@ -530,7 +503,6 @@ def test_leading_system_message_supplies_the_binding_system_prompt(
 
 
 def test_rejects_combined_system_instructions_and_system_message() -> None:
-    """A nonempty system-instructions attribute conflicts with a system message."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.provider.name": "fake",
@@ -569,7 +541,6 @@ def test_rejects_combined_system_instructions_and_system_message() -> None:
 def test_rejects_system_message_position_and_cardinality(
     input_messages: list[JsonValue], error_match: str
 ) -> None:
-    """System messages require one entry at the start of input messages."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.provider.name": "fake",
@@ -621,7 +592,6 @@ def test_rejects_system_message_position_and_cardinality(
 def test_rejects_unrepresentable_leading_system_message(
     system_message: dict[str, JsonValue], error_match: str
 ) -> None:
-    """A leading system message must convert losslessly to the binding system prompt."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [system_message],
@@ -632,7 +602,6 @@ def test_rejects_unrepresentable_leading_system_message(
 
 
 def test_converts_every_output_message_without_span_identity_or_finish_reason() -> None:
-    """Output message conversion requires no provider name, model, or finish reason."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.output.messages": [
@@ -648,7 +617,6 @@ def test_converts_every_output_message_without_span_identity_or_finish_reason() 
 
 
 def test_function_definition_without_description_converts() -> None:
-    """A function definition without a description converts to `description=None`."""
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.tool.definitions": [
@@ -662,7 +630,6 @@ def test_function_definition_without_description_converts() -> None:
 
 
 def test_absent_optional_values_return_none() -> None:
-    """Conversion functions return `None` when the span has no corresponding value."""
     parsed = parse_otel_chat(_chat_span())
     assert system_prompt_from_otel(parsed) is None
     assert output_messages_from_otel(parsed) is None
@@ -670,7 +637,6 @@ def test_absent_optional_values_return_none() -> None:
 
 
 def test_reconstruction_rejects_a_different_llm_identity() -> None:
-    """bound_llm_from_otel rejects a provider or model mismatch."""
     parsed = parse_otel_chat(
         _chat_span({"gen_ai.provider.name": "other", "gen_ai.request.model": "fake-model"})
     )
@@ -679,10 +645,6 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
 
 
 def test_generation_record_fills_its_synthetic_request_record() -> None:
-    """generation_record_from_otel reads gen_ai.response.id and fills timing, billing, and request id.
-
-    Trace usage and service-tier attributes are ignored.
-    """
     span = _generation_chat_span({
         "gen_ai.response.id": "response-1",
         "gen_ai.usage.input_tokens": 100,
@@ -707,7 +669,6 @@ def test_generation_record_fills_its_synthetic_request_record() -> None:
 
 
 def _json_output_span(texts: list[str]) -> OtelChatSpan:
-    """Return a json-output chat span whose assistant message has one text part per entry of `texts`."""
     return _generation_chat_span({
         "gen_ai.output.type": "json",
         "gen_ai.output.messages": [
@@ -718,7 +679,6 @@ def _json_output_span(texts: list[str]) -> OtelChatSpan:
 
 @pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
 def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
-    """Declared JSON output accepts JSON scalars, arrays, and objects."""
     assert generation_record_from_otel(_json_output_span([json.dumps(output)])).output == output
 
 
@@ -730,7 +690,6 @@ def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
 def test_declared_json_output_validates_the_final_text_part(
     texts: list[str], output: JsonValue
 ) -> None:
-    """Declared JSON output validates the final complete text part independently."""
     record = generation_record_from_otel(_json_output_span(texts))
     assert record.output == output
     assert record.commentary == texts[0]
@@ -740,7 +699,6 @@ def test_declared_json_output_validates_the_final_text_part(
     "texts", [["not json", " either"], ["1", "invalid"], ["1", ""], ['{"answer":', "true}"]]
 )
 def test_rejects_invalid_declared_json_output(texts: list[str]) -> None:
-    """Declared JSON output requires the final complete text part to validate independently."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = generation_record_from_otel(_json_output_span(texts))
 
@@ -781,10 +739,6 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
 def test_output_without_text_matches_a_live_generation(
     output_type: str, parts: list[JsonValue], expected: tuple[str, JsonValue]
 ) -> None:
-    """An assistant message without text has the variant and output that `generate_one` returns.
-
-    An empty text part preserves its complete text-part boundary.
-    """
     span = _generation_chat_span({
         "gen_ai.output.type": output_type,
         "gen_ai.output.messages": [{"role": "assistant", "parts": parts}],
@@ -797,7 +751,6 @@ def test_output_without_text_matches_a_live_generation(
 
 @pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
 def test_generation_record_rejects_unsupported_output_type(output_type: str) -> None:
-    """generation_record_from_otel rejects each unsupported output type."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = generation_record_from_otel(_generation_chat_span({"gen_ai.output.type": output_type}))
 
@@ -812,7 +765,6 @@ def test_generation_record_rejects_unsupported_output_type(output_type: str) -> 
     ],
 )
 def test_generation_record_rejects_unsupported_assistant_parts(parts: list[JsonValue]) -> None:
-    """Output conversion rejects assistant parts without a lossless representation."""
     span = _generation_chat_span({
         "gen_ai.output.messages": [{"role": "assistant", "parts": parts}]
     })
@@ -839,14 +791,12 @@ def test_generation_record_rejects_unsupported_assistant_parts(parts: list[JsonV
 def test_generation_record_rejects_unsupported_output_message_metadata(
     message: dict[str, JsonValue],
 ) -> None:
-    """Output conversion rejects unsupported role, name, and additional properties."""
     span = _generation_chat_span({"gen_ai.output.messages": [message]})
     with pytest.raises(OtelToLangchaintConversionError):
         _ = generation_record_from_otel(span)
 
 
 def test_generation_record_rejects_output_part_additional_properties() -> None:
-    """Output conversion rejects additional properties on a supported part."""
     span = _generation_chat_span({
         "gen_ai.output.messages": [
             {
@@ -860,7 +810,6 @@ def test_generation_record_rejects_output_part_additional_properties() -> None:
 
 
 def test_generation_record_requires_output_messages() -> None:
-    """Output conversion rejects an absent output_messages attribute."""
     span = _generation_chat_span().model_copy(update={"output_messages": None})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.messages"):
         _ = generation_record_from_otel(span)
@@ -879,23 +828,23 @@ def test_generation_record_requires_output_messages() -> None:
 def test_generation_record_requires_exactly_one_output_message(
     output_messages: list[JsonValue],
 ) -> None:
-    """Output conversion rejects empty and multiple output message sequences."""
     span = _generation_chat_span({"gen_ai.output.messages": output_messages})
     with pytest.raises(OtelToLangchaintConversionError, match="exactly one"):
         _ = generation_record_from_otel(span)
 
 
-def test_generation_record_rejects_error_type() -> None:
-    """error.type marks a span as failed before output conversion."""
-    with pytest.raises(OtelToLangchaintConversionError, match=r"error\.type"):
-        _ = generation_record_from_otel(_generation_chat_span({"error.type": "ProviderError"}))
-
-
-def test_generation_record_rejects_error_finish_reason() -> None:
-    """The selected error finish reason marks a span as failed."""
-    span = _generation_chat_span({"gen_ai.response.finish_reasons": ["error"]})
-    with pytest.raises(OtelToLangchaintConversionError, match="finish_reason"):
-        _ = generation_record_from_otel(span)
+@pytest.mark.parametrize(
+    ("attributes", "error_match"),
+    [
+        ({"error.type": "ProviderError"}, r"error\.type"),
+        ({"gen_ai.response.finish_reasons": ["error"]}, "finish_reason"),
+    ],
+)
+def test_generation_record_rejects_failure_signals(
+    attributes: dict[str, JsonValue], error_match: str
+) -> None:
+    with pytest.raises(OtelToLangchaintConversionError, match=error_match):
+        _ = generation_record_from_otel(_generation_chat_span(attributes))
 
 
 @pytest.mark.parametrize(
@@ -908,13 +857,11 @@ def test_generation_record_rejects_error_finish_reason() -> None:
 def test_generation_record_maps_selected_finish_reason(
     finish_reason: str, stop_reason: str
 ) -> None:
-    """Finish-reason conversion maps content_filter to refusal and an unknown value to other."""
     span = _generation_chat_span({"gen_ai.response.finish_reasons": [finish_reason]})
     assert generation_record_from_otel(span).stop_reason == stop_reason
 
 
 def test_generation_record_falls_back_to_message_finish_reason() -> None:
-    """The deprecated message finish_reason supplies the value when the span attribute is absent."""
     span = _generation_chat_span({
         "gen_ai.output.messages": [
             {
@@ -928,7 +875,6 @@ def test_generation_record_falls_back_to_message_finish_reason() -> None:
 
 
 def test_generation_record_requires_matching_finish_reason_locations() -> None:
-    """Span-level and message-level finish reasons must agree when both are present."""
     span = _generation_chat_span({
         "gen_ai.output.messages": [
             {
@@ -946,7 +892,6 @@ def test_generation_record_requires_matching_finish_reason_locations() -> None:
 def test_generation_record_requires_one_span_finish_reason(
     finish_reasons: list[str],
 ) -> None:
-    """A present span finish-reason sequence must contain one value."""
     span = _generation_chat_span().model_copy(
         update={"response_finish_reasons": tuple(finish_reasons)}
     )
@@ -955,7 +900,6 @@ def test_generation_record_requires_one_span_finish_reason(
 
 
 def test_generation_record_requires_a_finish_reason() -> None:
-    """Output conversion rejects spans with neither finish-reason location."""
     span = _generation_chat_span().model_copy(update={"response_finish_reasons": None})
     with pytest.raises(OtelToLangchaintConversionError, match="contain no value"):
         _ = generation_record_from_otel(span)
@@ -966,7 +910,6 @@ def test_generation_record_requires_a_finish_reason() -> None:
 def test_generation_record_requires_request_history_identity(
     field_name: str, field_value: str | None
 ) -> None:
-    """RequestHistory identity requires a provider name and requested model."""
     span = _generation_chat_span().model_copy(update={field_name: field_value})
     with pytest.raises(OtelToLangchaintConversionError, match="is required"):
         _ = generation_record_from_otel(span)
@@ -974,7 +917,6 @@ def test_generation_record_requires_request_history_identity(
 
 @pytest.mark.parametrize("conversion_case", ["reasoning", "cardinality", "invalid_json"])
 def test_generation_record_errors_exclude_generated_content(conversion_case: str) -> None:
-    """Conversion error text excludes generated content for each content-bearing failure."""
     secret = "generated-secret-value"
     if conversion_case == "reasoning":
         span = _generation_chat_span({
@@ -1006,7 +948,6 @@ def test_generation_record_errors_exclude_generated_content(conversion_case: str
 
 @pytest.mark.parametrize("use_tool_manager", [True, False])
 def test_reconstruction_reads_each_tool_schema_once(*, use_tool_manager: bool) -> None:
-    """Count schema reads for a caller-supplied ToolManager and a tool list."""
     tool = _CountingTool()
     tools = ToolManager([tool]) if use_tool_manager else [tool]
     span = _generation_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
@@ -1035,7 +976,6 @@ def test_reconstruction_reads_each_tool_schema_once(*, use_tool_manager: bool) -
 def test_reconstruction_rejects_tool_schema_mismatch(
     tools: list[JSONSchemaTool[None]],
 ) -> None:
-    """Captured tool schemas must equal caller schemas in captured order."""
     if len(tools) == 1:
         span = _generation_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
     else:
@@ -1050,7 +990,6 @@ def test_reconstruction_rejects_tool_schema_mismatch(
 
 
 def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
-    """Captured tool definitions reject duplicate names."""
     span = _generation_chat_span({
         "gen_ai.tool.definitions": [
             _captured_tool_definition(),
@@ -1077,12 +1016,9 @@ def test_reconstruction_applies_tool_definition_presence_contract(
     *,
     accepted: bool,
 ) -> None:
-    """Absent definitions skip comparison while present definitions require exact schemas."""
     span = _generation_chat_span()
-    if definitions:
-        span = _generation_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
-    elif definitions == []:
-        span = span.model_copy(update={"tool_definitions": ()})
+    if definitions is not None:
+        span = _generation_chat_span({"gen_ai.tool.definitions": definitions})
     if accepted:
         _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
     else:
@@ -1091,7 +1027,6 @@ def test_reconstruction_applies_tool_definition_presence_contract(
 
 
 def test_reconstruction_binds_structured_response_model() -> None:
-    """JSON output binds the caller-supplied structured response model."""
     span = _generation_chat_span({"gen_ai.output.type": "json"})
     bound_llm = bound_llm_from_otel(
         span,
@@ -1110,7 +1045,6 @@ def test_reconstruction_rejects_response_format_mismatch(
     output_type: str | None,
     response_format: type[BaseModel] | type[str],
 ) -> None:
-    """output_type and response_format must select the same output form."""
     span = _generation_chat_span()
     if output_type is not None:
         span = _generation_chat_span({"gen_ai.output.type": output_type})
@@ -1124,14 +1058,12 @@ def test_reconstruction_rejects_response_format_mismatch(
 
 @pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
 def test_reconstruction_rejects_unsupported_output_type(output_type: str) -> None:
-    """Binding reconstruction rejects unsupported output types."""
     span = _generation_chat_span({"gen_ai.output.type": output_type})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()))
 
 
 def test_manifest_attribute_names_match_otel_execute_tool_span_aliases() -> None:
-    """OtelExecuteToolSpan has one aliased field per attribute in the committed declaration."""
     names = TypeAdapter(frozenset[str]).validate_json(
         (SEMCONV_DIRECTORY / "execute-tool-span-attribute-names.json").read_text()
     )
@@ -1144,9 +1076,32 @@ def test_manifest_attribute_names_match_otel_execute_tool_span_aliases() -> None
 
 
 def test_execute_tool_result_of_another_shape_parses_as_a_json_value() -> None:
-    """A result that is not a tool_call_response part, as another emitter records, parses unchanged."""
     parsed = parse_otel_execute_tool({
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.call.result": '{"temperature": 20}',
     })
     assert parsed.tool_call_result == {"temperature": 20}
+
+
+@pytest.mark.parametrize(
+    ("attribute_name", "field_name"),
+    [
+        ("gen_ai.tool.call.arguments", "tool_call_arguments"),
+        ("gen_ai.tool.call.result", "tool_call_result"),
+    ],
+)
+def test_execute_tool_null_requires_encoded_json(attribute_name: str, field_name: str) -> None:
+    absent = parse_otel_execute_tool({"gen_ai.operation.name": "execute_tool"})
+    encoded_null = parse_otel_execute_tool({
+        "gen_ai.operation.name": "execute_tool",
+        attribute_name: "null",
+    })
+    assert encoded_null.tool_call_arguments is None
+    assert encoded_null.tool_call_result is None
+    assert field_name not in absent.model_fields_set
+    assert field_name in encoded_null.model_fields_set
+    with pytest.raises(ValidationError, match="a present OTel attribute cannot be null"):
+        _ = parse_otel_execute_tool({
+            "gen_ai.operation.name": "execute_tool",
+            attribute_name: None,
+        })

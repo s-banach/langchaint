@@ -1,8 +1,4 @@
-"""Helpers shared by more than one test module.
-
-A helper lands here when a second module needs it. One used by a single module stays in that module.
-Fake adapters and streams that a second module needs land in tests/fake_adapter.py by the same rule.
-"""
+"""Helpers shared by more than one test module."""
 
 import asyncio
 import functools
@@ -55,7 +51,6 @@ def stated_billing(
     *,
     input_tokens_cache_none_usd_per_million_tokens: float = float("nan"),
 ) -> Billing:
-    """Build normalized Billing from test-stated Usage and an optional cache rate."""
     return Billing(
         usage=usage,
         service_tier="stub",
@@ -74,7 +69,6 @@ def stated_provider_billing(
     input_tokens_cache_none_usd_per_million_tokens: float = float("nan"),
     usage_raw: BaseModel | None = None,
 ) -> ProviderBilling:
-    """Build provider billing from normalized Billing and optional raw usage."""
     return ProviderBilling(
         billing=stated_billing(
             usage,
@@ -98,7 +92,6 @@ def request_record(
     response_id: str | None = None,
     request_id: str | None = None,
 ) -> SettledRequestRecord:
-    """Build one normalized settled request record."""
     normalized_error = (
         TransientErrorRecord(
             error_text=str(error),
@@ -131,7 +124,6 @@ def request_record(
 def call_record(
     records: tuple[SettledRequestRecord | CutOffRequestRecord, ...], *, elapsed_seconds: float
 ) -> RequestHistory:
-    """Build a RequestHistory over the records under test. The identity fields are fixed filler."""
     return RequestHistory(
         model="fake-model",
         provider_name="fake",
@@ -141,14 +133,14 @@ def call_record(
 
 
 def package_modules() -> Iterator[ModuleType]:
-    """Import every module under langchaint, backend subpackages included.
+    """Import every langchaint module, including backends and tracing.
 
     Backend imports require their provider SDKs.
     Tracing imports require opentelemetry-api.
     The development environment installs those dependencies.
 
     Yields:
-        Each imported module, the package itself first.
+        Each imported module, with langchaint first.
     """
     yield langchaint
     for module_info in pkgutil.walk_packages(langchaint.__path__, prefix="langchaint."):
@@ -156,7 +148,6 @@ def package_modules() -> Iterator[ModuleType]:
 
 
 TEST_TIMEOUT_SECONDS = 5.0
-"""How long `run_with_timeout` lets one awaitable run. The slowest test takes under half a second."""
 
 
 def run_with_timeout[ReturnT](awaitable: Awaitable[ReturnT]) -> ReturnT:
@@ -224,7 +215,6 @@ def status_error[ErrorT: openai.APIStatusError](
     headers: dict[str, str] | None = None,
     error_code: str | None = None,
 ) -> ErrorT:
-    """Build an openai status exception with optional error_code."""
     response = httpx2.Response(
         status_code,
         request=httpx2.Request("POST", "https://api.openai.com"),
@@ -239,12 +229,10 @@ def status_error[ErrorT: openai.APIStatusError](
 
 
 def connection_error() -> openai.APIConnectionError:
-    """Build an openai transport exception."""
     return openai.APIConnectionError(request=httpx2.Request("POST", "https://api.openai.com"))
 
 
 def transient(*, pauses_quota: bool, retry_after_seconds: float | None = None) -> RequestFailure:
-    """Return a transient `RequestFailure`."""
     return RequestFailure(
         kind="transient", pauses_quota=pauses_quota, retry_after_seconds=retry_after_seconds
     )
@@ -253,12 +241,10 @@ def transient(*, pauses_quota: bool, retry_after_seconds: float | None = None) -
 def terminal(
     kind: Literal["auth", "rejected", "provider_failed_terminally", "unknown_exception"],
 ) -> RequestFailure:
-    """Return a terminal `RequestFailure` that pauses nothing and states no wait."""
     return RequestFailure(kind=kind, pauses_quota=False, retry_after_seconds=None)
 
 
 def openai_sdk_errors_and_request_failures() -> Mapping[Exception, RequestFailure]:
-    """Return shared openai `RequestFailure` cases."""
     return {
         connection_error(): transient(pauses_quota=False),
         openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): transient(
@@ -324,14 +310,10 @@ class _TypeProperty(BaseModel, extra="allow"):
 
 
 class _DefinitionProperties(BaseModel, extra="allow"):
-    """A definition's `properties`, keyed by property name."""
-
     type: _TypeProperty = _TypeProperty()
 
 
 class _Definition(BaseModel, extra="allow"):
-    """One `$defs` entry of a vendored schema."""
-
     properties: _DefinitionProperties = _DefinitionProperties()
     additional_properties: JsonValue = Field(default=None, alias="additionalProperties")
     not_: JsonValue = Field(default=None, alias="not")
@@ -433,15 +415,11 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
 
 
 class _DeclaredAttribute(BaseModel):
-    """One attribute entry of the vendored chat span declaration."""
-
     name: str
     allowed_values: tuple[str, ...] | None
 
 
 class _ChatSpanDeclaration(BaseModel):
-    """The vendored chat span declaration's attributes, without its provider refinements."""
-
     attributes: tuple[_DeclaredAttribute, ...]
 
 
@@ -451,11 +429,6 @@ LANGCHAINT_KEYS = frozenset({"langchaint.request_count", "langchaint.cost_in_usd
 
 @functools.cache
 def _chat_span_declaration() -> _ChatSpanDeclaration:
-    """Read the vendored chat span declaration.
-
-    Raises:
-        pydantic.ValidationError: the file does not hold the declaration's shape.
-    """
     return _ChatSpanDeclaration.model_validate_json(
         (SEMCONV_GENAI_DIR / refresh_semconv_genai.CHAT_SPAN_ATTRIBUTES_FILE).read_text()
     )
@@ -565,27 +538,12 @@ class RaisingOperation:
     """An `ObservedOperation` whose every method raises."""
 
     def current(self) -> AbstractContextManager[None]:
-        """Raise instead of returning a context.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError("observer current boom")
 
     def conclude(self, outcome: object) -> None:
-        """Raise instead of recording the outcome.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError(f"observer conclude boom for {type(outcome).__name__}")
 
     def end(self) -> None:
-        """Raise instead of ending.
-
-        Raises:
-            RuntimeError: always.
-        """
         raise RuntimeError("observer end boom")
 
 
@@ -593,45 +551,24 @@ class RaisingObserver:
     """An `Observer` that raises from its start methods, or returns operations whose every method raises."""
 
     def __init__(self, *, raise_at_start: bool) -> None:
-        """Raise from the start methods when `raise_at_start` is set, and from the operations otherwise."""
         self._raise_at_start = raise_at_start
 
     def generation_started(
         self, start: GenerationStart
     ) -> ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]:
-        """Start a raising operation for the input.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
         return self._started(start.model)
 
     def dispatch_started(
         self, tool_call: ToolCall
     ) -> ObservedOperation[DispatchOutcome | Exception]:
-        """Start a raising operation for the dispatch.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
         return self._started(tool_call.name)
 
     def embedding_request_started(
         self, start: EmbeddingRequestStart
     ) -> ObservedOperation[EmbeddingRequestRecord]:
-        """Start a raising operation for the embedding request.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
         return self._started(start.model)
 
     def _started(self, name: str) -> RaisingOperation:
-        """Raise, or return an operation whose every method raises.
-
-        Raises:
-            RuntimeError: `raise_at_start` is set.
-        """
         if self._raise_at_start:
             raise RuntimeError(f"observer start boom for {name}")
         return RaisingOperation()

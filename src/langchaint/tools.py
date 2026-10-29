@@ -514,7 +514,7 @@ def render_unknown_tool(tool_name: str, held_names: SequenceNotStr[str]) -> str:
 
 def _details_from_pydantic(validation_error: ValidationError) -> tuple[InvalidToolArgsDetail, ...]:
     return tuple(
-        InvalidToolArgsDetail(path=tuple(error["loc"]), error_text=error["msg"])
+        InvalidToolArgsDetail(path=error["loc"], error_text=error["msg"])
         for error in validation_error.errors(
             include_url=False, include_context=False, include_input=False
         )
@@ -539,29 +539,30 @@ def _invalid_args_outcome(
     return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
 
-def _split_precomputed(
+def _precompute_tool_calls(
     tool_calls: Sequence[ToolCall],
     precomputed: Callable[[ToolCall], ToolMessage | None] | None,
-) -> tuple[dict[int, DispatchPrecomputed], list[tuple[int, ToolCall]]]:
-    """Apply `precomputed` before dispatch and partition the calls by input position.
+) -> list[ToolCall | DispatchPrecomputed]:
+    """Apply `precomputed` before dispatch and preserve call order.
 
     Raises:
         ValueError: `precomputed` returns a `ToolMessage` for a different `tool_call_id`.
     """
-    answered: dict[int, DispatchPrecomputed] = {}
-    to_dispatch: list[tuple[int, ToolCall]] = []
-    for index, tool_call in enumerate(tool_calls):
-        tool_message = precomputed(tool_call) if precomputed is not None else None
+    if precomputed is None:
+        return list(tool_calls)
+    outcomes_or_calls: list[ToolCall | DispatchPrecomputed] = []
+    for tool_call in tool_calls:
+        tool_message = precomputed(tool_call)
         if tool_message is None:
-            to_dispatch.append((index, tool_call))
-        elif tool_message.tool_call_id != tool_call.id:
+            outcomes_or_calls.append(tool_call)
+            continue
+        if tool_message.tool_call_id != tool_call.id:
             raise ValueError(
                 f"precomputed answered the call with id {tool_call.id!r} with a ToolMessage "
                 f"whose tool_call_id is {tool_message.tool_call_id!r}"
             )
-        else:
-            answered[index] = DispatchPrecomputed(tool_message=tool_message)
-    return answered, to_dispatch
+        outcomes_or_calls.append(DispatchPrecomputed(tool_message=tool_message))
+    return outcomes_or_calls
 
 
 def _tool_message_content(content: MessageContent) -> str | tuple[ContentPart, ...]:
@@ -677,9 +678,12 @@ class ToolManager:
             BaseException: `precomputed` raises it before any tool function starts.
             BaseException: A tool function raises a non-`Exception` value after every call settles.
         """
-        answered, to_dispatch = _split_precomputed(tool_calls, precomputed)
-        settled: dict[int, DispatchManyItemOutcome | BaseException] = dict(answered)
-        tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for _, tool_call in to_dispatch]
+        outcomes_or_calls = _precompute_tool_calls(tool_calls, precomputed)
+        tasks = [
+            asyncio.ensure_future(self.dispatch(outcome_or_call))
+            for outcome_or_call in outcomes_or_calls
+            if outcome_or_call.kind == "tool_call"
+        ]
         try:
             gathered: list[DispatchOutcome | BaseException] = await asyncio.gather(
                 *tasks, return_exceptions=True
@@ -690,13 +694,14 @@ class ToolManager:
                 _ = task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        for (index, _), outcome_or_exception in zip(to_dispatch, gathered, strict=True):
-            settled[index] = outcome_or_exception
+        dispatch_outcomes = iter(gathered)
         completed_outcomes: list[DispatchManyItemOutcome] = []
         raised_exceptions: list[Exception] = []
         base_exceptions: list[BaseException] = []
-        for index in range(len(tool_calls)):
-            outcome_or_exception = settled[index]
+        for outcome_or_call in outcomes_or_calls:
+            outcome_or_exception = (
+                next(dispatch_outcomes) if outcome_or_call.kind == "tool_call" else outcome_or_call
+            )
             if isinstance(outcome_or_exception, Exception):
                 raised_exceptions.append(outcome_or_exception)
             elif isinstance(outcome_or_exception, BaseException):

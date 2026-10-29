@@ -32,9 +32,9 @@ _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 
 class _GenerationRecordBase(_InputOutcomeRecordBase):
-    """Properties and invariants shared by the two generation records.
+    """Require settled requests with a final, error-free request holding billing and an assistant message.
 
-    Validation rejects unknown fields.
+    Every earlier request must contain an error.
     """
 
     stop_reason: StopReason
@@ -80,10 +80,7 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
 
 
 class PlainGenerationRecord[OutputT](_GenerationRecordBase):
-    """The normalized record of one `PlainGeneration`.
-
-    Validation rejects unknown fields.
-    """
+    """The normalized record of one `PlainGeneration`."""
 
     output: OutputT
     kind: Literal["plain"] = "plain"
@@ -92,7 +89,7 @@ class PlainGenerationRecord[OutputT](_GenerationRecordBase):
 class ToolCallGenerationRecord(_GenerationRecordBase):
     """The normalized record of one `ToolCallGeneration`.
 
-    Validation rejects unknown fields.
+    The kept assistant message must contain at least one tool call.
     """
 
     output: None = None
@@ -114,7 +111,9 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
 
     def __post_init__(self) -> None:
         """Require aligned provider data with a final provider response."""
-        _validate_live_generation(self.record, self.request_provider_data)
+        if len(self.request_provider_data) != len(self.record.request_history.records):
+            raise ValueError("request_provider_data must align with request_history.records")
+        _ = _final_raw(self.request_provider_data)
 
     @property
     def raw(self) -> BaseModel:
@@ -201,14 +200,6 @@ class ToolCallGeneration(_LiveGenerationBase[ToolCallGenerationRecord]):
         To continue the conversation, replay `assistant_message`.
         """
         return self.record.output
-
-
-def _validate_live_generation(
-    record: _GenerationRecordBase, request_provider_data: tuple[RequestProviderData, ...]
-) -> None:
-    if len(request_provider_data) != len(record.request_history.records):
-        raise ValueError("request_provider_data must align with request_history.records")
-    _ = _final_raw(request_provider_data)
 
 
 def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseModel:

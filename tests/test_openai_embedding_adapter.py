@@ -1,5 +1,3 @@
-"""OpenAI embedding catalog, batching, request, response, and cancellation tests."""
-
 import asyncio
 import json
 import sys
@@ -27,7 +25,6 @@ from tests.helpers import in_memory_tracer_provider, run_with_timeout
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
-    """Build an offline client whose requests reach `handler`."""
     return AsyncOpenAI(
         api_key="offline",
         max_retries=0,
@@ -40,7 +37,6 @@ def _response(
     *,
     indexes: Sequence[int] | None = None,
 ) -> httpx2.Response:
-    """Build one successful SDK response from vectors and optional indexes."""
     if indexes is None:
         indexes = range(len(vectors))
     return httpx2.Response(
@@ -74,7 +70,6 @@ def test_third_generation_models_accept_dimension_boundaries(
     model: Literal["text-embedding-3-small", "text-embedding-3-large"],
     dimension: int,
 ) -> None:
-    """Accept each third-generation model's inclusive dimension boundaries."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     embedding_model = openai.embedding_model(model, dimension=dimension)
@@ -97,7 +92,6 @@ def test_third_generation_models_reject_invalid_dimensions(
     model: Literal["text-embedding-3-small", "text-embedding-3-large"],
     dimension: int,
 ) -> None:
-    """Reject out-of-range dimensions and boolean dimensions."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     with pytest.raises(ValueError, match="dimension"):
@@ -106,7 +100,6 @@ def test_third_generation_models_reject_invalid_dimensions(
 
 
 def test_embedding_model_defaults_and_ada_dimension() -> None:
-    """Resolve each model's documented default dimension during construction."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     assert openai.embedding_model("text-embedding-3-small").dimension == 1536
@@ -118,7 +111,6 @@ def test_embedding_model_defaults_and_ada_dimension() -> None:
 def test_embedding_model_performs_no_tokenizer_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Construct an embedding model without loading `cl100k_base`."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
 
@@ -132,7 +124,6 @@ def test_embedding_model_performs_no_tokenizer_loading(
 
 
 def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Name the OpenAI embedding extra when tiktoken is unavailable."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     monkeypatch.delitem(sys.modules, "langchaint.openai.embedding_adapter")
@@ -145,7 +136,6 @@ def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch)
 def test_embedding_apis_name_the_install_for_missing_numpy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Name each supported install when numpy is unavailable."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     monkeypatch.delitem(sys.modules, "langchaint.embedding", raising=False)
@@ -165,7 +155,6 @@ def test_embedding_apis_name_the_install_for_missing_numpy(
 
 
 def test_request_maps_inputs_model_dimension_and_encoding() -> None:
-    """Send OpenAI fields without sending provider-neutral `task`."""
     request_bodies: list[dict[str, object]] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -195,7 +184,6 @@ def test_request_maps_inputs_model_dimension_and_encoding() -> None:
 
 
 def test_ada_request_omits_dimensions() -> None:
-    """Omit `dimensions` for `text-embedding-ada-002`."""
     request_bodies: list[dict[str, object]] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -215,7 +203,6 @@ def test_ada_request_omits_dimensions() -> None:
 
 
 def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
-    """Restore indexed rows into owned writable C-contiguous float32 storage, and report the usage and served model."""
     client = _client(lambda _request: _response([[3.0, 4.0], [0.0, 2.0]], indexes=[1, 0]))
 
     async def scenario() -> _EmbeddingBatchResponse:
@@ -247,7 +234,6 @@ def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
     ],
 )
 def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
-    """Reject missing, repeated, and out-of-range response indexes."""
     vectors = [[1.0], [2.0]][: len(indexes)]
     client = _client(lambda _request: _response(vectors, indexes=indexes))
 
@@ -270,8 +256,6 @@ def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
     [None, [None], [{"object": "embedding", "embedding": [1.0], "index": None}]],
 )
 def test_response_rejects_invalid_data_shapes(data: object) -> None:
-    """Malformed successful response data raises `EmbeddingOutputError`."""
-
     def handler(_request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(
             200,
@@ -299,13 +283,11 @@ def test_response_rejects_invalid_data_shapes(data: object) -> None:
 
 
 def test_partition_splits_at_input_count_limit() -> None:
-    """Fill 2048 inputs before placing the remainder in another batch."""
     batches = _partition_inputs_sync(["x"] * 2049)
     assert tuple(map(len, batches)) == (2048, 1)
 
 
 def test_partition_uses_cl100k_base(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Check token counting uses cl100k_base."""
     encoding = tiktoken.get_encoding("cl100k_base")
     encoding_names: list[str] = []
 
@@ -332,39 +314,31 @@ class _CountEncoding:
     """Return the decimal input as its token count."""
 
     def encode(self, text: str, *, disallowed_special: tuple[()] = ()) -> range:
-        """Return a sized range representing `text` tokens."""
         del disallowed_special
         return range(int(text))
 
 
-def test_partition_splits_before_request_token_limit(
+@pytest.mark.parametrize(
+    ("inputs", "expected"),
+    [
+        (("299999", "1", "2"), (("299999", "1"), ("2",))),
+        (("300001", "1"), (("300001",), ("1",))),
+    ],
+    ids=["fills-token-limit", "keeps-oversized-input-for-provider-validation"],
+)
+def test_partition_applies_request_token_limit(
+    inputs: tuple[str, ...],
+    expected: tuple[tuple[str, ...], ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fill 300,000 tokens before placing the remainder in another batch."""
-
     def count_encoding(_name: str) -> _CountEncoding:
         return _CountEncoding()
 
     monkeypatch.setattr(tiktoken, "get_encoding", count_encoding)
-    batches = _partition_inputs_sync(["299999", "1", "2"])
-    assert batches == (("299999", "1"), ("2",))
-
-
-def test_partition_keeps_oversized_input_for_provider_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep one oversized input intact for OpenAI's per-input validation."""
-
-    def count_encoding(_name: str) -> _CountEncoding:
-        return _CountEncoding()
-
-    monkeypatch.setattr(tiktoken, "get_encoding", count_encoding)
-    batches = _partition_inputs_sync(["300001", "1"])
-    assert batches == (("300001",), ("1",))
+    assert _partition_inputs_sync(inputs) == expected
 
 
 def test_empty_input_string_fails_before_sdk_request() -> None:
-    """Reject an empty string before request admission and SDK execution."""
     request_count = 0
 
     def handler(_request: httpx2.Request) -> httpx2.Response:
@@ -392,7 +366,6 @@ def test_transport_failure_retries_the_failed_batch(
     failure_type: type[httpx2.ConnectError] | type[httpx2.ReadTimeout],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retry an OpenAI transport failure through the private batch backoff."""
     request_count = 0
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -430,7 +403,6 @@ class _BlockingEncoding:
     """Block token counting until a test permits completion."""
 
     def __init__(self, started: threading.Event, permit_completion: threading.Event) -> None:
-        """Store the synchronization events."""
         self._started = started
         self._permit_completion = permit_completion
 
@@ -446,7 +418,6 @@ class _BlockingEncoding:
 def test_partition_cancellation_waits_for_token_counting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Settle synchronous token counting before propagating cancellation."""
     started = threading.Event()
     permit_completion = threading.Event()
     encoding = _BlockingEncoding(started, permit_completion)
@@ -476,7 +447,6 @@ def test_partition_cancellation_waits_for_token_counting(
 
 
 def test_the_openai_observer_traces_embedding_requests() -> None:
-    """An `OpenAI` observer traces each embedding request with the OpenAI provider name and the served model."""
     tracer_provider, exporter = in_memory_tracer_provider()
     client = _client(lambda _request: _response([[1.0]]))
     observer = OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)

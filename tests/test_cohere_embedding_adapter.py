@@ -1,5 +1,3 @@
-"""Tests for Cohere embeddings through Amazon Bedrock."""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,24 +39,19 @@ _INPUT_TOKENS_TOTAL = 2
 _RESPONSE_METADATA: dict[str, object] = {
     "HTTPHeaders": {"x-amzn-bedrock-input-token-count": str(_INPUT_TOKENS_TOTAL)}
 }
-"""Response metadata carrying the billed input token count, as botocore exposes it."""
 
 
 def _run_async_test[**Parameters](
     function: Callable[Parameters, Coroutine[object, object, None]],
 ) -> Callable[Parameters, None]:
-    """Run one asynchronous test through `asyncio.run`."""
-
     @wraps(function)
     def wrapped(*args: Parameters.args, **kwargs: Parameters.kwargs) -> None:
-        # Separate wrappers per pytest signature duplicate event-loop orchestration.
         run_with_timeout(function(*args, **kwargs))
 
     return wrapped
 
 
 def _bedrock_client(*, total_max_attempts: int = 1) -> BedrockRuntimeClient:
-    """Build an offline Bedrock Runtime client."""
     return boto3.client(
         "bedrock-runtime",
         region_name="us-east-1",
@@ -69,14 +62,12 @@ def _bedrock_client(*, total_max_attempts: int = 1) -> BedrockRuntimeClient:
 
 
 def _request_body(payload: dict[str, object]) -> bytes:
-    """Serialize one expected Cohere request."""
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def _response(
     vectors: list[list[float]], *, response_metadata: dict[str, object] = _RESPONSE_METADATA
 ) -> dict[str, object]:
-    """Build one constructed `invoke_model` response."""
     body_bytes = json.dumps({"embeddings": vectors}).encode()
     return {
         "body": StreamingBody(BytesIO(body_bytes), len(body_bytes)),
@@ -86,7 +77,6 @@ def _response(
 
 
 def _expected_parameters(body: bytes, model: str) -> dict[str, object]:
-    """Build expected `invoke_model` parameters."""
     return {
         "body": body,
         "modelId": model,
@@ -109,7 +99,6 @@ async def test_v4_routes_model_and_dimension_verbatim(
     model: CohereEmbedV4ModelId,
     dimension: CohereEmbedV4Dimension,
 ) -> None:
-    """Every v4 route sends its model and dimension verbatim."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -155,7 +144,6 @@ async def test_task_mapping(
     task: cohere_backend.EmbeddingTask,
     input_type: str,
 ) -> None:
-    """Each neutral task maps to Cohere's corresponding `input_type`."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -183,7 +171,6 @@ async def test_task_mapping(
 
 @_run_async_test
 async def test_v3_omits_dimension() -> None:
-    """V3 requests omit `output_dimension`."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -211,7 +198,6 @@ async def test_v3_omits_dimension() -> None:
 
 @_run_async_test
 async def test_v4_accepts_float_keyed_embeddings() -> None:
-    """Accept the float-keyed v4 response form."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -245,7 +231,6 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
 
 
 def test_embedding_model_default_dimensions() -> None:
-    """Check model-specific default dimensions."""
     client = _bedrock_client()
     try:
         cohere_bedrock = CohereBedrock(client=client)
@@ -267,7 +252,6 @@ def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
     *,
     pauses_quota: bool,
 ) -> None:
-    """Only the service model's throttling error pauses every request."""
     failure = ClientError(
         {
             "Error": {"Code": error_code, "Message": "retry"},
@@ -286,38 +270,28 @@ def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "body_target_bytes", "body_limit_bytes", "input_length"),
+    [
+        pytest.param("cohere.embed-v4:0", 500, 2000, 300, id="v4-local-target"),
+        pytest.param("cohere.embed-english-v3", 500, 1000, 500, id="v3-body-limit"),
+    ],
+)
 @_run_async_test
-async def test_v4_local_body_target_splits_before_the_next_input(
+async def test_request_body_size_splits_before_the_next_input(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    body_target_bytes: int,
+    body_limit_bytes: int,
+    input_length: int,
 ) -> None:
-    """V4 batches remain beneath the local body target."""
-    monkeypatch.setattr(cohere_backend, "_COHERE_V4_BODY_TARGET_BYTES", 500)
-    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 2000)
+    monkeypatch.setattr(cohere_backend, "_COHERE_V4_BODY_TARGET_BYTES", body_target_bytes)
+    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", body_limit_bytes)
     client = _bedrock_client()
     try:
         cohere_bedrock = CohereBedrock(client=client)
-        embedding_model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
-        texts = ("x" * 300, "y" * 300)
-        batches = await embedding_model._adapter.partition_inputs(
-            texts,
-            task="retrieval_document",
-        )
-        assert batches == ((texts[0],), (texts[1],))
-    finally:
-        client.close()
-
-
-@_run_async_test
-async def test_v3_exact_body_limit_splits_before_the_next_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """V3 batches remain beneath the exact `InvokeModel` body limit."""
-    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 1000)
-    client = _bedrock_client()
-    try:
-        cohere_bedrock = CohereBedrock(client=client)
-        embedding_model = cohere_bedrock.embedding_model("cohere.embed-english-v3")
-        texts = ("x" * 500, "y" * 500)
+        embedding_model = cohere_bedrock.embedding_model(model)
+        texts = ("x" * input_length, "y" * input_length)
         batches = await embedding_model._adapter.partition_inputs(
             texts,
             task="retrieval_document",
@@ -329,7 +303,6 @@ async def test_v3_exact_body_limit_splits_before_the_next_input(
 
 @_run_async_test
 async def test_batching_uses_ninety_six_inputs() -> None:
-    """A ninety-seventh input starts the following request."""
     client = _bedrock_client()
     stubber = Stubber(client)
     inputs = [f"text-{index}" for index in range(97)]
@@ -372,12 +345,14 @@ async def test_batching_uses_ninety_six_inputs() -> None:
         client.close()
 
 
+@pytest.mark.parametrize("inputs", [("x" * 200,), ("small", "x" * 200)])
 @_run_async_test
 async def test_oversized_singleton_fails_before_client_creation(
     monkeypatch: pytest.MonkeyPatch,
+    inputs: tuple[str, ...],
 ) -> None:
-    """An oversized singleton raises before client preparation."""
-    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 100)
+    monkeypatch.setattr(cohere_backend, "_COHERE_V4_BODY_TARGET_BYTES", 150)
+    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 200)
     creation_calls = 0
 
     def create_client(
@@ -397,13 +372,12 @@ async def test_oversized_singleton_fails_before_client_creation(
     cohere_bedrock = CohereBedrock(aws_region="us-east-1")
     model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     with pytest.raises(ValueError, match="body limit"):
-        await model.embed(["x" * 100], task="retrieval_document")
+        await model.embed(inputs, task="retrieval_document")
     assert creation_calls == 0
 
 
 @_run_async_test
 async def test_invalid_response_hides_vectors() -> None:
-    """Malformed response errors contain no generated vector values."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -441,7 +415,6 @@ async def test_invalid_response_hides_vectors() -> None:
 
 @_run_async_test
 async def test_a_response_without_a_token_count_is_invalid_output() -> None:
-    """A response without the token-count header ends `embed` with no billed usage."""
     client = _bedrock_client()
     stubber = Stubber(client)
     body = _request_body({
@@ -495,10 +468,8 @@ def test_embedding_model_rate_resolves_through_the_unprefixed_catalog_rate(
     usd_per_million_tokens: float | None,
     expected: float,
 ) -> None:
-    """A prefixed identifier's catalog rate is the unprefixed rate times the prefix multiplier.
+    """The vendored LiteLLM snapshot lists no `eu.cohere.embed-v4:0` entry, so the eu multiplier is NaN.
 
-    `apply_cross_region_multiplier=False` leaves it unmultiplied, and a given rate replaces it.
-    The vendored LiteLLM snapshot lists no `eu.cohere.embed-v4:0` entry, so the eu multiplier is NaN.
     That makes the multiplied rate differ from the unmultiplied rate.
     """
     client = _bedrock_client()
@@ -512,7 +483,6 @@ def test_embedding_model_rate_resolves_through_the_unprefixed_catalog_rate(
 
 
 def test_prefixed_v3_identifier_resolves_to_v3() -> None:
-    """A prefixed v3 identifier resolves to its v3 catalog identifier, which accepts no dimension."""
     client = _bedrock_client()
     try:
         cohere_bedrock = CohereBedrock(client=client)
@@ -524,7 +494,6 @@ def test_prefixed_v3_identifier_resolves_to_v3() -> None:
 
 
 def test_uncataloged_identifier_is_rejected() -> None:
-    """An identifier that resolves to no catalog identifier raises."""
     client = _bedrock_client()
     try:
         with pytest.raises(ValueError, match="not in COHERE_BEDROCK_EMBEDDING_MODELS"):
@@ -534,25 +503,18 @@ def test_uncataloged_identifier_is_rejected() -> None:
 
 
 class _FakeBody:
-    """A controllable synchronous response body."""
-
     def __init__(self, body_bytes: bytes) -> None:
-        """Store response bytes and start open."""
         self._body_bytes = body_bytes
         self.closed = False
 
     def read(self) -> bytes:
-        """Return stored response bytes."""
         return self._body_bytes
 
     def close(self) -> None:
-        """Record body closure."""
         self.closed = True
 
 
 class _FakeClient:
-    """A controllable Bedrock Runtime client."""
-
     def __init__(
         self,
         *,
@@ -561,7 +523,6 @@ class _FakeClient:
         invoke_release: threading.Event | None = None,
         failures: list[Exception] | None = None,
     ) -> None:
-        """Store request controls."""
         self.dimension = dimension
         self.invoke_started = invoke_started
         self.invoke_release = invoke_release
@@ -579,7 +540,6 @@ class _FakeClient:
         accept: str,
         contentType: str,  # noqa: N803 (matches boto3's required keyword)
     ) -> dict[str, object]:
-        """Record one request and return one valid vector."""
         assert modelId in COHERE_BEDROCK_EMBEDDING_MODELS
         assert accept == _JSON_CONTENT_TYPE
         assert contentType == _JSON_CONTENT_TYPE
@@ -597,7 +557,6 @@ class _FakeClient:
         return {"body": response_body, "ResponseMetadata": _RESPONSE_METADATA}
 
     def close(self) -> None:
-        """Record client closure."""
         self.closed = True
 
 
@@ -608,7 +567,6 @@ def _install_fake_client(
     creation_started: threading.Event | None = None,
     creation_release: threading.Event | None = None,
 ) -> list[Config]:
-    """Install one fake lazy-client factory."""
     configs: list[Config] = []
 
     def create_client(
@@ -631,7 +589,6 @@ def _install_fake_client(
 
 
 async def _wait_for_event(event: threading.Event) -> None:
-    """Wait for a thread event without blocking the event loop."""
     completed = await asyncio.to_thread(event.wait, 1.0)
     assert completed
 
@@ -640,7 +597,6 @@ async def _wait_for_event(event: threading.Event) -> None:
 async def test_lazy_client_creation_precedes_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lazy creation completes before the first admission."""
     creation_started = threading.Event()
     fake_client = _FakeClient()
     configs = _install_fake_client(
@@ -668,7 +624,6 @@ async def test_lazy_client_creation_precedes_admission(
 async def test_concurrent_preparation_creates_one_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Concurrent first requests share one serialized client creation."""
     creation_started = threading.Event()
     creation_release = threading.Event()
     fake_client = _FakeClient()
@@ -698,7 +653,6 @@ async def test_concurrent_preparation_creates_one_client(
 async def test_synchronous_request_runs_outside_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The complete SDK request runs outside the event-loop thread."""
     fake_client = _FakeClient()
     _ = _install_fake_client(monkeypatch, fake_client)
     cohere_bedrock = CohereBedrock(aws_region="us-east-1")
@@ -713,7 +667,6 @@ async def test_synchronous_request_runs_outside_event_loop(
 async def test_transient_client_error_retries_only_failed_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A transient `ClientError` retries its request."""
     failure = ClientError(
         {
             "Error": {"Code": "InternalServerException", "Message": "retry"},
@@ -839,7 +792,6 @@ async def test_cancelled_failed_creation_retries_client_creation(
 
 
 def test_passed_client_retry_configuration() -> None:
-    """Passed clients must configure one request per SDK call."""
     retrying_client = _bedrock_client(total_max_attempts=2)
     one_request_client = _bedrock_client()
     try:
@@ -855,7 +807,6 @@ def test_passed_client_retry_configuration() -> None:
 
 @_run_async_test
 async def test_the_cohere_bedrock_observer_traces_embedding_requests() -> None:
-    """A `CohereBedrock` observer traces each embedding request with the Bedrock provider name and no served model."""
     tracer_provider, exporter = in_memory_tracer_provider()
     client = _bedrock_client()
     stubber = Stubber(client)

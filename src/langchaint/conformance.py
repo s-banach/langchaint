@@ -65,16 +65,12 @@ class _WeatherReport(BaseModel):
 
 
 class _WeatherReportAlsoUnusableResponseBase(_WeatherReport, _UnusableResponseBase):
-    """A caller's response_format that also inherits `_UnusableResponseBase`.
-
-    `_UnusableResponseBase` is the base of every `UnusableResponse` variant.
-    """
+    """A caller's response_format that also inherits the base of every `UnusableResponse` variant."""
 
     assistant_message: AssistantMessage = AssistantMessage(content=())
 
 
 def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
-    """Return pydantic's error JSON, without documentation URLs, for text that response_format rejects."""
     try:
         _ = response_format.model_validate_json(text)
     except ValidationError as validation_error:
@@ -83,7 +79,7 @@ def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
-    """Whether two costs are the same number, counting NaN as the same as NaN."""
+    """Compare costs with rounding tolerance, counting NaN as equal to NaN."""
     if math.isnan(actual) and math.isnan(expected):
         return True
     return math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-12)
@@ -126,14 +122,12 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_without_usage(self) -> BaseModel:
-        """Return an SDK response carrying no usage at all, which a provider may answer with."""
+        """Return an SDK response carrying no usage."""
         ...
 
     @abstractmethod
     def response_at_an_unpriced_tier(self) -> BaseModel:
         """Return an SDK response reporting nonzero counters at a tier without rates.
-
-        The pricing table of make_adapter states no rates for that tier.
 
         Use nonzero counters because zero tokens cost zero at every rate.
         """
@@ -213,10 +207,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return one assistant message twice: as the type the SDK's stream assembles into, and whole.
-
-        Both responses must represent the same assistant message.
-        """
+        """Return the same assistant message as the SDK's assembled stream type and whole-response type."""
         ...
 
     @abstractmethod
@@ -234,22 +225,16 @@ class AdapterConformance(ABC):
         ...
 
     def _bound_adapter(self) -> BoundAdapter[str | None]:
-        """Bind a fresh adapter for plain text under the one binding these invariants use."""
         return self.make_adapter().bind_text(_PLAIN_BINDING)
 
     def _assistant_wire_parts_of(
         self, bound_adapter: BoundAdapter[str | None], messages: Sequence[Message]
     ) -> Sequence[object]:
-        """Build request params and read the assistant message's wire parts.
-
-        The assertion lets callers compare parts without repeating the guard.
-        """
         request_params = bound_adapter.build_request_params(messages)
         assert not isinstance(request_params, RejectedMessages)
         return self.assistant_wire_parts(request_params)
 
     def _billings(self) -> list[Billing]:
-        """Return the billing of each fixture response the cost invariants price."""
         bound_adapter = self._bound_adapter()
         return [
             bound_adapter.billing_from_raw(raw).billing
@@ -261,10 +246,7 @@ class AdapterConformance(ABC):
         ]
 
     def test_counters_that_cannot_be_partitioned_raise_at_arrival(self) -> None:
-        """A response whose counters leave one category negative fails where it arrives.
-
-        `Usage` rejects negative counters before a wrong cost reaches the caller.
-        """
+        """Reject negative usage categories before a wrong cost reaches the caller."""
         raw = self.response_with_impossible_counters()
         bound_adapter = self._bound_adapter()
         try:
@@ -274,19 +256,13 @@ class AdapterConformance(ABC):
         raise AssertionError("billing_from_raw accepted counters that cannot be partitioned")
 
     def test_a_response_reporting_no_usage_bills_zero_at_a_named_tier(self) -> None:
-        """A response carrying no usage bills ZERO_USAGE, never None and never absent.
-
-        A Billing exists whenever a response did, and it names the tier that would have priced it.
-        """
+        """Preserve a response's billing tier when usage is absent."""
         billing = self._bound_adapter().billing_from_raw(self.response_without_usage()).billing
         assert billing.usage == ZERO_USAGE
         assert billing.service_tier
 
     def test_a_served_tier_without_rates_prices_nan(self) -> None:
-        """Every price and the total cost are NaN at a tier without rates.
-
-        NaN preserves paid output without reporting a free request.
-        """
+        """Represent unknown prices with NaN so paid output does not appear free."""
         billing = (
             self._bound_adapter().billing_from_raw(self.response_at_an_unpriced_tier()).billing
         )
@@ -297,11 +273,7 @@ class AdapterConformance(ABC):
         assert math.isnan(billing.usage.cost_in_usd)
 
     def test_reasoning_round_trips_verbatim_in_position(self) -> None:
-        """The reasoning an adapter read off an assistant message goes back on the wire unchanged, where it sat.
-
-        Providers can verify reasoning payloads.
-        langchaint therefore sends the received payload unchanged.
-        """
+        """Replay reasoning unchanged in its original position so providers can verify its payload."""
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
         assert outcome.kind == "usable_response"
@@ -319,10 +291,7 @@ class AdapterConformance(ABC):
     def test_raw_part_round_trips_verbatim_in_position(self) -> None:
         """RawPart.raw returns unchanged in its original position.
 
-        Dropping the part loses paid output.
-        A continued tool loop would replay a different assistant message.
-        The assistant message must hold a RawPart.
-        Dropping a RawPart value shortens both compared sequences.
+        Require a RawPart because dropping it during interpretation shortens both compared sequences.
         """
         response = self.response_with_raw_part()
         if response is None:
@@ -342,9 +311,8 @@ class AdapterConformance(ABC):
                 assert wire_parts[index] == part.raw
 
     def test_a_json_round_tripped_assistant_message_builds_the_same_wire_request(self) -> None:
-        """A restored assistant message puts the original parts on the wire.
+        """Preserve provider-verified reasoning payloads through assistant message serialization and replay.
 
-        Serialization must preserve provider-verified raw payloads.
         Every `ReasoningPart.raw` value must be JSON-representable.
         """
         bound_adapter = self._bound_adapter()
@@ -385,10 +353,7 @@ class AdapterConformance(ABC):
             assert string_parts == tuple_parts
 
     def test_structured_output_may_inherit_the_unusable_response_base(self) -> None:
-        """A validated instance is output in a `UsableResponse` even when its class inherits `_UnusableResponseBase`.
-
-        The outcome kind, not the output's class, separates a usable response from an unusable one.
-        """
+        """Separate usable responses by outcome kind when output inherits `_UnusableResponseBase`."""
         bound_adapter = self.make_adapter().bind_structured(
             _PLAIN_BINDING, _WeatherReportAlsoUnusableResponseBase
         )
@@ -399,11 +364,7 @@ class AdapterConformance(ABC):
         assert outcome.output == _WeatherReportAlsoUnusableResponseBase(city="Nairobi", celsius=25)
 
     def test_text_the_response_format_rejects_is_a_schema_violation(self) -> None:
-        """A finished assistant message whose text fails response_format validation is SchemaViolation.
-
-        validation_error_json is pydantic's error JSON without documentation URLs.
-        It keeps each rejected field and value for the caller.
-        """
+        """Preserve pydantic's rejected fields and values in error JSON without documentation URLs."""
         text = '{"city": "Nairobi", "celsius": "SENTINEL"}'
         bound_adapter = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
         outcome = bound_adapter.interpret(self.response_with_text(text))
@@ -467,10 +428,7 @@ class AdapterConformance(ABC):
                 ] == [text]
 
     def test_every_sdk_exception_maps_and_an_unknown_one_is_unknown_exception(self) -> None:
-        """Every listed exception takes its stated `RequestFailure`, and a bare `Exception` is `unknown_exception`.
-
-        `request_failure` must return without raising for an exception the adapter cannot place.
-        """
+        """Map SDK exceptions and return `unknown_exception` for an exception the adapter cannot classify."""
         adapter = self.make_adapter()
         for error, request_failure in self.sdk_errors_and_request_failures().items():
             assert adapter.request_failure(error) == request_failure
@@ -479,10 +437,7 @@ class AdapterConformance(ABC):
         )
 
     def test_the_stream_assembled_type_reads_the_same_as_the_whole_response(self) -> None:
-        """One assistant message read off the type a stream assembles into and off a whole response agree.
-
-        Both request paths use `interpret`, which must read both response shapes identically.
-        """
+        """Interpret and bill the SDK's assembled stream type and whole-response type identically."""
         streamed, whole = self.streamed_and_whole()
         bound_adapter = self._bound_adapter()
         assert bound_adapter.interpret(streamed) == bound_adapter.interpret(whole)
@@ -491,15 +446,10 @@ class AdapterConformance(ABC):
         )
 
     def test_a_stream_missing_its_terminal_event_raises(self) -> None:
-        """Draining a stream whose assistant message never closed is a protocol violation, not an empty answer.
-
-        Received events do not form a finished assistant message.
-        Returning them would present truncated output as complete.
-        """
+        """Reject unfinished streams so truncated output cannot appear complete."""
         stream = self.stream_without_its_terminal_event()
 
         async def drain() -> None:
-            """Iterate the stream to its end, which is where the violation surfaces."""
             async for _item in stream.items():
                 pass
 
@@ -548,7 +498,6 @@ class AdapterConformance(ABC):
 
 
 def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedStreamRecord:
-    """Wrap one Billing in an `AbandonedStreamRecord`, to reach to_tables with a single request row."""
     return AbandonedStreamRecord(
         request_history=RequestHistory(
             model=adapter.model,

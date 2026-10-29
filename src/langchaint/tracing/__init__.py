@@ -37,6 +37,12 @@ An embeddings span has one attribute group, its request record's attributes.
 A key of a later attribute group replaces a matching earlier key.
 A filter that raises or returns a part of another kind is logged, and its attribute group is omitted.
 Each span kind's attribute transform, such as `chat_attribute_transform`, edits the attributes when the span ends.
+Each transform receives the outcome and every attribute, including the start attributes.
+The span records the returned attributes, and a returned key replaces the attribute of the same name.
+A start attribute missing from the result stays because the OTel `Span` API cannot remove an attribute.
+A transform that raises is logged, and the span keeps only its start attributes.
+A span with error status also keeps `error.type`.
+Extension keys must use the application's namespace because langchaint.* is reserved.
 Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
@@ -121,14 +127,6 @@ type ChatAttributeTransform = Callable[
 """Edits a chat span's attributes once, when the span ends.
 
 The first argument is `None` for an input cancelled before its outcome.
-The second argument holds every attribute langchaint records on the span.
-It includes the start attributes that `start_span` received.
-The span records the returned attributes.
-A returned key replaces the attribute of the same name.
-A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
-A transform that raises is logged, and the span keeps only its start attributes.
-A span with error status also keeps `error.type`.
-Extension keys must use the application's namespace because langchaint.* is reserved.
 """
 
 type ExecuteToolAttributeTransform = Callable[
@@ -137,17 +135,9 @@ type ExecuteToolAttributeTransform = Callable[
 """Edits an execute_tool span's attributes once, when the span ends.
 
 The first argument is `None` for a dispatch cancelled before its outcome.
-The second argument holds every attribute langchaint records on the span.
-It includes the start attributes that `start_span` received.
-`gen_ai.tool.name` is one of those start attributes, so a transform can edit one tool's spans.
-The span records the returned attributes.
-A returned key replaces the attribute of the same name.
-A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
-A transform that raises is logged, and the span keeps only its start attributes.
-A span with error status also keeps `error.type`.
+The attributes include `gen_ai.tool.name`, so a transform can edit one tool's spans.
 When the tool function raises, the span's exception event and status description record its message.
 The transform cannot change either.
-Extension keys must use the application's namespace because langchaint.* is reserved.
 """
 
 type EmbeddingsAttributeTransform = Callable[
@@ -156,14 +146,6 @@ type EmbeddingsAttributeTransform = Callable[
 """Edits an embeddings span's attributes once, when the span ends.
 
 The first argument is `None` for a request cancelled before it settled.
-The second argument holds every attribute langchaint records on the span.
-It includes the start attributes that `start_span` received.
-The span records the returned attributes.
-A returned key replaces the attribute of the same name.
-A start attribute missing from the result stays, because the OTel `Span` API cannot remove an attribute.
-A transform that raises is logged, and the span keeps only its start attributes.
-A span with error status also keeps `error.type`.
-Extension keys must use the application's namespace because langchaint.* is reserved.
 """
 
 type ContentFilter = Callable[
@@ -186,12 +168,10 @@ Message-level fields such as `role`, `tool_call_id`, `is_error`, and `finish_rea
 def _record_every_part(
     _attribute_name: str, part: ContentPart | AssistantPart
 ) -> ContentPart | AssistantPart:
-    """Return `part` unchanged."""
     return part
 
 
 def _keep_every_attribute(_outcome: object, attributes: SpanAttributes) -> SpanAttributes:
-    """Return `attributes` unchanged."""
     return attributes
 
 
@@ -268,20 +248,6 @@ class _SpanConfig:
     content_filter: ContentFilter
 
 
-_CONVENTION_FINISH_REASONS: Mapping[StopReason, str] = {
-    "max_completion_tokens": "length",
-}
-"""The StopReason values whose counterpart in the convention's finish-reason vocabulary has another name.
-
-stop and tool_call are the convention's own values.
-refusal, context_window_exceeded, and other are absent deliberately and pass through unmapped:
-the convention's content_filter means a provider filter blocked content.
-No convention value corresponds to a context-window overflow or to other.
-The convention's enum is open because the output schema permits the enum or a string.
-Unmapped values pass through unchanged.
-"""
-
-
 _NO_STOP_REASON_FINISH_REASON = "error"
 """What gen_ai.output.messages reports for an assistant message whose outcome states no stop reason.
 
@@ -292,34 +258,23 @@ The per-message field is required, so an assistant message recorded from a failu
 
 
 def _finish_reason(stop_reason: StopReason) -> str:
-    """Map a StopReason onto the convention's finish-reason vocabulary, passing unmapped values through.
+    """Translate the token limit to the convention's `length` finish reason.
 
-    gen_ai.response.finish_reasons and gen_ai.output.messages use this mapping.
+    Other values pass through because the convention permits arbitrary strings.
+    The convention's `content_filter` means a provider blocked content and does not cover every refusal.
     """
-    return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
+    return "length" if stop_reason == "max_completion_tokens" else stop_reason
 
 
 def _outcome_attributes(
     outcome: GenerationOutcome[object] | AbandonedStreamRecord,
 ) -> dict[str, SpanAttributeValue]:
-    """Map a `GenerationOutcome` to GenAI-convention span attributes plus langchaint scalars.
+    """Build outcome attributes from billing across every request and the final request's response details.
 
-    `outcome` supplies the response identity, usage, stop reason, and request records.
-    gen_ai.provider.name and gen_ai.request.model are omitted, because they are request attributes.
-    Both come from the adapter's `provider_name` and `model` in either place.
-    This function reads only the fields shared by every `GenerationOutcome` variant and `AbandonedStreamRecord`.
-    The langchaint.* prefix is used only when the GenAI convention has no corresponding key.
-    This applies to langchaint.request_count and langchaint.cost_in_usd.
     gen_ai.usage.input_tokens is Usage.input_tokens_total.
     The cache-read and cache-write attributes are parts of that total.
     No cache_none counter is emitted because it is derived.
-    gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
-    gen_ai.response.model is the last request's model_served and is omitted when unavailable.
-    gen_ai.response.time_to_first_chunk is the last request's first_item_after_seconds, settled or cut off.
-    That value runs from sending the request to the first stream item, so only a stream has it.
-    The usage and cost attributes are the input's paid totals across every request.
-    `outcome.usage` has that scope.
-    `langchaint.request_failed` span events retain per-request detail.
+    First-chunk timing covers the final request even when the stream ends early.
     """
     usage = outcome.usage
     request_history = outcome.request_history
@@ -392,13 +347,11 @@ def _recorded_content(
 
 
 def _tool_call_arguments(args_json: str) -> JsonValue:
-    """Deserialize a tool call's argument JSON, falling back to the raw text when it is not standard JSON.
+    """Deserialize tool-call argument JSON, preserving text that cannot produce a standard JSON value.
 
     The convention requests best-effort deserialization of serialized arguments.
-    Any JSON value is returned.
-    Text that does not validate as a `JsonValue` is returned unchanged, so DispatchInvalidToolArgs remains visible.
-    That includes Infinity, NaN, and a number such as 1e400 that overflows to a non-finite float.
-    RFC 8259 excludes those values, so the fallback keeps every emitted payload standard JSON.
+    Malformed JSON and non-finite floats use the original text, including numbers such as 1e400 that overflow a float.
+    The fallback preserves invalid tool arguments without emitting non-finite JSON numbers.
     """
     try:
         return _JSON_VALUE_ADAPTER.validate_json(args_json)
@@ -548,11 +501,7 @@ def _output_content_attributes(
     stop_reason: StopReason | None,
     content_filter: ContentFilter,
 ) -> dict[str, SpanAttributeValue]:
-    """Build gen_ai.output.messages from assistant content.
-
-    One function for the generation and the failure paths, so an assistant message renders the same from either.
-    One key contains one message.
-    """
+    """Build gen_ai.output.messages with one assistant message."""
     return {
         "gen_ai.output.messages": json.dumps([
             {
@@ -577,7 +526,6 @@ def _record_request_failed_events(
 
     Each event carries the request's error text and its own `elapsed_seconds`.
     Events are stamped at recording time because the records carry only monotonic brackets.
-    They answer the first question a slow traced input raises: was it one request or the retries.
     """
     for record in outcome.request_history.records:
         if record.kind == "settled" and record.error is not None:

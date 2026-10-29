@@ -36,6 +36,7 @@ from langchaint.adapter import (
     SchemaViolation,
     TransientError,
     UsableResponse,
+    text_output,
 )
 from tests.helpers import stated_provider_billing, terminal, yield_until
 
@@ -105,11 +106,11 @@ def as_fake_raw(raw: BaseModel) -> FakeRawResponse:
 class ScriptedResponse:
     """One response the fake hands back: what interpret reads off it, and what it billed."""
 
-    outcome: ResponseOutcome[str]
+    outcome: ResponseOutcome[str | None]
     usage: Usage
 
 
-def billed(outcome: ResponseOutcome[str]) -> ScriptedResponse:
+def billed(outcome: ResponseOutcome[str | None]) -> ScriptedResponse:
     """Script one 200 the provider billed, whatever interpret goes on to make of it."""
     return ScriptedResponse(outcome=outcome, usage=USAGE_BILLED)
 
@@ -141,7 +142,7 @@ FAKE_TOOL_CALL: ToolCall = ToolCall(id="call1", name="lookup", args_json='{"q": 
 class FakeStream(AdapterStream):
     """Provide fixed stream items and an assembled response."""
 
-    def __init__(self, *, outcome: ResponseOutcome[str] | None = None) -> None:
+    def __init__(self, *, outcome: ResponseOutcome[str | None] | None = None) -> None:
         """Script the assembled outcome, defaulting to a usable response whose output is "ab"."""
         self.closed: bool = False
         self.raw: FakeRawResponse = FakeRawResponse(id="fake-final")
@@ -249,7 +250,7 @@ def as_fake_request_params(request_params: RequestParams) -> FakeRequestParams:
     return request_params
 
 
-class FakeBoundAdapter(BoundAdapter[str]):
+class FakeBoundAdapter(BoundAdapter[str | None]):
     """A bound adapter whose open_stream follows the behavior its FakeAdapter was given.
 
     Each bound adapter consumes its own copy of the adapter's scripts and keeps its own counters.
@@ -284,7 +285,7 @@ class FakeBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
         """Return what the response under this raw was scripted to produce."""
         return self._scripted_by_raw_id[as_fake_raw(raw).id].outcome
 
@@ -346,7 +347,7 @@ class FakeBoundAdapter(BoundAdapter[str]):
         )
 
 
-class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
+class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None]):
     """A structured bound adapter that sends, bills, and identifies requests as `text_bound_adapter` does.
 
     interpret validates a usable response's assistant message text into `response_format`.
@@ -369,13 +370,14 @@ class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
         return self._text_bound_adapter.identity_from_raw(raw, request_id=request_id)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
         """Validate the assistant message text of a usable response, and return any other outcome unchanged."""
         outcome = self._text_bound_adapter.interpret(raw)
         if outcome.kind != "usable_response":
             return outcome
+        text = text_output(outcome.assistant_message)
         try:
-            output = self._response_format.model_validate_json(outcome.assistant_message.text)
+            output = self._response_format.model_validate_json(text) if text is not None else None
         except ValidationError as error:
             return SchemaViolation(
                 assistant_message=outcome.assistant_message,
@@ -480,7 +482,7 @@ class FakeAdapter(Adapter):
         return {"automatic_cache_breakpoints_default": self.automatic_cache_breakpoints_default}
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         bound = self._bound_adapter_class(self)
         self.bound_adapters.append(bound)
         return bound
@@ -488,7 +490,7 @@ class FakeAdapter(Adapter):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
+    ) -> BoundAdapter[ModelT | None]:
         """Build a structured bound adapter over a new text bound adapter, and count the call."""
         self.structured_bind_count += 1
         return FakeStructuredBoundAdapter(self._bound_adapter_class(self), response_format)

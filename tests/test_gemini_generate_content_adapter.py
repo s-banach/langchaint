@@ -955,11 +955,11 @@ _READ_PARTS_CASES = [
         (_SIGNED_ANSWER,),
         (ReasoningPart(raw=_dump(_SIGNED_ANSWER)), TextPart(text="final answer")),
     ),
-    # Empty answer text becomes no TextPart, and the signed part alone replays it.
+    # Signed empty answer text keeps its boundary and replays through the signed part.
     _ReadPartsCase(
         "signed_empty_answer_text",
         (_SIGNED_EMPTY_ANSWER,),
-        (ReasoningPart(raw=_dump(_SIGNED_EMPTY_ANSWER)),),
+        (ReasoningPart(raw=_dump(_SIGNED_EMPTY_ANSWER)), TextPart(text="")),
     ),
     # Thought text reaches ReasoningPart.text and stays outside the answer text.
     _ReadPartsCase(
@@ -1043,7 +1043,7 @@ def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
     response = _response([types.Part(text="par")], finish_reason=None)
     text_outcome = _adapter().bind_text(_binding()).interpret(response)
     assert text_outcome.kind == "unfinished_assistant_message"
-    assert text_outcome.assistant_message.text == "par"
+    assert text_outcome.assistant_message.content == (TextPart(text="par"),)
     structured_outcome = _adapter().bind_structured(_binding(), _Answer).interpret(response)
     assert structured_outcome.kind == "unfinished_assistant_message"
 
@@ -1624,6 +1624,29 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
     @override
     def response_with_text(self, text: str) -> BaseModel:
         return _response([types.Part(text=text)])
+
+    @override
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
+        """Construct complete ordered parts, separately from streamed partial JSON.
+
+        Google-genai 2.33.0 yields chunks without complete text-part boundary events.
+        The sources do not establish every constructed multi-part arrangement as provider output.
+        Source: https://ai.google.dev/api/generate-content#Content
+        Source: https://ai.google.dev/gemini-api/docs/structured-output#streaming
+        """
+        return _response([types.Part(text=text) for text in texts])
+
+    @override
+    def response_with_tool_call(self, text: str) -> BaseModel:
+        """Construct text beside a function call, including schema-valid commentary.
+
+        The provider documents pre-tool text without guaranteeing each constructed arrangement.
+        Source: https://ai.google.dev/gemini-api/docs/function-calling
+        """
+        return _response([
+            types.Part(text=text),
+            types.Part(function_call=types.FunctionCall(name="lookup", args={})),
+        ])
 
     @override
     def response_with_reasoning(self) -> BaseModel:

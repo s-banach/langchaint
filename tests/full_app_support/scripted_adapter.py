@@ -130,7 +130,7 @@ class ScriptedAdapter(Adapter):
         return {}
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
         """Bind to the script named by the system prompt.
 
         Raises:
@@ -168,7 +168,7 @@ class _ScriptedRequestParams(RequestParams):
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
-class _ScriptedBoundAdapter(BoundAdapter[str]):
+class _ScriptedBoundAdapter(BoundAdapter[str | None]):
     """Play one agent's scripted turns in order."""
 
     def __init__(self, adapter: ScriptedAdapter, system_prompt: str) -> None:
@@ -194,7 +194,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> UsableResponse[str]:
+    def interpret(self, raw: BaseModel) -> UsableResponse[str | None]:
         """Build the usable response for the scripted turn.
 
         Raises:
@@ -203,7 +203,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         turn = self._adapter.scripts[self._system_prompt].turns[_turn_index(raw)]
         if turn.tool_calls:
             return UsableResponse(
-                output="",
+                output=None,
                 assistant_message=AssistantMessage(content=turn.tool_calls),
                 stop_reason="tool_call",
             )

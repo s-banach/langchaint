@@ -724,20 +724,25 @@ def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
 
 @pytest.mark.parametrize(
     ("texts", "output"),
-    [(["1", "2"], 1), (['{"answer":', " true}"], {"answer": True})],
-    ids=["first_text_part", "joined_text"],
+    [(["1", "2"], 2), (["Checking.", '{"answer":true}'], {"answer": True})],
+    ids=["earlier_valid_json", "commentary"],
 )
-def test_declared_json_output_is_the_first_text_part_or_else_the_joined_text(
+def test_declared_json_output_validates_the_final_text_part(
     texts: list[str], output: JsonValue
 ) -> None:
-    """Declared JSON output validates the first text part, and the joined text when the first part is not JSON."""
-    assert generation_record_from_otel(_json_output_span(texts)).output == output
+    """Declared JSON output validates the final complete text part independently."""
+    record = generation_record_from_otel(_json_output_span(texts))
+    assert record.output == output
+    assert record.commentary == texts[0]
 
 
-def test_rejects_invalid_declared_json_output() -> None:
-    """Declared JSON output rejects an assistant message whose first text part and joined text are not JSON."""
+@pytest.mark.parametrize(
+    "texts", [["not json", " either"], ["1", "invalid"], ["1", ""], ['{"answer":', "true}"]]
+)
+def test_rejects_invalid_declared_json_output(texts: list[str]) -> None:
+    """Declared JSON output requires the final complete text part to validate independently."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = generation_record_from_otel(_json_output_span(["not json", " either"]))
+        _ = generation_record_from_otel(_json_output_span(texts))
 
 
 _TOOL_CALL_OUTPUT_PART: JsonValue = {
@@ -778,7 +783,7 @@ def test_output_without_text_matches_a_live_generation(
 ) -> None:
     """An assistant message without text has the variant and output that `generate_one` returns.
 
-    An empty text part becomes no `TextPart`, as an adapter drops empty provider text.
+    An empty text part preserves its complete text-part boundary.
     """
     span = _generation_chat_span({
         "gen_ai.output.type": output_type,
@@ -787,7 +792,7 @@ def test_output_without_text_matches_a_live_generation(
     record = generation_record_from_otel(span)
     assert (record.kind, record.output) == expected
     assert isinstance(record.assistant_message.content, tuple)
-    assert all(part.text for part in record.assistant_message.content if part.kind == "text")
+    assert len(record.assistant_message.content) == len(parts)
 
 
 @pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])

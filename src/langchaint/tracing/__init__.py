@@ -409,7 +409,8 @@ def _tool_call_arguments(args_json: str) -> JsonValue:
 def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
     """Render one AssistantPart as the convention's part object, or None when it records nothing.
 
-    ReasoningPart and TextPart emit their text, and render as None when it is empty.
+    TextPart emits its text, including empty text.
+    ReasoningPart renders as None when its text is empty.
     ReasoningPart.raw is opaque and is never emitted.
     A RawPart renders as None because it has no text.
     """
@@ -417,7 +418,7 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
         case "reasoning":
             return {"type": "reasoning", "content": part.text} if part.text else None
         case "text":
-            return {"type": "text", "content": part.text} if part.text else None
+            return {"type": "text", "content": part.text}
         case "tool_call":
             return {
                 "type": "tool_call",

@@ -1,6 +1,5 @@
 """Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
-import contextlib
 import json
 from importlib.resources import files
 from typing import Annotated, Literal, overload
@@ -645,14 +644,11 @@ def generation_input_from_otel(
 
 
 def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessage:
-    """Convert one output message, dropping empty text parts as an adapter drops empty provider text."""
+    """Convert one output message, preserving complete text-part boundaries."""
     _require_message_metadata(message)
     if message.role != "assistant":
         raise _unsupported(message, "output message role")
-    content = map(_assistant_part_from_otel, message.parts)
-    return AssistantMessage(
-        content=tuple(part for part in content if part.kind != "text" or part.text)
-    )
+    return AssistantMessage(content=tuple(map(_assistant_part_from_otel, message.parts)))
 
 
 def output_messages_from_otel(
@@ -685,11 +681,9 @@ def generation_record_from_otel(
 
     An output message with a tool call returns `ToolCallGenerationRecord`.
     Any other output message returns `PlainGenerationRecord`.
-    Under `gen_ai.output.type` `"text"` or absent, the output joins the text of every text part.
-    An output message with a tool call and no text part then has output `None`.
-    Under `"json"`, the output is the first non-empty text part validated as JSON.
-    When that part is not valid JSON, the output is the joined text validated as JSON.
-    An output message with a tool call has output `None` when neither is valid JSON.
+    Application tool calls give output `None` and make every text part commentary.
+    Otherwise, the final text part gives the output, with preceding text joined by newlines as commentary.
+    Under `gen_ai.output.type` `"json"`, the final text part must validate as JSON.
     The record contains one synthetic request record.
     `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
     `first_item_after_seconds`, `error`, and `request_id` are `None`.
@@ -747,9 +741,7 @@ def generation_record_from_otel(
         elapsed_seconds=0.0,
     )
     if assistant_message.tool_calls:
-        return ToolCallGenerationRecord[JsonValue](
-            request_history=request_history, output=output, stop_reason=stop_reason
-        )
+        return ToolCallGenerationRecord(request_history=request_history, stop_reason=stop_reason)
     return PlainGenerationRecord[JsonValue](
         request_history=request_history, output=output, stop_reason=stop_reason
     )
@@ -931,28 +923,20 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
     """Return the output `assistant_message` gives under `output_type`.
 
     Under `"text"`, the output is `text_output(assistant_message)`.
-    Under `"json"`, the output is the first text part validated as JSON, or else the joined text validated as JSON.
-    An assistant message with a tool call has output `None` when neither is valid JSON.
+    Under `"json"`, the final complete text part must validate as JSON.
+    Application tool calls give output `None`.
 
     Raises:
         OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
         OtelToLangchaintConversionError: Under `"json"`, a message without tool calls has no valid JSON text.
     """
-    if _supported_output_type(output_type) == "text":
-        return text_output(assistant_message)
-    content = assistant_message.content
-    first_text = (
-        content
-        if isinstance(content, str)
-        else next((part.text for part in content if part.kind == "text"), "")
-    )
-    with contextlib.suppress(ValidationError):
-        return _JSON_VALUE_ADAPTER.validate_json(first_text)
+    supported_output_type = _supported_output_type(output_type)
+    text = text_output(assistant_message)
+    if text is None or supported_output_type == "text":
+        return text
     try:
-        return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
+        return _JSON_VALUE_ADAPTER.validate_json(text)
     except ValidationError as error:
-        if assistant_message.tool_calls:
-            return None
         raise _attribute_conversion_error(
             "gen_ai.output.type",
             "declares output that is not valid JSON",

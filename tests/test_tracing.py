@@ -60,6 +60,7 @@ from langchaint.adapter import (
     RequestParams,
     TransientError,
     UsableResponse,
+    text_output,
 )
 from langchaint.common.messages import StopReason
 from langchaint.embedding import EmbeddingModel, EmbeddingTask, _EmbeddingBatchResponse
@@ -732,7 +733,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
 
     The input and system prompt use the forms span parsing returns: tuple content and compact `args_json`.
     Text output has one text part before any tool call and one after.
-    Json output has one text part, the only shape whose output every adapter validates from the same text.
+    JSON output uses one text part.
     `parse_otel_chat` reads each key of the span into a field, except the langchaint keys.
     The usage counters read back unchanged, and `gen_ai.output.type` names the output form.
     `gen_ai.request.stream` is present only on a stream.
@@ -764,7 +765,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             scripted_requests=[
                 ScriptedResponse(
                     outcome=UsableResponse(
-                        output=assistant_message.text,
+                        output=text_output(assistant_message),
                         assistant_message=assistant_message,
                         stop_reason=stop_reason,
                     ),
@@ -1830,7 +1831,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
         (
             (ReasoningPart(raw={"signature": "opaque"}, text=""), TextPart(text="")),
             "stop",
-            [],
+            [{"type": "text", "content": ""}],
             "stop",
         ),
         (

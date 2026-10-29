@@ -11,7 +11,7 @@ The system prompt remains a binding parameter because providers place it outside
 
 import math
 from collections.abc import Sequence
-from typing import Annotated, Literal, TypeIs
+from typing import Annotated, Literal, NamedTuple, TypeIs
 
 from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter, model_validator
 
@@ -250,21 +250,38 @@ class AssistantMessage(CheckedCopyModel):
         return self
 
     @property
-    def text(self) -> str:
-        """Return plain text or the concatenated `TextPart.text` values from `content`.
-
-        A tuple without a `TextPart` gives an empty string.
-        """
-        if isinstance(self.content, str):
-            return self.content
-        return "".join(part.text for part in self.content if part.kind == "text")
-
-    @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """Return the `ToolCall` values from `content` in emission order."""
         if isinstance(self.content, str):
             return ()
         return tuple(part for part in self.content if part.kind == "tool_call")
+
+
+class AssistantText(NamedTuple):
+    """Final text and newline-joined commentary selected from complete text parts."""
+
+    final_text: str | None
+    commentary: str | None
+
+
+def assistant_text(assistant_message: AssistantMessage) -> AssistantText:
+    """Select final text and commentary from the ordered assistant content.
+
+    Args:
+        assistant_message: The completed assistant message; string content counts as one text part.
+    """
+    content = assistant_message.content
+    texts = (
+        (content,)
+        if isinstance(content, str)
+        else tuple(part.text for part in content if part.kind == "text")
+    )
+    if assistant_message.tool_calls:
+        return AssistantText(None, "\n".join(texts) if texts else None)
+    return AssistantText(
+        texts[-1] if texts else None,
+        "\n".join(texts[:-1]) if len(texts) > 1 else None,
+    )
 
 
 class ToolMessage(CheckedCopyModel):

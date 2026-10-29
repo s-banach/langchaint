@@ -1,4 +1,4 @@
-"""Test OpenAI Responses with constructed SDK objects.
+"""Test OpenAI Responses with constructed SDK objects and sanitized Luna captures.
 
 Tests cover Usage, input items, tool choice, stop reasons, streams, and requests.
 """
@@ -6,6 +6,7 @@ Tests cover Usage, input items, tool choice, stop reasons, streams, and requests
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import override
 
 import httpx2
@@ -31,6 +32,8 @@ from openai.types.responses import (
     ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningSummaryTextDoneEvent,
     ResponseReasoningTextDeltaEvent,
@@ -414,7 +417,7 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
         (
             _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]),
             "tool_call",
-            "hey",
+            None,
         ),
         (
             _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM]),
@@ -424,7 +427,7 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
         (
             _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]),
             "refusal",
-            "I can't help with that",
+            None,
         ),
         (_incomplete_response("max_output_tokens"), "max_completion_tokens", "hey"),
         (_incomplete_response("content_filter"), "refusal", "hey"),
@@ -470,7 +473,7 @@ def test_every_output_item_replays_as_one_input_item_in_position() -> None:
     assert _assistant_items(assistant_message) == [
         _REASONING_OUTPUT_ITEM,
         _WEB_SEARCH_OUTPUT_ITEM,
-        {"role": "assistant", "content": "hey"},
+        {"role": "assistant", "content": "hey", "phase": "commentary"},
         {"type": "function_call", "call_id": "call1", "name": "lookup", "arguments": '{"q": 1}'},
     ]
 
@@ -530,8 +533,8 @@ def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_with
     assert reasoning_part.text == expected_text
 
 
-def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
-    """Output splits text parts and input rejoins adjacent text parts."""
+def test_text_parts_replay_as_separate_messages() -> None:
+    """Each complete text block becomes one text part and replays as one message."""
     two_part_message: dict[str, object] = {
         "type": "message",
         "id": "m1",
@@ -544,7 +547,59 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
     }
     assistant_message = _assistant_message_from(_response(usage=None, output=[two_part_message]))
     assert assistant_message.content == (TextPart(text="he"), TextPart(text="y"))
-    assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
+    assert _assistant_items(assistant_message) == [
+        {"role": "assistant", "content": "he", "phase": "commentary"},
+        {"role": "assistant", "content": "y", "phase": "final_answer"},
+    ]
+
+
+@pytest.mark.parametrize("content", ["answer", (TextPart(text="answer"),)])
+def test_text_binding_replays_plain_text_and_one_text_part_as_a_final_answer(
+    content: str | tuple[TextPart, ...],
+) -> None:
+    """The text binding sends one final text message with the structured format omitted."""
+    request = _text_bound().build_request_params([AssistantMessage(content=content)])
+    assert isinstance(request, _OpenAIResponsesRequestParams)
+    assert request.precomputed.text is openai.omit
+    assert request.input == [
+        {"role": "assistant", "content": "answer", "phase": "final_answer"},
+    ]
+
+
+def test_replay_uses_edited_content_to_reconstruct_text_and_phases() -> None:
+    """Removing reasoning and tool calls preserves text order and changes the final text phase."""
+    response = _response(
+        usage=None,
+        output=[_REASONING_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM],
+    )
+    assistant_message = _assistant_message_from(response)
+    assert isinstance(assistant_message.content, tuple)
+    tool_call = assistant_message.content[-1]
+    assert tool_call.kind == "tool_call"
+    edited = assistant_message.model_copy(
+        update={
+            "content": (
+                TextPart(text="Checking"),
+                tool_call.model_copy(update={"args_json": '{"q": 2}'}),
+                TextPart(text="Waiting"),
+            ),
+        }
+    )
+    assert _assistant_items(edited) == [
+        {"role": "assistant", "content": "Checking", "phase": "commentary"},
+        {"type": "function_call", "call_id": "call1", "name": "lookup", "arguments": '{"q": 2}'},
+        {"role": "assistant", "content": "Waiting", "phase": "commentary"},
+    ]
+    assert isinstance(edited.content, tuple)
+    without_tool_calls = edited.model_copy(
+        update={
+            "content": tuple(part for part in edited.content if part.kind != "tool_call"),
+        }
+    )
+    assert _assistant_items(without_tool_calls) == [
+        {"role": "assistant", "content": "Checking", "phase": "commentary"},
+        {"role": "assistant", "content": "Waiting", "phase": "final_answer"},
+    ]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
@@ -553,7 +608,7 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_items(assistant_message) == [
         raw,
-        {"role": "assistant", "content": "hi"},
+        {"role": "assistant", "content": "hi", "phase": "final_answer"},
     ]
 
 
@@ -571,7 +626,7 @@ def test_wire_input_converts_each_message_kind() -> None:
     ])
     assert wire == [
         {"role": "user", "content": "q"},
-        {"role": "assistant", "content": "thinking"},
+        {"role": "assistant", "content": "thinking", "phase": "commentary"},
         {"type": "function_call", "call_id": "call1", "name": "lookup", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call1", "output": "r"},
     ]
@@ -1533,6 +1588,77 @@ def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredRe
     return _structured_bound()._parsed_outcome(response, _assistant_message_from(response))
 
 
+class _CapturedAnswer(BaseModel):
+    """Validate the numeric answer requested in the live Luna experiment."""
+
+    value: int
+
+
+@pytest.mark.parametrize("name", ["final_commentary_no_tools", "final_provisional_no_tools"])
+def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name: str) -> None:
+    """Earlier commentary and a schema-valid provisional answer precede the final answer."""
+    path = Path(__file__).parent / "fixtures" / "responses_structured" / f"{name}.json"
+    response = OpenAIResponse.model_validate_json(path.read_text())
+    adapter = _adapter()
+    bound = _BoundOpenAIResponsesStructured(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=False)),
+        response_format=_CapturedAnswer,
+    )
+    billing = bound.billing_from_raw(response)
+    outcome = _assert_usable(bound.interpret(response))
+    assert outcome.output == _CapturedAnswer(value=17)
+    assert outcome.assistant_message == _assistant_message_from(response)
+    assert billing.usage_raw is response.usage
+
+    expected: list[object] = []
+    for item in response.output:
+        assert item.type == "message"
+        assert len(item.content) == 1
+        block = item.content[0]
+        assert block.type == "output_text"
+        expected.append({"role": "assistant", "content": block.text, "phase": item.phase})
+    assert _assistant_items(outcome.assistant_message) == expected
+
+    async def streamed() -> OpenAIResponse:
+        stream = _stream([_completed_event(response, 1)])
+        _ = [item async for item in stream.items()]
+        return await stream.final()
+
+    assert bound.interpret(run_with_timeout(streamed())) == outcome
+
+
+@pytest.mark.parametrize(
+    ("earlier", "final", "expected_kind"),
+    [
+        ("Checking the temperature", '{"city":"Lima","celsius":19}', "usable_response"),
+        ('{"city":"Nairobi","celsius":25}', '{"city":"Lima","celsius":19}', "usable_response"),
+        ('{"city":"Nairobi","celsius":25}', "Invalid final answer", "schema_violation"),
+        ('{"city":"Nairobi","celsius":25}', "", "schema_violation"),
+    ],
+)
+def test_structured_binding_validates_the_final_complete_block_without_a_phase(
+    earlier: str, final: str, expected_kind: str
+) -> None:
+    """Structured output validates the final complete text block within one provider message."""
+    message = ResponseOutputMessage(
+        id="message",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[
+            ResponseOutputText(type="output_text", text=text, annotations=[])
+            for text in (earlier, final)
+        ],
+    )
+    response = _response(usage=_usage_with_cache(), output=[message])
+    outcome = _structured_parse(response)
+    assert outcome.kind == expected_kind
+    assert outcome.assistant_message == _assistant_message_from(response)
+    if outcome.kind == "usable_response":
+        assert outcome.output == _StructuredReport(city="Lima", celsius=19)
+
+
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
@@ -1568,14 +1694,32 @@ def _structured_response(
     )
 
 
-def test_structured_bind_sets_output_on_an_assistant_message_that_also_called_a_tool() -> None:
-    """A valid instance takes precedence over the tool call, which the assistant message still carries."""
+def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() -> None:
+    """Text that validates against the schema remains commentary beside an application tool call."""
     outcome = _assert_usable(
         _structured_bound().interpret(_structured_response(_REPORT_JSON, tool_call=True))
     )
-    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
+    assert outcome.output is None
     assert outcome.assistant_message.tool_calls == (
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    )
+
+
+@pytest.mark.parametrize("refusal", ["I can't help with that", _REPORT_JSON])
+def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
+    """A final refusal supplies the final text and prevents earlier JSON from becoming output."""
+    response = _response(
+        usage=None,
+        output=[
+            *_structured_response(_REPORT_JSON).output,
+            {**_REFUSAL_MESSAGE_ITEM, "content": [{"type": "refusal", "refusal": refusal}]},
+        ],
+    )
+    outcome = _structured_bound().interpret(response)
+    assert outcome.kind == "refusal"
+    assert outcome.assistant_message.content == (
+        TextPart(text=_REPORT_JSON),
+        TextPart(text=refusal),
     )
 
 
@@ -1709,7 +1853,7 @@ def test_a_failed_run_takes_its_variant_from_the_error_code(
     assert outcome.kind == expected_kind
     assert isinstance(outcome, ProviderFailedTransiently | ProviderFailedTerminally)
     assert outcome.error_text == expected_reason
-    assert outcome.assistant_message.text == "hey"
+    assert outcome.assistant_message.content == (TextPart(text="hey"),)
 
 
 @pytest.mark.parametrize(
@@ -1937,6 +2081,26 @@ class TestOpenAIResponsesConformance(AdapterConformance):
     @override
     def response_with_text(self, text: str) -> BaseModel:
         return _structured_response(text)
+
+    @override
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
+        return _response(
+            usage=None,
+            output=[
+                ResponseOutputMessage(
+                    id=f"message_{index}",
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+                )
+                for index, text in enumerate(texts)
+            ],
+        )
+
+    @override
+    def response_with_tool_call(self, text: str) -> BaseModel:
+        return _structured_response(text, tool_call=True)
 
     @override
     def response_with_reasoning(self) -> BaseModel:

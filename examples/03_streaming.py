@@ -1,4 +1,11 @@
-"""Consume every `StreamItem` variant."""
+"""Consume every `StreamItem` variant.
+
+Streamed text can contain commentary and final output.
+The completed generation separates them: `output` contains the final text part or validated caller model.
+`commentary` contains preceding plain text joined with one newline, or `None` when absent.
+Application tool calls give `output=None` and make every text part commentary.
+Replay `assistant_message` to preserve ordered content, including reasoning.
+"""
 
 from pydantic import BaseModel
 
@@ -53,4 +60,7 @@ async def stream_tool_call() -> Generation[str]:
     async with bound.stream_one("What is the weather in Oslo?") as handle:
         async for item in handle:
             print_stream_item(item)
-        return await handle.final()
+        generation = await handle.final()
+        print("commentary:", generation.commentary)
+        print("output:", generation.output)
+        return generation

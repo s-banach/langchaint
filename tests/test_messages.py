@@ -29,7 +29,6 @@ def test_string_content() -> None:
     """Plain text stays a string on construction and validation."""
     assistant = AssistantMessage(content="hey")
     assert assistant.content == "hey"
-    assert assistant.text == "hey"
     assert assistant.tool_calls == ()
     assert AssistantMessage.model_validate({"kind": "assistant", "content": "hey"}) == assistant
     assert messages_from_json(messages_to_json([assistant])) == [assistant]

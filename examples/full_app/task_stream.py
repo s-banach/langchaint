@@ -288,7 +288,11 @@ class ReActAgent(AgentRun):
                 GenerationReported(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    text=generation.assistant_message.text,
+                    text="\n".join(
+                        text
+                        for text in (generation.commentary, generation.output)
+                        if text is not None
+                    ),
                     usage=generation.usage,
                     usage_so_far=self.usage,
                 )

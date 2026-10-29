@@ -76,7 +76,7 @@ async def _close_stream_quietly(
         _logger.warning(failure_log_message, exc_info=True)
 
 
-class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Never]:
+class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
     """An async context manager and iterator for one streamed input.
 
     Entry opens the request. `final` drains items.
@@ -519,7 +519,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration[object] = Ne
     ) -> PlainGeneration[OutputT]: ...
     @overload
     async def final(self) -> "PlainGeneration[OutputT] | ToolCallGenerationT": ...
-    async def final(self) -> PlainGeneration[OutputT] | ToolCallGeneration[object]:
+    async def final(self) -> PlainGeneration[OutputT] | ToolCallGeneration:
         """Drain remaining items and return the stored generation.
 
         Repeated calls return or raise the same outcome without reading the stream again.

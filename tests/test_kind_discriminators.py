@@ -149,7 +149,7 @@ def _by_generation_kind(generation: Generation[_Answer]) -> object:
             assert_type(generation.output, _Answer)
             return generation.output
         case "tool_call":
-            assert_type(generation.output, _Answer | None)
+            assert_type(generation.output, None)
             return generation.tool_calls
 
 

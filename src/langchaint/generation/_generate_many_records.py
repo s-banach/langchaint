@@ -18,7 +18,7 @@ from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
 from langchaint.generation.response import GenerationOutcomeRecord
 
-_RESUME_FORMAT_VERSION = 5
+_RESUME_FORMAT_VERSION = 6
 """The resume file version that this code reads and writes.
 
 Restoring a file of this version gives the records that rerunning its binding and inputs would give.
@@ -65,7 +65,7 @@ class _PositionDocument[OutputT](CheckedCopyModel):
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[5] = 5
+    format_version: Literal[6] = 6
     config_fingerprint: str
     identity_mode: Literal["position"] = "position"
     items: tuple[_PositionItem[OutputT], ...]
@@ -76,7 +76,7 @@ class _InputIdDocument[OutputT](CheckedCopyModel):
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[5] = 5
+    format_version: Literal[6] = 6
     config_fingerprint: str
     identity_mode: Literal["input_id"] = "input_id"
     items: tuple[_InputIdItem[OutputT], ...]
@@ -228,7 +228,7 @@ def prepare_resume_state[OutputT](
 ) -> ResumeState[OutputT]:
     """Validate or replace one resume document before generation starts.
 
-    Records hold `output_type` output, or `output_type | None` output for tool calls.
+    Records hold `output_type` output, or `None` output for tool calls.
     `ResumeState.store_outcome_record` validates each record against these types before writing it.
 
     Raises:

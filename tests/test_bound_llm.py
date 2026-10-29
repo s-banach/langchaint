@@ -1132,11 +1132,11 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
     assert_type(
         await structured_with_tools.generate_one("hi"),
-        PlainGeneration[_Answer] | ToolCallGeneration[_Answer | None],
+        PlainGeneration[_Answer] | ToolCallGeneration,
     )
     assert_type(
         structured_with_tools.stream_one("hi"),
-        StreamHandle[_Answer, ToolCallGeneration[_Answer | None]],
+        StreamHandle[_Answer, ToolCallGeneration],
     )
     assert_type(
         await structured_with_tools.generate_many_records(
@@ -1153,15 +1153,13 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(
         await text_with_tools.generate_one("hi"),
-        PlainGeneration[str] | ToolCallGeneration[str | None],
+        PlainGeneration[str] | ToolCallGeneration,
     )
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
         list[GenerationOutcomeRecord[str]],
     )
-    assert_type(
-        text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration[str | None]]
-    )
+    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration])
     async with text_with_tools.stream_one("hi") as stream_with_tools:
         async for item in stream_with_tools:
             assert_type(item, StreamItem)
@@ -1240,8 +1238,8 @@ _STRUCTURED_TOOL_CALL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
 )
 """A structured assistant message of tool calls alone: nothing parsed, one tool call to dispatch."""
 
-_STRUCTURED_TOOL_CALL_RESPONSE_WITH_INSTANCE: UsableResponse[_Answer | None] = UsableResponse(
-    output=_Answer(value=7),
+_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY: UsableResponse[_Answer | None] = UsableResponse(
+    output=None,
     assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
     stop_reason="tool_call",
 )
@@ -1313,9 +1311,9 @@ def test_structured_tool_bound_generate_one_splits_on_tool_calls(
     [
         (_STRUCTURED_FINAL_RESPONSE, "plain"),
         (_STRUCTURED_TOOL_CALL_RESPONSE, "tool_call"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE_WITH_INSTANCE, "tool_call"),
+        (_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY, "tool_call"),
     ],
-    ids=["plain", "tool_call", "tool_call_with_instance"],
+    ids=["plain", "tool_call", "tool_call_with_commentary"],
 )
 def test_generate_many_records_restores_a_structured_record(
     tmp_path: Path, outcome: UsableResponse[_Answer | None], kind: str
@@ -1943,12 +1941,12 @@ def test_generate_many_records_rejects_invalid_input_ids_before_requests(tmp_pat
     [
         "not json\n",
         '{"format_version": 999, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
-        '{"format_version": 4, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
+        '{"format_version": 5, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
         '{"unrelated": true}\n',
-        '{"format_version": "5"}\n',
-        '{"format_version": 5.0}\n',
+        '{"format_version": "6"}\n',
+        '{"format_version": 6.0}\n',
         '{"format_version": true}\n',
-        '{"format_version": 5, "config_fingerprint": "x", "identity_mode": "position", "items": [], "unknown": true}\n',
+        '{"format_version": 6, "config_fingerprint": "x", "identity_mode": "position", "items": [], "unknown": true}\n',
     ],
     ids=[
         "malformed",

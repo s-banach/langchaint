@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 from langchaint.adapter import RequestParams, ResponseOutcome
 from langchaint.billing.pricing import ProviderBilling
 from langchaint.billing.usage import Usage
-from langchaint.common.messages import AssistantMessage, StopReason, ToolCall
+from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, assistant_text
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
     GenerationError,
@@ -69,6 +69,15 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
         """Return the kept assistant message's tool calls."""
         return self.assistant_message.tool_calls
 
+    @property
+    def commentary(self) -> str | None:
+        """Return plain text before the final text, joined with one newline, or `None` when absent.
+
+        An assistant message with application tool calls contributes every text part.
+        Reasoning and other provider content remain in `assistant_message.content`.
+        """
+        return assistant_text(self.assistant_message).commentary
+
 
 class PlainGenerationRecord[OutputT](_GenerationRecordBase):
     """The normalized record of one `PlainGeneration`.
@@ -80,16 +89,13 @@ class PlainGenerationRecord[OutputT](_GenerationRecordBase):
     kind: Literal["plain"] = "plain"
 
 
-class ToolCallGenerationRecord[OutputT](_GenerationRecordBase):
+class ToolCallGenerationRecord(_GenerationRecordBase):
     """The normalized record of one `ToolCallGeneration`.
-
-    `output` is `None` when the kept assistant message gives no output.
-    A text binding's message gives no output without text, and a structured binding's without a validated caller model.
 
     Validation rejects unknown fields.
     """
 
-    output: OutputT
+    output: None = None
     kind: Literal["tool_call"] = "tool_call"
 
     @model_validator(mode="after")
@@ -150,6 +156,15 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
         """Return the kept assistant message's tool calls."""
         return self.record.tool_calls
 
+    @property
+    def commentary(self) -> str | None:
+        """Return the kept assistant message's commentary, preserving text within each part.
+
+        Text before the final text is joined with one newline, or `None` when absent.
+        An assistant message with application tool calls contributes every text part.
+        """
+        return self.record.commentary
+
 
 @dataclass(frozen=True, kw_only=True)
 class PlainGeneration(
@@ -164,17 +179,14 @@ class PlainGeneration(
     def output(self) -> _OutputT_co:
         """Return the assistant text or validated caller model.
 
-        A text binding returns the joined `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
+        A text binding returns the final `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
         To continue the conversation, replay `assistant_message`.
         """
         return self.record.output
 
 
 @dataclass(frozen=True, kw_only=True)
-class ToolCallGeneration(
-    _LiveGenerationBase[ToolCallGenerationRecord[_OutputT_co]],
-    Generic[_OutputT_co],  # noqa: UP046
-):
+class ToolCallGeneration(_LiveGenerationBase[ToolCallGenerationRecord]):
     """A generation whose kept assistant message has tool calls, with provider SDK values.
 
     Only a binding with tools produces one.
@@ -183,11 +195,9 @@ class ToolCallGeneration(
     kind: Literal["tool_call"] = "tool_call"
 
     @property
-    def output(self) -> _OutputT_co:
-        """Return the kept assistant message's text or validated caller model, or `None` without either.
+    def output(self) -> None:
+        """Return `None` because application tool calls make all text commentary.
 
-        A text binding returns the joined `TextPart` text of `assistant_message`, or `None` without a `TextPart`.
-        A structured binding returns `None` when the kept assistant message has no validated caller model.
         To continue the conversation, replay `assistant_message`.
         """
         return self.record.output
@@ -208,14 +218,12 @@ def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseMo
     return final_raw
 
 
-type Generation[OutputT] = PlainGeneration[OutputT] | ToolCallGeneration[OutputT | None]
+type Generation[OutputT] = PlainGeneration[OutputT] | ToolCallGeneration
 """What an input produces when it succeeds.
 
-A `ToolCallGeneration` has `None` output when its kept assistant message gives no output.
+A `ToolCallGeneration` has `None` output.
 """
-type GenerationRecord[OutputT] = (
-    PlainGenerationRecord[OutputT] | ToolCallGenerationRecord[OutputT | None]
-)
+type GenerationRecord[OutputT] = PlainGenerationRecord[OutputT] | ToolCallGenerationRecord
 """The normalized record of one `PlainGeneration` or `ToolCallGeneration`."""
 type GenerationOutcome[OutputT] = Generation[OutputT] | GenerationError
 """Every live outcome of an input: a `Generation` or a `GenerationError`.
@@ -225,7 +233,7 @@ type GenerationOutcome[OutputT] = Generation[OutputT] | GenerationError
 
 type GenerationOutcomeRecord[OutputT] = Annotated[
     SerializeAsAny[PlainGenerationRecord[OutputT]]
-    | SerializeAsAny[ToolCallGenerationRecord[OutputT | None]]
+    | ToolCallGenerationRecord
     | PlainErrorRecord
     | SchemaViolationErrorRecord,
     Field(discriminator="kind"),
@@ -271,6 +279,7 @@ def _generation_variant[OutputT](
     """Build one live generation and its normalized record.
 
     Raises:
+        ValueError: The adapter gives output for a message with application tool calls and a `ToolManager`.
         ValueError: The adapter gives `None` output for a message that does not become a `ToolCallGeneration`.
             The message has no tool calls, or the binding has no `ToolManager`.
     """
@@ -278,9 +287,11 @@ def _generation_variant[OutputT](
     assert final.kind == "settled"
     assert final.assistant_message is not None
     if splits_on_tool_calls and final.assistant_message.tool_calls:
+        if output is not None:
+            raise ValueError("the adapter gave output for a ToolCallGeneration")
         return ToolCallGeneration(
             record=ToolCallGenerationRecord(
-                output=output, request_history=request_history, stop_reason=stop_reason
+                request_history=request_history, stop_reason=stop_reason
             ),
             request_provider_data=request_provider_data,
         )

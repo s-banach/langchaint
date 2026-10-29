@@ -131,9 +131,9 @@ See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `
 | Binding | `generate_one` return type |
 | --- | --- |
 | text, without tools | `PlainGeneration[str]` |
-| text, with `ToolManager` | `PlainGeneration[str] \| ToolCallGeneration[str \| None]` |
+| text, with `ToolManager` | `PlainGeneration[str] \| ToolCallGeneration` |
 | structured, without tools | `PlainGeneration[Model]` |
-| structured, with `ToolManager` | `PlainGeneration[Model] \| ToolCallGeneration[Model \| None]` |
+| structured, with `ToolManager` | `PlainGeneration[Model] \| ToolCallGeneration` |
 
 `Generation[str]` and `Generation[Model]` name the unions `generate_one` returns.
 A binding with `ToolManager` returns `ToolCallGeneration` whenever the kept assistant message has tool calls.

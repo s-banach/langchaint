@@ -128,6 +128,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    assistant_text,
 )
 
 _PAUSE_STATUSES = frozenset({429, 503})
@@ -552,7 +553,7 @@ def _assistant_message_from(provider_content: types.Content | None) -> Assistant
     Thought or signed parts become replayable `ReasoningPart` values.
     Signed answer text and function calls also produce `TextPart` or `ToolCall`.
     Unmodeled parts become replayable `RawPart` values.
-    A part holding only empty text produces nothing, as every adapter drops empty provider text.
+    Empty answer text preserves its complete text-part boundary.
     Missing provider parts produce empty assistant content.
     """
     wire_parts = (
@@ -572,10 +573,10 @@ def _assistant_message_from(provider_content: types.Content | None) -> Assistant
             )
         if part.function_call is not None:
             content.append(_tool_call_from(part.function_call))
-        elif part.text:
+        elif part.text is not None and (part.text or _is_text_only(part)):
             if not part.thought:
                 content.append(TextPart(text=part.text))
-        elif not carries_reasoning and part.model_dump(exclude_none=True) != {"text": ""}:
+        elif not carries_reasoning:
             content.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(content=tuple(content))
 
@@ -637,11 +638,7 @@ def _matches_replayed_part_payload(part: AssistantPart, replayed_part: types.Par
             and args == (function_call.args or {})
         )
     if part.kind == "text" and function_call is None:
-        return (
-            bool(replayed_part.text)
-            and not replayed_part.thought
-            and part.text == replayed_part.text
-        )
+        return not replayed_part.thought and part.text == replayed_part.text
     return False
 
 
@@ -675,7 +672,7 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
                 replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
                 wire_parts.append(replayed_part)
                 if replayed_part.function_call is not None or (
-                    replayed_part.text and not replayed_part.thought
+                    replayed_part.text is not None and not replayed_part.thought
                 ):
                     replayed_part_with_paired_payload = replayed_part
             case "raw":
@@ -1604,7 +1601,8 @@ def _finished_message_or_unusable_response(
             assistant_message=assistant_message,
         )
     return _FinishedMessage(
-        finish_reason=candidate.finish_reason, assistant_message=assistant_message
+        finish_reason=candidate.finish_reason,
+        assistant_message=assistant_message,
     )
 
 
@@ -1760,12 +1758,13 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         """Validate the text into the instance, report tool calls as None, or report why neither exists.
 
         Local validation preserves the response and rejected text.
-        A non-finished reason takes precedence over schema validation.
-        MAX_TOKENS takes precedence over SchemaViolation.
+        Google-genai 2.33.0 parses concatenated non-thought text; this adapter validates the final complete text part.
+        Source: https://github.com/googleapis/python-genai/blob/v2.33.0/google/genai/types.py
+        Without validated output, a non-finished reason or MAX_TOKENS takes precedence over schema validation.
         """
         validation_error: ValidationError | None = None
-        text = finished_message.assistant_message.text
-        if text:
+        text = assistant_text(finished_message.assistant_message).final_text
+        if text is not None:
             try:
                 output = self._output_type_adapter.validate_json(text)
                 return _usable_response(finished_message, output)

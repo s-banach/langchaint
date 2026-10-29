@@ -157,6 +157,26 @@ class AdapterConformance(ABC):
         ...
 
     @abstractmethod
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel | None:
+        """Construct a finished SDK response with separate complete text parts in order.
+
+        Return `None` when the provider represents response text as one string.
+
+        Args:
+            texts: The complete text parts, including empty text.
+        """
+        ...
+
+    @abstractmethod
+    def response_with_tool_call(self, text: str) -> BaseModel:
+        """Construct a finished SDK response containing text and an application tool call.
+
+        Args:
+            text: The text accompanying the tool call.
+        """
+        ...
+
+    @abstractmethod
     def response_with_reasoning(self) -> BaseModel:
         """Return an SDK response whose assistant message holds one ReasoningPart and one TextPart.
 
@@ -336,15 +356,12 @@ class AdapterConformance(ABC):
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
 
-    def test_empty_provider_text_becomes_no_text_part(self) -> None:
-        """Empty provider text leaves no part in the assistant message, and the text output is then `""`.
-
-        Anthropic rejects an empty text block, so a replayed assistant message with tool calls must not carry one.
-        """
+    def test_empty_provider_text_preserves_its_text_part(self) -> None:
+        """Empty provider text preserves its complete text-part boundary and gives empty output."""
         outcome = self._bound_adapter().interpret(self.response_with_text(""))
         assert outcome.kind == "usable_response"
         assert outcome.output == ""
-        assert outcome.assistant_message.content == ()
+        assert outcome.assistant_message.content == (TextPart(text=""),)
 
     def test_an_empty_text_part_is_sent_as_given(self) -> None:
         """Replay sends every assistant `TextPart`, including one with empty text."""
@@ -392,6 +409,62 @@ class AdapterConformance(ABC):
         outcome = bound_adapter.interpret(self.response_with_text(text))
         assert outcome.kind == "schema_violation"
         assert outcome.validation_error_json == _validation_error_json(_WeatherReport, text)
+
+    def test_final_complete_text_controls_text_and_structured_output(self) -> None:
+        """Constructed responses distinguish commentary from final output independently of schema validity."""
+        final = '{"city":"Lima","celsius":19}'
+        for earlier in ("Checking the temperature.", '{"city":"Nairobi","celsius":25}'):
+            raw = self.response_with_text_parts((earlier, final))
+            if raw is None:
+                return
+            text_outcome = self._bound_adapter().interpret(raw)
+            assert text_outcome.kind == "usable_response"
+            assert text_outcome.output == final
+            bound = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
+            outcome = bound.interpret(raw)
+            assert outcome.kind == "usable_response"
+            assert outcome.output == _WeatherReport(city="Lima", celsius=19)
+            assert outcome.assistant_message == text_outcome.assistant_message
+            assert isinstance(outcome.assistant_message.content, tuple)
+            assert [
+                part.text for part in outcome.assistant_message.content if part.kind == "text"
+            ] == [earlier, final]
+
+    def test_invalid_final_text_cannot_use_earlier_valid_json(self) -> None:
+        """Constructed final text must validate independently, including empty final text."""
+        earlier = '{"city":"Nairobi","celsius":25}'
+        bound = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
+        for final in ("Invalid final answer", ""):
+            raw = self.response_with_text_parts((earlier, final))
+            if raw is None:
+                return
+            outcome = bound.interpret(raw)
+            assert outcome.kind == "schema_violation"
+            assert outcome.validation_error_json == _validation_error_json(_WeatherReport, final)
+            assert isinstance(outcome.assistant_message.content, tuple)
+            assert [
+                part.text for part in outcome.assistant_message.content if part.kind == "text"
+            ] == [earlier, final]
+            text_outcome = self._bound_adapter().interpret(raw)
+            assert text_outcome.kind == "usable_response"
+            assert text_outcome.output == final
+
+    def test_tool_call_text_is_commentary_for_both_bindings(self) -> None:
+        """Constructed text beside application tool calls gives no output, even when it validates."""
+        for text in ("Checking the temperature.", '{"city":"Nairobi","celsius":25}'):
+            raw = self.response_with_tool_call(text)
+            for bound in (
+                self._bound_adapter(),
+                self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport),
+            ):
+                outcome = bound.interpret(raw)
+                assert outcome.kind == "usable_response"
+                assert outcome.output is None
+                assert outcome.assistant_message.tool_calls
+                assert isinstance(outcome.assistant_message.content, tuple)
+                assert [
+                    part.text for part in outcome.assistant_message.content if part.kind == "text"
+                ] == [text]
 
     def test_every_sdk_exception_maps_and_an_unknown_one_is_unknown_exception(self) -> None:
         """Every listed exception takes its stated `RequestFailure`, and a bare `Exception` is `unknown_exception`.

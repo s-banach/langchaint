@@ -155,6 +155,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    assistant_text,
 )
 from langchaint.tools import ToolSchema
 
@@ -889,22 +890,10 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
     return raw
 
 
-def _first_text_block_text(message: anthropic.types.Message) -> str | None:
-    """Return the text of the assistant message's first text block, None when it holds none.
-
-    Structured output validation uses this block.
-    SDK parsing validates every text block and returns the first instance.
-    """
-    for block in message.content:
-        if block.type == "text":
-            return block.text
-    return None
-
-
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
     """Build `AssistantMessage` from SDK blocks in order.
 
-    Empty text blocks are dropped because the API rejects them on replay.
+    Text blocks preserve complete text-part boundaries, including empty text.
     Thinking blocks become replayable `ReasoningPart` values.
     Redacted thinking has `text=None`.
     Unmodeled blocks become replayable `RawPart` values.
@@ -912,8 +901,7 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     content: list[AssistantPart] = []
     for block in message.content:
         if block.type == "text":
-            if block.text:
-                content.append(TextPart(text=block.text))
+            content.append(TextPart(text=block.text))
         elif block.type == "tool_use":
             content.append(
                 ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
@@ -1561,11 +1549,13 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         """Validate text, return `None` for an assistant message with tool calls, or return a failure variant.
 
         Validation occurs after the request records its message and billing.
-        Stop reasons take precedence over schema validation.
+        Anthropic 2.3.0 parses every text block independently; this adapter validates the final text part.
+        Source: https://github.com/anthropics/anthropic-sdk-python/blob/v2.3.0/src/anthropic/lib/_parse/_response.py
+        Without validated output, stop reasons take precedence over schema validation.
         Every failure variant carries `assistant_message`.
         """
         validation_error: ValidationError | None = None
-        text = _first_text_block_text(message)
+        text = assistant_text(assistant_message).final_text
         if text is not None:
             try:
                 output = self._output_type_adapter.validate_json(text)
@@ -1577,14 +1567,14 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         )
         if unfinished_message is not None:
             return unfinished_message
-        if message.stop_reason == "tool_use" and assistant_message.tool_calls:
-            return _usable_response(message, None, assistant_message)
         if message.stop_reason == "refusal":
             return Refusal(assistant_message=assistant_message)
         if message.stop_reason == "max_tokens":
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if message.stop_reason == "model_context_window_exceeded":
             return ContextWindowExceeded(assistant_message=assistant_message)
+        if assistant_message.tool_calls:
+            return _usable_response(message, None, assistant_message)
         if validation_error is not None:
             return SchemaViolation(
                 validation_error_json=validation_error.json(include_url=False),

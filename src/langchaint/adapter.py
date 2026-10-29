@@ -21,7 +21,14 @@ from langchaint.billing.pricing import (
     require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError, TransientError
-from langchaint.common.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
+from langchaint.common.messages import (
+    AssistantMessage,
+    Message,
+    StopReason,
+    TextPart,
+    ToolCall,
+    assistant_text,
+)
 from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.tools import ToolSchema
 
@@ -222,6 +229,8 @@ type StreamItem = str | ReasoningDelta | ToolCallDelta | ToolCall
 """What a stream yields: answer text chunks, reasoning text deltas, tool-call argument deltas, and completed tool calls.
 
 Answer text chunks are the provider SDK's own strings, passed through without a wrapper class or copy.
+Text chunks can contain commentary and final output.
+The completed generation returned by `final()` distinguishes them.
 `ReasoningDelta` distinguishes reasoning text from answer text.
 Each tool call is yielded once, complete, when its block closes.
 A call's `ToolCallDelta` values all precede its completed `ToolCall`.
@@ -401,8 +410,7 @@ class UsableResponse[OutputT]:
     """A response whose assistant message is usable: it gives output or has tool calls.
 
     `output` contains text or a validated `response_format` instance.
-    `output` is `None` when the assistant message has tool calls and no output.
-    A text binding's message then has no text, and a structured binding's has no validated instance.
+    `output` is `None` when the assistant message has application tool calls.
     """
 
     output: OutputT
@@ -412,14 +420,17 @@ class UsableResponse[OutputT]:
 
 
 def text_output(assistant_message: AssistantMessage) -> str | None:
-    """Return a text binding's output: the joined `TextPart` text of `assistant_message`.
+    """Return the final text part of `assistant_message` as a text binding's output.
 
-    The output is `None` when the message has tool calls and no text.
+    The output is `None` when the message has application tool calls.
     A message without tool calls or text gives `""`.
+
+    Args:
+        assistant_message: The completed assistant message to interpret.
     """
-    if assistant_message.tool_calls and not assistant_message.text:
+    if assistant_message.tool_calls:
         return None
-    return assistant_message.text
+    return assistant_text(assistant_message).final_text or ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -836,7 +847,7 @@ class Adapter(ABC):
     ) -> BoundAdapter[ModelT | None]:
         """Bind structured output parsed into `response_format`.
 
-        An assistant message with tool calls and no structured instance gives `output=None`.
+        An assistant message with application tool calls gives `output=None`.
 
         Args:
             binding: The provider-neutral binding.

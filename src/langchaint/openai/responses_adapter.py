@@ -38,7 +38,7 @@ Request and response mappings:
 - A parts `system_prompt` becomes the first developer-role input message because only parts support breakpoints.
 - `AssistantMessage` replays `AssistantPart` values in emission order under `store=False`.
 - `ReasoningPart` and `RawPart` replay their stored items unchanged.
-- `ToolCall` becomes `function_call`, and adjacent `TextPart` values become one assistant message.
+- `ToolCall` becomes `function_call`, and each `TextPart` becomes one assistant message.
 - `ToolMessage` becomes `function_call_output` keyed by `tool_call_id`.
 - The API has no `is_error` field, so `ToolMessage.content` carries the error signal.
 - `ResponseOutputRefusal` becomes `TextPart` and maps to `stop_reason="refusal"`.
@@ -382,26 +382,40 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     """Convert one AssistantMessage to its input items in `content` order.
 
     The API requires the original item order for replay under store=False.
-    Adjacent `TextPart` values become one assistant message item.
+    Each `TextPart` becomes one assistant message item.
+    Without tool calls, the final text message uses phase `final_answer`.
+    All other text messages use phase `commentary`.
+    Text and structured bindings use the same phase assignment.
+    Plain text becomes one assistant message with phase `final_answer`.
     Each `ToolCall` becomes `function_call` keyed by `call_id`.
     `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
     The API validates another provider's unknown `type` key.
     """
     if isinstance(assistant_message.content, str):
-        return [{"role": "assistant", "content": assistant_message.content}]
+        return [
+            {
+                "role": "assistant",
+                "content": assistant_message.content,
+                "phase": "final_answer",
+            }
+        ]
+    final_text_index = (
+        max(
+            (index for index, part in enumerate(assistant_message.content) if part.kind == "text"),
+            default=None,
+        )
+        if not assistant_message.tool_calls
+        else None
+    )
     items: list[ResponseInputItemParam] = []
-    pending_texts: list[str] = []
-
-    def flush_text_run() -> None:
-        if pending_texts:
-            items.append({"role": "assistant", "content": "".join(pending_texts)})
-            pending_texts.clear()
-
-    for part in assistant_message.content:
+    for index, part in enumerate(assistant_message.content):
         if part.kind == "text":
-            pending_texts.append(part.text)
+            items.append({
+                "role": "assistant",
+                "content": part.text,
+                "phase": "final_answer" if index == final_text_index else "commentary",
+            })
         elif part.kind == "tool_call":
-            flush_text_run()
             function_call_item: ResponseFunctionToolCallParam = {
                 "type": "function_call",
                 "call_id": part.id,
@@ -410,9 +424,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             }
             items.append(function_call_item)
         else:
-            flush_text_run()
             items.append(_replayed_item(part.raw))
-    flush_text_run()
     return items
 
 
@@ -534,20 +546,6 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
     return raw
 
 
-def _first_output_text(response: OpenAIResponse) -> str | None:
-    """Return the text of the assistant message's first output_text content part, None when it holds none.
-
-    Structured output validation uses this part.
-    SDK parsing validates every `output_text` part and returns the first instance.
-    """
-    for item in response.output:
-        if item.type == "message":
-            for content_part in item.content:
-                if content_part.type == "output_text":
-                    return content_part.text
-    return None
-
-
 _STOP_REASON_BY_INCOMPLETE_REASON: dict[str, StopReason] = {
     "max_output_tokens": "max_completion_tokens",
     "content_filter": "refusal",
@@ -592,7 +590,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     """Build the langchaint assistant message from the output items, item order preserved.
 
     Reasoning items become replayable `ReasoningPart` values with readable text.
-    Non-empty message content becomes ordered `TextPart` values, including refusals.
+    Message content becomes ordered `TextPart` values, including empty text and refusals.
     Other items become replayable `RawPart` values.
     """
     content: list[AssistantPart] = []
@@ -610,7 +608,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
             texts = (
                 part.text if part.type == "output_text" else part.refusal for part in item.content
             )
-            content.extend(TextPart(text=text) for text in texts if text)
+            content.extend(TextPart(text=text) for text in texts)
         else:
             content.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(content=tuple(content))
@@ -1123,7 +1121,7 @@ class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str | None]):
 
         A failed status returns `_provider_failure` because emitted items are fragments.
         An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
-        `assistant_message.text` includes refusal text that `response.output_text` omits.
+        The assistant message includes refusal text that `response.output_text` omits.
 
         Raises:
             TypeError: raw is not an openai Response.
@@ -1164,17 +1162,14 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
         validation_error: ValidationError | None,
         assistant_message: AssistantMessage,
     ) -> UnusableResponse:
-        """Report why the assistant message has no instance and no tool call.
+        """Report why the response gives no validated output.
 
-        Failed status takes precedence because emitted items are fragments.
         Refusal and truncation take precedence over validation.
         Completed text with `validation_error` returns `SchemaViolation`.
         Completed output without text returns `EmptyAssistantMessage`.
         Other statuses return `UnfinishedAssistantMessage`.
         Every variant carries `assistant_message`.
         """
-        if response.status == "failed":
-            return _provider_failure(response, assistant_message=assistant_message)
         if _normalized_stop_reason(response) == "refusal":
             return Refusal(assistant_message=assistant_message)
         if (
@@ -1202,20 +1197,30 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
 
         Validation occurs after the request records its response and billing.
         Failed status returns `_provider_failure` even when fragment text validates.
-        A valid instance takes precedence over tool calls.
-        An assistant message with tool calls and no instance returns `None`.
+        Application tool calls prevent structured validation.
         """
-        validation_error: ValidationError | None = None
-        text = _first_output_text(response)
-        if response.status != "failed" and text is not None:
-            try:
-                output = self._response_format.model_validate_json(text)
-                return _usable_response(response, output, assistant_message)
-            except ValidationError as rejection:
-                validation_error = rejection
-        if response.status == "completed" and _normalized_stop_reason(response) == "tool_call":
-            return _usable_response(response, None, assistant_message)
-        return self._no_instance(response, validation_error, assistant_message)
+        if response.status == "failed":
+            return _provider_failure(response, assistant_message=assistant_message)
+        if assistant_message.tool_calls:
+            if response.status == "completed" and _normalized_stop_reason(response) != "refusal":
+                return _usable_response(response, None, assistant_message)
+            return self._no_instance(response, None, assistant_message)
+        final_content_part = next(
+            (
+                part
+                for item in reversed(response.output)
+                if item.type == "message"
+                for part in reversed(item.content)
+            ),
+            None,
+        )
+        if final_content_part is None or final_content_part.type == "refusal":
+            return self._no_instance(response, None, assistant_message)
+        try:
+            output = self._response_format.model_validate_json(final_content_part.text)
+        except ValidationError as validation_error:
+            return self._no_instance(response, validation_error, assistant_message)
+        return _usable_response(response, output, assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:

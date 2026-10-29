@@ -510,8 +510,8 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
     assert outcome.output == "partial text"
 
 
-def test_text_output_concatenates_the_text_blocks() -> None:
-    """The text binding's output joins every text block, and a tool_use stop maps to the tool_call stop reason."""
+def test_text_output_selects_the_final_text_block() -> None:
+    """The text binding selects the final complete block and preserves preceding commentary."""
     message = _message_with_content([
         at.TextBlock(type="text", text="hello "),
         at.TextBlock(type="text", text="world"),
@@ -522,7 +522,8 @@ def test_text_output_concatenates_the_text_blocks() -> None:
         .interpret(message)
     )
     assert outcome.kind == "usable_response"
-    assert outcome.output == "hello world"
+    assert outcome.output == "world"
+    assert outcome.assistant_message.content == (TextPart(text="hello "), TextPart(text="world"))
     assert outcome.stop_reason == "tool_call"
 
 
@@ -1894,7 +1895,11 @@ def test_structured_outcome_by_text_and_stop_reason(
         assert outcome.output == expected_output
 
 
-@pytest.mark.parametrize("text", [None, "let me look that up"], ids=["alone", "with_prose"])
+@pytest.mark.parametrize(
+    "text",
+    [None, "let me look that up", _REPORT_JSON],
+    ids=["alone", "with_prose", "with_valid_json"],
+)
 def test_a_structured_tool_call_message_has_none_output(text: str | None) -> None:
     """A tool call parses no instance and nothing went wrong, so its output is None even beside prose."""
     outcome = _structured_parse(_structured_message(text, stop_reason="tool_use", tool_use=True))
@@ -2232,6 +2237,24 @@ class TestAnthropicMessagesConformance(AdapterConformance):
     @override
     def response_with_text(self, text: str) -> BaseModel:
         return _structured_message(text)
+
+    @override
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
+        """Construct separate blocks; anthropic 2.3.0 assembles streaming deltas by block index.
+
+        Source: https://platform.claude.com/docs/en/build-with-claude/streaming
+        """
+        return _message_with_content(
+            [at.TextBlock(type="text", text=text) for text in texts], stop_reason="end_turn"
+        )
+
+    @override
+    def response_with_tool_call(self, text: str) -> BaseModel:
+        """Construct text beside tool use as in the documented response example.
+
+        Source: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+        """
+        return _structured_message(text, stop_reason="tool_use", tool_use=True)
 
     @override
     def response_with_reasoning(self) -> BaseModel:

@@ -399,7 +399,7 @@ class LLM:
             tools: The application tools or an existing `ToolManager`.
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `str` for text.
-                With `str`, `output` is the kept assistant message's joined text.
+                With `str`, `output` is the kept assistant message's final text.
                 Without text, `PlainGeneration.output` is `""` and `ToolCallGeneration.output` is `None`.
                 To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
@@ -1354,13 +1354,13 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[CallOutputT, ToolCallGeneration[CallOutputT | None]]: ...
+    ) -> StreamHandle[CallOutputT, ToolCallGeneration]: ...
     def stream_one[CallOutputT: str | BaseModel](
         self: "BoundLLM[CallOutputT, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = None,
-    ) -> StreamHandle[CallOutputT, ToolCallGeneration[CallOutputT | None]]:
+    ) -> StreamHandle[CallOutputT, ToolCallGeneration]:
         """Build a `StreamHandle` that opens on context-manager entry.
 
         `timeout_seconds` starts on entry and covers request opening, iteration, and caller work.

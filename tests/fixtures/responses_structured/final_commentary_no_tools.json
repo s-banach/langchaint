@@ -1,0 +1,55 @@
+{
+  "id": "response_final_commentary_no_tools",
+  "created_at": 0.0,
+  "model": "gpt-6-luna",
+  "object": "response",
+  "output": [
+    {
+      "id": "message_0",
+      "content": [
+        {
+          "annotations": [],
+          "text": "I’m checking 8+9.",
+          "type": "output_text",
+          "logprobs": []
+        }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message",
+      "phase": "commentary"
+    },
+    {
+      "id": "message_1",
+      "content": [
+        {
+          "annotations": [],
+          "text": "{\"value\":17}",
+          "type": "output_text",
+          "logprobs": []
+        }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message",
+      "phase": "final_answer"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "tool_choice": "none",
+  "tools": [],
+  "service_tier": "default",
+  "status": "completed",
+  "usage": {
+    "input_tokens": 232,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+    },
+    "output_tokens": 27,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 259
+  }
+}

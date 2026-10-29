@@ -137,6 +137,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    assistant_text,
 )
 from langchaint.openai.shared import (
     OpenAIPricingTable,
@@ -482,7 +483,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     """Preserve replayable provider values inside AssistantMessage.content.
 
     A non-empty reasoning_content becomes ReasoningPart first.
-    message.content then becomes TextPart when non-empty.
+    message.content then becomes TextPart when present, including empty text.
     message.refusal then becomes TextPart when non-empty.
     message.function_call then becomes RawPart when present.
     Each function message.tool_calls entry becomes ToolCall.
@@ -498,7 +499,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
         content.append(
             ReasoningPart(raw={"reasoning_content": reasoning_content}, text=reasoning_content)
         )
-    if message.content:
+    if message.content is not None:
         content.append(TextPart(text=message.content))
     if message.refusal:
         content.append(TextPart(text=message.refusal))
@@ -1143,35 +1144,34 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
     def _parsed_outcome(
         self, finished_message: _FinishedMessage
     ) -> ResponseOutcome[ModelT | None]:
-        """Validate message.content after the response enters langchaint.
+        """Validate final text after the response enters langchaint.
 
-        Therefore, rejected content and billing remain available.
-        message.refusal never enters validation.
-        A valid instance returns first.
-        Otherwise, message.refusal or finish_reason "content_filter" returns Refusal.
-        finish_reason "length" returns MaxCompletionTokensExceeded.
-        A `tool_call` stop with non-empty AssistantMessage.tool_calls returns None.
+        Rejected content and billing remain available.
+        Application tool calls prevent structured validation.
+        message.refusal returns Refusal before validation.
+        Validated output takes precedence over finish_reason.
+        Without validated output, "content_filter" returns Refusal and "length" returns MaxCompletionTokensExceeded.
+        Remaining application tool calls return None.
         Remaining invalid content returns SchemaViolation.
         Every remaining response returns EmptyAssistantMessage.
         """
         validation_error: ValidationError | None = None
-        text = finished_message.message.content
-        if text:
+        assistant_message = finished_message.assistant_message
+        if finished_message.message.refusal:
+            return Refusal(assistant_message=assistant_message)
+        text = assistant_text(assistant_message).final_text
+        if text is not None:
             try:
                 output = self._response_format.model_validate_json(text)
                 return _usable_response(finished_message, output)
             except ValidationError as rejection:
                 validation_error = rejection
-        assistant_message = finished_message.assistant_message
-        if (
-            _normalized_stop_reason(finished_message) == "tool_call"
-            and assistant_message.tool_calls
-        ):
-            return _usable_response(finished_message, None)
-        if finished_message.message.refusal or finished_message.finish_reason == "content_filter":
+        if finished_message.finish_reason == "content_filter":
             return Refusal(assistant_message=assistant_message)
         if finished_message.finish_reason == "length":
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
+        if assistant_message.tool_calls:
+            return _usable_response(finished_message, None)
         if validation_error is not None:
             return SchemaViolation(
                 validation_error_json=validation_error.json(include_url=False),

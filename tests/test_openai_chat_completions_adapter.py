@@ -340,7 +340,7 @@ def test_the_reported_tier_selects_the_rates() -> None:
                 usage=None, message={"content": "on it", "tool_calls": [_TOOL_CALL_WIRE]}
             ),
             "tool_call",
-            "on it",
+            None,
         ),
         (
             lambda: _completion(
@@ -908,12 +908,12 @@ def _structured_completion(
     return _completion(usage=None, message=message, finish_reason=finish_reason)
 
 
-def test_structured_bind_sets_output_on_an_assistant_message_that_also_called_a_tool() -> None:
-    """The message's content validates into the response_format beside the extracted tool call."""
+def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() -> None:
+    """Text that validates against the schema remains commentary beside an application tool call."""
     outcome = _assert_usable(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
     )
-    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
+    assert outcome.output is None
     assert outcome.assistant_message.tool_calls == (_TOOL_CALL,)
 
 
@@ -980,7 +980,7 @@ def test_a_choice_with_no_finish_reason_is_unfinished_and_keeps_the_partial_text
     """finish_reason reads None at runtime on a lenient snapshot, which leaves the assistant message unfinished."""
     outcome = _text_bound().interpret(_lenient_completion(None))
     assert outcome.kind == "unfinished_assistant_message"
-    assert outcome.assistant_message.text == "hey"
+    assert outcome.assistant_message.content == (TextPart(text="hey"),)
 
 
 def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
@@ -1374,6 +1374,14 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
     @override
     def response_with_text(self, text: str) -> BaseModel:
         return _structured_completion(text)
+
+    @override
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel | None:
+        return None
+
+    @override
+    def response_with_tool_call(self, text: str) -> BaseModel:
+        return _structured_completion(text, tool_call=True, finish_reason="tool_calls")
 
     @override
     def response_with_reasoning(self) -> BaseModel:

@@ -64,7 +64,7 @@ Document every public parameter and cross-provider difference.
 - Write an SDK `TypedDict` value as a dict literal.
 - Send model ids, `system_prompt`, and every message exactly as given, including a replayed assistant message.
 - When a provider rejects a message the user wrote, return the provider's error.
-- Never build a `TextPart` from empty provider text, because Anthropic rejects an empty text block on replay.
+- Preserve complete provider text parts, including empty text, because text-part boundaries determine output and commentary.
 - Do not predict provider responses, probe endpoints, or add guards based on guessed provider rules.
 - Raise client-side only for documented provider facts and detectable defects that would otherwise produce a silently wrong result.
 - Keep SDKs as optional dependencies.

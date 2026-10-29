@@ -12,6 +12,7 @@ from langchaint import (
     ZERO_USAGE,
     AbandonedStreamRecord,
     AssistantMessage,
+    AssistantPart,
     Billing,
     CutOffRequestRecord,
     GenerationError,
@@ -21,6 +22,7 @@ from langchaint import (
     PlainErrorRecord,
     PlainGeneration,
     PlainGenerationRecord,
+    ReasoningPart,
     RequestHistory,
     RequestProviderData,
     SchemaViolationErrorRecord,
@@ -28,12 +30,13 @@ from langchaint import (
     TextPart,
     TokenRates,
     ToolCall,
+    ToolCallGeneration,
     ToolCallGenerationRecord,
     TransientErrorRecord,
     Usage,
     to_tables,
 )
-from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity
+from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity, text_output
 from langchaint.generation.request_history import _less_than_or_ulp_close, _RequestLedger
 from langchaint.generation.response import _generation_variant, _timed_out_error
 from tests.helpers import StubRaw
@@ -285,13 +288,68 @@ def test_tool_call_generation_record_requires_a_tool_call() -> None:
             output=None, request_history=_completed_request_history(), stop_reason="tool_call"
         )
     record = ToolCallGenerationRecord(
-        output=Report(value=4),
         request_history=_completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE),
         stop_reason="tool_call",
     )
-    restored = ToolCallGenerationRecord[Report].model_validate_json(record.model_dump_json())
+    restored = ToolCallGenerationRecord.model_validate_json(record.model_dump_json())
     assert restored.tool_calls == _TOOL_CALL_ASSISTANT_MESSAGE.tool_calls
-    assert isinstance(restored.output, Report)
+    assert restored.output is None
+
+
+@pytest.mark.parametrize(
+    ("content", "commentary"),
+    [
+        ("final", None),
+        ("", None),
+        ((), None),
+        ((TextPart(text="final"),), None),
+        (
+            (TextPart(text=" first \n"), TextPart(text="second"), TextPart(text="final")),
+            " first \n\nsecond",
+        ),
+        ((TextPart(text=""), TextPart(text="final")), ""),
+        ((TextPart(text="Checking."), TextPart(text="")), "Checking."),
+        ((TextPart(text="Checking."), TextPart(text=""), TextPart(text="Done")), "Checking.\n"),
+        (
+            (
+                TextPart(text="checking"),
+                *_TOOL_CALL_ASSISTANT_MESSAGE.tool_calls,
+                TextPart(text='{"value":4}'),
+            ),
+            'checking\n{"value":4}',
+        ),
+        (_TOOL_CALL_ASSISTANT_MESSAGE.content, None),
+        (
+            (
+                TextPart(text="checking"),
+                ReasoningPart(raw={}, text="reasoning"),
+                TextPart(text="final"),
+            ),
+            "checking",
+        ),
+    ],
+)
+def test_generation_commentary_is_computed_from_preserved_content(
+    content: str | tuple[AssistantPart, ...], commentary: str | None
+) -> None:
+    """Live and restored generations expose commentary without duplicating it in serialized records."""
+    assistant_message = AssistantMessage(content=content)
+    history = _completed_request_history(assistant_message=assistant_message)
+    if assistant_message.tool_calls:
+        record = ToolCallGenerationRecord(request_history=history, stop_reason="tool_call")
+        response = ToolCallGeneration(
+            record=record, request_provider_data=_request_provider_data()
+        )
+        restored = ToolCallGenerationRecord.model_validate_json(record.model_dump_json())
+    else:
+        record = PlainGenerationRecord(
+            output=text_output(assistant_message), request_history=history, stop_reason="stop"
+        )
+        response = PlainGeneration(record=record, request_provider_data=_request_provider_data())
+        restored = PlainGenerationRecord[str | None].model_validate_json(record.model_dump_json())
+    assert response.commentary == record.commentary == restored.commentary == commentary
+    assert restored.assistant_message == assistant_message
+    assert '"commentary":' not in record.model_dump_json()
 
 
 def test_live_generation_preserves_provider_data_and_requires_alignment() -> None:
@@ -335,7 +393,7 @@ def test_generation_variant_constructs_one_normalized_record() -> None:
     request_history = _completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE)
     generation = _generation_variant(
         splits_on_tool_calls=True,
-        output=Report(value=6),
+        output=None,
         request_history=request_history,
         request_provider_data=_request_provider_data(),
         stop_reason="tool_call",

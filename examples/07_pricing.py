@@ -22,7 +22,7 @@ async def price_at_negotiated_rates() -> PlainGeneration[str]:
     bound = openai.llm(
         "gpt-5.6",
         pricing=pricing,
-        supports_prompt_cache_options=True,
+        supports_cache_breakpoints=True,
     ).bind(system_prompt="Be terse.")
     generation = await bound.generate_one("Name three primary colors.")
     print(f"billed {generation.usage.cost_in_usd} USD across every request")

@@ -85,7 +85,7 @@ cohere_embeddings = cohere_bedrock.embedding_model(
 
 `DeepSeek()` reads `DEEPSEEK_API_KEY` when `client` is absent.
 Uncataloged models require explicit pricing.
-`OpenAI.llm` also requires `supports_prompt_cache_options` for uncataloged models.
+`OpenAI.llm` also requires `supports_cache_breakpoints` for uncataloged models.
 `OpenAIBedrock.llm` always requires both values.
 `Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `bind`, because the Messages API requires `max_tokens`.
 

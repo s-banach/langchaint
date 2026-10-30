@@ -573,12 +573,6 @@ class _BindDefect(NamedTuple):
 
 
 _BIND_DEFECTS = [
-    # cache_breakpoint has no Gemini wire form.
-    _BindDefect(
-        "system_prompt_cache_breakpoint",
-        _binding(system_prompt=(TextPart(text="a", cache_breakpoint=True),)),
-        "cache_breakpoint",
-    ),
     # An empty parts tuple can only come from a directly constructed Binding.
     _BindDefect("empty_system_prompt_parts", _binding(system_prompt=()), "empty tuple"),
     # No wire form disables parallel function calls.
@@ -830,6 +824,52 @@ def _cache_breakpoint_part_messages(
     )
 
 
+@pytest.mark.parametrize("message_class", [UserMessage, ToolMessage])
+@pytest.mark.parametrize(
+    "part",
+    [
+        TextPart(text=""),
+        TextPart(text="context"),
+        ImagePart(data=b"png", media_type="image/png"),
+        ImageUrlPart(url="gs://bucket/image.png", media_type="image/png"),
+        AudioPart(data=b"WAV", media_type="audio/wav"),
+    ],
+)
+def test_cache_breakpoints_preserve_requests(
+    part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
+) -> None:
+    bound = _adapter().bind_text(_binding())
+    unmarked = bound.build_request_params(_cache_breakpoint_part_messages(part, message_class))
+    marked = bound.build_request_params(
+        _cache_breakpoint_part_messages(
+            part.model_copy(update={"cache_breakpoint": True}), message_class
+        )
+    )
+    assert not isinstance(unmarked, RejectedMessages)
+    assert not isinstance(marked, RejectedMessages)
+    assert marked.as_json() == unmarked.as_json()
+
+
+def test_system_cache_breakpoints_preserve_requests() -> None:
+    def request(*, cache_breakpoint: bool) -> str:
+        params = (
+            _adapter()
+            .bind_text(
+                _binding(
+                    system_prompt=(
+                        TextPart(text="", cache_breakpoint=cache_breakpoint),
+                        TextPart(text="context", cache_breakpoint=cache_breakpoint),
+                    )
+                )
+            )
+            .build_request_params((UserMessage(content="question"),))
+        )
+        assert not isinstance(params, RejectedMessages)
+        return params.as_json()
+
+    assert request(cache_breakpoint=True) == request(cache_breakpoint=False)
+
+
 class _InvalidMessages(NamedTuple):
     case_id: str
     messages: tuple[Message, ...]
@@ -867,20 +907,6 @@ _INVALID_MESSAGES = [
             ),
         ),
         ("ReasoningPart",),
-    ),
-    # cache_breakpoint has no Gemini wire form in UserMessage or ToolMessage.
-    *(
-        _InvalidMessages(
-            f"{type(part).__name__}_cache_breakpoint_in_{message_class.__name__}",
-            _cache_breakpoint_part_messages(part, message_class),
-            ("cache_breakpoint", type(part).__name__, message_class.__name__),
-        )
-        for part, message_class in (
-            (TextPart(text="a", cache_breakpoint=True), UserMessage),
-            (TextPart(text="a", cache_breakpoint=True), ToolMessage),
-            (ImageUrlPart(url="gs://bucket/image.png", cache_breakpoint=True), UserMessage),
-            (AudioPart(data=b"WAV", media_type="audio/wav", cache_breakpoint=True), UserMessage),
-        )
     ),
 ]
 

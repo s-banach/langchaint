@@ -174,7 +174,6 @@ class Gemini:
 
         `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
         - `parallel_tool_calls=False`, because `generateContent` cannot disable parallel function calls.
-        - A system part sets `cache_breakpoint=True`.
         - `reasoning_level` differs only in letter case from a `types.ThinkingLevel` name, such as `"high"`.
           google-genai 2.33.0 would send the uppercase name instead.
         - `extra_body` has a `generationConfig` key whose value is not a mapping with only string keys.

@@ -64,7 +64,6 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     ToolMessage,
-    UserMessage,
     assistant_text,
 )
 
@@ -121,11 +120,6 @@ _FINISHED_FINISH_REASONS = (
 
 All other values produce `UnfinishedAssistantMessage` for a structured binding.
 """
-
-_NO_CACHE_BREAKPOINT_WIRE_FORM = (
-    "cache_breakpoint has no Gemini wire form: generateContent has no request field for a "
-    "prompt-cache boundary, and dropping the cache breakpoint would silently misstate the request"
-)
 
 _SUPPORTED_PROVIDER_EXECUTED_TOOL_FIELDS = frozenset({
     "code_execution",
@@ -596,16 +590,6 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
     return wire_parts
 
 
-def _cache_breakpoint_error_text(
-    part: ContentPart, *, message_class: type[UserMessage] | type[ToolMessage]
-) -> str:
-    """Name the ContentPart with `cache_breakpoint=True` and the message_class that Gemini cannot send."""
-    return (
-        f"GeminiGenerateContentAdapter cannot send {type(part).__name__} inside "
-        f"{message_class.__name__}.content: cache_breakpoint has no Gemini wire form"
-    )
-
-
 def _inline_part(data: bytes, media_type: str) -> types.Part:
     return types.Part(inline_data=types.Blob(data=data, mime_type=media_type))
 
@@ -621,18 +605,11 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
 
     ImagePart and AudioPart use Part.inline_data.
     ImageUrlPart uses Part.file_data.
-
-    Raises:
-        _RejectedMessagesError: A ContentPart sets cache_breakpoint.
     """
     if isinstance(content, str):
         return [types.Part(text=content)]
     wire_parts: list[types.Part] = []
     for part in content:
-        if part.cache_breakpoint:
-            raise _RejectedMessagesError(
-                _cache_breakpoint_error_text(part, message_class=UserMessage)
-            )
         match part.kind:
             case "text":
                 wire_parts.append(types.Part(text=part.text))
@@ -663,7 +640,6 @@ def _function_response_part(
     Raises:
         _RejectedMessagesError: ToolMessage.tool_call_id matches no earlier ToolCall.id.
             FunctionResponse.name cannot be recovered in that case.
-            cache_breakpoint on any ContentPart also raises.
     """
     name = tool_call_names.get(tool_message.tool_call_id)
     if name is None:
@@ -677,10 +653,6 @@ def _function_response_part(
     else:
         texts: list[str] = []
         for part in tool_message.content:
-            if part.cache_breakpoint:
-                raise _RejectedMessagesError(
-                    _cache_breakpoint_error_text(part, message_class=ToolMessage)
-                )
             match part.kind:
                 case "text":
                     texts.append(part.text)
@@ -1057,7 +1029,6 @@ class GeminiGenerateContentAdapter(Adapter):
         Raises:
             pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
             ValueError: Parallel calls are disabled, `system_prompt` is empty, or a key is reserved.
-                A system part that sets `cache_breakpoint` also raises it.
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A bound charged tool has no stated price.
         """
@@ -1092,12 +1063,6 @@ class GeminiGenerateContentAdapter(Adapter):
                         "system_prompt is an empty tuple of parts; bind rejects this, "
                         "so it can only come from a directly constructed Binding"
                     )
-                for part in binding.system_prompt:
-                    if part.cache_breakpoint:
-                        raise ValueError(
-                            f"cache_breakpoint on a system part is unsendable: "
-                            f"{_NO_CACHE_BREAKPOINT_WIRE_FORM}"
-                        )
                 system_instruction = types.Content(
                     parts=[types.Part(text=part.text) for part in binding.system_prompt]
                 )

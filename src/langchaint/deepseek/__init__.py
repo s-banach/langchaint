@@ -166,7 +166,7 @@ class DeepSeek:
             model=model,
             pricing=OpenAIPricingTable(default=rates),
             provider_name="deepseek",
-            supports_prompt_cache_options=False,
+            supports_cache_breakpoints=False,
             input_tokens_cache_read_from_usage=input_tokens_cache_read_from_usage_deepseek,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)

@@ -429,20 +429,23 @@ def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
 
 
 def test_wire_messages_converts_each_message_kind() -> None:
-    wire = _wire_messages([
-        UserMessage(content="q"),
-        AssistantMessage(
-            content=(
-                ReasoningPart(
-                    raw={"reasoning_content": "thought it over"}, text="thought it over"
-                ),
-                TextPart(text="he"),
-                TextPart(text="y"),
-                _TOOL_CALL,
-            )
-        ),
-        ToolMessage(tool_call_id="call1", content="r"),
-    ])
+    wire = _wire_messages(
+        [
+            UserMessage(content="q"),
+            AssistantMessage(
+                content=(
+                    ReasoningPart(
+                        raw={"reasoning_content": "thought it over"}, text="thought it over"
+                    ),
+                    TextPart(text="he"),
+                    TextPart(text="y"),
+                    _TOOL_CALL,
+                )
+            ),
+            ToolMessage(tool_call_id="call1", content="r"),
+        ],
+        supports_cache_breakpoints=True,
+    )
     assert wire == [
         {"role": "user", "content": "q"},
         {
@@ -457,22 +460,25 @@ def test_wire_messages_converts_each_message_kind() -> None:
 
 def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() -> None:
     breakpoint_field = {"prompt_cache_breakpoint": {"mode": "explicit"}}
-    wire = _wire_messages([
-        UserMessage(
-            content=(
-                TextPart(text="shared context", cache_breakpoint=True),
-                ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
-                ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
-                AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
-                AudioPart(data=b"mp3", media_type="audio/mpeg"),
-                TextPart(text="question"),
-            )
-        ),
-        ToolMessage(
-            tool_call_id="c1",
-            content=(TextPart(text="saw", cache_breakpoint=True), TextPart(text="more")),
-        ),
-    ])
+    wire = _wire_messages(
+        [
+            UserMessage(
+                content=(
+                    TextPart(text="shared context", cache_breakpoint=True),
+                    ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
+                    ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
+                    AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
+                    AudioPart(data=b"mp3", media_type="audio/mpeg"),
+                    TextPart(text="question"),
+                )
+            ),
+            ToolMessage(
+                tool_call_id="c1",
+                content=(TextPart(text="saw", cache_breakpoint=True), TextPart(text="more")),
+            ),
+        ],
+        supports_cache_breakpoints=True,
+    )
     assert wire == [
         {
             "role": "user",
@@ -595,28 +601,28 @@ def test_wire_tool_choice(tool_choice: ToolChoice, expected: object) -> None:
 def _adapter(
     *,
     client: AsyncOpenAI | None = None,
-    supports_prompt_cache_options: bool = True,
+    supports_cache_breakpoints: bool = True,
     service_tier: OpenAIServiceTier | None = None,
 ) -> OpenAIChatCompletionsAdapter:
     """Build an adapter over a keyless client unless a test supplies one, valid because no request leaves.
 
-    supports_prompt_cache_options=True sends the binding's cache setting.
+    supports_cache_breakpoints=True sends the binding's cache setting.
     """
     return OpenAIChatCompletionsAdapter(
         client=AsyncOpenAI(api_key="test") if client is None else client,
         model="m",
         pricing=_PRICING,
         provider_name="openai",
-        supports_prompt_cache_options=supports_prompt_cache_options,
+        supports_cache_breakpoints=supports_cache_breakpoints,
         service_tier=service_tier,
     )
 
 
 def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
-    adapter = _adapter(supports_prompt_cache_options=False, service_tier="priority")
+    adapter = _adapter(supports_cache_breakpoints=False, service_tier="priority")
     assert adapter.config_fingerprint_data() == {
         "service_tier": "priority",
-        "supports_prompt_cache_options": False,
+        "supports_cache_breakpoints": False,
     }
 
 
@@ -753,7 +759,7 @@ def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions()
 
 
 @pytest.mark.parametrize(
-    ("supports_prompt_cache_options", "automatic_cache_breakpoints", "expected_options"),
+    ("supports_cache_breakpoints", "automatic_cache_breakpoints", "expected_options"),
     [
         (True, False, {"mode": "explicit"}),
         (True, True, None),
@@ -768,11 +774,11 @@ def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions()
 def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabled(
     expected_options: dict[str, str] | None,
     *,
-    supports_prompt_cache_options: bool,
+    supports_cache_breakpoints: bool,
     automatic_cache_breakpoints: bool,
 ) -> None:
     precomputed_fields = _adapter(
-        supports_prompt_cache_options=supports_prompt_cache_options
+        supports_cache_breakpoints=supports_cache_breakpoints
     )._precompute_fields(_binding(automatic_cache_breakpoints=automatic_cache_breakpoints))
     if expected_options is None:
         assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
@@ -780,9 +786,43 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
         assert precomputed_fields.prompt_cache_options == expected_options
 
 
+@pytest.mark.parametrize(
+    ("supports_cache_breakpoints", "automatic_cache_breakpoints"),
+    [(True, False), (True, True), (False, True)],
+)
+def test_request_cache_breakpoints_follow_capability(
+    *, supports_cache_breakpoints: bool, automatic_cache_breakpoints: bool
+) -> None:
+    bound = _adapter(supports_cache_breakpoints=supports_cache_breakpoints).bind_text(
+        _binding(
+            automatic_cache_breakpoints=automatic_cache_breakpoints,
+            system_prompt=(TextPart(text="", cache_breakpoint=True),),
+        )
+    )
+    params = bound.build_request_params((
+        UserMessage(
+            content=(
+                TextPart(text="context", cache_breakpoint=True),
+                ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
+                ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
+                AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
+            )
+        ),
+        ToolMessage(tool_call_id="c", content=(TextPart(text="result", cache_breakpoint=True),)),
+    ))
+    assert isinstance(params, _OpenAIChatCompletionsRequestParams)
+    request_json = json.dumps(params.messages)
+    assert request_json.count('"prompt_cache_breakpoint"') == (
+        6 if supports_cache_breakpoints else 0
+    )
+    assert ('"prompt_cache_options"' in params.as_json()) == (not automatic_cache_breakpoints)
+    assert '"context"' in request_json
+    assert '"result"' in request_json
+
+
 def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises() -> None:
-    with pytest.raises(ValueError, match="supports_prompt_cache_options"):
-        _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
+    with pytest.raises(ValueError, match="supports_cache_breakpoints"):
+        _ = _adapter(supports_cache_breakpoints=False)._precompute_fields(
             _binding(automatic_cache_breakpoints=False)
         )
 

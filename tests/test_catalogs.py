@@ -126,14 +126,14 @@ def test_openai_llm_wires_model_and_pricing() -> None:
     assert adapter.pricing is OPENAI_PRICING[model]
 
 
-def test_openai_llm_wires_prompt_cache_options_support() -> None:
+def test_openai_llm_wires_cache_breakpoint_support() -> None:
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).llm(
         "gpt-5.6-terra",
         regional_processing=False,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
-    assert adapter.supports_prompt_cache_options is True
+    assert adapter.supports_cache_breakpoints is True
     assert adapter.automatic_cache_breakpoints_default is False
 
 
@@ -143,13 +143,13 @@ def test_openai_llm_accepts_an_uncataloged_model(*, supported: bool) -> None:
         "ft:gpt-5.6-terra:acme::abc123",
         regional_processing=False,
         pricing=_ARBITRARY_PRICING,
-        supports_prompt_cache_options=supported,
+        supports_cache_breakpoints=supported,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == "ft:gpt-5.6-terra:acme::abc123"
     assert adapter.pricing is _ARBITRARY_PRICING
-    assert adapter.supports_prompt_cache_options is supported
+    assert adapter.supports_cache_breakpoints is supported
     assert adapter.automatic_cache_breakpoints_default is not supported
 
 
@@ -157,11 +157,11 @@ def test_openai_llm_honors_a_stated_flag_on_a_cataloged_id() -> None:
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).llm(
         "gpt-5.6-terra",
         regional_processing=False,
-        supports_prompt_cache_options=False,
+        supports_cache_breakpoints=False,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
-    assert adapter.supports_prompt_cache_options is False
+    assert adapter.supports_cache_breakpoints is False
 
 
 @pytest.mark.parametrize("model", ["gemini-3.5-flash", "gemini-next-preview"])
@@ -275,15 +275,15 @@ def test_deepseek_shares_backoff() -> None:
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_openai_bedrock_llm_forwards_prompt_cache_options_support(*, supported: bool) -> None:
+def test_openai_bedrock_llm_forwards_cache_breakpoint_support(*, supported: bool) -> None:
     llm = OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1")).llm(
         "openai.gpt-oss-120b-1:0",
         pricing=_ARBITRARY_PRICING,
-        supports_prompt_cache_options=supported,
+        supports_cache_breakpoints=supported,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
-    assert adapter.supports_prompt_cache_options is supported
+    assert adapter.supports_cache_breakpoints is supported
     assert adapter.automatic_cache_breakpoints_default is not supported
 
 
@@ -305,7 +305,7 @@ def test_openai_bedrock_llm_forwards_prompt_cache_options_support(*, supported: 
                 model="gpt-5.6-terra",
                 pricing=_ARBITRARY_PRICING,
                 provider_name="groq",
-                supports_prompt_cache_options=False,
+                supports_cache_breakpoints=False,
             ),
             "groq",
         ),
@@ -321,7 +321,7 @@ def test_openai_bedrock_llm_wires_model_pricing_and_region() -> None:
     llm = OpenAIBedrock(aws_region="eu-west-1").llm(
         "openai.gpt-oss-120b-1:0",
         pricing=_ARBITRARY_PRICING,
-        supports_prompt_cache_options=False,
+        supports_cache_breakpoints=False,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
@@ -442,7 +442,7 @@ def test_openai_llm_regional_processing_scales_every_token_rate() -> None:
         "uncataloged-model",
         regional_processing=True,
         pricing=_ARBITRARY_PRICING,
-        supports_prompt_cache_options=False,
+        supports_cache_breakpoints=False,
     ).adapter
     assert isinstance(unstated, OpenAIResponsesAdapter)
     assert math.isnan(unstated.pricing.default.output_tokens)
@@ -528,7 +528,7 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
             lambda: OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1")).llm(
                 "openai.gpt-oss-120b-1:0",
                 pricing=_ARBITRARY_PRICING,
-                supports_prompt_cache_options=False,
+                supports_cache_breakpoints=False,
             ),
             "aws.bedrock",
         ),

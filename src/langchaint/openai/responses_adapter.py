@@ -223,10 +223,12 @@ def _tool_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInpu
     return output_image
 
 
-def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
+def _user_item(
+    user_message: UserMessage, *, supports_cache_breakpoints: bool
+) -> EasyInputMessageParam:
     """Convert one UserMessage to a user message item.
 
-    Parts with `cache_breakpoint=True` send `prompt_cache_breakpoint`.
+    Supported explicit cache breakpoints use `prompt_cache_breakpoint`.
 
     Raises:
         _RejectedMessagesError: content holds AudioPart.
@@ -238,18 +240,22 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
         match part.kind:
             case "text":
                 wire_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
-                if part.cache_breakpoint:
+                if supports_cache_breakpoints and part.cache_breakpoint:
                     wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 wire_parts.append(wire_text)
             case "image":
                 wire_parts.append(
                     _user_image_param(
-                        _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
+                        _image_data_uri(part),
+                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
                     )
                 )
             case "image_url":
                 wire_parts.append(
-                    _user_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
+                    _user_image_param(
+                        part.url,
+                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
+                    )
                 )
             case "audio":
                 raise _RejectedMessagesError(
@@ -260,9 +266,9 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
 
 
 def _function_call_output(
-    content: str | tuple[ContentPart, ...],
+    content: str | tuple[ContentPart, ...], *, supports_cache_breakpoints: bool
 ) -> str | ResponseFunctionCallOutputItemListParam:
-    """Preserve tool-result content order and explicit cache breakpoints.
+    """Preserve tool-result content order and supported explicit cache breakpoints.
 
     A string passes through; parts become text and image output content.
 
@@ -279,18 +285,22 @@ def _function_call_output(
                     "type": "input_text",
                     "text": part.text,
                 }
-                if part.cache_breakpoint:
+                if supports_cache_breakpoints and part.cache_breakpoint:
                     output_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 output_content.append(output_text)
             case "image":
                 output_content.append(
                     _tool_image_param(
-                        _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
+                        _image_data_uri(part),
+                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
                     )
                 )
             case "image_url":
                 output_content.append(
-                    _tool_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
+                    _tool_image_param(
+                        part.url,
+                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
+                    )
                 )
             case "audio":
                 raise _RejectedMessagesError(
@@ -361,7 +371,9 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     return items
 
 
-def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
+def _wire_input(
+    messages: Sequence[Message], *, supports_cache_breakpoints: bool
+) -> list[ResponseInputItemParam]:
     """Convert messages to input items.
 
     The system prompt is separate.
@@ -377,11 +389,15 @@ def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
                 function_call_output: FunctionCallOutput = {
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": _function_call_output(message.content),
+                    "output": _function_call_output(
+                        message.content, supports_cache_breakpoints=supports_cache_breakpoints
+                    ),
                 }
                 wire.append(function_call_output)
             case "user":
-                wire.append(_user_item(message))
+                wire.append(
+                    _user_item(message, supports_cache_breakpoints=supports_cache_breakpoints)
+                )
             case "assistant":
                 wire.extend(_assistant_items(message))
     return wire
@@ -638,7 +654,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         model: str,
         pricing: OpenAIPricingTable,
         provider_name: str,
-        supports_prompt_cache_options: bool,
+        supports_cache_breakpoints: bool,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIResponsesServiceTier | None = None,
     ) -> None:
@@ -651,9 +667,11 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         `provider_name` identifies OpenAI, Bedrock, or Azure.
         Bedrock and Azure clients require their fixed `provider_name` values.
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
-        `supports_prompt_cache_options` identifies gpt-5.6-and-later support in openai 2.45.0.
-        `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
-        `OpenAI.llm` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
+        `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
+        False omits explicit markers and cache-breakpoint controls while preserving content.
+        OpenAI 3.41.0 documents explicit cache breakpoints for gpt-5.6-and-later models.
+        `supports_cache_breakpoints` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
+        `OpenAI.llm` derives cataloged values from `CACHE_BREAKPOINT_MODELS`.
         It requires the parameter for uncataloged identifiers.
         `OpenAIBedrock.llm` always requires it because Bedrock ids have no catalog.
         `pricing` supplies the rates the endpoint charges.
@@ -666,11 +684,11 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             client=client,
             model=model,
             provider_name=provider_name,
-            automatic_cache_breakpoints_default=not supports_prompt_cache_options,
+            automatic_cache_breakpoints_default=not supports_cache_breakpoints,
         )
         self.client: AsyncOpenAI = client_without_retries(client)
         self.pricing: OpenAIPricingTable = pricing
-        self.supports_prompt_cache_options: bool = supports_prompt_cache_options
+        self.supports_cache_breakpoints: bool = supports_cache_breakpoints
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
         self.service_tier: OpenAIResponsesServiceTier | None = service_tier
 
@@ -680,7 +698,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         return {
             "reasoning_summary": self.reasoning_summary,
             "service_tier": self.service_tier,
-            "supports_prompt_cache_options": self.supports_prompt_cache_options,
+            "supports_cache_breakpoints": self.supports_cache_breakpoints,
         }
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIResponsesPrecomputedFields:
@@ -688,7 +706,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
 
         A string system prompt uses `instructions`; parts form the first developer-role input message.
         `automatic_cache_breakpoints=False` sends explicit caching mode; True preserves implicit caching.
-        Parts retain explicit cache breakpoints under either mode, and the API enforces its write limits.
+        Supported parts retain explicit cache breakpoints under either mode, and the API enforces its write limits.
 
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
@@ -702,7 +720,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         require_prompt_cache_options_support(
             model=self.model,
             automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
-            supports_prompt_cache_options=self.supports_prompt_cache_options,
+            supports_cache_breakpoints=self.supports_cache_breakpoints,
         )
         provider_executed_tool_types = validated_provider_executed_tool_types(
             binding.provider_executed_tools,
@@ -731,7 +749,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             system_parts: ResponseInputMessageContentListParam = []
             for part in binding.system_prompt:
                 system_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
-                if part.cache_breakpoint:
+                if self.supports_cache_breakpoints and part.cache_breakpoint:
                     system_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 system_parts.append(system_text)
             input_prefix.append({"role": "developer", "content": system_parts})
@@ -1001,7 +1019,9 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
     ) -> RequestParams | RejectedMessages:
         """Convert messages into the input items every request for one input sends."""
         try:
-            wire_input = _wire_input(messages)
+            wire_input = _wire_input(
+                messages, supports_cache_breakpoints=self._adapter.supports_cache_breakpoints
+            )
         except _RejectedMessagesError as rejected:
             return RejectedMessages(error_text=str(rejected))
         return _OpenAIResponsesRequestParams(

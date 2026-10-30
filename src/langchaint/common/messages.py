@@ -72,7 +72,11 @@ type JsonValue = Annotated[_JsonValue, BeforeValidator(_require_json_runtime_sha
 
 
 class TextPart(CheckedCopyModel):
-    """End a reusable prompt prefix after this text with `cache_breakpoint=True`."""
+    """Use `cache_breakpoint=True` as an optional placement hint after this text.
+
+    Adapters send explicit cache breakpoints where supported and ignore them otherwise.
+    `automatic_cache_breakpoints` separately controls adapter or provider placement.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

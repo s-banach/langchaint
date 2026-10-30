@@ -344,8 +344,9 @@ class Binding:
 
     `automatic_cache_breakpoints=True` lets the adapter or provider select cache boundaries.
     `automatic_cache_breakpoints=False` forbids that selection where supported.
-    `cache_breakpoint=True` requests an explicit breakpoint under either value.
-    OpenAI models lacking `prompt_cache_options` require `automatic_cache_breakpoints=True`.
+    `cache_breakpoint=True` supplies an optional explicit placement hint under either value.
+    Adapters ignore explicit hints when the provider API lacks support.
+    OpenAI models with `supports_cache_breakpoints=False` require `automatic_cache_breakpoints=True`.
     Gemini cannot control implicit caching, so both values build identical requests.
     """
 

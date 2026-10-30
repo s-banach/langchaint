@@ -1,12 +1,4 @@
-"""Run a multi-agent app that reports progress through on_event.
-
-AgentRun.final installs GuiEmitter, emits terminal events, and drives run.
-on_event executes synchronously inside the run.
-A `timed_out_error` lets the loop record a timed-out input and continue.
-
-Each run registers at construction and appends settled TurnLogEntry values to turn_log.
-Usage is derived from the registered runs' turn_log values.
-"""
+"""Run a multi-agent app with accounting and synchronous progress events."""
 
 import asyncio
 import itertools
@@ -14,7 +6,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import override
+from typing import Literal, final, override
 
 from config import AgentConfig
 from events import (
@@ -29,7 +21,6 @@ from events import (
     ToolCalled,
     ToolDispatched,
     TurnStarted,
-    content_text,
     describe_error,
     gui_emitter_var,
 )
@@ -41,8 +32,8 @@ from langchaint import (
     BoundLLM,
     DispatchExceptionGroup,
     DispatchManyItemOutcome,
-    Generation,
     GenerationError,
+    GenerationOutcome,
     Message,
     PydanticTool,
     ToolCall,
@@ -58,99 +49,83 @@ from langchaint import (
 
 @dataclass(frozen=True)
 class GenerationEntry:
-    """Record one `Generation`."""
+    """Record one input's outcome and its billing."""
 
     turn_number: int
-    generation: Generation[str]
-
-
-@dataclass(frozen=True)
-class GenerationErrorEntry:
-    """Record one failed or timed-out input and its billing."""
-
-    turn_number: int
-    error: GenerationError
+    outcome: GenerationOutcome[str]
+    kind: Literal["generation"] = "generation"
 
 
 @dataclass(frozen=True)
 class DispatchEntry:
-    """Record one settled tool call and its reported Usage."""
+    """Record one tool call and its settled outcome."""
 
     turn_number: int
-    tool_name: str
-    tool_message: ToolMessage
-    reported_usage: Usage
+    tool_call: ToolCall
+    outcome: DispatchManyItemOutcome
+    kind: Literal["dispatch"] = "dispatch"
 
 
-type TurnLogEntry = GenerationEntry | GenerationErrorEntry | DispatchEntry
+type TurnLogEntry = GenerationEntry | DispatchEntry
 """One entry in a run's ordered turn_log."""
 
 
 def _usage_of(entry: TurnLogEntry) -> Usage:
-    match entry:
-        case GenerationEntry():
-            return entry.generation.usage
-        case GenerationErrorEntry():
-            return entry.error.usage
-        case DispatchEntry():
-            return entry.reported_usage
+    match entry.kind:
+        case "generation":
+            return entry.outcome.usage
+        case "dispatch":
+            outcome = entry.outcome
+            if outcome.kind == "handled" and isinstance(outcome.app_data, Usage):
+                return outcome.app_data
+            return ZERO_USAGE
+
+
+class RunLimitError(RuntimeError):
+    """A configured turn or cost limit prevents another turn."""
 
 
 def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
-    """Raise when usage reaches max_cost_in_usd or has an unknown cost.
-
-    Raises:
-        RuntimeError: max_cost_in_usd is set and usage cannot support another turn.
-    """
+    """Require known cost below max_cost_in_usd when configured."""
     if max_cost_in_usd is None:
         return
     cost_in_usd = usage.cost_in_usd
     if math.isnan(cost_in_usd):
-        raise RuntimeError("Cannot enforce max_cost_in_usd because cost_in_usd is NaN")
+        raise RunLimitError("Cannot enforce max_cost_in_usd because cost_in_usd is NaN")
     if cost_in_usd >= max_cost_in_usd:
-        raise RuntimeError(f"Run reached max_cost_in_usd={max_cost_in_usd}")
+        raise RunLimitError(f"Run reached max_cost_in_usd={max_cost_in_usd}")
 
 
 class AgentRun(ABC):
-    """Report one agent's execution through on_event.
+    """Define this demo app's base class for agent execution.
 
-    Subclasses implement run and append settled entries to turn_log.
-    final installs GuiEmitter and emits terminal events.
+    The app's agent classes inherit from AgentRun and implement their own workflow in _execute.
+    Subclasses append settled outcomes to turn_log for accounting and return a final answer.
+    Call the inherited run method to route tool progress and emit lifecycle events:
+    AgentStarted, AgentFinished, AgentFailed, and AgentCancelled.
     """
 
     def __init__(
         self,
         *,
         agent_path: str,
-        config: AgentConfig,
         registry: dict[str, "AgentRun"],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Store and register the run.
+        """Register agent_path for descendant accounting and store on_event for synchronous progress callbacks.
+
+        registry stores runs under unique agent_path values.
 
         Raises:
             ValueError: registry already contains agent_path.
         """
         if agent_path in registry:
-            raise ValueError(
-                f"agent_path {agent_path!r} is already registered. "
-                "A second run at the same agent_path would replace the first run. "
-                "Use a distinct agent_path, as delegate does with its spawn index."
-            )
+            raise ValueError(f"agent_path {agent_path!r} is already registered")
         self.agent_path: str = agent_path
-        self.config: AgentConfig = config
         self.registry: dict[str, AgentRun] = registry
         self.on_event: Callable[[Event], None] = on_event
         self.turn_log: list[TurnLogEntry] = []
         registry[agent_path] = self
-
-    @abstractmethod
-    async def run(self) -> str:
-        """Run the agent and report progress through on_event.
-
-        Returns:
-            The final answer.
-        """
 
     @property
     def own_usage(self) -> Usage:
@@ -166,18 +141,19 @@ class AgentRun(ABC):
             if path == self.agent_path or path.startswith(f"{self.agent_path}/")
         )
 
-    async def final(self) -> str:
-        """Run the agent with its GuiEmitter.
+    @final
+    async def run(self) -> str:
+        """Execute the agent with GuiEmitter and emit a terminal event.
 
         Raises:
-            Exception: `run()` or `on_event` raises.
+            Exception: _execute or on_event raises.
             asyncio.CancelledError: An outer scope cancels the run.
         """
         token = gui_emitter_var.set(GuiEmitter(self.agent_path, self.on_event))
         try:
             self.on_event(AgentStarted(agent_path=self.agent_path))
             try:
-                answer = await self.run()
+                answer = await self._execute()
             except asyncio.CancelledError as error:
                 try:
                     self.on_event(AgentCancelled(agent_path=self.agent_path, usage=self.usage))
@@ -200,50 +176,60 @@ class AgentRun(ABC):
         finally:
             gui_emitter_var.reset(token)
 
+    @abstractmethod
+    async def _execute(self) -> str:
+        """Record settled outcomes in turn_log and return the final answer."""
+
 
 class ReActAgent(AgentRun):
-    """Implement the example's generate and tool loop."""
+    """Generate and dispatch tools until the model answers within configured limits.
+
+    Raises:
+        GenerationError: Generation fails, except with kind timed_out_error.
+        RunLimitError: The turn or cost limit prevents another turn.
+        RuntimeError: Tool-call IDs repeat or a dispatch outcome has an invalid ID.
+        DispatchExceptionGroup: A tool function raises after settled sibling outcomes enter turn_log.
+    """
 
     def __init__(
         self,
         *,
         agent_path: str,
         config: AgentConfig,
+        llm: LLM,
+        tools: ToolSequence,
+        prompt: str,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
-        bound: BoundLLM[str, ToolManager],
-        prompt: str,
     ) -> None:
-        """Store the loop state."""
-        super().__init__(
-            agent_path=agent_path,
-            config=config,
-            registry=registry,
-            on_event=on_event,
+        """Bind config and tools, initialize prompt messages, and register agent_path.
+
+        config sets the system prompt, binding options, and execution limits.
+        self_correction_enabled adds a fresh scripted critique tool to tools.
+        registry stores runs for descendant accounting under unique agent_path values.
+        on_event receives synchronous progress callbacks from the run and its tools.
+
+        Raises:
+            ValueError: registry already contains agent_path.
+            ValueError: A binding option in config is invalid or unsupported by the provider.
+        """
+        tools = [*tools, build_critique_tool()] if config.self_correction_enabled else tools
+        self.bound: BoundLLM[str, ToolManager] = llm.bind(
+            system_prompt=config.system_prompt,
+            tools=tools,
+            max_requests=config.max_requests,
+            automatic_cache_breakpoints=config.automatic_cache_breakpoints,
         )
-        self.bound: BoundLLM[str, ToolManager] = bound
-        self.prompt: str = prompt
+        self.config: AgentConfig = config
         self.turn_number: int = 0
         self.tool_calls_made: int = 0
         self.critique_approved: bool = False
-        self.messages: list[Message] = []
+        self.messages: list[Message] = [UserMessage(content=prompt)]
+        super().__init__(agent_path=agent_path, registry=registry, on_event=on_event)
 
     @override
-    async def run(self) -> str:
-        """Run turns of generation and tool dispatch until the agent answers.
-
-        config.self_correction_enabled requires critique approval.
-        Each input uses config.generate_one_timeout_seconds.
-        Each settled outcome is appended to turn_log.
-
-        Raises:
-            GenerationError: Generation fails after its retries, except with kind `timed_out_error`.
-            RuntimeError: `max_turns` elapses or the configured cost prevents another turn.
-            DispatchExceptionGroup: A tool function raises after settled sibling outcomes enter `turn_log`.
-            asyncio.CancelledError: An outer deadline cancels the run.
-            Exception: `on_event` raises.
-        """
-        self.messages.append(UserMessage(content=self.prompt))
+    async def _execute(self) -> str:
+        """Generate and dispatch tools until the agent answers."""
         for _ in range(self.config.max_turns):
             if (
                 self.tool_calls_made >= self.config.max_tool_calls
@@ -266,9 +252,7 @@ class ReActAgent(AgentRun):
                     timeout_seconds=self.config.generate_one_timeout_seconds,
                 )
             except GenerationError as error:
-                self.turn_log.append(
-                    GenerationErrorEntry(turn_number=self.turn_number, error=error)
-                )
+                self.turn_log.append(GenerationEntry(turn_number=self.turn_number, outcome=error))
                 if error.kind != "timed_out_error":
                     raise
                 # The timed-out `generate_one` leaves self.messages unchanged for the next turn.
@@ -280,19 +264,12 @@ class ReActAgent(AgentRun):
                     )
                 )
                 continue
-            self.turn_log.append(
-                GenerationEntry(turn_number=self.turn_number, generation=generation)
-            )
+            self.turn_log.append(GenerationEntry(turn_number=self.turn_number, outcome=generation))
             self.on_event(
                 GenerationReported(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    text="\n".join(
-                        text
-                        for text in (generation.commentary, generation.output)
-                        if text is not None
-                    ),
-                    usage=generation.usage,
+                    generation=generation,
                     usage_so_far=self.usage,
                 )
             )
@@ -309,33 +286,25 @@ class ReActAgent(AgentRun):
                         )
                         continue
                     return generation.output
-        raise RuntimeError(
+        raise RunLimitError(
             f"{self.agent_path} did not finish within {self.config.max_turns} turns"
         )
 
     async def _dispatch_all(self, tool_calls: Sequence[ToolCall]) -> None:
-        """Announce, dispatch, and settle each tool call.
-
-        Calls above config.max_tool_calls are declined through precomputed.
-
-        Raises:
-            DispatchExceptionGroup: A tool function raises after `completed_outcomes` settle.
-            RuntimeError: A `ToolCall.id` repeats.
-            asyncio.CancelledError: An outer deadline cancels the dispatch.
-        """
+        """Dispatch the affordable prefix and settle dispatched and declined calls."""
+        call_of_id = {tool_call.id: tool_call for tool_call in tool_calls}
+        if len(call_of_id) != len(tool_calls):
+            raise RuntimeError("ToolCall.id appears twice in one assistant message")
         usage_so_far = self.usage
         for tool_call in tool_calls:
             self.on_event(
                 ToolCalled(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    args_json=tool_call.args_json,
+                    tool_call=tool_call,
                     usage_so_far=usage_so_far,
                 )
             )
-        _validate_tool_call_ids(tool_calls)
         remaining = max(0, self.config.max_tool_calls - self.tool_calls_made)
         affordable_ids = {tool_call.id for tool_call in tool_calls[:remaining]}
         # Dispatch consumes the budget even when settlement raises.
@@ -355,24 +324,17 @@ class ReActAgent(AgentRun):
                 tool_calls, precomputed=_decline_over_budget
             )
         except DispatchExceptionGroup as group:
-            self._settle_outcomes(tool_calls, group.completed_outcomes)
+            self._settle_outcomes(call_of_id, group.completed_outcomes)
             raise
-        self._settle_outcomes(tool_calls, outcomes)
+        self._settle_outcomes(call_of_id, outcomes)
         self.messages.extend(outcome.tool_message for outcome in outcomes)
 
     def _settle_outcomes(
-        self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
+        self, call_of_id: Mapping[str, ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
     ) -> None:
-        """Record each outcome and emit ToolDispatched.
-
-        tool_call_id matches partial outcomes to their calls.
-        An outcome with `kind == "handled"` may carry reported Usage or CritiqueVerdict through app_data.
-
-        Raises:
-            RuntimeError: An outcome repeats or names an unknown tool_call_id.
-        """
-        call_of_id = {tool_call.id: tool_call for tool_call in tool_calls}
+        """Record the batch, then emit events with usage captured after each entry."""
         settled_ids: set[str] = set()
+        events: list[ToolDispatched] = []
         for outcome in outcomes:
             tool_message = outcome.tool_message
             tool_call_id = tool_message.tool_call_id
@@ -385,46 +347,35 @@ class ReActAgent(AgentRun):
                 raise RuntimeError(
                     f"dispatch_many returned unknown tool_call_id {tool_call_id!r}"
                 ) from None
-            reported_usage = ZERO_USAGE
-            if outcome.kind == "handled":
-                app_data = outcome.app_data
-                if isinstance(app_data, Usage):
-                    reported_usage = app_data
-                elif isinstance(app_data, CritiqueVerdict) and app_data.approved:
-                    self.critique_approved = True
-            self.turn_log.append(
-                DispatchEntry(
-                    turn_number=self.turn_number,
-                    tool_name=tool_call.name,
-                    tool_message=tool_message,
-                    reported_usage=reported_usage,
-                )
+            entry = DispatchEntry(
+                turn_number=self.turn_number,
+                tool_call=tool_call,
+                outcome=outcome,
             )
-            self.on_event(
+            self.turn_log.append(entry)
+            if (
+                outcome.kind == "handled"
+                and isinstance(outcome.app_data, CritiqueVerdict)
+                and outcome.app_data.approved
+            ):
+                self.critique_approved = True
+            events.append(
                 ToolDispatched(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    tool_call_id=tool_call_id,
-                    tool_name=tool_call.name,
-                    content=content_text(tool_message),
-                    is_error=tool_message.is_error,
-                    reported_usage=reported_usage,
+                    tool_call=entry.tool_call,
+                    tool_message=outcome.tool_message,
+                    reported_usage=_usage_of(entry),
                     usage_so_far=self.usage,
                 )
             )
+        for event in events:
+            self.on_event(event)
 
 
 def top_level_path(name: str) -> str:
     """Build a top-level agent_path."""
     return f"root/{name}"
-
-
-def _tools_for(
-    config: AgentConfig,
-    tools: ToolSequence,
-) -> ToolSequence:
-    """Add a fresh critique tool when self_correction_enabled."""
-    return [*tools, build_critique_tool()] if config.self_correction_enabled else tools
 
 
 def build_delegate_tool(
@@ -443,57 +394,38 @@ def build_delegate_tool(
     spawn_counter = itertools.count()
 
     @tool(description="Delegate a focused question to the specialist sub-agent.")
-    async def delegate(args: DelegateArgs) -> ToolReturnExplicit[None]:
-        """Run the specialist and return its answer.
+    async def delegate(args: DelegateArgs) -> str | ToolReturnExplicit[None]:
+        """Return the specialist's answer or a tool error for a classified generation failure or run limit.
 
         Raises:
             DispatchExceptionGroup: A specialist tool function raises.
+            GenerationError: The specialist reports an unknown generation failure.
+            Exception: A callback or application defect raises.
         """
         sub_run = ReActAgent(
             agent_path=f"{parent_path}/{config.name}#{next(spawn_counter)}",
             config=config,
             registry=registry,
             on_event=on_event,
-            bound=llm.bind(
-                system_prompt=config.system_prompt,
-                tools=_tools_for(config, [search_tool]),
-                max_requests=config.max_requests,
-                automatic_cache_breakpoints=config.automatic_cache_breakpoints,
-            ),
+            llm=llm,
+            tools=[search_tool],
             prompt=args.question,
         )
         try:
-            answer = await sub_run.final()
-        except DispatchExceptionGroup:
-            raise
-        except Exception as error:
+            return await sub_run.run()
+        except (GenerationError, RunLimitError) as error:
+            if isinstance(error, GenerationError) and error.kind == "unknown_exception_error":
+                raise
             return ToolReturnExplicit(
                 content=f"The specialist failed: {describe_error(error)}. Answer without it.",
-                app_data=None,
                 is_error=True,
             )
-        return ToolReturnExplicit(content=answer, app_data=None)
 
     return delegate
 
 
-def _validate_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
-    """Reject duplicate IDs because partial outcomes correlate through tool_call_id.
-
-    Raises:
-        RuntimeError: tool_calls contains a duplicate ToolCall.id.
-    """
-    seen_ids: set[str] = set()
-    for tool_call in tool_calls:
-        if tool_call.id in seen_ids:
-            raise RuntimeError(
-                f"ToolCall.id {tool_call.id!r} appears twice in one assistant message"
-            )
-        seen_ids.add(tool_call.id)
-
-
 class App:
-    """Run a graph of ReActAgent values through one on_event callback."""
+    """Run a graph of AgentRun values through one on_event callback."""
 
     def __init__(
         self,
@@ -502,14 +434,18 @@ class App:
         configs: Mapping[str, AgentConfig],
         on_event: Callable[[Event], None],
     ) -> None:
-        """`configs` maps each graph node name, including `specialist`, to its `AgentConfig`."""
+        """Share llm and on_event across runs; configs must include every node name and specialist."""
         self._llm = llm
         self._configs = configs
         self._on_event = on_event
         self._runs: dict[str, AgentRun] = {}
         self.answers: dict[str, str] = {}
         self.failures: dict[str, str] = {}
-        self.final_answer: str | None = None
+
+    @property
+    def final_answer(self) -> str | None:
+        """Return the synthesis answer when it completed successfully."""
+        return self.answers.get(top_level_path("synthesize"))
 
     @property
     def runs(self) -> Mapping[str, AgentRun]:
@@ -529,12 +465,8 @@ class App:
             config=config,
             registry=self._runs,
             on_event=self._on_event,
-            bound=self._llm.bind(
-                system_prompt=config.system_prompt,
-                tools=_tools_for(config, tools),
-                max_requests=config.max_requests,
-                automatic_cache_breakpoints=config.automatic_cache_breakpoints,
-            ),
+            llm=self._llm,
+            tools=tools,
             prompt=prompt,
         )
 
@@ -543,13 +475,15 @@ class App:
 
         Raises:
             DispatchExceptionGroup: A tool function raises.
+            GenerationError: The run reports an unknown generation failure.
+            Exception: A callback or application defect raises.
             asyncio.CancelledError: An outer scope cancels the graph.
         """
         try:
-            self.answers[run.agent_path] = await run.final()
-        except DispatchExceptionGroup:
-            raise
-        except Exception as error:
+            self.answers[run.agent_path] = await run.run()
+        except (GenerationError, RunLimitError) as error:
+            if isinstance(error, GenerationError) and error.kind == "unknown_exception_error":
+                raise
             self.failures[run.agent_path] = describe_error(error)
 
     async def run(self) -> None:
@@ -562,7 +496,9 @@ class App:
             ValueError: `automatic_cache_breakpoints` is unsupported.
             asyncio.CancelledError: An outer deadline cancels the graph after researcher tasks settle.
             DispatchExceptionGroup: A synthesize tool function raises.
-            ExceptionGroup: A concurrent researcher tool function raises.
+            GenerationError: Synthesis reports an unknown generation failure.
+            ExceptionGroup: A concurrent researcher raises an unhandled failure.
+            Exception: A synthesis callback or application defect raises.
         """
         delegate_tool = build_delegate_tool(
             llm=self._llm,
@@ -595,4 +531,3 @@ class App:
             prompt=f"Synthesize these findings, critiquing your draft before answering:\n{upstream}",
         )
         await self._settle_node(synthesize)
-        self.final_answer = self.answers.get(synthesize.agent_path)

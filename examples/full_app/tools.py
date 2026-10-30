@@ -59,10 +59,6 @@ async def search_tool(args: SearchArgs) -> ToolReturnExplicit[Usage]:
     )
 
 
-_FIRST_VERDICT = "revise: the draft cites no figures."
-"""The first rejection that exercises revision."""
-
-
 class CritiqueVerdict(BaseModel):
     """Carry critique approval through app_data."""
 
@@ -70,10 +66,12 @@ class CritiqueVerdict(BaseModel):
 
 
 def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
-    """Build a critique tool that rejects once and then approves."""
-    pending_rejections = [_FIRST_VERDICT]
+    """Reject the first valid call and approve later calls regardless of draft contents."""
+    pending_rejections = ["revise: submit another draft."]
 
-    @tool(description="Critique a draft; return approval or a revision instruction.")
+    @tool(
+        description="Return a scripted critique verdict: reject the first valid call and approve subsequent valid calls."
+    )
     async def critique(_args: CritiqueArgs) -> ToolReturnExplicit[CritiqueVerdict]:
         """Return the next verdict through app_data."""
         if pending_rejections:

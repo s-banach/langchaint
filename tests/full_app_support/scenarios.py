@@ -4,11 +4,7 @@ from collections.abc import Mapping
 
 from config import AgentConfig
 
-from tests.full_app_support.scripted_adapter import Turn, call
-
-
-class SubAgentError(Exception):
-    """A provider failure inside the specialist sub-agent."""
+from tests.full_app_support.scripted_adapter import TerminalProviderError, Turn, call
 
 
 def build_scripts(scenario: str, configs: Mapping[str, AgentConfig]) -> dict[str, list[Turn]]:
@@ -19,13 +15,17 @@ def build_scripts(scenario: str, configs: Mapping[str, AgentConfig]) -> dict[str
         input_timeout: one input exceeds config.generate_one_timeout_seconds.
         app_timeout: both researchers stall on their second turn.
         subagent_error: the specialist's second turn raises.
+        subagent_defect: the specialist's second turn reports an unknown failure.
+        input_defect: the first climate input reports an unknown failure.
         unapproved_answer: synthesize answers before critique approves a draft.
     """
     climate_delay = 5.0 if scenario == "input_timeout" else 0.0
     app_delay = 5.0 if scenario == "app_timeout" else 0.0
-    specialist_error = (
-        SubAgentError("specialist backend fell over") if scenario == "subagent_error" else None
-    )
+    specialist_error: Exception | None = None
+    if scenario == "subagent_error":
+        specialist_error = TerminalProviderError("specialist backend fell over")
+    elif scenario == "subagent_defect":
+        specialist_error = ValueError("specialist defect")
     return {
         configs["research_climate"].system_prompt: [
             Turn(
@@ -33,6 +33,7 @@ def build_scripts(scenario: str, configs: Mapping[str, AgentConfig]) -> dict[str
                     call("search", '{"query": "sea level 2030"}'),
                     call("search", '{"query": "arctic ice extent"}'),
                 ),
+                error=ValueError("climate defect") if scenario == "input_defect" else None,
             ),
             Turn(
                 tool_calls=(call("delegate", '{"question": "quantify the ice loss trend"}'),),

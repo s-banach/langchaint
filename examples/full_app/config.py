@@ -1,9 +1,4 @@
-"""Define each agent's identity and limits.
-
-generate_one_timeout_seconds bounds one input.
-A timed-out `generate_one` appends no messages, and the next turn uses the same messages.
-max_turns bounds repeated timeouts.
-"""
+"""Define each agent's identity and limits."""
 
 import math
 from dataclasses import dataclass
@@ -14,10 +9,13 @@ class AgentConfig:
     """Configure one agent.
 
     name matches the last segment of agent_path before any spawn index.
+    automatic_cache_breakpoints passes unchanged to the provider binding.
+    generate_one_timeout_seconds bounds one input, including admission and retries.
+    max_turns counts inputs, including timed-out inputs that leave messages unchanged.
     max_tool_calls bounds the whole run and declines excess calls with an error ToolMessage.
     max_requests counts every request for one generate_one input, including the first.
     max_cost_in_usd stops new turns after settled spend reaches the limit.
-    self_correction_enabled requires critique approval before a final answer.
+    self_correction_enabled requires one scripted critique approval during the run before a final answer.
     """
 
     name: str

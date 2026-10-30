@@ -46,6 +46,10 @@ class FakeRaw(BaseModel):
     turn_index: int
 
 
+class TerminalProviderError(Exception):
+    """A scripted provider failure that ends handling the input."""
+
+
 def _turn_index(raw: BaseModel) -> int:
     """Return the scripted turn index from raw.
 
@@ -150,9 +154,15 @@ class ScriptedAdapter(Adapter):
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Place every error as unknown_exception."""
+        """Classify TerminalProviderError and preserve other errors as unknown_exception."""
         return RequestFailure(
-            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+            kind=(
+                "provider_failed_terminally"
+                if isinstance(error, TerminalProviderError)
+                else "unknown_exception"
+            ),
+            pauses_quota=False,
+            retry_after_seconds=None,
         )
 
 

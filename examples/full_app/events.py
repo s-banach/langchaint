@@ -2,14 +2,15 @@
 
 agent_path identifies the emitting run and includes a spawn index for tool-spawned runs.
 usage_so_far and terminal usage include sub-agent spend.
-GenerationReported.usage covers one input.
+GenerationReported.generation.usage covers one input.
 """
 
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Literal
 
-from langchaint import ToolMessage, Usage
+from langchaint import Generation, ToolCall, ToolMessage, Usage
 
 
 def describe_error(error: BaseException) -> str:
@@ -18,19 +19,12 @@ def describe_error(error: BaseException) -> str:
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
-def content_text(message: ToolMessage) -> str:
-    """Render a tool message's content as the plain text a UI shows."""
-    content = message.content
-    if isinstance(content, str):
-        return content
-    return " ".join(part.text for part in content if part.kind == "text")
-
-
 @dataclass(frozen=True)
 class AgentStarted:
     """Report that a run began."""
 
     agent_path: str
+    kind: Literal["agent_started"] = "agent_started"
 
 
 @dataclass(frozen=True)
@@ -40,57 +34,45 @@ class TurnStarted:
     agent_path: str
     turn_number: int
     usage_so_far: Usage
+    kind: Literal["turn_started"] = "turn_started"
 
 
 @dataclass(frozen=True)
 class GenerationReported:
-    """Report one generation and updated usage.
-
-    text is empty for an assistant message without text.
-    usage covers this input, and usage_so_far covers the run.
-    """
+    """Report one generation and captured cumulative usage."""
 
     agent_path: str
     turn_number: int
-    text: str
-    usage: Usage
+    generation: Generation[str]
     usage_so_far: Usage
+    kind: Literal["generation_reported"] = "generation_reported"
 
 
 @dataclass(frozen=True)
 class ToolCalled:
-    """Report a tool call before dispatch.
-
-    args_json preserves the model's unvalidated argument text.
-    tool_call_id links the tool call to its ToolDispatched.
-    """
+    """Report a tool call before dispatch."""
 
     agent_path: str
     turn_number: int
-    tool_call_id: str
-    tool_name: str
-    args_json: str
+    tool_call: ToolCall
     usage_so_far: Usage
+    kind: Literal["tool_called"] = "tool_called"
 
 
 @dataclass(frozen=True)
 class ToolDispatched:
     """Report one dispatched tool call.
 
-    tool_call_id links this event to ToolCalled.
-    content is the model-facing result.
-    is_error marks failed, declined, and misrouted calls.
-    reported_usage is the Usage from DispatchHandled.app_data, or ZERO_USAGE otherwise, and is included in usage_so_far.
+    reported_usage uses Usage in the handled outcome's app_data, or ZERO_USAGE, and enters usage_so_far.
     """
 
     agent_path: str
     turn_number: int
-    tool_call_id: str
-    tool_name: str
-    content: str
-    is_error: bool
+    tool_call: ToolCall
+    tool_message: ToolMessage
     reported_usage: Usage
     usage_so_far: Usage
+    kind: Literal["tool_dispatched"] = "tool_dispatched"
 
 
 @dataclass(frozen=True)
@@ -100,6 +82,7 @@ class ToolProgress:
     agent_path: str
     tool_name: str
     message: str
+    kind: Literal["tool_progress"] = "tool_progress"
 
 
 @dataclass(frozen=True)
@@ -113,6 +96,7 @@ class LlmInputTimedOut:
     agent_path: str
     turn_number: int
     usage_so_far: Usage
+    kind: Literal["llm_input_timed_out"] = "llm_input_timed_out"
 
 
 @dataclass(frozen=True)
@@ -122,6 +106,7 @@ class AgentFinished:
     agent_path: str
     answer: str
     usage: Usage
+    kind: Literal["agent_finished"] = "agent_finished"
 
 
 @dataclass(frozen=True)
@@ -131,6 +116,7 @@ class AgentFailed:
     agent_path: str
     error_text: str
     usage: Usage
+    kind: Literal["agent_failed"] = "agent_failed"
 
 
 @dataclass(frozen=True)
@@ -139,6 +125,7 @@ class AgentCancelled:
 
     agent_path: str
     usage: Usage
+    kind: Literal["agent_cancelled"] = "agent_cancelled"
 
 
 type Event = (

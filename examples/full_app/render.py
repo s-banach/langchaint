@@ -1,56 +1,47 @@
 """Render each event as one line indented by agent_path depth."""
 
-from events import (
-    AgentCancelled,
-    AgentFailed,
-    AgentFinished,
-    AgentStarted,
-    Event,
-    GenerationReported,
-    LlmInputTimedOut,
-    ToolCalled,
-    ToolDispatched,
-    ToolProgress,
-    TurnStarted,
-)
+from events import Event
 
 
 def render(event: Event) -> str:
     """Render one event indented by agent_path depth."""
-    indent = "  " * (event.agent_path.count("/"))
-    return f"{indent}{_render_body(event)}"
-
-
-def _render_body(event: Event) -> str:
-    match event:
-        case AgentStarted(agent_path=path):
-            return f"* {path} started"
-        case AgentFinished(agent_path=path, usage=usage):
-            return f"* {path} done, spent ${usage.cost_in_usd:.4f}"
-        case AgentFailed(agent_path=path, error_text=error_text, usage=usage):
-            return f"! {path} FAILED ({error_text[:40]}), spent ${usage.cost_in_usd:.4f}"
-        case AgentCancelled(agent_path=path, usage=usage):
-            return f"! {path} CANCELLED, settled spend ${usage.cost_in_usd:.4f}"
-        case ToolProgress(tool_name=name, message=message):
-            return f"  .. {name}: {message}"
-        case TurnStarted(turn_number=turn, usage_so_far=usage):
-            return f"  turn {turn} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
-        case GenerationReported(turn_number=turn, text=text, usage_so_far=usage):
-            shown = text or "(no text)"
-            return f"  llm t{turn}: {shown[:40]!r} -> {usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f}"
-        case LlmInputTimedOut(turn_number=turn, usage_so_far=usage):
-            return (
-                f"  llm t{turn}: TIMED OUT past the per-input deadline -> ${usage.cost_in_usd:.4f}"
+    match event.kind:
+        case "agent_started":
+            body = f"* {event.agent_path} started"
+        case "agent_finished":
+            body = f"* {event.agent_path} done, spent ${event.usage.cost_in_usd:.4f}"
+        case "agent_failed":
+            body = f"! {event.agent_path} FAILED ({event.error_text[:40]}), spent ${event.usage.cost_in_usd:.4f}"
+        case "agent_cancelled":
+            body = f"! {event.agent_path} CANCELLED, settled spend ${event.usage.cost_in_usd:.4f}"
+        case "tool_progress":
+            body = f"  .. {event.tool_name}: {event.message}"
+        case "turn_started":
+            usage = event.usage_so_far
+            body = f"  turn {event.turn_number} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
+        case "generation_reported":
+            usage = event.usage_so_far
+            text = "\n".join(
+                text
+                for text in (event.generation.commentary, event.generation.output)
+                if text is not None
             )
-        case ToolCalled(tool_name=name, args_json=args):
-            return f"  -> {name}({args})"
-        case ToolDispatched(
-            tool_name=name,
-            content=content,
-            is_error=is_error,
-            reported_usage=reported,
-            usage_so_far=usage,
-        ):
-            mark = "ERR" if is_error else "ok"
-            fee = f" +${reported.cost_in_usd:.4f}" if reported.cost_in_usd else ""
-            return f"  <- {name} {mark}: {content[:38]!r}{fee} -> ${usage.cost_in_usd:.4f}"
+            shown = text or "(no text)"
+            body = f"  llm t{event.turn_number}: {shown[:40]!r} -> {usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f}"
+        case "llm_input_timed_out":
+            body = f"  llm t{event.turn_number}: TIMED OUT past the per-input deadline -> ${event.usage_so_far.cost_in_usd:.4f}"
+        case "tool_called":
+            body = f"  -> {event.tool_call.name}({event.tool_call.args_json})"
+        case "tool_dispatched":
+            mark = "ERR" if event.tool_message.is_error else "ok"
+            reported_usage = event.reported_usage
+            fee = f" +${reported_usage.cost_in_usd:.4f}" if reported_usage.cost_in_usd else ""
+            content = event.tool_message.content
+            text = (
+                content
+                if isinstance(content, str)
+                else " ".join(part.text for part in content if part.kind == "text")
+            )
+            body = f"  <- {event.tool_call.name} {mark}: {text[:38]!r}{fee} -> ${event.usage_so_far.cost_in_usd:.4f}"
+    indent = "  " * event.agent_path.count("/")
+    return f"{indent}{body}"

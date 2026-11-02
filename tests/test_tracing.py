@@ -486,7 +486,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         adapter = FakeAdapter(echo=True)
         llm, exporter = _traced(adapter)
         bound = llm.bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(
             ["a", "b"],
             resume_path=resume_path,

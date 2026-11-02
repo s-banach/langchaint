@@ -43,7 +43,7 @@ async def basics() -> None:
 
     outcome_records = await assistant.generate_many_records(
         ["Define entropy.", "Define enthalpy."],
-        resume_path=Path("definition-records.json"),
+        resume_path=Path("definition-records.jsonl"),
     )
     outcome_rows, request_rows = to_tables(outcome_records)
     print(f"{len(outcome_rows)} outcomes over {len(request_rows)} requests")

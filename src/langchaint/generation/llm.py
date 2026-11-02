@@ -37,8 +37,9 @@ from langchaint.generation._config_fingerprint import (
 )
 from langchaint.generation._generate_many_records import (
     _run_resume_io,
+    append_outcome_record,
     claim_resume_path,
-    prepare_resume_state,
+    prepare_resume_file,
 )
 from langchaint.generation.errors import (
     GenerationError,
@@ -1146,22 +1147,27 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
         Each input retries transient failures as `generate_one` does.
         Each `GenerationError` becomes that input's record and does not cancel sibling inputs.
-        The JSON file stores one item per current input.
-        It stores input fingerprints instead of `GenerationInput` values.
-        It stores normalized records without live provider SDK objects.
         The returned list follows `generation_inputs` order.
-        When `input_ids=None`, each input is identified by its position in the complete ordered input list.
+        The resume file holds JSON Lines.
+        Its first line holds `format_version`, `config_fingerprint`, `input_ids`, and `input_fingerprints`.
+        It stores input fingerprints instead of `GenerationInput` values.
+        Each later line holds an `input_index` into those sequences and one outcome record.
+        The last line for an input holds its record.
+        It stores normalized records without live provider SDK objects.
+        When `input_ids=None`, the first line holds `"input_ids": null`.
+        Each input is then identified by its position in the complete ordered input list.
         Any ordered input change then replaces a valid resume file.
         Providing `input_ids` identifies inputs by those strings.
-        Both cases use one JSON format whose `identity_mode` records whether `input_ids` was provided.
         Adding, deleting, or reordering inputs preserves records for unchanged `input_ids` entries.
-        Deleting an `input_ids` entry removes its saved item.
-        Reusing an `input_ids` entry with a changed input generates that item again.
-        Repeated equal inputs remain separate items by position or by distinct `input_ids` entries.
+        Deleting an `input_ids` entry removes its saved record.
+        Reusing an `input_ids` entry with a changed input generates that input again.
+        Repeated equal inputs remain separate inputs by position or by distinct `input_ids` entries.
         Changing the binding or switching whether `input_ids` is provided replaces a valid resume file.
         The file's `config_fingerprint` is the value from `config_fingerprint()`.
         Changes excluded by `config_fingerprint()` do not replace the file.
-        A malformed file or unsupported format raises before any provider request and remains unchanged.
+        A malformed first line or unsupported format raises before any provider request.
+        So does a malformed record line in a file whose header matches a current input.
+        Either failure leaves the file unchanged.
         A file in the supported format holds the records this langchaint version would write.
         Those are the records for the binding and inputs that produced the file.
         That equality assumes the provider answers the same way both times.
@@ -1172,13 +1178,15 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         The new record replaces the saved error record.
         The replacement record excludes the earlier requests and billing for that input.
         Every other saved record is reused.
-        Each generated record is written with an atomic file replacement before its item finishes.
-        A process failure before file replacement can cause a repeated request after restart.
+        Before any request, an atomic file replacement writes the first line and one line per reused record.
+        Each generated record is then appended and flushed to disk before its item finishes.
+        A process failure before the append finishes can cause a repeated request after restart.
+        Loading ignores a last line without a trailing newline, which only a cut-off append leaves.
         Separate processes must not use the same `resume_path` concurrently.
 
         Args:
             generation_inputs: The input-aligned text or message values.
-            resume_path: The JSON file whose parent directory already exists, or `None` to disable persistence.
+            resume_path: The JSON Lines file whose parent directory already exists, or `None` to disable persistence.
             input_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
                 Used only when `resume_path` is provided.
             warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
@@ -1222,9 +1230,9 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         config_fingerprint = self.config_fingerprint()
         resume_path = await _run_resume_io(resume_path.resolve)
         with claim_resume_path(resume_path):
-            resume_state = await _run_resume_io(
+            reused_record_by_input_index = await _run_resume_io(
                 partial(
-                    prepare_resume_state,
+                    prepare_resume_file,
                     resume_path=resume_path,
                     output_type=self.response_format,
                     config_fingerprint=config_fingerprint,
@@ -1232,27 +1240,41 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                     input_ids=input_ids,
                 )
             )
-            pending_indices = resume_state.pending_indices()
+            pending_indices = tuple(
+                input_index
+                for input_index in range(len(input_snapshots))
+                if input_index not in reused_record_by_input_index
+            )
 
-            async def run_one(outcome_index: int) -> None:
+            async def run_one(input_index: int) -> GenerationOutcomeRecord[CallOutputT]:
                 generation_outcome = await self._generate_one_or_failure(
-                    input_snapshots[outcome_index],
+                    input_snapshots[input_index],
                     deadline=WorkingTimeDeadline(max_working_seconds_per_input),
                 )
+                outcome_record = _generation_outcome_record(generation_outcome)
                 await _run_resume_io(
                     partial(
-                        resume_state.store_outcome_record,
-                        outcome_index,
-                        _generation_outcome_record(generation_outcome),
+                        append_outcome_record,
+                        resume_path=resume_path,
+                        output_type=self.response_format,
+                        input_index=input_index,
+                        outcome_record=outcome_record,
                     )
                 )
+                return outcome_record
 
-            _ = await _run_many_with_warm_cache(
-                tuple(partial(run_one, outcome_index) for outcome_index in pending_indices),
+            generated_records = await _run_many_with_warm_cache(
+                tuple(partial(run_one, input_index) for input_index in pending_indices),
                 warm_cache=warm_cache,
                 max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
             )
-            return resume_state.outcome_records()
+            outcome_record_by_input_index = reused_record_by_input_index | dict(
+                zip(pending_indices, generated_records, strict=True)
+            )
+            return [
+                outcome_record_by_input_index[input_index]
+                for input_index in range(len(input_snapshots))
+            ]
 
     # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
     # Typing the invariant `StreamHandle` result with it keeps `OutputT` covariant.

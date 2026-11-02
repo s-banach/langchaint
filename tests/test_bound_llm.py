@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, assert_type, override
 
 import pytest
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, field_serializer
 
 from langchaint import (
     LLM,
@@ -68,6 +68,7 @@ from langchaint.adapter import (
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
+from langchaint.generation._generate_many_records import _ResumeHeader
 from langchaint.generation.llm import WorkingTimeDeadline, _run_many_with_warm_cache
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.streaming import StreamHandle
@@ -134,8 +135,9 @@ async def _generate_through(
         return await handle.final()
 
 
-def _resume_json_object(resume_path: Path) -> dict[str, object]:
-    return TypeAdapter(dict[str, object]).validate_json(resume_path.read_bytes())
+def _resume_header(resume_path: Path) -> _ResumeHeader:
+    header_json, *_ = resume_path.read_bytes().split(b"\n")
+    return _ResumeHeader.model_validate_json(header_json)
 
 
 _UNFINISHED_ASSISTANT_MESSAGE = UnfinishedAssistantMessage(
@@ -758,7 +760,11 @@ class _OtherAnswer(BaseModel):
 
 
 class _NonRoundTrippableAnswer(BaseModel):
-    value: float
+    value: int
+
+    @field_serializer("value")
+    def _serialize_value(self, value: int) -> str:
+        return f"#{value}"
 
 
 class _UnschematizableAnswer(BaseModel):
@@ -944,14 +950,14 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     )
     assert_type(
         await structured_with_tools.generate_many_records(
-            ["hi"], resume_path=Path("records.json")
+            ["hi"], resume_path=Path("records.jsonl")
         ),
         list[GenerationOutcomeRecord[_Answer]],
     )
     structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), PlainGeneration[_Answer])
     assert_type(
-        await structured.generate_many_records(["hi"], resume_path=Path("records.json")),
+        await structured.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
         list[PlainGenerationRecord[_Answer] | GenerationErrorRecord],
     )
     text_with_tools = llm.bind(tools=tool_manager)
@@ -960,7 +966,7 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         PlainGeneration[str] | ToolCallGeneration,
     )
     assert_type(
-        await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
+        await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
         list[GenerationOutcomeRecord[str]],
     )
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration])
@@ -977,7 +983,7 @@ async def _pin_generic_request_method_return_types[
     ToolManagerT: ToolManager | None,
 ](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
     assert_type(
-        await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
+        await bound_llm.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
         list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[OutputT]],
     )
@@ -1107,7 +1113,7 @@ def test_generate_many_records_restores_a_structured_record(
         bound_llm = _structured_tool_bound_llm(outcome)
         structured_adapter = bound_llm._bound_adapter
         assert isinstance(structured_adapter, _ScriptedBoundAdapter)
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         generated = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         (generated_record,) = generated
@@ -1122,24 +1128,13 @@ def test_generate_many_records_restores_a_structured_record(
     run_with_timeout(scenario())
 
 
-def test_generate_many_records_validates_serialized_bytes_before_replacing_the_file(
-    monkeypatch: pytest.MonkeyPatch,
+def test_generate_many_records_validates_a_record_line_before_appending_it(
     tmp_path: Path,
 ) -> None:
-    resume_path = tmp_path / "records.json"
-    original_replace = Path.replace
-    replaced_document_json: list[bytes] = []
-
-    def observed_replace(path: Path, target: Path) -> Path:
-        replaced_path = original_replace(path, target)
-        if target == resume_path:
-            replaced_document_json.append(target.read_bytes())
-        return replaced_path
-
-    monkeypatch.setattr(Path, "replace", observed_replace)
+    resume_path = tmp_path / "records.jsonl"
 
     async def scenario() -> None:
-        answer = _NonRoundTrippableAnswer(value=float("nan"))
+        answer = _NonRoundTrippableAnswer(value=1)
         outcome: UsableResponse[_NonRoundTrippableAnswer] = UsableResponse(
             output=answer,
             assistant_message=AssistantMessage(content=(TextPart(text=answer.model_dump_json()),)),
@@ -1147,10 +1142,11 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
         )
         bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
         bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(outcome))
-        with pytest.raises(ValueError, match="Input should be a valid number"):
+        with pytest.raises(ValueError, match="Input should be a valid integer"):
             await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
-        assert len(replaced_document_json) == 1
-        assert resume_path.read_bytes() == replaced_document_json[0]
+        header_json, record_lines_json = resume_path.read_bytes().split(b"\n", 1)
+        assert _ResumeHeader.model_validate_json(header_json).input_fingerprints
+        assert record_lines_json == b""
 
     run_with_timeout(scenario())
 
@@ -1453,7 +1449,7 @@ def test_generate_many_records_aligns_a_failure_among_generations() -> None:
 def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_path: Path) -> None:
 
     async def scenario() -> None:
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first_adapter = FakeAdapter(echo=True)
         first_bound = LLM(first_adapter, shared_backoff=fast_shared_backoff()).bind()
         first_records = await first_bound.generate_many_records(
@@ -1477,13 +1473,14 @@ def test_generate_many_records_uses_one_background_thread_for_resume_io(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    resume_path = tmp_path / "records.json"
+    resume_path = tmp_path / "records.jsonl"
     original_resolve = Path.resolve
     original_replace = Path.replace
-    first_record_replace_started = threading.Event()
-    release_first_record_replace = threading.Event()
+    original_open = Path.open
+    first_append_started = threading.Event()
+    release_first_append = threading.Event()
     resolve_thread_ids: list[int] = []
-    replace_thread_ids: list[int] = []
+    write_thread_ids: list[int] = []
 
     def observed_resolve(path: Path, *, strict: bool = False) -> Path:
         if path == resume_path:
@@ -1492,14 +1489,30 @@ def test_generate_many_records_uses_one_background_thread_for_resume_io(
 
     def observed_replace(path: Path, target: Path) -> Path:
         if target == resume_path:
-            replace_thread_ids.append(threading.get_ident())
-            if len(replace_thread_ids) == 2:
-                first_record_replace_started.set()
-                assert release_first_record_replace.wait(timeout=5.0)
+            write_thread_ids.append(threading.get_ident())
         return original_replace(path, target)
+
+    def observed_open(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        *,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        if path == resume_path and mode == "ab":
+            write_thread_ids.append(threading.get_ident())
+            if len(write_thread_ids) == 2:
+                first_append_started.set()
+                assert release_first_append.wait(timeout=5.0)
+        return original_open(
+            path, mode, buffering, encoding=encoding, errors=errors, newline=newline
+        )
 
     monkeypatch.setattr(Path, "resolve", observed_resolve)
     monkeypatch.setattr(Path, "replace", observed_replace)
+    monkeypatch.setattr(Path, "open", observed_open)
 
     async def scenario() -> None:
         event_loop_thread_id = threading.get_ident()
@@ -1508,15 +1521,15 @@ def test_generate_many_records_uses_one_background_thread_for_resume_io(
         task = asyncio.create_task(
             bound.generate_many_records(["a", "b"], resume_path=resume_path)
         )
-        assert await asyncio.to_thread(first_record_replace_started.wait, 5.0)
+        assert await asyncio.to_thread(first_append_started.wait, 5.0)
         await yield_until(lambda: adapter.bound_adapters[0].open_count >= 2)
         assert not task.done()
-        release_first_record_replace.set()
+        release_first_append.set()
         records = await task
         assert _outputs(records) == ["a", "b"]
         assert len(resolve_thread_ids) == 1
-        assert len(replace_thread_ids) == 3
-        assert set(resolve_thread_ids) == set(replace_thread_ids)
+        assert len(write_thread_ids) == 3
+        assert set(resolve_thread_ids) == set(write_thread_ids)
         assert resolve_thread_ids[0] != event_loop_thread_id
 
     run_with_timeout(scenario())
@@ -1527,7 +1540,7 @@ def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True, scripted_requests=[TransientError("try again")])
         bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(max_requests=1)
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(["a"], resume_path=resume_path)
         assert first[0].kind == "retries_exhausted_error"
         second = await bound.generate_many_records(["a"], resume_path=resume_path)
@@ -1547,7 +1560,7 @@ def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) ->
             scripted_requests=[billed(REFUSAL)],
         )
         bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         generated = await bound.generate_many_records(["a"], resume_path=resume_path)
         restored = await bound.generate_many_records(["a"], resume_path=resume_path)
         assert generated[0].kind == "refusal_error"
@@ -1564,7 +1577,7 @@ def test_generate_many_records_without_input_ids_replaces_changed_input_lists(
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
         bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(["a", "b"], resume_path=resume_path)
         reordered = await bound.generate_many_records(["b", "a"], resume_path=resume_path)
         added = await bound.generate_many_records(["b", "a", "c"], resume_path=resume_path)
@@ -1583,7 +1596,7 @@ def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_p
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
         position_bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         await position_bound.generate_many_records(["a"], resume_path=resume_path)
         changed_bound = position_bound.bind(system_prompt="changed")
         await changed_bound.generate_many_records(["a"], resume_path=resume_path)
@@ -1593,7 +1606,7 @@ def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_p
         await changed_bound.generate_many_records(["a"], resume_path=resume_path)
         assert adapter.bound_adapters[0].open_count == 1
         assert adapter.bound_adapters[1].open_count == 3
-        assert _resume_json_object(resume_path)["identity_mode"] == "position"
+        assert _resume_header(resume_path).input_ids is None
 
     run_with_timeout(scenario())
 
@@ -1605,7 +1618,7 @@ def test_generate_many_records_input_ids_support_batch_edits_and_equal_inputs(
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
         bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(
             ["same", "same"],
             resume_path=resume_path,
@@ -1643,10 +1656,7 @@ def test_generate_many_records_input_ids_support_batch_edits_and_equal_inputs(
         assert _outputs(restored) == ["third", "same", "same"]
         assert _outputs(changed) == ["third", "changed", "same"]
         assert adapter.bound_adapters[0].open_count == 5
-        items = TypeAdapter(list[dict[str, object]]).validate_python(
-            _resume_json_object(resume_path)["items"]
-        )
-        assert [item["input_id"] for item in items] == ["third", "left", "right"]
+        assert _resume_header(resume_path).input_ids == ("third", "left", "right")
 
     run_with_timeout(scenario())
 
@@ -1656,7 +1666,7 @@ def test_generate_many_records_rejects_invalid_input_ids_before_requests(tmp_pat
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
         bound = LLM(adapter).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         with pytest.raises(ValueError, match="input_ids"):
             await bound.generate_many_records(
                 ["a", "b"], resume_path=resume_path, input_ids=["same", "same"]
@@ -1674,24 +1684,30 @@ def test_generate_many_records_rejects_invalid_input_ids_before_requests(tmp_pat
 @pytest.mark.parametrize(
     "resume_text",
     [
+        "",
         "not json\n",
-        '{"format_version": 999, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
-        '{"format_version": 5, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
+        '{"format_version": 999, "config_fingerprint": "x", "input_ids": null, "input_fingerprints": []}\n',
+        '{\n  "format_version": 6,\n  "config_fingerprint": "x",\n  "identity_mode": "position",\n  "items": []\n}\n',
+        '{"format_version": 6, "config_fingerprint": "x", "identity_mode": "position", "items": []}\n',
         '{"unrelated": true}\n',
-        '{"format_version": "6"}\n',
-        '{"format_version": 6.0}\n',
+        '{"format_version": "7"}\n',
+        '{"format_version": 7.0}\n',
         '{"format_version": true}\n',
-        '{"format_version": 6, "config_fingerprint": "x", "identity_mode": "position", "items": [], "unknown": true}\n',
+        '{"format_version": 7, "config_fingerprint": "x", "input_ids": null, "input_fingerprints": [], "unknown": true}\n',
+        '{"format_version": 7, "config_fingerprint": "x", "input_ids": ["a", "a"], "input_fingerprints": ["f", "g"]}\n',
     ],
     ids=[
+        "empty",
         "malformed",
         "unsupported-version",
-        "version-4",
+        "pretty-printed-version-6",
+        "version-6",
         "unrelated-json",
         "string-version",
         "float-version",
         "boolean-version",
         "unknown-field",
+        "duplicate-input-ids",
     ],
 )
 def test_generate_many_records_preserves_an_unrecognized_file(
@@ -1699,7 +1715,7 @@ def test_generate_many_records_preserves_an_unrecognized_file(
 ) -> None:
 
     async def scenario() -> None:
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         _ = resume_path.write_text(resume_text)
         adapter = FakeAdapter(echo=True)
         bound = LLM(adapter).bind()
@@ -1716,7 +1732,7 @@ def test_generate_many_records_persists_a_settled_item_before_batch_cancellation
 ) -> None:
 
     async def scenario() -> None:
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first_adapter = FakeAdapter(echo=True, hang_from_open=2)
         first_bound = LLM(
             first_adapter,
@@ -1739,12 +1755,66 @@ def test_generate_many_records_persists_a_settled_item_before_batch_cancellation
     run_with_timeout(scenario())
 
 
+def _move_record_outside_header(resume_text: str) -> str:
+    return resume_text.replace('"input_index":0', '"input_index":1')
+
+
+def _append_malformed_record_line(resume_text: str) -> str:
+    return resume_text + "not json\n"
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "message"),
+    [
+        (_move_record_outside_header, "outside its header"),
+        (_append_malformed_record_line, "invalid resume record line"),
+    ],
+    ids=["outside-header", "malformed"],
+)
+def test_generate_many_records_rejects_a_bad_record_line_in_a_reused_file(
+    tmp_path: Path, corrupt: Callable[[str], str], message: str
+) -> None:
+
+    async def scenario() -> None:
+        resume_path = tmp_path / "records.jsonl"
+        adapter = FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        await bound.generate_many_records(["a"], resume_path=resume_path)
+        resume_text = corrupt(resume_path.read_text())
+        _ = resume_path.write_text(resume_text)
+        with pytest.raises(ValueError, match=message):
+            await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert resume_path.read_text() == resume_text
+        assert adapter.bound_adapters[0].open_count == 1
+
+    run_with_timeout(scenario())
+
+
+def test_generate_many_records_ignores_a_cut_off_last_line(tmp_path: Path) -> None:
+
+    async def scenario() -> None:
+        resume_path = tmp_path / "records.jsonl"
+        first_bound = LLM(FakeAdapter(echo=True)).bind()
+        await first_bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        complete_file_bytes = resume_path.read_bytes()
+        _ = resume_path.write_bytes(complete_file_bytes[:-10])
+
+        resumed_adapter = FakeAdapter(echo=True)
+        resumed_bound = LLM(resumed_adapter).bind()
+        resumed = await resumed_bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        assert _outputs(resumed) == ["a", "b"]
+        assert resumed_adapter.bound_adapters[0].open_count == 1
+        assert resume_path.read_bytes().count(b"\n") == 3
+
+    run_with_timeout(scenario())
+
+
 def test_generate_many_records_rejects_concurrent_use_of_one_path(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True, hang_from_open=1)
         bound = LLM(adapter).bind()
-        resume_path = tmp_path / "records.json"
+        resume_path = tmp_path / "records.jsonl"
         first_call = asyncio.create_task(
             bound.generate_many_records(["a"], resume_path=resume_path)
         )

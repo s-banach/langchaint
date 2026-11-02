@@ -23,7 +23,6 @@ Cataloged embedding model dimensions come from the OpenAI model catalog.
 Source: https://developers.openai.com/api/docs/models/all.
 `OpenAI.llm(pricing=...)` replaces cataloged estimates.
 `OpenAIBedrock.llm(pricing=...)` uses caller rates.
-`CACHE_BREAKPOINT_MODELS` lists models supporting explicit cache breakpoints independently of pricing.
 """
 
 from __future__ import annotations
@@ -77,18 +76,6 @@ _REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID = dict[str, float](
     OPENAI_REGIONAL_PROCESSING_MULTIPLIER.items()
 )
 """`OPENAI_REGIONAL_PROCESSING_MULTIPLIER` with `str` keys for runtime model lookup."""
-
-CACHE_BREAKPOINT_MODELS: frozenset[OpenAIModelId] = frozenset({
-    "gpt-5.6-luna",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-    "gpt-5.6",
-})
-"""Cataloged models supporting explicit cache breakpoints.
-
-`OpenAI.llm` derives `supports_cache_breakpoints` from this set.
-The set stays independent from pricing because parameter availability can change independently.
-"""
 
 
 class OpenAI:
@@ -166,7 +153,8 @@ class OpenAI:
         State its regional rates in `pricing` and leave `regional_processing=False`.
         `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
         False omits explicit markers and cache-breakpoint controls while preserving content.
-        Cataloged models derive that value from `CACHE_BREAKPOINT_MODELS`.
+        Cataloged models default to True because every cataloged model is gpt-5.6 or later.
+        OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
         `reasoning_summary` requests readable reasoning summary text.
         `service_tier` sets the requested OpenAI service tier.
         The reported service tier selects pricing.
@@ -199,7 +187,7 @@ class OpenAI:
         else:
             pricing = pricing or catalog_table
             if supports_cache_breakpoints is None:
-                supports_cache_breakpoints = model in CACHE_BREAKPOINT_MODELS
+                supports_cache_breakpoints = True
         if regional_processing:
             pricing = pricing.scaled(
                 _REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID.get(model, float("nan"))
@@ -378,7 +366,6 @@ class OpenAIBedrock:
 
 
 __all__ = [
-    "CACHE_BREAKPOINT_MODELS",
     "OPENAI_EMBEDDING_MODELS",
     "OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS",
     "OPENAI_PRICING",

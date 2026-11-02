@@ -655,7 +655,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
         `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
         False omits explicit markers and cache-breakpoint controls while preserving content.
-        OpenAI 3.41.0 documents explicit cache breakpoints for gpt-5.6-and-later models.
+        OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
         `supports_cache_breakpoints` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
         `input_tokens_cache_read_from_usage` reads provider-specific cache-read counters.
         The default reads `prompt_tokens_details.cached_tokens`.

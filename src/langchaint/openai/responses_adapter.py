@@ -669,10 +669,9 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
         `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
         False omits explicit markers and cache-breakpoint controls while preserving content.
-        OpenAI 3.41.0 documents explicit cache breakpoints for gpt-5.6-and-later models.
+        OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
         `supports_cache_breakpoints` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
-        `OpenAI.llm` derives cataloged values from `CACHE_BREAKPOINT_MODELS`.
-        It requires the parameter for uncataloged identifiers.
+        `OpenAI.llm` sets it to True for cataloged identifiers and requires it for uncataloged identifiers.
         `OpenAIBedrock.llm` always requires it because Bedrock ids have no catalog.
         `pricing` supplies the rates the endpoint charges.
         `service_tier` requests a tier, while the reported tier selects pricing.

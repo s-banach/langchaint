@@ -124,15 +124,6 @@ def test_openai_llm_wires_model_and_pricing() -> None:
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
     assert adapter.pricing is OPENAI_PRICING[model]
-
-
-def test_openai_llm_wires_cache_breakpoint_support() -> None:
-    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).llm(
-        "gpt-5.6-terra",
-        regional_processing=False,
-    )
-    adapter = llm.adapter
-    assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.supports_cache_breakpoints is True
     assert adapter.automatic_cache_breakpoints_default is False
 

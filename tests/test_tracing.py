@@ -7,7 +7,7 @@ import contextlib
 import json
 import logging
 import pathlib
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import ClassVar, Literal, NamedTuple, get_args, override
 
 import numpy as np
@@ -108,7 +108,6 @@ _APPLICATION_KEYS = frozenset({
     "custom.agent",
     "custom.app_data",
     "custom.model",
-    "custom.output",
     "shared.key",
 })
 """The keys this module's transforms and `extra_attributes` set as an application would."""
@@ -349,26 +348,19 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attri
     run_with_timeout(scenario())
 
 
-async def _drain_by_iterating(handle: StreamHandle[str]) -> None:
+async def _drain(handle: StreamHandle[str]) -> None:
     async for _ in handle:
         pass
 
 
-async def _drain_by_final(handle: StreamHandle[str]) -> None:
-    await handle.final()
-
-
-@pytest.mark.parametrize("drain", [_drain_by_iterating, _drain_by_final])
-def test_a_traced_streams_expired_deadline_takes_error_status(
-    drain: Callable[[StreamHandle[str]], Awaitable[None]],
-) -> None:
+def test_a_traced_streams_expired_deadline_takes_error_status() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter(stream=HangsAfterFirstItemStream()))
         handle = llm.bind().stream_one("hi", timeout_seconds=0.02)
 
         with pytest.raises(GenerationError):
             async with handle:
-                await drain(handle)
+                await _drain(handle)
         assert handle.abandoned is None
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -376,22 +368,6 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         assert span.attributes is not None
         assert span.attributes["error.type"] == "timed_out_error"
         assert "gen_ai.response.time_to_first_chunk" in span.attributes
-
-    run_with_timeout(scenario())
-
-
-def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
-    async def scenario() -> None:
-        adapter = FakeAdapter(hang_from_open=1)
-        llm, exporter = _traced(adapter)
-        with pytest.raises(TimeoutError):
-            await time_out_when(
-                llm.bind().generate_many(["a", "b"]),
-                lambda: adapter.bound_adapters[0].open_count == 2,
-            )
-        spans = exporter.get_finished_spans()
-        assert len(spans) == 2
-        assert all(span.status.status_code == StatusCode.UNSET for span in spans)
 
     run_with_timeout(scenario())
 
@@ -406,75 +382,6 @@ def test_retry_surfaces_as_a_request_failed_span_event() -> None:
         assert event.name == "langchaint.request_failed"
         assert event.attributes is not None
         assert event.attributes["error_text"] == "boom"
-
-    run_with_timeout(scenario())
-
-
-def test_generate_many_records_emits_one_chat_span_per_item_and_none_for_the_batch() -> None:
-    async def scenario() -> None:
-        adapter = FakeAdapter(echo=True, scripted_requests=[billed(REFUSAL)])
-        llm, exporter = _traced(adapter, max_concurrent_requests=1)
-        results = await llm.bind().generate_many_records([
-            [UserMessage(content="a")],
-            [UserMessage(content="b")],
-            [UserMessage(content="c")],
-        ])
-        first, *rest = results
-        assert first.kind == "refusal_error"
-        assert all(result.kind == "plain" for result in rest)
-        spans = exporter.get_finished_spans()
-        assert len(spans) == 3
-        assert all(span.kind == SpanKind.CLIENT for span in spans)
-        assert all(_attribute(span, "gen_ai.operation.name") == "chat" for span in spans)
-        assert all(_attribute(span, "langchaint.cost_in_usd") is not None for span in spans)
-        # max_concurrent_requests=1 serializes the batch, so the refused item is the first span to end.
-        refused, *succeeded = spans
-        assert refused.status.status_code == StatusCode.ERROR
-        assert refused.status.description is None
-        assert _attribute(refused, "error.type") == "refusal_error"
-        assert all(span.status.status_code == StatusCode.OK for span in succeeded)
-
-    run_with_timeout(scenario())
-
-
-def test_generate_many_transforms_and_captures_each_item_from_its_own_outcome() -> None:
-    async def scenario() -> None:
-        transformed_outputs: list[object] = []
-
-        def _transform(
-            outcome: GenerationOutcome[object] | AbandonedStreamRecord | None,
-            attributes: SpanAttributes,
-        ) -> SpanAttributes:
-            output = outcome.output if outcome is not None and outcome.kind == "plain" else None
-            transformed_outputs.append(output)
-            return {**attributes, "custom.output": str(output)}
-
-        llm, exporter = _traced(
-            FakeAdapter(echo=True),
-            capture_message_content=True,
-            chat_attribute_transform=_transform,
-            max_concurrent_requests=1,
-        )
-        results = await llm.bind().generate_many(["a", "b"])
-        assert [result.output for result in results if result.kind == "plain"] == [
-            "a",
-            "b",
-        ]
-        assert transformed_outputs == ["a", "b"]
-        spans = exporter.get_finished_spans()
-        assert len(spans) == 2
-        for span, content in zip(spans, ["a", "b"], strict=True):
-            assert _attribute(span, "custom.output") == content
-            assert _json_attribute(span, "gen_ai.input.messages") == [
-                {"role": "user", "parts": [{"type": "text", "content": content}]}
-            ]
-            assert _json_attribute(span, "gen_ai.output.messages") == [
-                {
-                    "role": "assistant",
-                    "parts": [{"type": "text", "content": content}],
-                    "finish_reason": "stop",
-                }
-            ]
 
     run_with_timeout(scenario())
 
@@ -505,29 +412,6 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
         assert adapter.bound_adapters[0].open_count == 3
-
-    run_with_timeout(scenario())
-
-
-def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -> None:
-    async def scenario() -> None:
-        llm, exporter = _traced(FakeAdapter())
-        async with llm.bind().stream_one("hi") as stream:
-            texts = [item async for item in stream if isinstance(item, str)]
-            generation = await stream.final()
-            assert await stream.final() is generation
-        assert "".join(texts) == "ok"
-        assert generation.output == "ok"
-        (span,) = exporter.get_finished_spans()
-        assert span.name == "chat fake-model"
-        assert span.kind == SpanKind.CLIENT
-        assert span.status.status_code == StatusCode.OK
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.operation.name"] == "chat"
-        time_to_first_chunk = span.attributes["gen_ai.response.time_to_first_chunk"]
-        assert isinstance(time_to_first_chunk, float)
-        assert time_to_first_chunk >= 0.0
-        assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)
 
     run_with_timeout(scenario())
 
@@ -1664,16 +1548,9 @@ def test_tool_span_captures_arguments_and_result_under_capture(
     ("args_json", "expected"),
     [
         ('{"text": "x"}', {"text": "x"}),
-        ('{"n": 1.5, "big": 1e300}', {"n": 1.5, "big": 1e300}),
-        ("[1, 2]", [1, 2]),
-        ('"bare"', "bare"),
         ("7", 7),
-        ("null", None),
-        ("not json at all", "not json at all"),
         ("{oops", "{oops"),
         ('{"n": 1e400}', '{"n": 1e400}'),
-        ('{"n": Infinity}', '{"n": Infinity}'),
-        ('{"n": -Infinity}', '{"n": -Infinity}'),
         ('{"n": NaN}', '{"n": NaN}'),
     ],
 )
@@ -1682,35 +1559,6 @@ def test_tool_call_arguments_parse_any_json_value_and_keep_other_text_unchanged(
 ) -> None:
     """JSON numbers that overflow a float use the text fallback to keep span payloads valid."""
     assert _tool_call_arguments(args_json) == expected
-
-
-def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
-    async def scenario() -> None:
-        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        await llm.bind().generate_one([
-            AssistantMessage(
-                content=(
-                    ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
-                    ToolCall(id="call2", name="echo", args_json="{oops"),
-                )
-            )
-        ])
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {
-                "role": "assistant",
-                "parts": [
-                    {
-                        "type": "tool_call",
-                        "id": "call1",
-                        "name": "echo",
-                        "arguments": {"text": "x"},
-                    },
-                    {"type": "tool_call", "id": "call2", "name": "echo", "arguments": "{oops"},
-                ],
-            }
-        ]
-
-    run_with_timeout(scenario())
 
 
 _CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"

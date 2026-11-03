@@ -995,13 +995,6 @@ def _anthropic_table_answers(error: anthropic.APIStatusError) -> tuple[bool, boo
         (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, False),
     ):
         if error.type in error_types or error.status_code in statuses:
-            if error.status_code not in statuses:
-                record_request_failure_fallthrough(
-                    REQUEST_FAILURE_FALLTHROUGH_COUNTS,
-                    function_name="anthropic_request_failure",
-                    status_code=error.status_code,
-                    error_type=error.type,
-                )
             return True, pauses_quota
     if error.status_code in _DO_NOT_RETRY_STATUSES:
         return False, False

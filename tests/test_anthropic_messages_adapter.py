@@ -1756,16 +1756,13 @@ def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -
     before = dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS)
     _ = anthropic_request_failure(_status_error(anthropic.RateLimitError, 429))
     _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 408))
+    _ = anthropic_request_failure(
+        _status_error(anthropic.APIStatusError, 200, error_type="api_error")
+    )
     assert dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS) == before
-    for failure, tag in (
-        (_status_error(anthropic.APIStatusError, 599), "status=599 type=None"),
-        (
-            _status_error(anthropic.APIStatusError, 200, error_type="api_error"),
-            "status=200 type=api_error",
-        ),
-    ):
-        _ = anthropic_request_failure(failure)
-        assert REQUEST_FAILURE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
+    _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 599))
+    tag = "status=599 type=None"
+    assert REQUEST_FAILURE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:

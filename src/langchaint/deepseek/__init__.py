@@ -146,6 +146,7 @@ class DeepSeek:
         - `provider_executed_tools` is nonempty.
         - `extra_body` contains `web_search_options`, which langchaint cannot price.
         - `extra_body` contains `functions`, which declares tools outside `tools`.
+        - `extra_body` sets `n` to a value other than 1, because the adapter reads one choice per response.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.

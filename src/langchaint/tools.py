@@ -565,6 +565,10 @@ def _precompute_tool_calls(
     return outcomes_or_calls
 
 
+async def _resolved(precomputed_outcome: DispatchPrecomputed) -> DispatchPrecomputed:
+    return precomputed_outcome
+
+
 def _tool_message_content(content: MessageContent) -> str | tuple[ContentPart, ...]:
     return content if isinstance(content, str) else tuple(content)
 
@@ -678,14 +682,12 @@ class ToolManager:
             BaseException: `precomputed` raises it before any tool function starts.
             BaseException: A tool function raises a non-`Exception` value after every call settles.
         """
-        outcomes_or_calls = _precompute_tool_calls(tool_calls, precomputed)
         tasks = [
-            asyncio.ensure_future(self.dispatch(outcome_or_call))
-            for outcome_or_call in outcomes_or_calls
-            if outcome_or_call.kind == "tool_call"
+            asyncio.ensure_future(self.dispatch(x) if x.kind == "tool_call" else _resolved(x))
+            for x in _precompute_tool_calls(tool_calls, precomputed)
         ]
         try:
-            gathered: list[DispatchOutcome | BaseException] = await asyncio.gather(
+            gathered: list[DispatchManyItemOutcome | BaseException] = await asyncio.gather(
                 *tasks, return_exceptions=True
             )
         except asyncio.CancelledError:
@@ -694,25 +696,16 @@ class ToolManager:
                 _ = task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        dispatch_outcomes = iter(gathered)
-        completed_outcomes: list[DispatchManyItemOutcome] = []
-        raised_exceptions: list[Exception] = []
-        base_exceptions: list[BaseException] = []
-        for outcome_or_call in outcomes_or_calls:
-            outcome_or_exception = (
-                next(dispatch_outcomes) if outcome_or_call.kind == "tool_call" else outcome_or_call
-            )
-            if isinstance(outcome_or_exception, Exception):
-                raised_exceptions.append(outcome_or_exception)
-            elif isinstance(outcome_or_exception, BaseException):
-                base_exceptions.append(outcome_or_exception)
-            else:
-                completed_outcomes.append(outcome_or_exception)
+        completed_outcomes = tuple(x for x in gathered if not isinstance(x, BaseException))
+        raised_exceptions = [x for x in gathered if isinstance(x, Exception)]
+        base_exceptions = [
+            x for x in gathered if isinstance(x, BaseException) and not isinstance(x, Exception)
+        ]
         if raised_exceptions:
             group = DispatchExceptionGroup(
                 f"{len(raised_exceptions)} of {len(tool_calls)} tool calls raised during dispatch_many",
                 raised_exceptions,
-                completed_outcomes=tuple(completed_outcomes),
+                completed_outcomes=completed_outcomes,
             )
             if base_exceptions:
                 # Preserve concurrent function exceptions as the cause.
@@ -720,4 +713,4 @@ class ToolManager:
             raise group
         if base_exceptions:
             raise base_exceptions[0]
-        return tuple(completed_outcomes)
+        return completed_outcomes

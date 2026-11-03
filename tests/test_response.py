@@ -176,9 +176,10 @@ def test_usage_rejects_string_costs_in_python_input(value: str) -> None:
         _ = Usage.model_validate(usage_data)
 
 
-def test_usage_rejects_a_finite_string_cost_in_json() -> None:
+@pytest.mark.parametrize("value", ["1.25", "nan", "inf", "+Infinity"])
+def test_usage_rejects_other_string_costs_in_json(value: str) -> None:
     usage_data = ZERO_USAGE.model_dump()
-    usage_data["output_tokens_cost_in_usd"] = "1.25"
+    usage_data["output_tokens_cost_in_usd"] = value
     with pytest.raises(ValidationError, match="output_tokens_cost_in_usd"):
         _ = Usage.model_validate_json(json.dumps(usage_data))
 

@@ -23,17 +23,9 @@ def _serialize_nonfinite_float(value: float) -> float | str:
 
 
 def _deserialize_nonfinite_float(value: object, info: ValidationInfo) -> object:
-    if info.mode != "json" or not isinstance(value, str):
-        return value
-    match value:
-        case "NaN":
-            return float("nan")
-        case "Infinity":
-            return float("inf")
-        case "-Infinity":
-            return float("-inf")
-        case _:
-            return value
+    if info.mode == "json" and value in ("NaN", "Infinity", "-Infinity"):
+        return float(value)
+    return value
 
 
 type JSONFloat = Annotated[

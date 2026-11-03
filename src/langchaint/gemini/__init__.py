@@ -170,7 +170,7 @@ class Gemini:
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
         `service_tier` sets the requested Gemini service tier.
-        The reported traffic type selects pricing.
+        Responses price at `on_demand` rates because google-genai 2.34.0 drops the served tier.
 
         `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
         - `parallel_tool_calls=False`, because `generateContent` cannot disable parallel function calls.

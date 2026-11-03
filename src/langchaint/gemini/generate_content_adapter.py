@@ -192,6 +192,7 @@ class GeminiPricingTable:
 
     Each rates field prices the responses whose `traffic_type` is the `GeminiReportedServiceTier` of the same name.
     A response that reports no `traffic_type` uses the `on_demand` rates.
+    Developer API responses report no `traffic_type`, so they use the `on_demand` rates.
     A response at a tier without rates costs NaN in every nonzero token category.
     `long_context` prices a request whose `prompt_token_count` exceeds its threshold.
     The per-query prices apply at every tier.
@@ -256,6 +257,8 @@ def _priced_tier(traffic_type: types.TrafficType | None) -> str:
     """Return the tier that selects the rates: what the response reports, "ON_DEMAND" where it reports none.
 
     TRAFFIC_TYPE_UNSPECIFIED counts as reporting none: it is the proto zero value, not a tier.
+    The Developer API reports the served tier in `usageMetadata.serviceTier` instead, which google-genai 2.34.0 drops.
+    Price Developer API responses by that field once the SDK models it.
     """
     if traffic_type is None or traffic_type == types.TrafficType.TRAFFIC_TYPE_UNSPECIFIED:
         return _ON_DEMAND_TIER

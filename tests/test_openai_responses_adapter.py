@@ -1595,6 +1595,13 @@ def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() 
     )
 
 
+def test_a_refusal_before_structured_text_is_a_refusal() -> None:
+    response = _response(
+        usage=None, output=[_REFUSAL_MESSAGE_ITEM, *_structured_response(_REPORT_JSON).output]
+    )
+    assert _structured_parse(response).kind == "refusal"
+
+
 @pytest.mark.parametrize("refusal", ["I can't help with that", _REPORT_JSON])
 def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
     response = _response(

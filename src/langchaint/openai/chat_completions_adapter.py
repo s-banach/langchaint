@@ -66,6 +66,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
     text_output,
+    validated_final_text,
 )
 from langchaint.billing.pricing import ProviderBilling, billing_at_rates
 from langchaint.common.exceptions import StreamProtocolError
@@ -81,7 +82,6 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    final_text,
 )
 from langchaint.openai.shared import (
     OpenAIPricingTable,
@@ -1087,26 +1087,21 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         Remaining invalid content returns SchemaViolation.
         Every remaining response returns EmptyAssistantMessage.
         """
-        validation_error: ValidationError | None = None
         assistant_message = finished_message.assistant_message
         if finished_message.message.refusal:
             return Refusal(assistant_message=assistant_message)
-        text = final_text(assistant_message)
-        if text is not None:
-            try:
-                output = self._response_format.model_validate_json(text)
-                return _usable_response(finished_message, output)
-            except ValidationError as rejection:
-                validation_error = rejection
+        validated = validated_final_text(assistant_message, self._response_format)
+        if isinstance(validated, BaseModel):
+            return _usable_response(finished_message, validated)
         if finished_message.finish_reason == "content_filter":
             return Refusal(assistant_message=assistant_message)
         if finished_message.finish_reason == "length":
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if assistant_message.tool_calls:
             return _usable_response(finished_message, None)
-        if validation_error is not None:
+        if isinstance(validated, ValidationError):
             return SchemaViolation(
-                validation_error_json=validation_error.json(include_url=False),
+                validation_error_json=validated.json(include_url=False),
                 assistant_message=assistant_message,
             )
         return EmptyAssistantMessage(assistant_message=assistant_message)

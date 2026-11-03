@@ -42,6 +42,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
     text_output,
+    validated_final_text,
 )
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -64,7 +65,6 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    final_text,
 )
 
 _PAUSE_STATUSES = frozenset({429, 503})
@@ -1155,15 +1155,14 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
         config, provider_executed_tool_fields = self._bound_config(
-            binding, response_json_schema=output_type_adapter.json_schema()
+            binding, response_json_schema=TypeAdapter(response_format).json_schema()
         )
         return _BoundGeminiStructured(
             adapter=self,
             config=config,
             provider_executed_tool_fields=provider_executed_tool_fields,
-            output_type_adapter=output_type_adapter,
+            response_format=response_format,
         )
 
     @override
@@ -1612,14 +1611,14 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         adapter: GeminiGenerateContentAdapter,
         config: types.GenerateContentConfig,
         provider_executed_tool_fields: frozenset[str],
-        output_type_adapter: TypeAdapter[ModelT],
+        response_format: type[ModelT],
     ) -> None:
         super().__init__(
             adapter=adapter,
             config=config,
             provider_executed_tool_fields=provider_executed_tool_fields,
         )
-        self._output_type_adapter = output_type_adapter
+        self._response_format = response_format
 
     def _parsed_outcome(
         self, finished_message: _FinishedMessage
@@ -1631,16 +1630,11 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         Source: https://github.com/googleapis/python-genai/blob/v2.33.0/google/genai/types.py
         Without validated output, a non-finished reason or MAX_TOKENS takes precedence over schema validation.
         """
-        validation_error: ValidationError | None = None
-        text = final_text(finished_message.assistant_message)
-        if text is not None:
-            try:
-                output = self._output_type_adapter.validate_json(text)
-                return _usable_response(finished_message, output)
-            except ValidationError as rejection:
-                validation_error = rejection
-        finish_reason = finished_message.finish_reason
         assistant_message = finished_message.assistant_message
+        validated = validated_final_text(assistant_message, self._response_format)
+        if isinstance(validated, BaseModel):
+            return _usable_response(finished_message, validated)
+        finish_reason = finished_message.finish_reason
         if finish_reason not in _FINISHED_FINISH_REASONS:
             return UnfinishedAssistantMessage(
                 error_text=f"gemini returned finish_reason {finish_reason.value!r}, "
@@ -1653,9 +1647,9 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
             return Refusal(assistant_message=assistant_message)
         if finish_reason == types.FinishReason.MAX_TOKENS:
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        if validation_error is not None:
+        if isinstance(validated, ValidationError):
             return SchemaViolation(
-                validation_error_json=validation_error.json(include_url=False),
+                validation_error_json=validated.json(include_url=False),
                 assistant_message=assistant_message,
             )
         return EmptyAssistantMessage(assistant_message=assistant_message)

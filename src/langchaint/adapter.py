@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import ClassVar, Literal, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -427,11 +427,31 @@ def text_output(assistant_message: AssistantMessage) -> str | None:
     A message without tool calls or text gives `""`.
 
     Args:
-        assistant_message: The completed assistant message to interpret.
+        assistant_message: The assistant message read from one response.
     """
     if assistant_message.tool_calls:
         return None
     return final_text(assistant_message) or ""
+
+
+def validated_final_text[ModelT: BaseModel](
+    assistant_message: AssistantMessage, response_format: type[ModelT]
+) -> ModelT | ValidationError | None:
+    """Validate the text at `final_text_index` as `response_format` JSON.
+
+    The result is the `ValidationError` when the text does not validate, and `None` when no text part gives output.
+
+    Args:
+        assistant_message: The assistant message read from one response.
+        response_format: The structured binding's output type.
+    """
+    text = final_text(assistant_message)
+    if text is None:
+        return None
+    try:
+        return response_format.model_validate_json(text)
+    except ValidationError as validation_error:
+        return validation_error
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -933,5 +953,6 @@ __all__ = [
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
     "text_output",
+    "validated_final_text",
     "validated_provider_executed_tool_types",
 ]

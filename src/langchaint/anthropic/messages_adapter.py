@@ -84,6 +84,7 @@ from langchaint.adapter import (
     request_failure_from_response,
     request_params_json,
     text_output,
+    validated_final_text,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -109,7 +110,6 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    final_text,
 )
 from langchaint.tools import ToolSchema
 
@@ -1476,9 +1476,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         The format matches `messages.parse(output_format=...)` in anthropic 2.3.0.
         The merge preserves the binding's reasoning effort.
         """
-        self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
+        self._response_format = response_format
         output_format: JSONOutputFormatParam = {
-            "schema": transform_schema(self._output_type_adapter.json_schema()),
+            "schema": transform_schema(TypeAdapter(response_format).json_schema()),
             "type": "json_schema",
         }
         bound_output_config = precomputed_fields.output_config
@@ -1503,14 +1503,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         Without validated output, stop reasons take precedence over schema validation.
         Every failure variant carries `assistant_message`.
         """
-        validation_error: ValidationError | None = None
-        text = final_text(assistant_message)
-        if text is not None:
-            try:
-                output = self._output_type_adapter.validate_json(text)
-                return _usable_response(message, output, assistant_message)
-            except ValidationError as rejection:
-                validation_error = rejection
+        validated = validated_final_text(assistant_message, self._response_format)
+        if isinstance(validated, BaseModel):
+            return _usable_response(message, validated, assistant_message)
         unfinished_message = _unfinished_message_or_none(
             message, assistant_message=assistant_message
         )
@@ -1524,9 +1519,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
             return ContextWindowExceeded(assistant_message=assistant_message)
         if assistant_message.tool_calls:
             return _usable_response(message, None, assistant_message)
-        if validation_error is not None:
+        if isinstance(validated, ValidationError):
             return SchemaViolation(
-                validation_error_json=validation_error.json(include_url=False),
+                validation_error_json=validated.json(include_url=False),
                 assistant_message=assistant_message,
             )
         return EmptyAssistantMessage(assistant_message=assistant_message)

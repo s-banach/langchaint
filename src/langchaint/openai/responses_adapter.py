@@ -69,6 +69,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
     text_output,
+    validated_final_text,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -1128,30 +1129,22 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
 
         Validation occurs after the request records its response and billing.
         Failed status returns `_provider_failure` even when fragment text validates.
+        A refusal content part returns `Refusal` ahead of tool calls and validation.
+        Refusal text becomes a `TextPart`, so validation alone cannot tell it from output.
         Application tool calls prevent structured validation.
         """
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
+        if _has_refusal(response):
+            return Refusal(assistant_message=assistant_message)
         if assistant_message.tool_calls:
-            if response.status == "completed" and _normalized_stop_reason(response) != "refusal":
+            if response.status == "completed":
                 return _usable_response(response, None, assistant_message)
             return self._no_instance(response, None, assistant_message)
-        final_content_part = next(
-            (
-                part
-                for item in reversed(response.output)
-                if item.type == "message"
-                for part in reversed(item.content)
-            ),
-            None,
-        )
-        if final_content_part is None or final_content_part.type == "refusal":
-            return self._no_instance(response, None, assistant_message)
-        try:
-            output = self._response_format.model_validate_json(final_content_part.text)
-        except ValidationError as validation_error:
-            return self._no_instance(response, validation_error, assistant_message)
-        return _usable_response(response, output, assistant_message)
+        validated = validated_final_text(assistant_message, self._response_format)
+        if isinstance(validated, BaseModel):
+            return _usable_response(response, validated, assistant_message)
+        return self._no_instance(response, validated, assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:

@@ -294,8 +294,6 @@ class _RequestLedger:
         self._request_started_at_monotonic_seconds = time.monotonic()
         self._request_in_flight = True
         self._first_item_at_monotonic_seconds = None
-        self._noted_request_id = None
-        self._provider_billing_in_flight = None
 
     def stamp_first_item(self) -> None:
         """Record the first streamed item once."""
@@ -309,11 +307,6 @@ class _RequestLedger:
     def note_provider_billing_in_flight(self, provider_billing: ProviderBilling | None) -> None:
         """Store billing reported before an interruption."""
         self._provider_billing_in_flight = provider_billing
-
-    @property
-    def provider_billing_in_flight(self) -> ProviderBilling | None:
-        """Return billing for the current request, when reported."""
-        return self._provider_billing_in_flight
 
     @property
     def request_count(self) -> int:
@@ -330,15 +323,9 @@ class _RequestLedger:
         *,
         error: "TransientError | None",
         assistant_message: AssistantMessage | None,
-        provider_billing: ProviderBilling | None = None,
     ) -> None:
         """Close the current request at the current monotonic time."""
-        self.record_ending_at(
-            time.monotonic(),
-            error=error,
-            assistant_message=assistant_message,
-            provider_billing=provider_billing,
-        )
+        self.record_ending_at(time.monotonic(), error=error, assistant_message=assistant_message)
 
     def record_ending_at(
         self,
@@ -346,14 +333,21 @@ class _RequestLedger:
         *,
         error: "TransientError | None",
         assistant_message: AssistantMessage | None,
-        provider_billing: ProviderBilling | None = None,
     ) -> None:
-        """Close the current request at an existing monotonic timestamp."""
+        """Close the current request at an existing monotonic timestamp.
+
+        Without a staged response, the record takes the noted billing and request id.
+        Both notes clear.
+        """
         staged = self._staged_response
         self._staged_response = None
         self._request_in_flight = False
+        provider_billing = (
+            staged.provider_billing if staged is not None else self._provider_billing_in_flight
+        )
+        noted_request_id = self._noted_request_id
         self._provider_billing_in_flight = None
-        provider_billing = staged.provider_billing if staged is not None else provider_billing
+        self._noted_request_id = None
         started_after_seconds = (
             self._request_started_at_monotonic_seconds - self._started_at_monotonic_seconds
         )
@@ -382,7 +376,7 @@ class _RequestLedger:
                 model_served=staged.identity.model_served if staged is not None else None,
                 response_id=staged.identity.response_id if staged is not None else None,
                 request_id=(
-                    staged.identity.request_id if staged is not None else self._noted_request_id
+                    staged.identity.request_id if staged is not None else noted_request_id
                 ),
             )
         )
@@ -408,10 +402,11 @@ class _RequestLedger:
             elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
         )
 
-    def freeze_with_cut_off(
-        self, provider_billing: ProviderBilling | None = None
-    ) -> tuple[RequestHistory, tuple[RequestProviderData, ...]]:
-        """Freeze the request history and append one cut-off record for an open request."""
+    def freeze_with_cut_off(self) -> tuple[RequestHistory, tuple[RequestProviderData, ...]]:
+        """Freeze the request history and append one cut-off record for an open request.
+
+        The cut-off record takes the noted billing.
+        """
         ended_at_monotonic_seconds = time.monotonic()
         cut_off_in_flight = self._request_in_flight and self._staged_response is None
         request_started_at_monotonic_seconds = self._request_started_at_monotonic_seconds
@@ -420,9 +415,7 @@ class _RequestLedger:
         request_provider_data = self.request_provider_data
         if not cut_off_in_flight:
             return request_history, request_provider_data
-        provider_billing = (
-            provider_billing if provider_billing is not None else self._provider_billing_in_flight
-        )
+        provider_billing = self._provider_billing_in_flight
         cut_off = CutOffRequestRecord(
             started_after_seconds=request_started_at_monotonic_seconds
             - self._started_at_monotonic_seconds,

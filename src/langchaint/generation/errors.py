@@ -21,7 +21,6 @@ from langchaint.generation.request_history import (
 
 if TYPE_CHECKING:
     from langchaint.adapter import RequestParams
-    from langchaint.billing.pricing import ProviderBilling
 
 
 class _GenerationErrorRecordBase(_InputOutcomeRecordBase):
@@ -336,17 +335,15 @@ def _terminal_generation_error(
     *,
     error_text: str,
     ledger: _RequestLedger,
-    provider_billing: "ProviderBilling | None",
     request_params: "RequestParams | None",
     stream_opened: bool,
 ) -> GenerationError:
     """Settle the failed request when the provider answered or the stream opened, then build the input's error.
 
-    `provider_billing` is the provider-reported billing of the failed request.
     `stream_opened` is true when the provider stream opened before the failure.
     """
     if request_failure_kind in _PROVIDER_ANSWERED_KINDS or stream_opened:
-        ledger.record(error=None, assistant_message=None, provider_billing=provider_billing)
+        ledger.record(error=None, assistant_message=None)
     return GenerationError(
         record=_terminal_error_record(
             request_failure_kind, error_text=error_text, request_history=ledger.freeze()

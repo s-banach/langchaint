@@ -689,7 +689,8 @@ def test_timed_out_error_appends_one_cut_off_request_with_live_usage() -> None:
     ledger = _RequestLedger(model="model", provider_name="provider")
     ledger.start_request()
     provider_billing = ProviderBilling(billing=_BILLING, usage_raw=ProviderUsage(billed_units=23))
-    failure = _timed_out_error(ledger, provider_billing)
+    ledger.note_provider_billing_in_flight(provider_billing)
+    failure = _timed_out_error(ledger)
     assert failure.record.kind == "timed_out_error"
     assert len(failure.request_history.records) == 1
     assert failure.request_history.records[0].kind == "cut_off"

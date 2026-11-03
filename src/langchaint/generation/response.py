@@ -6,7 +6,6 @@ from typing import Annotated, Generic, Literal, Self, TypeVar, override
 from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 
 from langchaint.adapter import RequestParams, ResponseOutcome
-from langchaint.billing.pricing import ProviderBilling
 from langchaint.billing.usage import Usage
 from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, final_text_index
 from langchaint.generation.errors import (
@@ -308,11 +307,9 @@ def _generation_outcome_from_response_outcome[OutputT](
     )
 
 
-def _timed_out_error(
-    ledger: _RequestLedger, provider_billing_in_flight: ProviderBilling | None = None
-) -> GenerationError:
+def _timed_out_error(ledger: _RequestLedger) -> GenerationError:
     """Build the expired deadline's failure with one normalized cut-off request."""
-    request_history, request_provider_data = ledger.freeze_with_cut_off(provider_billing_in_flight)
+    request_history, request_provider_data = ledger.freeze_with_cut_off()
     return GenerationError(
         record=PlainErrorRecord(kind="timed_out_error", request_history=request_history),
         request_params=None,

@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Final, NamedTuple, Protocol, overload
+from typing import Final, Protocol, overload
 
 from pydantic import BaseModel
 
@@ -17,7 +17,6 @@ from langchaint.adapter import (
     ResponseOutcome,
     ToolChoice,
 )
-from langchaint.billing.pricing import ProviderBilling
 from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.common.observed_operation import (
@@ -63,12 +62,6 @@ from langchaint.generation.response import (
 )
 from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
-
-
-class _StreamObservations(NamedTuple):
-    provider_billing: ProviderBilling | None
-    request_id: str | None
-    opened: bool
 
 
 class Unchanged:
@@ -758,12 +751,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             observer=self.observer,
         )
 
-    def _request_id_for_failure(
-        self, exc: Exception, observations: _StreamObservations
-    ) -> str | None:
-        request_id = self.adapter.request_id_from_error(exc)
-        return request_id if request_id is not None else observations.request_id
-
     async def _settle_failed_request(
         self,
         exc: Exception,
@@ -773,7 +760,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         assistant_message: AssistantMessage | None,
         ledger: _RequestLedger,
         request_params: RequestParams,
-        observations: _StreamObservations,
+        stream_opened: bool,
     ) -> None:
         """Record a failed request and wait before the next one, as its `RequestFailure` decides.
 
@@ -785,7 +772,9 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             GenerationError: The failure is not transient.
             Exception: `exc`, when `request_failure` is `None`.
         """
-        ledger.note_request_id(self._request_id_for_failure(exc, observations))
+        request_id = self.adapter.request_id_from_error(exc)
+        if request_id is not None:
+            ledger.note_request_id(request_id)
         if request_failure is None:
             raise exc
         if request_failure.kind != "transient":
@@ -793,14 +782,12 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                 request_failure.kind,
                 error_text=str(exc),
                 ledger=ledger,
-                provider_billing=observations.provider_billing,
                 request_params=request_params,
-                stream_opened=observations.opened,
+                stream_opened=stream_opened,
             ) from exc
         ledger.record(
             error=_transient_error_for(exc, str(exc), request_failure),
             assistant_message=assistant_message,
-            provider_billing=observations.provider_billing,
         )
         if not request_failure.pauses_quota and ledger.request_count < self.max_requests:
             await asyncio.sleep(
@@ -827,9 +814,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             deadline.suspend_until_admitted()
             admission = self.shared_backoff.admitted()
             assistant_message: AssistantMessage | None = None
-            observations = _StreamObservations(
-                provider_billing=None, request_id=None, opened=False
-            )
+            stream_opened = False
             request_failure: RequestFailure | None = None
             try:
                 async with admission:
@@ -837,20 +822,17 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                         deadline.resume_on_admission()
                         ledger.start_request()
                         adapter_stream = await self._bound_adapter.open_stream(request_params)
-                        observations = observations._replace(opened=True)
+                        stream_opened = True
                         try:
+                            request_id = adapter_stream.request_id()
+                            ledger.note_request_id(request_id)
                             async for _ in adapter_stream.items():
                                 pass
                             raw = await adapter_stream.final()
-                            observations = observations._replace(
-                                request_id=adapter_stream.request_id()
-                            )
                         except BaseException:
-                            observations = observations._replace(
-                                provider_billing=adapter_stream.provider_billing(),
-                                request_id=adapter_stream.request_id(),
+                            ledger.note_provider_billing_in_flight(
+                                adapter_stream.provider_billing()
                             )
-                            ledger.note_provider_billing_in_flight(observations.provider_billing)
                             raise
                         finally:
                             await _close_stream_quietly(
@@ -860,7 +842,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                                 ),
                             )
                         outcome = self._staged_interpretation(
-                            raw, request_id=observations.request_id, ledger=ledger
+                            raw, request_id=request_id, ledger=ledger
                         )
                         if outcome.kind == "provider_failed_transiently":
                             # Raise inside the try so the handler below records its `RequestFailure`.
@@ -884,7 +866,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                     assistant_message=assistant_message,
                     ledger=ledger,
                     request_params=request_params,
-                    observations=observations,
+                    stream_opened=stream_opened,
                 )
             else:
                 ledger.record(error=None, assistant_message=outcome.assistant_message)
@@ -988,9 +970,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             raise
         except Exception as escaped:
             if isinstance(escaped, TimeoutError) and timeout_scope.expired():
-                # The ledger retains billing that the interrupted stream reported.
-                # A settled request record clears this value to `None`.
-                raise _timed_out_error(ledger, ledger.provider_billing_in_flight) from None
+                raise _timed_out_error(ledger) from None
             raise _escaped_error(ledger, escaped) from escaped
 
     def _generation_started(

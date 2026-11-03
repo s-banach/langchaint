@@ -17,7 +17,6 @@ from langchaint.adapter import (
     ResponseOutcome,
     StreamItem,
 )
-from langchaint.billing.pricing import ProviderBilling
 from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import Message
 from langchaint.common.observed_operation import ObservedOperation
@@ -176,11 +175,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             # Cancellation during entry must also record abandonment here.
             self._state = "finished"
             self._exit_admission()
-            provider_billing_in_flight = self._provider_billing()
+            self._note_provider_billing_in_flight()
             if await self._close_timeout_scope(exc):
-                raise _timed_out_error(self._ledger, provider_billing_in_flight) from None
+                raise _timed_out_error(self._ledger) from None
             if isinstance(exc, asyncio.CancelledError):
-                self._abandon(provider_billing_in_flight)
+                self._abandon()
             raise
 
     async def __aexit__(
@@ -218,16 +217,16 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
 
     async def _close(self, exc: BaseException | None) -> None:
         self._state = "finished"
-        # Read before the close, which drops the stream that reports it.
-        provider_billing_in_flight = self._provider_billing()
+        # Note before the close, which drops the stream that reports it.
+        self._note_provider_billing_in_flight()
         timed_out = await self._close_timeout_scope(exc)
         try:
             await self._close_adapter_stream()
         finally:
             if not timed_out:
-                self._abandon(provider_billing_in_flight)
+                self._abandon()
         if timed_out:
-            raise _timed_out_error(self._ledger, provider_billing_in_flight) from None
+            raise _timed_out_error(self._ledger) from None
 
     async def _close_timeout_scope(self, exc: BaseException | None) -> bool:
         """Close the timeout scope and return whether it caused the current cancellation.
@@ -247,16 +246,16 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             return True
         return False
 
-    def _provider_billing(self) -> ProviderBilling | None:
-        if self._adapter_stream is None:
-            return None
-        return self._adapter_stream.provider_billing()
+    def _note_provider_billing_in_flight(self) -> None:
+        """Note the open stream's billing on the ledger. Without an open stream, do nothing."""
+        if self._adapter_stream is not None:
+            self._ledger.note_provider_billing_in_flight(self._adapter_stream.provider_billing())
 
-    def _abandon(self, provider_billing_in_flight: ProviderBilling | None) -> None:
-        """Record abandonment with the interrupted request's billing unless an outcome exists."""
+    def _abandon(self) -> None:
+        """Record abandonment with the interrupted request's noted billing unless an outcome exists."""
         if self._outcome is not None:
             return
-        request_history, _ = self._ledger.freeze_with_cut_off(provider_billing_in_flight)
+        request_history, _ = self._ledger.freeze_with_cut_off()
         self.abandoned = AbandonedStreamRecord(request_history=request_history)
         self._end_operation(self.abandoned)
 
@@ -357,7 +356,6 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                         request_failure.kind,
                         error_text=str(exc),
                         ledger=self._ledger,
-                        provider_billing=None,
                         request_params=request_params,
                         stream_opened=False,
                     ) from exc
@@ -435,15 +433,13 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         `stage` names the stream step that failed in the transient error text.
         """
         self._state = "finished"
-        provider_billing_in_flight = self._provider_billing()
-        self._ledger.note_provider_billing_in_flight(provider_billing_in_flight)
+        self._note_provider_billing_in_flight()
         request_failure = self._request_failure_exiting_admission(exc)
         if request_failure.kind != "transient":
             error = _terminal_generation_error(
                 request_failure.kind,
                 error_text=str(exc),
                 ledger=self._ledger,
-                provider_billing=provider_billing_in_flight,
                 request_params=self._request_params,
                 stream_opened=True,
             )
@@ -452,9 +448,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             wrapped = _transient_error_for(
                 exc, f"open stream failed during {stage}: {exc}", request_failure
             )
-            self._ledger.record(
-                error=wrapped, assistant_message=None, provider_billing=provider_billing_in_flight
-            )
+            self._ledger.record(error=wrapped, assistant_message=None)
             error = GenerationError(
                 record=PlainErrorRecord(
                     kind="retry_unavailable_error", request_history=self._ledger.freeze()

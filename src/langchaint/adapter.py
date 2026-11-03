@@ -27,7 +27,7 @@ from langchaint.common.messages import (
     StopReason,
     TextPart,
     ToolCall,
-    assistant_text,
+    final_text,
 )
 from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.tools import ToolSchema
@@ -431,7 +431,7 @@ def text_output(assistant_message: AssistantMessage) -> str | None:
     """
     if assistant_message.tool_calls:
         return None
-    return assistant_text(assistant_message).final_text or ""
+    return final_text(assistant_message) or ""
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -109,7 +109,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    assistant_text,
+    final_text,
 )
 from langchaint.tools import ToolSchema
 
@@ -1504,7 +1504,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         Every failure variant carries `assistant_message`.
         """
         validation_error: ValidationError | None = None
-        text = assistant_text(assistant_message).final_text
+        text = final_text(assistant_message)
         if text is not None:
             try:
                 output = self._output_type_adapter.validate_json(text)

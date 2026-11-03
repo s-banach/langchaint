@@ -11,7 +11,7 @@ The system prompt remains a binding parameter because providers place it outside
 
 import math
 from collections.abc import Sequence
-from typing import Annotated, Literal, NamedTuple, TypeIs
+from typing import Annotated, Literal, TypeIs
 
 from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter
 
@@ -232,26 +232,28 @@ class AssistantMessage(CheckedCopyModel):
         return tuple(part for part in self.content_parts if part.kind == "tool_call")
 
 
-class AssistantText(NamedTuple):
-    """Final text and newline-joined commentary selected from complete text parts."""
+def final_text_index(assistant_message: AssistantMessage) -> int | None:
+    """Return the `content_parts` index of the text part that gives output, or `None` when no part does.
 
-    final_text: str | None
-    commentary: str | None
-
-
-def assistant_text(assistant_message: AssistantMessage) -> AssistantText:
-    """Select final text and commentary from the ordered assistant content.
-
-    Args:
-        assistant_message: The completed assistant message.
+    The last text part gives output when the message has no tool calls.
+    Every other text part is commentary.
     """
-    texts = tuple(part.text for part in assistant_message.content_parts if part.kind == "text")
     if assistant_message.tool_calls:
-        return AssistantText(None, "\n".join(texts) if texts else None)
-    return AssistantText(
-        texts[-1] if texts else None,
-        "\n".join(texts[:-1]) if len(texts) > 1 else None,
+        return None
+    return max(
+        (i for i, x in enumerate(assistant_message.content_parts) if x.kind == "text"),
+        default=None,
     )
+
+
+def final_text(assistant_message: AssistantMessage) -> str | None:
+    """Return the text of the part at `final_text_index`, or `None` when no part gives output."""
+    final_index = final_text_index(assistant_message)
+    if final_index is None:
+        return None
+    part = assistant_message.content_parts[final_index]
+    assert part.kind == "text"
+    return part.text
 
 
 class ToolMessage(CheckedCopyModel):

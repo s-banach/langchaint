@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 from langchaint.adapter import RequestParams, ResponseOutcome
 from langchaint.billing.pricing import ProviderBilling
 from langchaint.billing.usage import Usage
-from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, assistant_text
+from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, final_text_index
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
     GenerationError,
@@ -76,7 +76,13 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
         An assistant message with application tool calls contributes every text part.
         Reasoning and other provider content remain in `assistant_message.content`.
         """
-        return assistant_text(self.assistant_message).commentary
+        final_index = final_text_index(self.assistant_message)
+        texts = [
+            x.text
+            for i, x in enumerate(self.assistant_message.content_parts)
+            if x.kind == "text" and i != final_index
+        ]
+        return "\n".join(texts) if texts else None
 
 
 class PlainGenerationRecord[OutputT](_GenerationRecordBase):

@@ -89,6 +89,7 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     UserMessage,
+    final_text_index,
 )
 from langchaint.openai.shared import (
     _DEFAULT_TIER,
@@ -326,29 +327,21 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
 
     The API requires the original item order for replay under store=False.
     Each `TextPart` becomes one assistant message item.
-    Without tool calls, the final text message uses phase `final_answer`.
+    The text message at `final_text_index` uses phase `final_answer`.
     All other text messages use phase `commentary`.
     Text and structured bindings use the same phase assignment.
     Each `ToolCall` becomes `function_call` keyed by `call_id`.
     `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
     The API validates another provider's unknown `type` key.
     """
-    parts = assistant_message.content_parts
-    final_text_index = (
-        max(
-            (index for index, part in enumerate(parts) if part.kind == "text"),
-            default=None,
-        )
-        if not assistant_message.tool_calls
-        else None
-    )
+    final_index = final_text_index(assistant_message)
     items: list[ResponseInputItemParam] = []
-    for index, part in enumerate(parts):
+    for index, part in enumerate(assistant_message.content_parts):
         if part.kind == "text":
             items.append({
                 "role": "assistant",
                 "content": part.text,
-                "phase": "final_answer" if index == final_text_index else "commentary",
+                "phase": "final_answer" if index == final_index else "commentary",
             })
         elif part.kind == "tool_call":
             function_call_item: ResponseFunctionToolCallParam = {

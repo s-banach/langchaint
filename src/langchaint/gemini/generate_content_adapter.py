@@ -64,7 +64,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    assistant_text,
+    final_text,
 )
 
 _PAUSE_STATUSES = frozenset({429, 503})
@@ -1632,7 +1632,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         Without validated output, a non-finished reason or MAX_TOKENS takes precedence over schema validation.
         """
         validation_error: ValidationError | None = None
-        text = assistant_text(finished_message.assistant_message).final_text
+        text = final_text(finished_message.assistant_message)
         if text is not None:
             try:
                 output = self._output_type_adapter.validate_json(text)

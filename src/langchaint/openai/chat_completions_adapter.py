@@ -81,7 +81,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     UserMessage,
-    assistant_text,
+    final_text,
 )
 from langchaint.openai.shared import (
     OpenAIPricingTable,
@@ -1091,7 +1091,7 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         assistant_message = finished_message.assistant_message
         if finished_message.message.refusal:
             return Refusal(assistant_message=assistant_message)
-        text = assistant_text(assistant_message).final_text
+        text = final_text(assistant_message)
         if text is not None:
             try:
                 output = self._response_format.model_validate_json(text)

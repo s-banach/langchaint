@@ -641,35 +641,41 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
 
 
 @pytest.mark.parametrize(
-    ("output_type", "parts", "expected_kind"),
+    ("output_type", "parts"),
     [
-        ("text", [], "plain"),
-        ("text", [_TOOL_CALL_OUTPUT_PART], "tool_call"),
-        ("text", [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART], "tool_call"),
-        ("json", [_TOOL_CALL_OUTPUT_PART], "tool_call"),
-        ("json", [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART], "tool_call"),
+        ("text", [_TOOL_CALL_OUTPUT_PART]),
+        ("text", [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART]),
+        ("json", [_TOOL_CALL_OUTPUT_PART]),
+        ("json", [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART]),
     ],
     ids=[
-        "text_without_parts",
         "text_tool_call_without_text",
         "text_tool_call_with_empty_text",
         "json_tool_call_without_text",
         "json_tool_call_with_invalid_json",
     ],
 )
-def test_output_without_text_matches_a_live_generation(
-    output_type: str, parts: list[JsonValue], expected_kind: str
+def test_tool_calls_without_output_match_a_live_generation(
+    output_type: str, parts: list[JsonValue]
 ) -> None:
     span = _generation_chat_span({
         "gen_ai.output.type": output_type,
         "gen_ai.output.messages": [{"role": "assistant", "parts": parts}],
     })
     record = generation_record_from_otel(span)
-    assert record.kind == expected_kind
-    if record.kind == "plain":
-        assert record.output == ""
+    assert record.kind == "tool_call"
     assert isinstance(record.assistant_message.content, tuple)
     assert len(record.assistant_message.content) == len(parts)
+
+
+def test_a_text_span_without_parts_reads_as_empty_output() -> None:
+    span = _generation_chat_span({
+        "gen_ai.output.type": "text",
+        "gen_ai.output.messages": [{"role": "assistant", "parts": []}],
+    })
+    record = generation_record_from_otel(span)
+    assert record.kind == "plain"
+    assert record.output == ""
 
 
 def test_generation_record_rejects_unsupported_output_type() -> None:

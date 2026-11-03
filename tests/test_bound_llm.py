@@ -50,7 +50,7 @@ from langchaint.adapter import (
     BoundAdapter,
     ContextWindowExceeded,
     EmptyAssistantMessage,
-    PlainResponse,
+    FinishedResponse,
     ProviderBilling,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
@@ -58,13 +58,11 @@ from langchaint.adapter import (
     RequestFailure,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
     SchemaViolation,
     StreamProtocolError,
-    ToolCallResponse,
     TransientError,
     UnexpectedResponse,
-    UsableResponse,
+    UnusableResponse,
 )
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
@@ -92,7 +90,7 @@ from tests.fake_adapter import (
     assert_the_first_open_runs_alone,
     billed,
     fast_shared_backoff,
-    plain_text_response,
+    finished_text_response,
 )
 from tests.helpers import (
     TEST_TIMEOUT_SECONDS,
@@ -236,7 +234,7 @@ class _FailingCloseStream(FakeStream):
 
 class _InterpretRaisesBoundAdapter(FakeBoundAdapter):
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+    def interpret(self, raw: BaseModel) -> FinishedResponse:
         raise RuntimeError("interpretation failed")
 
 
@@ -308,7 +306,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
         assert failed.assistant_message is None
         assert (failed.model_served, failed.response_id, failed.request_id) == (None, None, None)
         assert succeeded.error is None
-        assert succeeded.assistant_message == plain_text_response("ok").assistant_message
+        assert succeeded.assistant_message == finished_text_response("ok").assistant_message
         assert succeeded.model_served == "fake-model-served"
         assert succeeded.response_id == as_fake_raw(generation.raw).id
         assert succeeded.request_id == f"req-{as_fake_raw(generation.raw).id}"
@@ -516,14 +514,14 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_a_terminal_outcome_raises_without_retry(
     path: _GenerationPath,
-    outcome: ResponseOutcome[str],
+    outcome: UnusableResponse,
     kind: GenerationErrorKind,
     stop_reason: StopReason | None,
     error_text: str,
 ) -> None:
 
     async def scenario() -> None:
-        adapter = FakeAdapter(stream=FakeStream(outcome=outcome))
+        adapter = FakeAdapter(stream=FakeStream(interpretation=outcome))
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as caught:
             await _generate_through(path, bound_llm)
@@ -982,9 +980,9 @@ def _pin_covariance(
     return structured_with_tools
 
 
-class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
-    def __init__(self, outcome: ResponseOutcome[OutputT]) -> None:
-        self._outcome = outcome
+class _ScriptedBoundAdapter(BoundAdapter):
+    def __init__(self, finished_response: FinishedResponse) -> None:
+        self._finished_response = finished_response
         self.stream = FakeStream()
         self.open_count = 0
 
@@ -1001,8 +999,8 @@ class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
-        return self._outcome
+    def interpret(self, raw: BaseModel) -> FinishedResponse:
+        return self._finished_response
 
     @override
     def build_request_params(self, messages: Sequence[Message]) -> RequestParams:
@@ -1014,29 +1012,32 @@ class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
         return self.stream
 
 
-_TOOL_CALL_RESPONSE = ToolCallResponse(
+_TOOL_CALL_RESPONSE = FinishedResponse(
     assistant_message=AssistantMessage(content=(FAKE_TOOL_CALL,)),
     stop_reason="tool_call",
+    cannot_continue=None,
 )
 
-_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY = ToolCallResponse(
+_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY = FinishedResponse(
     assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
     stop_reason="tool_call",
+    cannot_continue=None,
 )
 
-_STRUCTURED_FINAL_RESPONSE = PlainResponse(
-    output=_Answer(value=7),
+_STRUCTURED_FINAL_RESPONSE = FinishedResponse(
     assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'),)),
     stop_reason="stop",
+    cannot_continue=None,
 )
 
 
 def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
-    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter[OutputT]
+    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter
 ) -> BoundLLM[OutputT, ToolManagerT]:
     return BoundLLM(
         adapter=bound_llm.adapter,
         bound_adapter=bound_adapter,
+        read_output=bound_llm._read_output,
         response_format=bound_llm.response_format,
         binding=bound_llm.binding,
         tool_manager=bound_llm.tool_manager,
@@ -1047,17 +1048,17 @@ def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | No
 
 
 def _structured_tool_bound_llm(
-    outcome: ResponseOutcome[_Answer],
+    finished_response: FinishedResponse,
 ) -> BoundLLM[_Answer, ToolManager]:
     """Supply structured output through a scripted adapter while preserving the binding."""
     bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
         response_format=_Answer, tools=ToolManager([])
     )
-    return _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(outcome))
+    return _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(finished_response))
 
 
 @pytest.mark.parametrize(
-    ("outcome", "kind"),
+    ("finished_response", "kind"),
     [
         (_STRUCTURED_FINAL_RESPONSE, "plain"),
         (_TOOL_CALL_RESPONSE, "tool_call"),
@@ -1065,21 +1066,21 @@ def _structured_tool_bound_llm(
     ids=["plain", "tool_call"],
 )
 def test_structured_tool_bound_generate_one_splits_on_tool_calls(
-    outcome: UsableResponse[_Answer], kind: str
+    finished_response: FinishedResponse, kind: str
 ) -> None:
 
     async def scenario() -> None:
-        result = await _structured_tool_bound_llm(outcome).generate_one("hi")
+        result = await _structured_tool_bound_llm(finished_response).generate_one("hi")
         assert result.kind == kind
-        assert result.assistant_message is outcome.assistant_message
-        if result.kind == "plain" and outcome.kind == "plain_response":
-            assert result.output is outcome.output
+        assert result.assistant_message is finished_response.assistant_message
+        if result.kind == "plain":
+            assert result.output == _Answer(value=7)
 
     run_with_timeout(scenario())
 
 
 @pytest.mark.parametrize(
-    ("outcome", "kind"),
+    ("finished_response", "kind"),
     [
         (_STRUCTURED_FINAL_RESPONSE, "plain"),
         (_TOOL_CALL_RESPONSE, "tool_call"),
@@ -1088,11 +1089,11 @@ def test_structured_tool_bound_generate_one_splits_on_tool_calls(
     ids=["plain", "tool_call", "tool_call_with_commentary"],
 )
 def test_generate_many_records_restores_a_structured_record(
-    tmp_path: Path, outcome: UsableResponse[_Answer], kind: str
+    tmp_path: Path, finished_response: FinishedResponse, kind: str
 ) -> None:
 
     async def scenario() -> None:
-        bound_llm = _structured_tool_bound_llm(outcome)
+        bound_llm = _structured_tool_bound_llm(finished_response)
         structured_adapter = bound_llm._bound_adapter
         assert isinstance(structured_adapter, _ScriptedBoundAdapter)
         resume_path = tmp_path / "records.jsonl"
@@ -1102,9 +1103,9 @@ def test_generate_many_records_restores_a_structured_record(
         (restored_record,) = restored
         assert generated_record.kind == kind
         assert restored_record.kind == kind
-        assert restored_record.assistant_message == outcome.assistant_message
-        if restored_record.kind == "plain" and outcome.kind == "plain_response":
-            assert restored_record.output == outcome.output
+        assert restored_record.assistant_message == finished_response.assistant_message
+        if restored_record.kind == "plain":
+            assert restored_record.output == _Answer(value=7)
         assert structured_adapter.open_count == 1
 
     run_with_timeout(scenario())
@@ -1116,14 +1117,13 @@ def test_generate_many_records_validates_a_record_line_before_appending_it(
     resume_path = tmp_path / "records.jsonl"
 
     async def scenario() -> None:
-        answer = _NonRoundTrippableAnswer(value=1)
-        outcome = PlainResponse(
-            output=answer,
-            assistant_message=AssistantMessage(content=(TextPart(text=answer.model_dump_json()),)),
+        finished_response = FinishedResponse(
+            assistant_message=AssistantMessage(content=(TextPart(text='{"value":1}'),)),
             stop_reason="stop",
+            cannot_continue=None,
         )
         bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
-        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(outcome))
+        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(finished_response))
         with pytest.raises(ValueError, match="Input should be a valid integer"):
             await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         header_json, record_lines_json = resume_path.read_bytes().split(b"\n", 1)
@@ -2083,8 +2083,8 @@ def test_a_block_left_before_the_outcome_sets_abandoned_with_the_first_item_time
 @pytest.mark.parametrize(
     ("stream", "request_failure"),
     [
-        (FakeStream(outcome=REFUSAL), terminal("unknown_exception")),
-        (FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY), terminal("unknown_exception")),
+        (FakeStream(interpretation=REFUSAL), terminal("unknown_exception")),
+        (FakeStream(interpretation=_PROVIDER_FAILED_TRANSIENTLY), terminal("unknown_exception")),
         (_FailsAfterFirstItemStream(), transient(pauses_quota=False)),
         (_UnnamedItemErrorStream(), terminal("unknown_exception")),
         (_ProtocolErrorStream(), terminal("unknown_exception")),
@@ -2180,7 +2180,7 @@ def test_a_streamed_response_reporting_a_quota_pause_pauses_the_quota() -> None:
             assistant_message=REJECTED_ASSISTANT_MESSAGE,
         )
         bound_llm = LLM(
-            FakeAdapter(stream=FakeStream(outcome=outcome)), shared_backoff=shared_backoff
+            FakeAdapter(stream=FakeStream(interpretation=outcome)), shared_backoff=shared_backoff
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
@@ -2462,7 +2462,7 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
 def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unavailable() -> None:
 
     async def scenario() -> None:
-        adapter = FakeAdapter(stream=FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY))
+        adapter = FakeAdapter(stream=FakeStream(interpretation=_PROVIDER_FAILED_TRANSIENTLY))
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as retry_unavailable:
@@ -2679,8 +2679,8 @@ def test_stream_final_is_idempotent() -> None:
 @pytest.mark.parametrize(
     "stream",
     [
-        FakeStream(outcome=REFUSAL),
-        FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY),
+        FakeStream(interpretation=REFUSAL),
+        FakeStream(interpretation=_PROVIDER_FAILED_TRANSIENTLY),
         _ProtocolErrorStream(),
         _FinalRaisesStream(),
     ],

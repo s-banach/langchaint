@@ -1,7 +1,6 @@
 """Implement Gemini `generateContent` through the google-genai SDK."""
 
 import json
-from abc import ABC
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,29 +19,21 @@ from langchaint.adapter import (
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyAssistantMessage,
-    MaxCompletionTokensExceeded,
-    PlainResponse,
+    FinishedResponse,
     ReasoningDelta,
     Refusal,
     RejectedMessages,
     RequestFailure,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
-    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
-    ToolCallResponse,
     ToolChoice,
-    UnexpectedResponse,
     _RejectedMessagesError,
     narrowed_request_params,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
-    text_response,
-    validated_final_text,
 )
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -116,10 +107,7 @@ _REFUSAL_FINISH_REASONS = frozenset({
 _FINISHED_FINISH_REASONS = (
     frozenset({types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}) | _REFUSAL_FINISH_REASONS
 )
-"""The finish reasons langchaint can read a finished assistant message from.
-
-All other values produce `UnexpectedResponse` for a structured binding.
-"""
+"""The finish reasons langchaint can read a finished assistant message from; langchaint cannot continue from others."""
 
 _SUPPORTED_PROVIDER_EXECUTED_TOOL_FIELDS = frozenset({
     "code_execution",
@@ -1117,7 +1105,7 @@ class GeminiGenerateContentAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1127,17 +1115,18 @@ class GeminiGenerateContentAdapter(Adapter):
         config, provider_executed_tool_fields = self._bound_config(
             binding, response_json_schema=None
         )
-        return _BoundGeminiText(
+        return _BoundGemini(
             adapter=self,
             config=config,
             provider_executed_tool_fields=provider_executed_tool_fields,
         )
 
     @override
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind for structured output validated into response_format without I/O.
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
+        """Bind for structured output in response_format without I/O.
+
+        google-genai 2.34.0 parses concatenated non-thought text, and langchaint validates only the final text part.
+        Source: https://github.com/googleapis/python-genai/blob/v2.34.0/google/genai/types.py
 
         Raises:
             pydantic.ValidationError: A provider-executed tool is invalid.
@@ -1148,11 +1137,10 @@ class GeminiGenerateContentAdapter(Adapter):
         config, provider_executed_tool_fields = self._bound_config(
             binding, response_json_schema=TypeAdapter(response_format).json_schema()
         )
-        return _BoundGeminiStructured(
+        return _BoundGemini(
             adapter=self,
             config=config,
             provider_executed_tool_fields=provider_executed_tool_fields,
-            response_format=response_format,
         )
 
     @override
@@ -1409,50 +1397,30 @@ def _as_response(raw: BaseModel) -> types.GenerateContentResponse:
     return raw
 
 
-@dataclass(frozen=True, kw_only=True)
-class _FinishedMessage:
-    """A candidate with an assistant message: its finish reason and its converted assistant message."""
-
-    finish_reason: types.FinishReason
-    assistant_message: AssistantMessage
-
-
-def _finished_message_or_refusal(
-    response: types.GenerateContentResponse,
-) -> _FinishedMessage | Refusal:
-    """Read the first candidate as a finished assistant message, or a blocked prompt as a refusal.
-
-    `response` is assembled by a `_GeminiStream` whose `items` finished, so a finish_reason or a block_reason arrived.
-    A response without candidates received neither parts nor a finish_reason, so its prompt was blocked.
-    It becomes Refusal with an assistant message without parts.
-    """
-    candidates = response.candidates
-    if not candidates:
-        return Refusal(assistant_message=AssistantMessage(content=()))
-    candidate = candidates[0]
-    # Gemini returns no candidates for a blocked prompt, so a stream with a candidate ended with a finish_reason.
-    # Source: https://aistudio.google.com/api-reference/generate-content, read 2026-11-02.
-    assert candidate.finish_reason is not None
-    return _FinishedMessage(
-        finish_reason=candidate.finish_reason,
-        assistant_message=_assistant_message_from(candidate.content),
-    )
-
-
-def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
+def _normalized_stop_reason(
+    finish_reason: types.FinishReason, assistant_message: AssistantMessage
+) -> StopReason:
     """Map the finish reason to the neutral vocabulary."""
-    finish_reason = finished_message.finish_reason
     if finish_reason == types.FinishReason.MAX_TOKENS:
         return "max_completion_tokens"
     if finish_reason in _REFUSAL_FINISH_REASONS:
         return "refusal"
     if finish_reason == types.FinishReason.STOP:
-        return "tool_call" if finished_message.assistant_message.tool_calls else "stop"
+        return "tool_call" if assistant_message.tool_calls else "stop"
     return "other"
 
 
-class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
-    """What both gemini bindings share: the request path, and what a response says about itself."""
+def _cannot_continue(finish_reason: types.FinishReason) -> str | None:
+    """Return the error text for a finish reason outside `_FINISHED_FINISH_REASONS`, or `None` for any other."""
+    if finish_reason in _FINISHED_FINISH_REASONS:
+        return None
+    return (
+        f"gemini returned finish_reason {finish_reason.value!r}, which langchaint cannot continue"
+    )
+
+
+class _BoundGemini(BoundAdapter):
+    """A Gemini adapter bound to a frozen prefix."""
 
     def __init__(
         self,
@@ -1535,92 +1503,28 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
             first_chunk=first_chunk,
         )
 
-
-class _BoundGeminiText(_BoundGemini[str]):
-    """Text-bound adapter: `text_response` builds each usable response."""
-
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message through `text_response`.
+    def interpret(self, raw: BaseModel) -> FinishedResponse | Refusal:
+        """Read the first candidate, or a blocked prompt as `Refusal`.
 
-        Every finished assistant message returns `text_response`; stop_reason reports refusal or truncation.
+        The stream that assembled `raw` finished, so a finish_reason or a block_reason arrived.
+        A response without candidates received neither parts nor a finish_reason, so its prompt was blocked.
+        It becomes Refusal with an assistant message without parts.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
-        finished_message = _finished_message_or_refusal(_as_response(raw))
-        if isinstance(finished_message, Refusal):
-            return finished_message
-        return text_response(
-            finished_message.assistant_message, _normalized_stop_reason(finished_message)
+        candidates = _as_response(raw).candidates
+        if not candidates:
+            return Refusal(assistant_message=AssistantMessage(content=()))
+        candidate = candidates[0]
+        # Gemini returns no candidates for a blocked prompt, so a stream with a candidate ended with a finish_reason.
+        # Source: https://aistudio.google.com/api-reference/generate-content, read 2026-11-02.
+        finish_reason = candidate.finish_reason
+        assert finish_reason is not None
+        assistant_message = _assistant_message_from(candidate.content)
+        return FinishedResponse(
+            assistant_message=assistant_message,
+            stop_reason=_normalized_stop_reason(finish_reason, assistant_message),
+            cannot_continue=_cannot_continue(finish_reason),
         )
-
-
-class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT]):
-    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
-
-    def __init__(
-        self,
-        *,
-        adapter: GeminiGenerateContentAdapter,
-        config: types.GenerateContentConfig,
-        provider_executed_tool_fields: frozenset[str],
-        response_format: type[ModelT],
-    ) -> None:
-        super().__init__(
-            adapter=adapter,
-            config=config,
-            provider_executed_tool_fields=provider_executed_tool_fields,
-        )
-        self._response_format = response_format
-
-    def _parsed_outcome(self, finished_message: _FinishedMessage) -> ResponseOutcome[ModelT]:
-        """Validate the text into the instance, report tool calls as `ToolCallResponse`, or report why neither exists.
-
-        Local validation preserves the response and rejected text.
-        Google-genai 2.33.0 parses concatenated non-thought text; this adapter validates the final complete text part.
-        Source: https://github.com/googleapis/python-genai/blob/v2.33.0/google/genai/types.py
-        Without validated output, a non-finished reason or MAX_TOKENS takes precedence over schema validation.
-        """
-        assistant_message = finished_message.assistant_message
-        validated = validated_final_text(assistant_message, self._response_format)
-        if isinstance(validated, BaseModel):
-            return PlainResponse(
-                output=validated,
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(finished_message),
-            )
-        finish_reason = finished_message.finish_reason
-        if finish_reason not in _FINISHED_FINISH_REASONS:
-            return UnexpectedResponse(
-                error_text=f"gemini returned finish_reason {finish_reason.value!r}, "
-                f"which langchaint cannot continue",
-                assistant_message=assistant_message,
-            )
-        if assistant_message.tool_calls:
-            return ToolCallResponse(
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(finished_message),
-            )
-        if finish_reason in _REFUSAL_FINISH_REASONS:
-            return Refusal(assistant_message=assistant_message)
-        if finish_reason == types.FinishReason.MAX_TOKENS:
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        if isinstance(validated, ValidationError):
-            return SchemaViolation(
-                validation_error_json=validated.json(include_url=False),
-                assistant_message=assistant_message,
-            )
-        return EmptyAssistantMessage(assistant_message=assistant_message)
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Validate the assistant message's text into the instance, or report why the response produced none.
-
-        Raises:
-            TypeError: raw is not a genai GenerateContentResponse.
-        """
-        finished_message = _finished_message_or_refusal(_as_response(raw))
-        if isinstance(finished_message, Refusal):
-            return finished_message
-        return self._parsed_outcome(finished_message)

@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import ClassVar, Literal, NamedTuple
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -27,7 +27,6 @@ from langchaint.common.messages import (
     StopReason,
     TextPart,
     ToolCall,
-    final_text,
 )
 from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.tools import ToolSchema
@@ -432,47 +431,6 @@ type UsableResponse[OutputT] = PlainResponse[OutputT] | ToolCallResponse
 """Every way reading a response can end when its assistant message is usable."""
 
 
-def text_response(
-    assistant_message: AssistantMessage, stop_reason: StopReason
-) -> UsableResponse[str]:
-    """Return a text binding's response for `assistant_message`.
-
-    A message with application tool calls gives `ToolCallResponse`.
-    Any other message gives `PlainResponse` whose output is the final text, or `""` without a text part.
-
-    Args:
-        assistant_message: The assistant message read from one response.
-        stop_reason: The response's normalized stop reason.
-    """
-    if assistant_message.tool_calls:
-        return ToolCallResponse(assistant_message=assistant_message, stop_reason=stop_reason)
-    return PlainResponse(
-        output=final_text(assistant_message) or "",
-        assistant_message=assistant_message,
-        stop_reason=stop_reason,
-    )
-
-
-def validated_final_text[ModelT: BaseModel](
-    assistant_message: AssistantMessage, response_format: type[ModelT]
-) -> ModelT | ValidationError | None:
-    """Validate the text at `final_text_index` as `response_format` JSON.
-
-    The result is the `ValidationError` when the text does not validate, and `None` when no text part gives output.
-
-    Args:
-        assistant_message: The assistant message read from one response.
-        response_format: The structured binding's output type.
-    """
-    text = final_text(assistant_message)
-    if text is None:
-        return None
-    try:
-        return response_format.model_validate_json(text)
-    except ValidationError as validation_error:
-        return validation_error
-
-
 @dataclass(frozen=True, kw_only=True)
 class _UnusableResponseBase:
     """The base of every `UnusableResponse` variant, with the response's assistant message."""
@@ -482,14 +440,14 @@ class _UnusableResponseBase:
 
 @dataclass(frozen=True, kw_only=True)
 class Refusal(_UnusableResponseBase):
-    """A completed response that a refusal ended before it produced output."""
+    """A completed response that a refusal ended at its final tool call, which may be cut off, or without output."""
 
     kind: Literal["refusal"] = "refusal"
 
 
 @dataclass(frozen=True, kw_only=True)
 class MaxCompletionTokensExceeded(_UnusableResponseBase):
-    """A completed 200 that reached the token cap before its JSON closed, or at a tool call that may be incomplete."""
+    """A completed 200 that reached its token limit at its final tool call, which may be cut off, or without output."""
 
     kind: Literal["max_completion_tokens_exceeded"] = "max_completion_tokens_exceeded"
 
@@ -534,7 +492,7 @@ class ProviderFailedTerminally(_UnusableResponseBase):
 
 @dataclass(frozen=True, kw_only=True)
 class EmptyAssistantMessage(_UnusableResponseBase):
-    """A finished assistant message with neither a `response_format` instance nor a ToolCall.
+    """A finished assistant message with neither output nor a ToolCall.
 
     The retry loop records the request and raises `GenerationError` without retrying.
     A retry would request a new sample.
@@ -670,6 +628,20 @@ type ResponseOutcome[OutputT] = UsableResponse[OutputT] | UnusableResponse
 """Every way reading one response can end: a usable response, or the reason it is not usable."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class FinishedResponse:
+    """A response the provider finished, as `BoundAdapter.interpret` reads it before the binding reads output.
+
+    `cannot_continue` is the error text for a response langchaint cannot continue from, such as one with an unknown
+    provider stop reason, and `None` for any other.
+    """
+
+    assistant_message: AssistantMessage
+    stop_reason: StopReason
+    cannot_continue: str | None
+    kind: Literal["finished_response"] = "finished_response"
+
+
 class AdapterStream(ABC):
     """One open stream, backed by the SDK's stream manager."""
 
@@ -715,7 +687,7 @@ class AdapterStream(ABC):
         ...
 
 
-class BoundAdapter[OutputT](ABC):
+class BoundAdapter(ABC):
     """One adapter bound to a frozen prefix."""
 
     @abstractmethod
@@ -760,8 +732,8 @@ class BoundAdapter[OutputT](ABC):
         ...
 
     @abstractmethod
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
-        """Return a `UsableResponse` or an `UnusableResponse`.
+    def interpret(self, raw: BaseModel) -> FinishedResponse | UnusableResponse:
+        """Return what the response says about itself, or the reason it is unusable.
 
         Args:
             raw: The provider SDK response.
@@ -866,11 +838,10 @@ class Adapter(ABC):
         ...
 
     @abstractmethod
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
-        `text_response` gives each usable response.
 
         Args:
             binding: The provider-neutral binding.
@@ -881,16 +852,12 @@ class Adapter(ABC):
         ...
 
     @abstractmethod
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind structured output parsed into `response_format`.
-
-        An assistant message with application tool calls gives `ToolCallResponse`.
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
+        """Bind for structured output in `response_format`.
 
         Args:
             binding: The provider-neutral binding.
-            response_format: The pydantic model used to validate structured output.
+            response_format: The pydantic model whose JSON schema the request asks for.
 
         Raises:
             ValueError: `binding` contains unsupported values.
@@ -938,6 +905,7 @@ __all__ = [
     "BoundAdapter",
     "ContextWindowExceeded",
     "EmptyAssistantMessage",
+    "FinishedResponse",
     "MaxCompletionTokensExceeded",
     "PlainResponse",
     "ProviderBilling",
@@ -972,7 +940,5 @@ __all__ = [
     "require_stated_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
-    "text_response",
-    "validated_final_text",
     "validated_provider_executed_tool_types",
 ]

@@ -1,6 +1,7 @@
 import json
 import math
 from collections.abc import Callable
+from functools import partial
 from typing import Literal, override
 
 import pytest
@@ -33,10 +34,16 @@ from langchaint import (
     Usage,
     to_tables,
 )
-from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity
-from langchaint.common.messages import final_text
+from langchaint.adapter import (
+    FinishedResponse,
+    ProviderBilling,
+    RequestParams,
+    ResponseIdentity,
+    _UnusableResponseBase,
+)
+from langchaint.common.messages import StopReason, final_text
 from langchaint.generation.request_history import _less_than_or_ulp_close, _RequestLedger
-from langchaint.generation.response import _timed_out_error
+from langchaint.generation.response import _timed_out_error, response_outcome, structured_output
 from tests.helpers import StubRaw
 
 
@@ -732,3 +739,104 @@ def test_interruption_after_a_staged_response_records_no_cut_off_request() -> No
     assert len(failure.request_history.records) == 1
     assert failure.request_history.records[0].kind == "settled"
     assert failure.request_provider_data[0].raw is raw
+
+
+class _ReportAlsoUnusableResponseBase(Report, _UnusableResponseBase):
+    """A caller's model that inherits the base of every `UnusableResponse` variant."""
+
+    assistant_message: AssistantMessage = AssistantMessage(content=())
+
+
+_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": 1}')
+_JSON = TextPart(text='{"value": 1}')
+_PROSE = TextPart(text="Checking.")
+
+
+@pytest.mark.parametrize(
+    ("content", "stop_reason", "cannot_continue", "expected_kind"),
+    [
+        ((_JSON, _CALL), "tool_call", "pause_turn", "unexpected_response"),
+        ((_PROSE, _CALL), "max_completion_tokens", None, "max_completion_tokens_exceeded"),
+        ((_JSON, _CALL), "refusal", None, "refusal"),
+        ((_CALL, _PROSE), "max_completion_tokens", None, "tool_call_response"),
+        ((_JSON,), "refusal", None, "plain_response"),
+        ((_PROSE,), "refusal", None, "refusal"),
+        ((_PROSE,), "max_completion_tokens", None, "max_completion_tokens_exceeded"),
+        ((_PROSE,), "stop", None, "schema_violation"),
+        ((), "stop", None, "empty_assistant_message"),
+    ],
+    ids=[
+        "cannot_continue_beats_everything",
+        "truncation_at_a_final_tool_call",
+        "refusal_at_a_final_tool_call",
+        "truncation_after_a_complete_tool_call",
+        "valid_json_beats_a_refusal_stop",
+        "refusal_explains_invalid_json",
+        "truncation_explains_invalid_json",
+        "invalid_json",
+        "no_text",
+    ],
+)
+def test_response_outcome_applies_the_first_matching_rule(
+    content: tuple[TextPart | ToolCall, ...],
+    stop_reason: StopReason,
+    cannot_continue: str | None,
+    expected_kind: str,
+) -> None:
+    finished_response = FinishedResponse(
+        assistant_message=AssistantMessage(content=content),
+        stop_reason=stop_reason,
+        cannot_continue=cannot_continue,
+    )
+    outcome = response_outcome(
+        finished_response, partial(structured_output, response_format=Report)
+    )
+    assert outcome.kind == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("content", "stop_reason", "expected_kind"),
+    [
+        ((_PROSE,), "max_completion_tokens", "plain_response"),
+        ((), "max_completion_tokens", "max_completion_tokens_exceeded"),
+        ((), "stop", "empty_assistant_message"),
+    ],
+    ids=["truncated_text_is_output", "truncation_without_text", "no_text"],
+)
+def test_a_text_binding_without_a_text_part_has_no_output(
+    content: tuple[TextPart, ...], stop_reason: StopReason, expected_kind: str
+) -> None:
+    finished_response = FinishedResponse(
+        assistant_message=AssistantMessage(content=content),
+        stop_reason=stop_reason,
+        cannot_continue=None,
+    )
+    assert response_outcome(finished_response, final_text).kind == expected_kind
+
+
+def test_a_schema_violation_carries_pydantic_errors_without_urls() -> None:
+    finished_response = FinishedResponse(
+        assistant_message=AssistantMessage(content=(TextPart(text='{"value": "seven"}'),)),
+        stop_reason="stop",
+        cannot_continue=None,
+    )
+    outcome = response_outcome(
+        finished_response, partial(structured_output, response_format=Report)
+    )
+    assert outcome.kind == "schema_violation"
+    assert "value" in outcome.validation_error_json
+    assert "https://" not in outcome.validation_error_json
+
+
+def test_output_that_inherits_the_unusable_response_base_is_still_output() -> None:
+    finished_response = FinishedResponse(
+        assistant_message=AssistantMessage(content=(_JSON,)),
+        stop_reason="stop",
+        cannot_continue=None,
+    )
+    outcome = response_outcome(
+        finished_response,
+        partial(structured_output, response_format=_ReportAlsoUnusableResponseBase),
+    )
+    assert outcome.kind == "plain_response"
+    assert outcome.output == _ReportAlsoUnusableResponseBase(value=1)

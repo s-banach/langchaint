@@ -54,6 +54,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     Binding,
+    BoundAdapter,
     ProviderBilling,
     RejectedMessages,
     RequestFailure,
@@ -79,7 +80,6 @@ from langchaint.anthropic.messages_adapter import (
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
-    _BoundAnthropicStructured,
     _extra_body_with_temperature,
     _wire_messages,
     _wire_tool_choice,
@@ -90,7 +90,13 @@ from langchaint.anthropic.messages_adapter import (
 )
 from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
-from tests.helpers import run_with_timeout, terminal, transient
+from tests.helpers import (
+    run_with_timeout,
+    structured_outcome,
+    terminal,
+    text_outcome,
+    transient,
+)
 
 
 def _billing_from_sdk_usage(
@@ -470,28 +476,6 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
         assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == (
             _CACHE_CONTROL_1H
         )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("end_turn", "stop"),
-        ("max_tokens", "max_completion_tokens"),
-        ("refusal", "refusal"),
-        ("model_context_window_exceeded", "context_window_exceeded"),
-        ("pause_turn", "other"),
-    ],
-)
-def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
-    message = _message_snapshot(raw, [at.TextBlock(type="text", text="partial text")])
-    outcome = (
-        _adapter()
-        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
-        .interpret(message)
-    )
-    assert outcome.kind == "plain_response"
-    assert outcome.stop_reason == expected
-    assert outcome.output == "partial text"
 
 
 def _message_with_content(
@@ -1561,19 +1545,16 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
+def _structured_bound() -> BoundAdapter:
     """Build a structured-bound adapter over a keyless client. No request is sent."""
-    adapter = _adapter()
-    precomputed_fields = adapter._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
-    )
-    return _BoundAnthropicStructured(
-        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
+    return _adapter().bind_structured(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False),
+        _StructuredReport,
     )
 
 
 def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport]:
-    return _structured_bound()._parsed_outcome(message, _assistant_message_from(message))
+    return structured_outcome(_structured_bound(), message, _StructuredReport)
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1729,21 +1710,12 @@ def test_a_structured_tool_call_message_without_text_is_a_tool_call_response() -
     assert outcome.kind == "tool_call_response"
 
 
-@pytest.mark.parametrize(
-    ("text", "structured"),
-    [
-        pytest.param("let me look", False, id="text_after_prose"),
-        pytest.param(None, True, id="structured_alone"),
-        pytest.param(_REPORT_JSON, True, id="structured_after_valid_text"),
-    ],
-)
-def test_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(
-    text: str | None, *, structured: bool
-) -> None:
+@pytest.mark.parametrize("text", ["let me look", None, _REPORT_JSON])
+def test_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(text: str | None) -> None:
     """The SDK can parse a partial tool input into a complete-looking object."""
     message = _structured_message(text, stop_reason="max_tokens", tool_use=True)
-    bound = _structured_bound() if structured else _adapter().bind_text(_UNSET_BINDING)
-    assert bound.interpret(message).kind == "max_completion_tokens_exceeded"
+    outcome = text_outcome(_adapter().bind_text(_UNSET_BINDING), message)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_an_unexpected_structured_response_names_the_stop_reason() -> None:

@@ -77,6 +77,7 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.messages import final_text
 from langchaint.conformance import AdapterConformance
 from langchaint.openai import (
     OpenAIPricingTable,
@@ -87,8 +88,6 @@ from langchaint.openai import (
 from langchaint.openai.responses_adapter import (
     _assistant_items,
     _assistant_message_from,
-    _BoundOpenAIResponsesStructured,
-    _BoundOpenAIResponsesText,
     _OpenAIResponsesRequestParams,
     _OpenAIResponsesStream,
     _wire_input,
@@ -103,7 +102,9 @@ from tests.helpers import (
     openai_sdk_errors_and_request_failures,
     run_with_timeout,
     status_error,
+    structured_outcome,
     terminal,
+    text_outcome,
     transient,
 )
 
@@ -380,18 +381,9 @@ _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
 }
 
 
-def _incomplete_response(reason: str) -> OpenAIResponse:
-    return _response(
-        usage=None,
-        status="incomplete",
-        incomplete_details=IncompleteDetails.model_construct(reason=reason),
-    )
-
-
 @pytest.mark.parametrize(
     ("response", "expected", "expected_output"),
     [
-        (_response(usage=None), "stop", "hey"),
         (
             _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]),
             "tool_call",
@@ -407,30 +399,16 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
             "refusal",
             None,
         ),
-        (_incomplete_response("max_output_tokens"), "max_completion_tokens", "hey"),
-        (_incomplete_response("content_filter"), "refusal", "hey"),
-        (_incomplete_response("max_messages"), "other", "hey"),
     ],
-    ids=[
-        "completed",
-        "function_call_item",
-        "refusal_block",
-        "refusal_block_beside_a_function_call",
-        "incomplete_max_output_tokens",
-        "incomplete_content_filter",
-        "incomplete_max_messages",
-    ],
+    ids=["function_call_item", "refusal_block", "refusal_block_beside_a_function_call"],
 )
-def test_stop_reason_mapping(
+def test_a_completed_response_derives_its_stop_reason_from_its_items(
     response: OpenAIResponse, expected: StopReason, expected_output: str | None
 ) -> None:
-    outcome = _text_bound().interpret(response)
-    if expected_output is None:
-        assert outcome.kind == "tool_call_response"
-        assert outcome.stop_reason == expected
-    else:
-        plain = _assert_plain(outcome)
-        assert (plain.output, plain.stop_reason) == (expected_output, expected)
+    interpretation = _text_bound().interpret(response)
+    assert interpretation.kind == "finished_response"
+    assert interpretation.stop_reason == expected
+    assert final_text(interpretation.assistant_message) == expected_output
 
 
 def test_every_output_item_replays_as_one_input_item_in_position() -> None:
@@ -980,8 +958,8 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         )
 
 
-def _request_body_sent[OutputT](
-    bind: Callable[[OpenAIResponsesAdapter], BoundAdapter[OutputT]],
+def _request_body_sent(
+    bind: Callable[[OpenAIResponsesAdapter], BoundAdapter],
 ) -> object:
     bodies: list[bytes] = []
 
@@ -1008,7 +986,7 @@ def _request_body_sent[OutputT](
 def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_reference() -> None:
     extra_body = {"safety_identifier": "user-7"}
 
-    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter[str]:
+    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter:
         bound = adapter.bind_text(
             _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
         )
@@ -1422,7 +1400,7 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         async for _item in adapter_stream.items():
             pass
         assert await adapter_stream.final() is leniently_built
-        usable = _assert_plain(_text_bound().interpret(leniently_built))
+        usable = _assert_plain(text_outcome(_text_bound(), leniently_built))
         assert usable.output == "hey"
         assert usable.stop_reason == "max_completion_tokens"
 
@@ -1460,18 +1438,11 @@ def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -
     run_with_timeout(scenario())
 
 
-def _structured_bound() -> _BoundOpenAIResponsesStructured[_StructuredReport]:
-    adapter = _adapter()
-    precomputed_fields = adapter._precompute_fields(
-        _binding(automatic_cache_breakpoints=False, system_prompt="sys")
-    )
-    return _BoundOpenAIResponsesStructured(
-        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
-    )
-
-
 def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport]:
-    return _structured_bound()._parsed_outcome(response, _assistant_message_from(response))
+    bound = _adapter().bind_structured(
+        _binding(automatic_cache_breakpoints=False, system_prompt="sys"), _StructuredReport
+    )
+    return structured_outcome(bound, response, _StructuredReport)
 
 
 class _CapturedAnswer(BaseModel):
@@ -1483,14 +1454,11 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
     """Earlier commentary and a schema-valid provisional answer precede the final answer."""
     path = Path(__file__).parent / "fixtures" / "responses_structured" / f"{name}.json"
     response = OpenAIResponse.model_validate_json(path.read_text())
-    adapter = _adapter()
-    bound = _BoundOpenAIResponsesStructured(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=False)),
-        response_format=_CapturedAnswer,
+    bound = _adapter().bind_structured(
+        _binding(automatic_cache_breakpoints=False), _CapturedAnswer
     )
     billing = bound.billing_from_raw(response)
-    outcome = _assert_plain(bound.interpret(response))
+    outcome = _assert_plain(structured_outcome(bound, response, _CapturedAnswer))
     assert outcome.output == _CapturedAnswer(value=17)
     assert outcome.assistant_message == _assistant_message_from(response)
     assert billing.usage_raw is response.usage
@@ -1509,7 +1477,7 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
         _ = [item async for item in stream.items()]
         return await stream.final()
 
-    assert bound.interpret(run_with_timeout(streamed())) == outcome
+    assert structured_outcome(bound, run_with_timeout(streamed()), _CapturedAnswer) == outcome
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1546,15 +1514,8 @@ def _structured_response(
     )
 
 
-def test_a_refusal_before_structured_text_is_a_refusal() -> None:
-    response = _response(
-        usage=None, output=[_REFUSAL_MESSAGE_ITEM, *_structured_response(_REPORT_JSON).output]
-    )
-    assert _structured_parse(response).kind == "refusal"
-
-
-@pytest.mark.parametrize("refusal", ["I can't help with that", _REPORT_JSON])
-def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
+def test_final_refusal_cannot_use_earlier_structured_text() -> None:
+    refusal = "I can't help with that"
     response = _response(
         usage=None,
         output=[
@@ -1562,7 +1523,7 @@ def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
             {**_REFUSAL_MESSAGE_ITEM, "content": [{"type": "refusal", "refusal": refusal}]},
         ],
     )
-    outcome = _structured_bound().interpret(response)
+    outcome = _structured_parse(response)
     assert outcome.kind == "refusal"
     assert outcome.assistant_message.content == (
         TextPart(text=_REPORT_JSON),
@@ -1631,16 +1592,14 @@ def test_an_incomplete_max_messages_run_is_an_unexpected_response() -> None:
     )
     assert outcome.kind == "unexpected_response"
     assert (
-        outcome.error_text == "openai returned an incomplete response with reason 'max_messages'"
+        outcome.error_text
+        == "openai returned status 'incomplete' with incomplete reason 'max_messages', "
+        "which langchaint cannot continue"
     )
 
 
-def _text_bound() -> _BoundOpenAIResponsesText:
-    adapter = _adapter()
-    return _BoundOpenAIResponsesText(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=False)),
-    )
+def _text_bound() -> BoundAdapter:
+    return _adapter().bind_text(_binding(automatic_cache_breakpoints=False))
 
 
 def test_identity_reads_the_responses_own_id_and_served_model() -> None:

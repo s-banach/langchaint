@@ -49,13 +49,12 @@ from langchaint import (
 )
 from langchaint.adapter import (
     AdapterStream,
-    PlainResponse,
+    FinishedResponse,
     Refusal,
     RejectedMessages,
     RequestFailure,
     RequestParams,
     TransientError,
-    text_response,
 )
 from langchaint.common.messages import StopReason
 from langchaint.embedding import EmbeddingModel, EmbeddingTask, _EmbeddingBatchResponse
@@ -264,7 +263,7 @@ class _TerminalCase(NamedTuple):
     "case",
     [
         _TerminalCase(
-            adapter=lambda: FakeAdapter(stream=FakeStream(outcome=REFUSAL)),
+            adapter=lambda: FakeAdapter(stream=FakeStream(interpretation=REFUSAL)),
             error_type="refusal_error",
             status_description=None,
             finish_reasons=("refusal",),
@@ -272,7 +271,9 @@ class _TerminalCase(NamedTuple):
             request_failed_events=0,
         ),
         _TerminalCase(
-            adapter=lambda: FakeAdapter(stream=FakeStream(outcome=MAX_COMPLETION_TOKENS_EXCEEDED)),
+            adapter=lambda: FakeAdapter(
+                stream=FakeStream(interpretation=MAX_COMPLETION_TOKENS_EXCEEDED)
+            ),
             error_type="max_completion_tokens_exceeded_error",
             status_description=None,
             finish_reasons=("length",),
@@ -531,7 +532,11 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         adapter = FakeAdapter(
             scripted_requests=[
                 ScriptedResponse(
-                    outcome=text_response(assistant_message, stop_reason),
+                    interpretation=FinishedResponse(
+                        assistant_message=assistant_message,
+                        stop_reason=stop_reason,
+                        cannot_continue=None,
+                    ),
                     usage=USAGE,
                 )
             ]
@@ -655,7 +660,7 @@ def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation
 def test_a_raising_transform_keeps_error_type_beside_the_error_status() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(
-            FakeAdapter(stream=FakeStream(outcome=REFUSAL)),
+            FakeAdapter(stream=FakeStream(interpretation=REFUSAL)),
             chat_attribute_transform=_raising_transform,
         )
         with pytest.raises(GenerationError):
@@ -1283,10 +1288,10 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             FakeAdapter(
                 scripted_requests=[
                     ScriptedResponse(
-                        outcome=PlainResponse(
-                            output="answer",
+                        interpretation=FinishedResponse(
                             assistant_message=scripted_assistant_message,
                             stop_reason="stop",
+                            cannot_continue=None,
                         ),
                         usage=USAGE,
                     )

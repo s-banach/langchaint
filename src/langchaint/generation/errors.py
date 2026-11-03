@@ -115,13 +115,12 @@ type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_err
 
 - `retries_exhausted_error`: every request failed transiently and the retry budget ended.
 - `retry_unavailable_error`: an open stream failed transiently after retry became unavailable.
-- `refusal_error`: a refusal ended a response that produced no output.
-- `max_completion_tokens_exceeded_error`: a structured response reached its token limit before its JSON closed.
-  An Anthropic response that stops at a tool call that may be incomplete also gives this kind.
-- `empty_assistant_message_error`: a structured response produced no output or tool call.
+- `refusal_error`: a refusal ended a response at its final tool call, or without output.
+- `max_completion_tokens_exceeded_error`: a response reached its token limit at its final tool call, or without output.
+- `empty_assistant_message_error`: a response produced no output or tool call.
 - `schema_violation_error`: a structured response failed the caller's model validation.
 - `context_window_exceeded_error`: a response reported that the request exceeded the context window.
-- `unexpected_response_error`: the adapter returned `UnexpectedResponse`.
+- `unexpected_response_error`: langchaint cannot continue from the response, such as one with an unknown stop reason.
   A response with application tool calls under a binding without a `ToolManager` also gives this kind.
 - `provider_failed_terminally_error`: a provider reported a failure that sending the request again would repeat.
   A response body or an error response can report it.

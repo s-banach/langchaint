@@ -31,13 +31,11 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    PlainResponse,
+    FinishedResponse,
     ProviderBilling,
     RequestFailure,
     RequestParams,
     ResponseIdentity,
-    ToolCallResponse,
-    UsableResponse,
 )
 from langchaint.generation.observer import Observer
 
@@ -136,7 +134,7 @@ class ScriptedAdapter(Adapter):
         return {}
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind to the script named by the system prompt.
 
         Raises:
@@ -148,9 +146,7 @@ class ScriptedAdapter(Adapter):
         return _ScriptedBoundAdapter(self, system_prompt)
 
     @override
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         """Reject structured bindings because tools carry structured output."""
         raise NotImplementedError
 
@@ -180,7 +176,7 @@ class _ScriptedRequestParams(RequestParams):
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
-class _ScriptedBoundAdapter(BoundAdapter[str]):
+class _ScriptedBoundAdapter(BoundAdapter):
     """Play one agent's scripted turns in order."""
 
     def __init__(self, adapter: ScriptedAdapter, system_prompt: str) -> None:
@@ -206,23 +202,24 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> UsableResponse[str]:
-        """Build the usable response for the scripted turn.
+    def interpret(self, raw: BaseModel) -> FinishedResponse:
+        """Build the finished response for the scripted turn.
 
         Raises:
             TypeError: `raw` is not a `FakeRaw`.
         """
         turn = self._adapter.scripts[self._system_prompt].turns[_turn_index(raw)]
         if turn.tool_calls:
-            return ToolCallResponse(
+            return FinishedResponse(
                 assistant_message=AssistantMessage(content=turn.tool_calls),
                 stop_reason="tool_call",
+                cannot_continue=None,
             )
         assert turn.text is not None
-        return PlainResponse(
-            output=turn.text,
+        return FinishedResponse(
             assistant_message=AssistantMessage(content=(TextPart(text=turn.text),)),
             stop_reason="stop",
+            cannot_continue=None,
         )
 
     @override

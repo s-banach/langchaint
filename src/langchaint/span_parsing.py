@@ -17,7 +17,6 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from langchaint.adapter import text_response
 from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, Billing
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
@@ -36,6 +35,7 @@ from langchaint.common.messages import (
     ToolMessage,
     UserMessage,
     _is_object_dict,
+    final_text,
 )
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
@@ -651,6 +651,7 @@ def generation_record_from_otel(
     Any other output message returns `PlainGenerationRecord`.
     Application tool calls make every text part commentary.
     Otherwise, the final text part gives the output, with preceding text joined by newlines as commentary.
+    An output message with neither a text part nor a tool call gives output `""`.
     Under `gen_ai.output.type` `"json"`, the final text part must validate as JSON.
     The record contains one synthetic request record.
     `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
@@ -708,18 +709,13 @@ def generation_record_from_otel(
         records=(request_record,),
         elapsed_seconds=0.0,
     )
-    response = text_response(assistant_message, stop_reason)
-    match response.kind:
-        case "tool_call_response":
-            return ToolCallGenerationRecord(
-                request_history=request_history, stop_reason=stop_reason
-            )
-        case "plain_response":
-            return PlainGenerationRecord[JsonValue](
-                request_history=request_history,
-                output=_output_from_otel(output_type, response.output),
-                stop_reason=stop_reason,
-            )
+    if assistant_message.tool_calls:
+        return ToolCallGenerationRecord(request_history=request_history, stop_reason=stop_reason)
+    return PlainGenerationRecord[JsonValue](
+        request_history=request_history,
+        output=_output_from_otel(output_type, final_text(assistant_message) or ""),
+        stop_reason=stop_reason,
+    )
 
 
 @overload

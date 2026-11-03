@@ -7,7 +7,6 @@ Cache parameters match the Responses API values and follow `Binding.automatic_ca
 """
 
 import base64
-from abc import ABC
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, cast, override
@@ -31,6 +30,7 @@ from openai.types.chat import (
     ChatCompletionToolMessageParam,
     ChatCompletionUserMessageParam,
 )
+from openai.types.chat.chat_completion import Choice
 from openai.types.chat.completion_create_params import PromptCacheOptions
 from openai.types.completion_usage import CompletionUsage
 from openai.types.shared_params import FunctionDefinition
@@ -38,34 +38,26 @@ from openai.types.shared_params.response_format_json_schema import (
     JSONSchema,
     ResponseFormatJSONSchema,
 )
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from langchaint.adapter import (
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyAssistantMessage,
-    MaxCompletionTokensExceeded,
-    PlainResponse,
+    FinishedResponse,
     ReasoningDelta,
-    Refusal,
     RejectedMessages,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
-    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
-    ToolCallResponse,
     ToolChoice,
     _RejectedMessagesError,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
-    text_response,
-    validated_final_text,
 )
 from langchaint.billing.pricing import ProviderBilling, billing_at_rates
 from langchaint.common.exceptions import StreamProtocolError
@@ -434,32 +426,13 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     return AssistantMessage(content=tuple(content))
 
 
-@dataclass(frozen=True, kw_only=True)
-class _FinishedMessage:
-    """A choice with an assistant message: its finish reason, its message, and its converted assistant message."""
-
-    finish_reason: str
-    message: ChatCompletionMessage
-    assistant_message: AssistantMessage
-
-
-def _finished_message(completion: ChatCompletion) -> _FinishedMessage:
-    """Read the first choice, which a stream that ended with a finish reason always has."""
-    choice = completion.choices[0]
-    return _FinishedMessage(
-        finish_reason=choice.finish_reason,
-        message=choice.message,
-        assistant_message=_assistant_message_from(choice.message),
-    )
-
-
-def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
+def _normalized_stop_reason(choice: Choice, assistant_message: AssistantMessage) -> StopReason:
     """Map the finish reason, with a populated refusal field taking precedence."""
-    if finished_message.message.refusal:
+    if choice.message.refusal:
         return "refusal"
-    match finished_message.finish_reason:
+    match choice.finish_reason:
         case "stop":
-            return "tool_call" if finished_message.assistant_message.tool_calls else "stop"
+            return "tool_call" if assistant_message.tool_calls else "stop"
         case "tool_calls":
             return "tool_call"
         case "length":
@@ -468,6 +441,15 @@ def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
             return "refusal"
         case _:
             return "other"
+
+
+def _cannot_continue(choice: Choice, stop_reason: StopReason) -> str | None:
+    """Return the error text for a finish reason that maps to the stop reason `other`, or `None` for any other."""
+    if stop_reason != "other":
+        return None
+    return (
+        f"openai returned finish_reason {choice.finish_reason!r}, which langchaint cannot continue"
+    )
 
 
 def input_tokens_cache_read_from_usage_openai(usage: CompletionUsage) -> int:
@@ -693,31 +675,31 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output without I/O.
 
         Raises:
             ValueError: `binding` contains unsupported values.
         """
-        return _BoundOpenAIChatCompletionsText(
+        return _BoundOpenAIChatCompletions(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
         )
 
     @override
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind for structured output validated into response_format without I/O.
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
+        """Bind for structured output in response_format without I/O.
 
         Raises:
             ValueError: `binding` contains unsupported values.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        return _BoundOpenAIChatCompletionsStructured(
+        return _BoundOpenAIChatCompletions(
             adapter=self,
-            precomputed_fields=self._precompute_fields(binding),
-            response_format=response_format,
+            precomputed_fields=replace(
+                self._precompute_fields(binding),
+                response_format=_wire_response_format(response_format),
+            ),
         )
 
 
@@ -884,8 +866,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
-    """What both Chat Completions bindings share: the request path, and what a response says about itself."""
+class _BoundOpenAIChatCompletions(BoundAdapter):
+    """A Chat Completions adapter bound to a frozen prefix."""
 
     def __init__(
         self,
@@ -976,93 +958,18 @@ class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
             input_tokens_cache_read_from_usage=self._adapter.input_tokens_cache_read_from_usage,
         )
 
-
-class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
-    """Text-bound adapter: `text_response` builds each usable response."""
-
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message through `text_response`.
-
-        Refusals and truncations still return their text with a matching stop reason.
+    def interpret(self, raw: BaseModel) -> FinishedResponse:
+        """Read the first choice, which a stream that ended with a finish reason always has.
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_message = _finished_message(_as_chat_completion(raw))
-        return text_response(
-            finished_message.assistant_message, _normalized_stop_reason(finished_message)
+        choice = _as_chat_completion(raw).choices[0]
+        assistant_message = _assistant_message_from(choice.message)
+        stop_reason = _normalized_stop_reason(choice, assistant_message)
+        return FinishedResponse(
+            assistant_message=assistant_message,
+            stop_reason=stop_reason,
+            cannot_continue=_cannot_continue(choice, stop_reason),
         )
-
-
-class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
-    _BoundOpenAIChatCompletions[ModelT]
-):
-    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
-
-    def __init__(
-        self,
-        *,
-        adapter: OpenAIChatCompletionsAdapter,
-        precomputed_fields: _OpenAIChatCompletionsPrecomputedFields,
-        response_format: type[ModelT],
-    ) -> None:
-        """Precompute the request's response_format parameter, the JSON-schema format this binding asks for.
-
-        It replaces the omitted binding field in every request.
-        """
-        self._response_format = response_format
-        super().__init__(
-            adapter=adapter,
-            precomputed_fields=replace(
-                precomputed_fields, response_format=_wire_response_format(response_format)
-            ),
-        )
-
-    def _parsed_outcome(self, finished_message: _FinishedMessage) -> ResponseOutcome[ModelT]:
-        """Validate final text after the response enters langchaint.
-
-        Rejected content and billing remain available.
-        Application tool calls prevent structured validation.
-        message.refusal returns Refusal before validation.
-        Validated output takes precedence over finish_reason.
-        Without validated output, "content_filter" returns Refusal and "length" returns MaxCompletionTokensExceeded.
-        Remaining application tool calls return ToolCallResponse.
-        Remaining invalid content returns SchemaViolation.
-        Every remaining response returns EmptyAssistantMessage.
-        """
-        assistant_message = finished_message.assistant_message
-        if finished_message.message.refusal:
-            return Refusal(assistant_message=assistant_message)
-        validated = validated_final_text(assistant_message, self._response_format)
-        if isinstance(validated, BaseModel):
-            return PlainResponse(
-                output=validated,
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(finished_message),
-            )
-        if finished_message.finish_reason == "content_filter":
-            return Refusal(assistant_message=assistant_message)
-        if finished_message.finish_reason == "length":
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        if assistant_message.tool_calls:
-            return ToolCallResponse(
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(finished_message),
-            )
-        if isinstance(validated, ValidationError):
-            return SchemaViolation(
-                validation_error_json=validated.json(include_url=False),
-                assistant_message=assistant_message,
-            )
-        return EmptyAssistantMessage(assistant_message=assistant_message)
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Validate the assistant message's text into the instance, or report why the response produced none.
-
-        Raises:
-            TypeError: raw is not an openai ChatCompletion.
-        """
-        finished_message = _finished_message(_as_chat_completion(raw))
-        return self._parsed_outcome(finished_message)

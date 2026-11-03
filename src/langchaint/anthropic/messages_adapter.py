@@ -17,7 +17,6 @@ Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, re
 
 import base64
 import json
-from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -51,7 +50,7 @@ from anthropic.types import (
     ToolUseBlockParam,
     URLImageSourceParam,
 )
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter
 
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
@@ -60,32 +59,22 @@ from langchaint.adapter import (
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    ContextWindowExceeded,
-    EmptyAssistantMessage,
-    MaxCompletionTokensExceeded,
-    PlainResponse,
+    FinishedResponse,
     ReasoningDelta,
-    Refusal,
     RejectedMessages,
     RequestFailure,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
-    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
-    ToolCallResponse,
     ToolChoice,
-    UnexpectedResponse,
     _RejectedMessagesError,
     narrowed_request_params,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     request_failure_from_response,
     request_params_json,
-    text_response,
-    validated_final_text,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -802,39 +791,11 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
     return _STOP_REASON_BY_ANTHROPIC_STOP_REASON.get(stop_reason, "other")
 
 
-def _ends_in_cut_off_tool_call(message: anthropic.types.Message) -> bool:
-    """Return whether `max_tokens` stopped the message at its last block, a `tool_use` block that may be incomplete.
-
-    Only the last block can be incomplete.
-    anthropic 1.15.0 parses an incomplete block's partial input JSON, so its `ToolCall` looks complete.
-    Anthropic says to retry such a message with a higher `max_tokens`.
-    Source: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons, read 2026-10-15.
-    """
-    return (
-        message.stop_reason == "max_tokens"
-        and bool(message.content)
-        and message.content[-1].type == "tool_use"
-    )
-
-
-def _unexpected_response_or_none(
-    message: anthropic.types.Message, *, assistant_message: AssistantMessage
-) -> UnexpectedResponse | None:
-    """Return `UnexpectedResponse` for `pause_turn` or an unknown stop reason."""
-    stop_reason = message.stop_reason
-    if stop_reason in (
-        "end_turn",
-        "tool_use",
-        "max_tokens",
-        "refusal",
-        "stop_sequence",
-        "model_context_window_exceeded",
-    ):
+def _cannot_continue(stop_reason: str | None) -> str | None:
+    """Return the error text for `pause_turn` or an unknown stop reason, or `None` for any other."""
+    if stop_reason in _STOP_REASON_BY_ANTHROPIC_STOP_REASON or stop_reason == "stop_sequence":
         return None
-    return UnexpectedResponse(
-        error_text=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
-        assistant_message=assistant_message,
-    )
+    return f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue"
 
 
 def _as_message(raw: BaseModel) -> anthropic.types.Message:
@@ -1214,22 +1175,23 @@ class AnthropicMessagesAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output without I/O.
 
         Raises:
             ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
             TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
         """
-        return _BoundAnthropicText(
-            adapter=self, precomputed_fields=self._precompute_fields(binding)
-        )
+        return _BoundAnthropic(adapter=self, precomputed_fields=self._precompute_fields(binding))
 
     @override
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind for structured output validated into response_format without I/O.
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
+        """Bind for structured output in response_format without I/O.
+
+        The output format matches `messages.parse(output_format=...)` in anthropic 2.4.0, merged into the binding's
+        `output_config` to preserve its reasoning effort.
+        anthropic 2.4.0 parses every text block independently, and langchaint validates only the final text part.
+        Source: https://github.com/anthropics/anthropic-sdk-python/blob/v2.4.0/src/anthropic/lib/_parse/_response.py
 
         Raises:
             ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
@@ -1237,10 +1199,20 @@ class AnthropicMessagesAdapter(Adapter):
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        return _BoundAnthropicStructured(
+        precomputed_fields = self._precompute_fields(binding)
+        output_format: JSONOutputFormatParam = {
+            "schema": transform_schema(TypeAdapter(response_format).json_schema()),
+            "type": "json_schema",
+        }
+        bound_output_config = precomputed_fields.output_config
+        output_config: OutputConfigParam = (
+            {"format": output_format}
+            if isinstance(bound_output_config, Omit)
+            else {**bound_output_config, "format": output_format}
+        )
+        return _BoundAnthropic(
             adapter=self,
-            precomputed_fields=self._precompute_fields(binding),
-            response_format=response_format,
+            precomputed_fields=replace(precomputed_fields, output_config=output_config),
         )
 
     @override
@@ -1360,8 +1332,8 @@ class _AnthropicStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
-    """Share request execution, billing, and response identity between text and structured bindings."""
+class _BoundAnthropic(BoundAdapter):
+    """An Anthropic Messages adapter bound to a frozen prefix."""
 
     def __init__(
         self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
@@ -1439,110 +1411,21 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             provider_executed_tools=precomputed.provider_executed_tools,
         )
 
-
-class _BoundAnthropicText(_BoundAnthropic[str]):
-    """Text-bound adapter: `text_response` builds each usable response."""
-
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message through `text_response`.
+    def interpret(self, raw: BaseModel) -> FinishedResponse:
+        """Read the message.
 
-        A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.
-        Every other message returns `text_response`, including one with an unhandled stop reason.
+        `max_tokens` can stop a message inside its last block.
+        anthropic 2.4.0 parses a cut-off `tool_use` block's partial input JSON, so its `ToolCall` looks complete.
+        Anthropic says to retry such a message with a higher `max_tokens`.
+        Source: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons, read 2026-10-15.
 
         Raises:
             TypeError: `raw` is not an anthropic `Message`.
         """
         message = _as_message(raw)
-        assistant_message = _assistant_message_from(message)
-        if _ends_in_cut_off_tool_call(message):
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        return text_response(assistant_message, _normalized_stop_reason(message.stop_reason))
-
-
-class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT]):
-    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
-
-    def __init__(
-        self,
-        *,
-        adapter: AnthropicMessagesAdapter,
-        precomputed_fields: _AnthropicPrecomputedFields,
-        response_format: type[ModelT],
-    ) -> None:
-        """Precompute the request's output_config, the JSON-schema format merged into the binding's.
-
-        The format matches `messages.parse(output_format=...)` in anthropic 2.3.0.
-        The merge preserves the binding's reasoning effort.
-        """
-        self._response_format = response_format
-        output_format: JSONOutputFormatParam = {
-            "schema": transform_schema(TypeAdapter(response_format).json_schema()),
-            "type": "json_schema",
-        }
-        bound_output_config = precomputed_fields.output_config
-        output_config: OutputConfigParam = (
-            {"format": output_format}
-            if isinstance(bound_output_config, Omit)
-            else {**bound_output_config, "format": output_format}
+        return FinishedResponse(
+            assistant_message=_assistant_message_from(message),
+            stop_reason=_normalized_stop_reason(message.stop_reason),
+            cannot_continue=_cannot_continue(message.stop_reason),
         )
-        super().__init__(
-            adapter=adapter,
-            precomputed_fields=replace(precomputed_fields, output_config=output_config),
-        )
-
-    def _parsed_outcome(
-        self, message: anthropic.types.Message, assistant_message: AssistantMessage
-    ) -> ResponseOutcome[ModelT]:
-        """Validate text, return `ToolCallResponse` for an assistant message with tool calls, or return a failure.
-
-        Validation occurs after the request records its message and billing.
-        Anthropic 2.3.0 parses every text block independently; this adapter validates the final text part.
-        Source: https://github.com/anthropics/anthropic-sdk-python/blob/v2.3.0/src/anthropic/lib/_parse/_response.py
-        Without validated output, stop reasons take precedence over schema validation.
-        Every failure variant carries `assistant_message`.
-        """
-        validated = validated_final_text(assistant_message, self._response_format)
-        if isinstance(validated, BaseModel):
-            return PlainResponse(
-                output=validated,
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(message.stop_reason),
-            )
-        unexpected_response = _unexpected_response_or_none(
-            message, assistant_message=assistant_message
-        )
-        if unexpected_response is not None:
-            return unexpected_response
-        if message.stop_reason == "refusal":
-            return Refusal(assistant_message=assistant_message)
-        if message.stop_reason == "max_tokens":
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        if message.stop_reason == "model_context_window_exceeded":
-            return ContextWindowExceeded(assistant_message=assistant_message)
-        if assistant_message.tool_calls:
-            return ToolCallResponse(
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(message.stop_reason),
-            )
-        if isinstance(validated, ValidationError):
-            return SchemaViolation(
-                validation_error_json=validated.json(include_url=False),
-                assistant_message=assistant_message,
-            )
-        return EmptyAssistantMessage(assistant_message=assistant_message)
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Validate the assistant message's text into the instance, or report why the message produced none.
-
-        A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.
-
-        Raises:
-            TypeError: raw is not an anthropic Message.
-        """
-        message = _as_message(raw)
-        assistant_message = _assistant_message_from(message)
-        if _ends_in_cut_off_tool_call(message):
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        return self._parsed_outcome(message, assistant_message)

@@ -35,15 +35,38 @@ from langchaint import (
     TransientErrorRecord,
     Usage,
 )
-from langchaint.adapter import ProviderBilling, RequestFailure, TransientError
+from langchaint.adapter import (
+    BoundAdapter,
+    ProviderBilling,
+    RequestFailure,
+    ResponseOutcome,
+    TransientError,
+)
+from langchaint.common.messages import final_text
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
 from langchaint.generation.observer import GenerationStart
+from langchaint.generation.response import response_outcome, structured_output
 from scripts import refresh_semconv_genai
 
 
 class StubRaw(BaseModel):
     """Stand-in for the SDK's own response model a generation carries on raw."""
+
+
+def text_outcome(bound_adapter: BoundAdapter, raw: BaseModel) -> ResponseOutcome[str]:
+    """Read `raw` as `BoundLLM` does for a text binding."""
+    return response_outcome(bound_adapter.interpret(raw), final_text)
+
+
+def structured_outcome[ModelT: BaseModel](
+    bound_adapter: BoundAdapter, raw: BaseModel, response_format: type[ModelT]
+) -> ResponseOutcome[ModelT]:
+    """Read `raw` as `BoundLLM` does for a structured binding."""
+    return response_outcome(
+        bound_adapter.interpret(raw),
+        functools.partial(structured_output, response_format=response_format),
+    )
 
 
 def stated_billing(

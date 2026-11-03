@@ -1,6 +1,5 @@
 """Implement the OpenAI Responses API through the official openai SDK."""
 
-from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, cast, override
@@ -38,7 +37,7 @@ from openai.types.responses.response_input_param import (
 )
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from openai.types.shared_params.reasoning import Reasoning
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
@@ -46,31 +45,21 @@ from langchaint.adapter import (
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyAssistantMessage,
-    MaxCompletionTokensExceeded,
-    PlainResponse,
+    FinishedResponse,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     ReasoningDelta,
-    Refusal,
     RejectedMessages,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
-    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
-    ToolCallResponse,
     ToolChoice,
-    UnexpectedResponse,
-    UnusableResponse,
     _RejectedMessagesError,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
-    text_response,
-    validated_final_text,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -491,16 +480,30 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
     The API reports no finish reason field.
 
     An incomplete `content_filter` response maps to `refusal` without retry.
+    An incomplete response maps its reason even with function calls, because a truncation can cut off the last call.
     """
     if _has_refusal(response):
         return "refusal"
-    if any(item.type == "function_call" for item in response.output):
-        return "tool_call"
     if response.status == "completed":
-        return "stop"
+        return (
+            "tool_call"
+            if any(item.type == "function_call" for item in response.output)
+            else "stop"
+        )
     if response.incomplete_details is None or response.incomplete_details.reason is None:
         return "other"
     return _STOP_REASON_BY_INCOMPLETE_REASON.get(response.incomplete_details.reason, "other")
+
+
+def _cannot_continue(response: OpenAIResponse, stop_reason: StopReason) -> str | None:
+    """Return the error text for an unfinished response whose stop reason is `other`, or `None` for any other."""
+    if response.status == "completed" or stop_reason != "other":
+        return None
+    reason = None if response.incomplete_details is None else response.incomplete_details.reason
+    return (
+        f"openai returned status {response.status!r} with incomplete reason {reason!r}, "
+        "which langchaint cannot continue"
+    )
 
 
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
@@ -756,31 +759,33 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output without I/O.
 
         Raises:
             ValueError: `binding` contains unsupported values.
         """
-        return _BoundOpenAIResponsesText(
+        return _BoundOpenAIResponses(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
         )
 
     @override
-    def bind_structured[ModelT: BaseModel](
-        self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind for structured output validated into response_format without I/O.
+    def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
+        """Bind for structured output in response_format without I/O.
+
+        `type_to_text_format_param` matches `responses.parse(text_format=...)`.
 
         Raises:
             ValueError: `binding` contains unsupported values.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        return _BoundOpenAIResponsesStructured(
+        return _BoundOpenAIResponses(
             adapter=self,
-            precomputed_fields=self._precompute_fields(binding),
-            response_format=response_format,
+            precomputed_fields=replace(
+                self._precompute_fields(binding),
+                text={"format": type_to_text_format_param(response_format)},
+            ),
         )
 
 
@@ -946,8 +951,8 @@ class _OpenAIResponsesStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
-    """Share request execution, billing, and response identity between output bindings."""
+class _BoundOpenAIResponses(BoundAdapter):
+    """A Responses adapter bound to a frozen prefix."""
 
     def __init__(
         self,
@@ -1030,16 +1035,13 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
             charged_provider_executed_tools=precomputed.charged_provider_executed_tools,
         )
 
-
-class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
-    """Text-bound adapter: `text_response` builds each usable response."""
-
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the assistant message through `text_response`, or report the run openai says failed.
+    def interpret(
+        self, raw: BaseModel
+    ) -> FinishedResponse | ProviderFailedTerminally | ProviderFailedTransiently:
+        """Read the response, or report the run openai says failed.
 
-        A failed status returns `_provider_failure` because emitted items are fragments.
-        An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
+        A failed status returns `_provider_failure`, because its items are fragments even when their text gives output.
         The assistant message includes refusal text that `response.output_text` omits.
 
         Raises:
@@ -1049,107 +1051,9 @@ class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
         assistant_message = _assistant_message_from(response)
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
-        return text_response(assistant_message, _normalized_stop_reason(response))
-
-
-class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[ModelT]):
-    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
-
-    def __init__(
-        self,
-        *,
-        adapter: OpenAIResponsesAdapter,
-        precomputed_fields: _OpenAIResponsesPrecomputedFields,
-        response_format: type[ModelT],
-    ) -> None:
-        """Precompute the request's text parameter, the JSON-schema format this binding asks for.
-
-        `type_to_text_format_param` matches `responses.parse(text_format=...)`.
-        The format replaces the omitted binding field in every request.
-        """
-        self._response_format = response_format
-        super().__init__(
-            adapter=adapter,
-            precomputed_fields=replace(
-                precomputed_fields, text={"format": type_to_text_format_param(response_format)}
-            ),
-        )
-
-    def _no_instance(
-        self,
-        response: OpenAIResponse,
-        validation_error: ValidationError | None,
-        assistant_message: AssistantMessage,
-    ) -> UnusableResponse:
-        """Report why the response gives no validated output.
-
-        Refusal and truncation take precedence over validation.
-        Completed text with `validation_error` returns `SchemaViolation`.
-        Completed output without text returns `EmptyAssistantMessage`.
-        An incomplete response for any other reason returns `UnexpectedResponse`.
-        Every variant carries `assistant_message`.
-        """
-        if _normalized_stop_reason(response) == "refusal":
-            return Refusal(assistant_message=assistant_message)
-        if (
-            response.status == "incomplete"
-            and response.incomplete_details is not None
-            and response.incomplete_details.reason == "max_output_tokens"
-        ):
-            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        if response.status == "completed":
-            if validation_error is not None:
-                return SchemaViolation(
-                    validation_error_json=validation_error.json(include_url=False),
-                    assistant_message=assistant_message,
-                )
-            return EmptyAssistantMessage(assistant_message=assistant_message)
-        reason = (
-            None if response.incomplete_details is None else response.incomplete_details.reason
-        )
-        return UnexpectedResponse(
-            error_text=f"openai returned an incomplete response with reason {reason!r}",
+        stop_reason = _normalized_stop_reason(response)
+        return FinishedResponse(
             assistant_message=assistant_message,
+            stop_reason=stop_reason,
+            cannot_continue=_cannot_continue(response, stop_reason),
         )
-
-    def _parsed_outcome(
-        self, response: OpenAIResponse, assistant_message: AssistantMessage
-    ) -> ResponseOutcome[ModelT]:
-        """Validate the text into the instance, report tool calls as `ToolCallResponse`, or report why neither exists.
-
-        Validation occurs after the request records its response and billing.
-        Failed status returns `_provider_failure` even when fragment text validates.
-        A refusal content part returns `Refusal` ahead of tool calls and validation.
-        Refusal text becomes a `TextPart`, so validation alone cannot tell it from output.
-        Application tool calls prevent structured validation.
-        """
-        if response.status == "failed":
-            return _provider_failure(response, assistant_message=assistant_message)
-        if _has_refusal(response):
-            return Refusal(assistant_message=assistant_message)
-        if assistant_message.tool_calls:
-            if response.status == "completed":
-                return ToolCallResponse(
-                    assistant_message=assistant_message,
-                    stop_reason=_normalized_stop_reason(response),
-                )
-            return self._no_instance(response, None, assistant_message)
-        validated = validated_final_text(assistant_message, self._response_format)
-        if isinstance(validated, BaseModel):
-            return PlainResponse(
-                output=validated,
-                assistant_message=assistant_message,
-                stop_reason=_normalized_stop_reason(response),
-            )
-        return self._no_instance(response, validated, assistant_message)
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Validate the assistant message's text into the instance, or report why the response produced none.
-
-        Raises:
-            TypeError: raw is not an openai Response.
-        """
-        response = _as_response(raw)
-        assistant_message = _assistant_message_from(response)
-        return self._parsed_outcome(response, assistant_message)

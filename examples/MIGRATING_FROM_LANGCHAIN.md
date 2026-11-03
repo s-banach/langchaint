@@ -158,7 +158,7 @@ match generation.kind:
         print(generation.output.text)
 ```
 
-A text `PlainGeneration.output` is the assistant message's text, which is `""` for an assistant message without text.
+A text `PlainGeneration.output` is the final text part of the assistant message.
 Append `assistant_message`, never `output`, when continuing a conversation.
 
 See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.

@@ -13,17 +13,17 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from langchaint.adapter import (
     Adapter,
     AdapterStream,
     Binding,
     BoundAdapter,
+    FinishedResponse,
     RejectedMessages,
     RequestFailure,
     RequestParams,
-    _UnusableResponseBase,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.billing.usage import ZERO_USAGE
@@ -58,27 +58,6 @@ _PLAIN_BINDING = Binding(
 
 The limit is stated because `AnthropicMessagesAdapter` rejects a binding without one.
 """
-
-
-class _WeatherReport(BaseModel):
-    """The response_format of the structured-output invariants, standing in for a caller's model."""
-
-    city: str
-    celsius: int
-
-
-class _WeatherReportAlsoUnusableResponseBase(_WeatherReport, _UnusableResponseBase):
-    """A caller's response_format that also inherits the base of every `UnusableResponse` variant."""
-
-    assistant_message: AssistantMessage = AssistantMessage(content=())
-
-
-def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
-    try:
-        _ = response_format.model_validate_json(text)
-    except ValidationError as validation_error:
-        return validation_error.json(include_url=False)
-    raise AssertionError(f"{response_format.__name__} accepted {text!r}")
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
@@ -146,11 +125,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_with_text(self, text: str) -> BaseModel:
-        """Return an SDK response for a finished assistant message whose only answer text is text.
-
-        Args:
-            text: The answer text, which the structured-output invariants validate.
-        """
+        """Return an SDK response for a finished assistant message whose only answer text is text."""
         ...
 
     @abstractmethod
@@ -229,11 +204,20 @@ class AdapterConformance(ABC):
         """
         ...
 
-    def _bound_adapter(self) -> BoundAdapter[str]:
+    def _bound_adapter(self) -> BoundAdapter:
         return self.make_adapter().bind_text(_PLAIN_BINDING)
 
+    def _finished_response(self, raw: BaseModel) -> FinishedResponse:
+        interpretation = self._bound_adapter().interpret(raw)
+        assert interpretation.kind == "finished_response"
+        return interpretation
+
+    def _text_parts(self, assistant_message: AssistantMessage) -> list[str]:
+        assert isinstance(assistant_message.content, tuple)
+        return [part.text for part in assistant_message.content if part.kind == "text"]
+
     def _assistant_wire_parts_of(
-        self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
+        self, bound_adapter: BoundAdapter, messages: Sequence[Message]
     ) -> Sequence[object]:
         request_params = bound_adapter.build_request_params(messages)
         assert not isinstance(request_params, RejectedMessages)
@@ -279,16 +263,16 @@ class AdapterConformance(ABC):
 
     def test_reasoning_round_trips_verbatim_in_position(self) -> None:
         """Replay reasoning unchanged in its original position so providers can verify its payload."""
-        bound_adapter = self._bound_adapter()
-        outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert outcome.kind in ("plain_response", "tool_call_response")
-        content = outcome.assistant_message.content
+        assistant_message = self._finished_response(
+            self.response_with_reasoning()
+        ).assistant_message
+        content = assistant_message.content
         assert isinstance(content, tuple)
         ((index, reasoning_part),) = [
             (index, part) for index, part in enumerate(content) if part.kind == "reasoning"
         ]
         wire_parts = self._assistant_wire_parts_of(
-            bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
+            self._bound_adapter(), [UserMessage(content="hi"), assistant_message]
         )
         assert len(wire_parts) == len(content)
         assert wire_parts[index] == reasoning_part.raw
@@ -301,14 +285,12 @@ class AdapterConformance(ABC):
         response = self.response_with_raw_part()
         if response is None:
             pytest.skip("One wire message holds the whole assistant message.")
-        bound_adapter = self._bound_adapter()
-        outcome = bound_adapter.interpret(response)
-        assert outcome.kind in ("plain_response", "tool_call_response")
-        content = outcome.assistant_message.content
+        assistant_message = self._finished_response(response).assistant_message
+        content = assistant_message.content
         assert isinstance(content, tuple)
         assert any(part.kind == "raw" for part in content)
         wire_parts = self._assistant_wire_parts_of(
-            bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
+            self._bound_adapter(), [UserMessage(content="hi"), assistant_message]
         )
         assert len(wire_parts) == len(content)
         for index, part in enumerate(content):
@@ -321,20 +303,19 @@ class AdapterConformance(ABC):
         Every `ReasoningPart.raw` value must be JSON-representable.
         """
         bound_adapter = self._bound_adapter()
-        outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert outcome.kind in ("plain_response", "tool_call_response")
-        original: list[Message] = [UserMessage(content="hi"), outcome.assistant_message]
+        assistant_message = self._finished_response(
+            self.response_with_reasoning()
+        ).assistant_message
+        original: list[Message] = [UserMessage(content="hi"), assistant_message]
         restored = messages_from_json(messages_to_json(original))
         assert self._assistant_wire_parts_of(
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
 
     def test_empty_provider_text_preserves_its_text_part(self) -> None:
-        """Empty provider text preserves its complete text-part boundary and gives empty output."""
-        outcome = self._bound_adapter().interpret(self.response_with_text(""))
-        assert outcome.kind == "plain_response"
-        assert outcome.output == ""
-        assert outcome.assistant_message.content == (TextPart(text=""),)
+        """Empty provider text preserves its complete text-part boundary."""
+        finished_response = self._finished_response(self.response_with_text(""))
+        assert finished_response.assistant_message.content == (TextPart(text=""),)
 
     def test_an_empty_text_part_is_sent_as_given(self) -> None:
         """Replay sends every assistant `TextPart`, including one with empty text."""
@@ -357,79 +338,23 @@ class AdapterConformance(ABC):
             )
             assert string_parts == tuple_parts
 
-    def test_structured_output_may_inherit_the_unusable_response_base(self) -> None:
-        """Separate usable responses by outcome kind when output inherits `_UnusableResponseBase`."""
-        bound_adapter = self.make_adapter().bind_structured(
-            _PLAIN_BINDING, _WeatherReportAlsoUnusableResponseBase
-        )
-        outcome = bound_adapter.interpret(
-            self.response_with_text('{"city": "Nairobi", "celsius": 25}')
-        )
-        assert outcome.kind == "plain_response"
-        assert outcome.output == _WeatherReportAlsoUnusableResponseBase(city="Nairobi", celsius=25)
+    def test_text_parts_keep_their_boundaries_and_order(self) -> None:
+        """Every provider text part becomes its own `TextPart`, so the final one gives output."""
+        texts = ("Checking the temperature.", '{"city":"Lima","celsius":19}', "")
+        raw = self.response_with_text_parts(texts)
+        if raw is None:
+            pytest.skip("The provider represents response text as one string.")
+        assistant_message = self._finished_response(raw).assistant_message
+        assert self._text_parts(assistant_message) == list(texts)
 
-    def test_text_the_response_format_rejects_is_a_schema_violation(self) -> None:
-        """Preserve pydantic's rejected fields and values in error JSON without documentation URLs."""
-        text = '{"city": "Nairobi", "celsius": "SENTINEL"}'
-        bound_adapter = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
-        outcome = bound_adapter.interpret(self.response_with_text(text))
-        assert outcome.kind == "schema_violation"
-        assert outcome.validation_error_json == _validation_error_json(_WeatherReport, text)
-
-    def test_final_complete_text_controls_text_and_structured_output(self) -> None:
-        """Constructed responses distinguish commentary from final output independently of schema validity."""
-        final = '{"city":"Lima","celsius":19}'
-        for earlier in ("Checking the temperature.", '{"city":"Nairobi","celsius":25}'):
-            raw = self.response_with_text_parts((earlier, final))
-            if raw is None:
-                pytest.skip("The provider represents response text as one string.")
-            text_outcome = self._bound_adapter().interpret(raw)
-            assert text_outcome.kind == "plain_response"
-            assert text_outcome.output == final
-            bound = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
-            outcome = bound.interpret(raw)
-            assert outcome.kind == "plain_response"
-            assert outcome.output == _WeatherReport(city="Lima", celsius=19)
-            assert outcome.assistant_message == text_outcome.assistant_message
-            assert isinstance(outcome.assistant_message.content, tuple)
-            assert [
-                part.text for part in outcome.assistant_message.content if part.kind == "text"
-            ] == [earlier, final]
-
-    def test_invalid_final_text_cannot_use_earlier_valid_json(self) -> None:
-        """Constructed final text must validate independently, including empty final text."""
-        earlier = '{"city":"Nairobi","celsius":25}'
-        bound = self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport)
-        for final in ("Invalid final answer", ""):
-            raw = self.response_with_text_parts((earlier, final))
-            if raw is None:
-                pytest.skip("The provider represents response text as one string.")
-            outcome = bound.interpret(raw)
-            assert outcome.kind == "schema_violation"
-            assert outcome.validation_error_json == _validation_error_json(_WeatherReport, final)
-            assert isinstance(outcome.assistant_message.content, tuple)
-            assert [
-                part.text for part in outcome.assistant_message.content if part.kind == "text"
-            ] == [earlier, final]
-            text_outcome = self._bound_adapter().interpret(raw)
-            assert text_outcome.kind == "plain_response"
-            assert text_outcome.output == final
-
-    def test_tool_call_text_is_commentary_for_both_bindings(self) -> None:
-        """Constructed text beside application tool calls is commentary, even when it validates."""
-        for text in ("Checking the temperature.", '{"city":"Nairobi","celsius":25}'):
-            raw = self.response_with_tool_call(text)
-            for bound in (
-                self._bound_adapter(),
-                self.make_adapter().bind_structured(_PLAIN_BINDING, _WeatherReport),
-            ):
-                outcome = bound.interpret(raw)
-                assert outcome.kind == "tool_call_response"
-                assert outcome.assistant_message.tool_calls
-                assert isinstance(outcome.assistant_message.content, tuple)
-                assert [
-                    part.text for part in outcome.assistant_message.content if part.kind == "text"
-                ] == [text]
+    def test_tool_call_text_stays_beside_the_tool_call(self) -> None:
+        """Text beside an application tool call stays in the assistant message with the call."""
+        text = "Checking the temperature."
+        assistant_message = self._finished_response(
+            self.response_with_tool_call(text)
+        ).assistant_message
+        assert assistant_message.tool_calls
+        assert self._text_parts(assistant_message) == [text]
 
     def test_every_sdk_exception_maps_and_an_unknown_one_is_unknown_exception(self) -> None:
         """Map SDK exceptions and return `unknown_exception` for an exception the adapter cannot classify."""

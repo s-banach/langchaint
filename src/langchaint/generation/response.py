@@ -1,13 +1,33 @@
 """Live generations, their records, and the outcome unions."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Generic, Literal, Self, TypeVar, override
 
-from pydantic import BaseModel, Field, SerializeAsAny, model_validator
+from pydantic import BaseModel, Field, SerializeAsAny, ValidationError, model_validator
 
-from langchaint.adapter import RequestParams, ResponseOutcome
+from langchaint.adapter import (
+    ContextWindowExceeded,
+    EmptyAssistantMessage,
+    FinishedResponse,
+    MaxCompletionTokensExceeded,
+    PlainResponse,
+    Refusal,
+    RequestParams,
+    ResponseOutcome,
+    SchemaViolation,
+    ToolCallResponse,
+    UnexpectedResponse,
+    UnusableResponse,
+)
 from langchaint.billing.usage import Usage
-from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, final_text_index
+from langchaint.common.messages import (
+    AssistantMessage,
+    StopReason,
+    ToolCall,
+    final_text,
+    final_text_index,
+)
 from langchaint.generation.errors import (
     GenerationError,
     PlainErrorRecord,
@@ -190,7 +210,7 @@ class PlainGeneration(
     def output(self) -> _OutputT_co:
         """Return the assistant text or validated caller model.
 
-        A text binding returns the final `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
+        A text binding returns the final `TextPart` text of `assistant_message`.
         To continue the conversation, replay `assistant_message`.
         """
         return self.record.output
@@ -234,6 +254,88 @@ type GenerationOutcomeRecord[OutputT] = Annotated[
 
 type InputOutcomeRecord[OutputT] = GenerationOutcomeRecord[OutputT] | AbandonedStreamRecord
 """Every record of an input's outcome, including a stream the application abandoned."""
+
+
+type OutputReader[OutputT] = Callable[[AssistantMessage], OutputT | ValidationError | None]
+"""Read a binding's output from an assistant message.
+
+`None` means no text part gives output, and a `ValidationError` means the text does not validate.
+A text binding reads with `final_text`, and a structured binding with a `partial` of `structured_output`.
+"""
+
+
+def structured_output[ModelT: BaseModel](
+    assistant_message: AssistantMessage, response_format: type[ModelT]
+) -> ModelT | ValidationError | None:
+    """Validate the text at `final_text_index` as `response_format` JSON.
+
+    The result is the `ValidationError` when the text does not validate, and `None` when no text part gives output.
+    """
+    text = final_text(assistant_message)
+    if text is None:
+        return None
+    try:
+        return response_format.model_validate_json(text)
+    except ValidationError as validation_error:
+        return validation_error
+
+
+def _stop_reason_outcome(
+    assistant_message: AssistantMessage, stop_reason: StopReason
+) -> Refusal | MaxCompletionTokensExceeded | ContextWindowExceeded | None:
+    """Return the outcome a refusal or truncation stop reason names, or `None` for any other."""
+    match stop_reason:
+        case "refusal":
+            return Refusal(assistant_message=assistant_message)
+        case "max_completion_tokens":
+            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
+        case "context_window_exceeded":
+            return ContextWindowExceeded(assistant_message=assistant_message)
+        case "stop" | "tool_call" | "other":
+            return None
+
+
+def response_outcome[OutputT](
+    interpretation: FinishedResponse | UnusableResponse, read_output: OutputReader[OutputT]
+) -> ResponseOutcome[OutputT]:
+    """Return the outcome of one response, reading a finished response's output with `read_output`.
+
+    An `UnusableResponse` is the outcome.
+    For a `FinishedResponse`, the first matching rule decides:
+    1. `cannot_continue` gives `UnexpectedResponse`.
+    2. A refusal or truncation stop reason at a final tool call gives its outcome, because the call may be cut off.
+    3. Application tool calls give `ToolCallResponse`, because the model waits for their results.
+    4. Output gives `PlainResponse`, whose `stop_reason` tells whether a refusal or truncation ended the text.
+    5. A refusal or truncation stop reason gives its outcome, which explains the missing or invalid output.
+    6. A validation error gives `SchemaViolation`, and anything else gives `EmptyAssistantMessage`.
+    """
+    if interpretation.kind != "finished_response":
+        return interpretation
+    assistant_message = interpretation.assistant_message
+    stop_reason = interpretation.stop_reason
+    if interpretation.cannot_continue is not None:
+        return UnexpectedResponse(
+            error_text=interpretation.cannot_continue, assistant_message=assistant_message
+        )
+    stop_reason_outcome = _stop_reason_outcome(assistant_message, stop_reason)
+    content_parts = assistant_message.content_parts
+    if stop_reason_outcome is not None and content_parts and content_parts[-1].kind == "tool_call":
+        return stop_reason_outcome
+    if assistant_message.tool_calls:
+        return ToolCallResponse(assistant_message=assistant_message, stop_reason=stop_reason)
+    output = read_output(assistant_message)
+    if output is not None and not isinstance(output, ValidationError):
+        return PlainResponse(
+            output=output, assistant_message=assistant_message, stop_reason=stop_reason
+        )
+    if stop_reason_outcome is not None:
+        return stop_reason_outcome
+    if isinstance(output, ValidationError):
+        return SchemaViolation(
+            validation_error_json=output.json(include_url=False),
+            assistant_message=assistant_message,
+        )
+    return EmptyAssistantMessage(assistant_message=assistant_message)
 
 
 def _generation_outcome_from_response_outcome[OutputT](

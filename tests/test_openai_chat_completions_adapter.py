@@ -47,6 +47,7 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import Billing, ProviderBilling, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.messages import final_text
 from langchaint.conformance import AdapterConformance
 from langchaint.deepseek import input_tokens_cache_read_from_usage_deepseek
 from langchaint.openai import (
@@ -69,6 +70,8 @@ from tests.helpers import (
     connection_error,
     openai_sdk_errors_and_request_failures,
     run_with_timeout,
+    structured_outcome,
+    text_outcome,
     transient,
 )
 
@@ -166,32 +169,6 @@ def _completion(
         "usage": usage,
         "service_tier": service_tier,
     })
-
-
-def _lenient_completion(finish_reason: str) -> ChatCompletion:
-    """Build the runtime shape strict validation rejects: a finish_reason outside the SDK's Literal.
-
-    interpret handles unknown stop reasons from lenient SDK snapshots.
-    """
-    completion = construct_type_unchecked(
-        value={
-            "id": "r1",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "m",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hey"},
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": None,
-        },
-        type_=ChatCompletion,
-    )
-    assert isinstance(completion, ChatCompletion)
-    return completion
 
 
 def _provider_billing(
@@ -298,56 +275,28 @@ def test_the_reported_tier_selects_the_rates() -> None:
 
 
 @pytest.mark.parametrize(
-    ("build_completion", "expected", "expected_output"),
+    ("completion", "expected", "expected_output"),
     [
-        (lambda: _completion(usage=None), "stop", "hey"),
         (
-            lambda: _completion(
-                usage=None, message={"content": "on it", "tool_calls": [_TOOL_CALL_WIRE]}
-            ),
+            _completion(usage=None, message={"content": "on it", "tool_calls": [_TOOL_CALL_WIRE]}),
             "tool_call",
             None,
         ),
         (
-            lambda: _completion(
-                usage=None,
-                message={"tool_calls": [_TOOL_CALL_WIRE]},
-                finish_reason="tool_calls",
-            ),
-            "tool_call",
-            None,
-        ),
-        (lambda: _completion(usage=None, finish_reason="length"), "max_completion_tokens", "hey"),
-        (lambda: _completion(usage=None, finish_reason="content_filter"), "refusal", "hey"),
-        (
-            lambda: _completion(usage=None, message={"refusal": "I can't help with that"}),
+            _completion(usage=None, message={"refusal": "I can't help with that"}),
             "refusal",
             "I can't help with that",
         ),
-        (lambda: _lenient_completion("weird"), "other", "hey"),
     ],
-    ids=[
-        "stop",
-        "stop_with_tool_calls",
-        "tool_calls",
-        "length",
-        "content_filter",
-        "refusal_field_beside_stop",
-        "unknown_value",
-    ],
+    ids=["stop_with_tool_calls", "refusal_field_beside_stop"],
 )
-def test_stop_reason_mapping(
-    build_completion: Callable[[], ChatCompletion],
-    expected: StopReason,
-    expected_output: str | None,
+def test_a_stop_finish_reason_defers_to_tool_calls_and_the_refusal_field(
+    completion: ChatCompletion, expected: StopReason, expected_output: str | None
 ) -> None:
-    outcome = _text_bound().interpret(build_completion())
-    if expected_output is None:
-        assert outcome.kind == "tool_call_response"
-        assert outcome.stop_reason == expected
-    else:
-        plain = _assert_plain(outcome)
-        assert (plain.output, plain.stop_reason) == (expected_output, expected)
+    interpretation = _text_bound().interpret(completion)
+    assert interpretation.kind == "finished_response"
+    assert interpretation.stop_reason == expected
+    assert final_text(interpretation.assistant_message) == expected_output
 
 
 def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
@@ -737,7 +686,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
     assert _adapter().client.max_retries == 0
 
 
-def _text_bound() -> BoundAdapter[str]:
+def _text_bound() -> BoundAdapter:
     return _adapter().bind_text(_binding())
 
 
@@ -746,11 +695,8 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_bound() -> BoundAdapter[_StructuredReport]:
+def _structured_bound() -> BoundAdapter:
     return _adapter().bind_structured(_binding(), _StructuredReport)
-
-
-_REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 
 
 def _structured_completion(
@@ -778,8 +724,6 @@ def _structured_completion(
             _structured_completion(None, finish_reason="length", tool_call=True),
             "max_completion_tokens_exceeded",
         ),
-        (_structured_completion(None, refusal="I can't help", tool_call=True), "refusal"),
-        (_structured_completion(None, refusal=_REPORT_JSON), "refusal"),
         (_structured_completion(None, finish_reason="content_filter"), "refusal"),
         (_structured_completion(None, tool_call=True), "tool_call_response"),
         (_structured_completion("let me look that up", tool_call=True), "tool_call_response"),
@@ -788,8 +732,6 @@ def _structured_completion(
         "no_text",
         "length_cut_mid_json",
         "length_cut_a_tool_call",
-        "refusal_beside_a_tool_call",
-        "refusal_text_that_would_validate",
         "content_filter",
         "tool_call",
         "tool_call_beside_prose",
@@ -798,7 +740,7 @@ def _structured_completion(
 def test_structured_bind_reports_why_an_assistant_message_produced_no_instance(
     completion: ChatCompletion, expected_kind: str
 ) -> None:
-    outcome = _structured_bound().interpret(completion)
+    outcome = structured_outcome(_structured_bound(), completion, _StructuredReport)
     assert outcome.kind == expected_kind
     assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
 
@@ -928,7 +870,7 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
         ReasoningDelta(text=" part b"),
         "hey",
     ]
-    usable = _assert_plain(_text_bound().interpret(final))
+    usable = _assert_plain(text_outcome(_text_bound(), final))
     assert usable.assistant_message.content[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
@@ -1071,8 +1013,8 @@ def test_an_api_error_subclass_raised_mid_stream_propagates_untouched(error: Exc
     assert raised.value is error
 
 
-def _request_body_sent[OutputT](
-    bind: Callable[[OpenAIChatCompletionsAdapter], BoundAdapter[OutputT]],
+def _request_body_sent(
+    bind: Callable[[OpenAIChatCompletionsAdapter], BoundAdapter],
 ) -> object:
     bodies: list[bytes] = []
 
@@ -1098,7 +1040,7 @@ def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> N
 
     def bind_then_edit_extra_body(
         adapter: OpenAIChatCompletionsAdapter,
-    ) -> BoundAdapter[str]:
+    ) -> BoundAdapter:
         bound = adapter.bind_text(_binding(extra_body=extra_body))
         extra_body["safety_identifier"] = "user-8"
         return bound

@@ -35,11 +35,13 @@ from langchaint.generation.errors import (
 from langchaint.generation.request_history import AbandonedStreamRecord, _RequestLedger
 from langchaint.generation.response import (
     GenerationOutcome,
+    OutputReader,
     PlainGeneration,
     ToolCallGeneration,
     _escaped_error,
     _generation_outcome_from_response_outcome,
     _timed_out_error,
+    response_outcome,
 )
 
 type _State = Literal["unopened", "open", "finished"]
@@ -79,7 +81,8 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         self,
         *,
         adapter: Adapter,
-        bound_adapter: BoundAdapter[OutputT],
+        bound_adapter: BoundAdapter,
+        read_output: OutputReader[OutputT],
         messages: Sequence[Message],
         shared_backoff: SharedBackoff,
         max_requests: int,
@@ -94,6 +97,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         Args:
             adapter: The provider adapter for request metadata and failure handling.
             bound_adapter: The bound adapter for request construction and response handling.
+            read_output: The reader of the binding's output.
             messages: The messages to send.
             shared_backoff: Shared admission and backoff for the rate-limit quota.
             max_requests: The request limit for opening the stream.
@@ -107,6 +111,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         ) = None
         self._adapter = adapter
         self._bound_adapter = bound_adapter
+        self._read_output = read_output
         self._messages = messages
         self._shared_backoff = shared_backoff
         self._max_requests = max_requests
@@ -519,11 +524,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                     raw, request_id=adapter_stream.request_id()
                 ),
             )
-            response_outcome = self._bound_adapter.interpret(raw)
+            outcome = response_outcome(self._bound_adapter.interpret(raw), self._read_output)
         except Exception as exc:  # noqa: BLE001 (an assembly failure settles the request like an iteration failure)
             return await self._error_after_stream_failure(exc, stage="assembly")
         return self._outcome_from_response(
-            response_outcome, ended_at_monotonic_seconds=ended_at_monotonic_seconds
+            outcome, ended_at_monotonic_seconds=ended_at_monotonic_seconds
         )
 
     def _outcome_from_response(

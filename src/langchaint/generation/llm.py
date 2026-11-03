@@ -18,7 +18,13 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.common.exceptions import TransientError
-from langchaint.common.messages import AssistantMessage, Message, TextPart, UserMessage
+from langchaint.common.messages import (
+    AssistantMessage,
+    Message,
+    TextPart,
+    UserMessage,
+    final_text,
+)
 from langchaint.common.observed_operation import (
     UNOBSERVED_OPERATION,
     ObservedOperation,
@@ -53,12 +59,15 @@ from langchaint.generation.response import (
     Generation,
     GenerationOutcome,
     GenerationOutcomeRecord,
+    OutputReader,
     PlainGeneration,
     PlainGenerationRecord,
     ToolCallGeneration,
     _escaped_error,
     _generation_outcome_from_response_outcome,
     _timed_out_error,
+    response_outcome,
+    structured_output,
 )
 from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
@@ -207,28 +216,23 @@ def _build_binding(
     )
 
 
-@overload
-def _bind_adapter(
-    adapter: Adapter, binding: Binding, response_format: type[str]
-) -> BoundAdapter[str]: ...
-@overload
-def _bind_adapter[ModelT: BaseModel](
-    adapter: Adapter, binding: Binding, response_format: type[ModelT]
-) -> BoundAdapter[ModelT]: ...
-@overload
-def _bind_adapter(
+def _bound_adapter_and_reader(
     adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
-) -> BoundAdapter[str] | BoundAdapter[BaseModel]: ...
-def _bind_adapter(
-    adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
-) -> BoundAdapter[str] | BoundAdapter[BaseModel]:
+) -> tuple[BoundAdapter, OutputReader[str] | OutputReader[BaseModel]]:
+    """Bind `adapter` for `response_format` output, and return the reader of that output.
+
+    Raises:
+        TypeError: `response_format` is neither `str` nor a pydantic model.
+    """
     if response_format is str:
-        return adapter.bind_text(binding)
+        return adapter.bind_text(binding), final_text
     if not issubclass(response_format, BaseModel):
         raise TypeError(
             f"response_format must be str or a pydantic.BaseModel subclass, got {response_format!r}"
         )
-    return adapter.bind_structured(binding, response_format)
+    return adapter.bind_structured(binding, response_format), partial(
+        structured_output, response_format=response_format
+    )
 
 
 def _resolve_tool_manager(
@@ -359,8 +363,8 @@ class LLM:
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `str` for text.
                 With `str`, `output` is the kept assistant message's final text.
-                Without text, `PlainGeneration.output` is `""`.
-                To treat an empty output as a failure, bind a `response_format` that rejects empty text.
+                A response without a text part or tool call gives `GenerationError`.
+                An empty final text part gives `""`.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
             reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
             temperature: The sampling temperature, or `None` for the provider default.
@@ -402,9 +406,13 @@ class LLM:
             ),
             extra_body=extra_body,
         )
+        bound_adapter, read_output = _bound_adapter_and_reader(
+            self.adapter, binding, response_format
+        )
         return BoundLLM(
             adapter=self.adapter,
-            bound_adapter=_bind_adapter(self.adapter, binding, response_format),
+            bound_adapter=bound_adapter,
+            read_output=read_output,
             response_format=response_format,
             binding=binding,
             tool_manager=tool_manager,
@@ -429,7 +437,8 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self,
         *,
         adapter: Adapter,
-        bound_adapter: BoundAdapter[OutputT],
+        bound_adapter: BoundAdapter,
+        read_output: OutputReader[OutputT],
         response_format: type[OutputT],
         binding: Binding,
         tool_manager: ToolManagerT,
@@ -442,6 +451,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         Args:
             adapter: The provider SDK adapter.
             bound_adapter: `adapter` bound to `binding` for `response_format` output.
+            read_output: The reader of `response_format` output.
             response_format: The pydantic model for structured output, or `str` for text.
             binding: The frozen provider-neutral prompt prefix.
             tool_manager: The bound `ToolManager`, or `None`.
@@ -462,7 +472,8 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self.shared_backoff: Final[SharedBackoff] = shared_backoff
         self.max_requests: Final[int] = max_requests
         self.observer: Final[Observer | None] = observer
-        self._bound_adapter: Final[BoundAdapter[OutputT]] = bound_adapter
+        self._bound_adapter: Final[BoundAdapter] = bound_adapter
+        self._read_output: Final[OutputReader[OutputT]] = read_output
         self._adapter_class: Final[type[Adapter]] = type(adapter)
         self._adapter_model: Final[str] = adapter.model
         self._adapter_provider_name: Final[str] = adapter.provider_name
@@ -740,9 +751,13 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         )
         resolved_response_format = _resolved_replacement(response_format, self.response_format)
         max_requests = _resolved_replacement(max_requests, self.max_requests)
+        bound_adapter, read_output = _bound_adapter_and_reader(
+            self.adapter, binding, resolved_response_format
+        )
         return BoundLLM(
             adapter=self.adapter,
-            bound_adapter=_bind_adapter(self.adapter, binding, resolved_response_format),
+            bound_adapter=bound_adapter,
+            read_output=read_output,
             response_format=resolved_response_format,
             binding=binding,
             tool_manager=tool_manager,
@@ -802,7 +817,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             provider_billing=self._bound_adapter.billing_from_raw(raw),
             identity=self._bound_adapter.identity_from_raw(raw, request_id=request_id),
         )
-        return self._bound_adapter.interpret(raw)
+        return response_outcome(self._bound_adapter.interpret(raw), self._read_output)
 
     async def _request_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _RequestLedger, deadline: Deadline
@@ -1280,6 +1295,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         return StreamHandle(
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,
+            read_output=self._read_output,
             messages=messages,
             shared_backoff=self.shared_backoff,
             max_requests=self.max_requests,

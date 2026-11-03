@@ -546,10 +546,7 @@ def _user_content_blocks(
     """
     blocks: list[_ContentBlockParam] = []
     part_cache_breakpoint_blocks: list[TextBlockParam | ImageBlockParam] = []
-    if isinstance(user_message.content, str):
-        blocks.append({"type": "text", "text": user_message.content})
-        return blocks, part_cache_breakpoint_blocks
-    for part in user_message.content:
+    for part in user_message.content_parts:
         block = _part_block(part, message_class=UserMessage)
         blocks.append(block)
         if part.cache_breakpoint:
@@ -603,11 +600,9 @@ def _assistant_content_blocks(
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
         _RejectedMessagesError: A stored block lacks a `type` key.
     """
-    if isinstance(assistant_message.content, str):
-        return [{"type": "text", "text": assistant_message.content}], []
     blocks: list[_ContentBlockParam] = []
     part_cache_breakpoint_blocks: list[TextBlockParam] = []
-    for part in assistant_message.content:
+    for part in assistant_message.content_parts:
         if part.kind == "text":
             text_block: TextBlockParam = {"type": "text", "text": part.text}
             blocks.append(text_block)
@@ -631,14 +626,13 @@ def _tool_message_has_cache_breakpoint(tool_message: ToolMessage) -> bool:
     Raises:
         _RejectedMessagesError: A non-final part sets `cache_breakpoint`, because the API caches up to the block end.
     """
-    if isinstance(tool_message.content, str):
-        return False
-    if any(part.cache_breakpoint for part in tool_message.content[:-1]):
+    parts = tool_message.content_parts
+    if any(part.cache_breakpoint for part in parts[:-1]):
         raise _RejectedMessagesError(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
             "the cache breakpoint goes on the enclosing tool_result block, whose span ends at the last part"
         )
-    return bool(tool_message.content and tool_message.content[-1].cache_breakpoint)
+    return bool(parts and parts[-1].cache_breakpoint)
 
 
 def _wire_messages(

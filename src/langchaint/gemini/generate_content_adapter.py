@@ -57,13 +57,13 @@ from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
     Message,
-    MessageContent,
     RawPart,
     ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
+    UserMessage,
     assistant_text,
 )
 
@@ -563,11 +563,9 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
         _RejectedMessagesError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
-    if isinstance(assistant_message.content, str):
-        return [types.Part(text=assistant_message.content)]
     wire_parts: list[types.Part] = []
     replayed_part_with_paired_payload: types.Part | None = None
-    for part in assistant_message.content:
+    for part in assistant_message.content_parts:
         if replayed_part_with_paired_payload is not None:
             replayed_part = replayed_part_with_paired_payload
             replayed_part_with_paired_payload = None
@@ -600,16 +598,14 @@ def _inline_function_response_part(data: bytes, media_type: str) -> types.Functi
     )
 
 
-def _user_parts(content: MessageContent) -> list[types.Part]:
+def _user_parts(user_message: UserMessage) -> list[types.Part]:
     """Convert one UserMessage's content to wire parts.
 
     ImagePart and AudioPart use Part.inline_data.
     ImageUrlPart uses Part.file_data.
     """
-    if isinstance(content, str):
-        return [types.Part(text=content)]
     wire_parts: list[types.Part] = []
-    for part in content:
+    for part in user_message.content_parts:
         match part.kind:
             case "text":
                 wire_parts.append(types.Part(text=part.text))
@@ -648,28 +644,25 @@ def _function_response_part(
             f"assistant message, so the FunctionResponse name the wire requires cannot be recovered"
         )
     function_response_parts: list[types.FunctionResponsePart] = []
-    if isinstance(tool_message.content, str):
-        text = tool_message.content
-    else:
-        texts: list[str] = []
-        for part in tool_message.content:
-            match part.kind:
-                case "text":
-                    texts.append(part.text)
-                case "image" | "audio":
-                    function_response_parts.append(
-                        _inline_function_response_part(part.data, part.media_type)
-                    )
-                case "image_url":
-                    function_response_parts.append(
-                        types.FunctionResponsePart(
-                            file_data=types.FunctionResponseFileData(
-                                file_uri=part.url,
-                                mime_type=part.media_type,
-                            )
+    texts: list[str] = []
+    for part in tool_message.content_parts:
+        match part.kind:
+            case "text":
+                texts.append(part.text)
+            case "image" | "audio":
+                function_response_parts.append(
+                    _inline_function_response_part(part.data, part.media_type)
+                )
+            case "image_url":
+                function_response_parts.append(
+                    types.FunctionResponsePart(
+                        file_data=types.FunctionResponseFileData(
+                            file_uri=part.url,
+                            mime_type=part.media_type,
                         )
                     )
-        text = "".join(texts)
+                )
+    text = "".join(texts)
     return types.Part(
         function_response=types.FunctionResponse(
             id=None if tool_message.tool_call_id == name else tool_message.tool_call_id,
@@ -707,7 +700,7 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
                 )
             case "user":
                 flush_function_responses()
-                contents.append(types.Content(role="user", parts=_user_parts(message.content)))
+                contents.append(types.Content(role="user", parts=_user_parts(message)))
             case "assistant":
                 flush_function_responses()
                 for tool_call in message.tool_calls:

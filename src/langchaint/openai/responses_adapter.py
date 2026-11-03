@@ -329,29 +329,21 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     Without tool calls, the final text message uses phase `final_answer`.
     All other text messages use phase `commentary`.
     Text and structured bindings use the same phase assignment.
-    Plain text becomes one assistant message with phase `final_answer`.
     Each `ToolCall` becomes `function_call` keyed by `call_id`.
     `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
     The API validates another provider's unknown `type` key.
     """
-    if isinstance(assistant_message.content, str):
-        return [
-            {
-                "role": "assistant",
-                "content": assistant_message.content,
-                "phase": "final_answer",
-            }
-        ]
+    parts = assistant_message.content_parts
     final_text_index = (
         max(
-            (index for index, part in enumerate(assistant_message.content) if part.kind == "text"),
+            (index for index, part in enumerate(parts) if part.kind == "text"),
             default=None,
         )
         if not assistant_message.tool_calls
         else None
     )
     items: list[ResponseInputItemParam] = []
-    for index, part in enumerate(assistant_message.content):
+    for index, part in enumerate(parts):
         if part.kind == "text":
             items.append({
                 "role": "assistant",

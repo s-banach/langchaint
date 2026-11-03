@@ -525,11 +525,10 @@ def test_text_parts_replay_as_separate_messages() -> None:
     ]
 
 
-@pytest.mark.parametrize("content", ["answer", (TextPart(text="answer"),)])
-def test_text_binding_replays_plain_text_and_one_text_part_as_a_final_answer(
-    content: str | tuple[TextPart, ...],
-) -> None:
-    request = _text_bound().build_request_params([AssistantMessage(content=content)])
+def test_text_binding_replays_one_text_part_as_a_final_answer() -> None:
+    request = _text_bound().build_request_params([
+        AssistantMessage(content=(TextPart(text="answer"),))
+    ])
     assert isinstance(request, _OpenAIResponsesRequestParams)
     assert request.precomputed.text is openai.omit
     assert request.input == [

@@ -36,11 +36,8 @@ def render(event: Event) -> str:
             mark = "ERR" if event.tool_message.is_error else "ok"
             reported_usage = event.reported_usage
             fee = f" +${reported_usage.cost_in_usd:.4f}" if reported_usage.cost_in_usd else ""
-            content = event.tool_message.content
-            text = (
-                content
-                if isinstance(content, str)
-                else " ".join(part.text for part in content if part.kind == "text")
+            text = " ".join(
+                part.text for part in event.tool_message.content_parts if part.kind == "text"
             )
             body = f"  <- {event.tool_call.name} {mark}: {text[:38]!r}{fee} -> ${event.usage_so_far.cost_in_usd:.4f}"
     indent = "  " * event.agent_path.count("/")

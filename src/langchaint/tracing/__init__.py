@@ -102,11 +102,10 @@ from langchaint.common.messages import (
     ContentPart,
     JsonValue,
     Message,
-    MessageContent,
     StopReason,
-    TextPart,
     ToolCall,
     ToolMessage,
+    content_parts,
 )
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
@@ -332,18 +331,14 @@ def _content_part(part: ContentPart) -> dict[str, object]:
 
 
 def _recorded_content(
-    content: MessageContent, content_filter: ContentFilter, attribute_name: str
+    parts: tuple[ContentPart, ...], content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
     """Filter content parts and render the kept ones as the convention's parts array.
 
-    A str is filtered as one `TextPart`.
-    A bound system prompt is a str or a tuple of `TextPart`, so it renders here too.
+    A bound system prompt renders here too, as `TextPart` values.
     gen_ai.system_instructions items share the text part shape.
     """
-    content_parts: tuple[ContentPart, ...] = (
-        (TextPart(text=content),) if isinstance(content, str) else content
-    )
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in content_parts)
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in parts)
     return [_content_part(part) for part in kept if part is not None]
 
 
@@ -385,15 +380,13 @@ def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
 
 
 def _recorded_assistant_parts(
-    content: str | tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
+    parts: tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
     """Filter assistant content and render its kept parts as the convention's parts array, in order.
 
     If every part is omitted or renders as None, the message renders as an empty parts array, not as a missing message.
     """
-    if isinstance(content, str):
-        content = (TextPart(text=content),)
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in content)
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in parts)
     rendered = (_assistant_part(part) for part in kept if part is not None)
     return [part for part in rendered if part is not None]
 
@@ -406,13 +399,15 @@ def _input_message(message: Message, content_filter: ContentFilter) -> dict[str,
     attribute_name = "gen_ai.input.messages"
     match message.kind:
         case "user":
-            otel_parts = _recorded_content(message.content, content_filter, attribute_name)
+            otel_parts = _recorded_content(message.content_parts, content_filter, attribute_name)
             return {"role": "user", "parts": otel_parts}
         case "tool":
             otel_parts = [_tool_call_response_part(message, content_filter, attribute_name)]
             return {"role": "tool", "parts": otel_parts}
         case "assistant":
-            otel_parts = _recorded_assistant_parts(message.content, content_filter, attribute_name)
+            otel_parts = _recorded_assistant_parts(
+                message.content_parts, content_filter, attribute_name
+            )
             return {"role": "assistant", "parts": otel_parts}
 
 
@@ -429,7 +424,7 @@ def _tool_call_response_part(
         "type": "tool_call_response",
         "id": message.tool_call_id,
         "is_error": message.is_error,
-        "response": _recorded_content(message.content, content_filter, attribute_name),
+        "response": _recorded_content(message.content_parts, content_filter, attribute_name),
     }
 
 
@@ -465,7 +460,7 @@ def _input_content_attributes(
     attributes: dict[str, SpanAttributeValue] = {}
     if binding.system_prompt is not None:
         system_instructions = _recorded_content(
-            binding.system_prompt, content_filter, "gen_ai.system_instructions"
+            content_parts(binding.system_prompt), content_filter, "gen_ai.system_instructions"
         )
         if system_instructions:
             attributes["gen_ai.system_instructions"] = json.dumps(system_instructions)
@@ -498,7 +493,7 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
 
 
 def _output_content_attributes(
-    content: str | tuple[AssistantPart, ...],
+    parts: tuple[AssistantPart, ...],
     stop_reason: StopReason | None,
     content_filter: ContentFilter,
 ) -> dict[str, SpanAttributeValue]:
@@ -508,7 +503,7 @@ def _output_content_attributes(
             {
                 "role": "assistant",
                 "parts": _recorded_assistant_parts(
-                    content, content_filter, "gen_ai.output.messages"
+                    parts, content_filter, "gen_ai.output.messages"
                 ),
                 "finish_reason": (
                     _NO_STOP_REASON_FINISH_REASON
@@ -678,7 +673,7 @@ class _GenerationSpan(_SpanOperation[GenerationOutcome[object] | AbandonedStream
             stop_reason = outcome.stop_reason
             self.add_content_attribute_group(
                 lambda content_filter: _output_content_attributes(
-                    assistant_message.content, stop_reason, content_filter
+                    assistant_message.content_parts, stop_reason, content_filter
                 )
             )
         if isinstance(outcome, GenerationError):

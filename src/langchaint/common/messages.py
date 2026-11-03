@@ -86,6 +86,11 @@ class TextPart(CheckedCopyModel):
     kind: Literal["text"] = "text"
 
 
+def content_parts[PartT](content: str | tuple[PartT, ...]) -> tuple[PartT | TextPart, ...]:
+    """Return `content` as parts, with plain text as one `TextPart`."""
+    return (TextPart(text=content),) if isinstance(content, str) else content
+
+
 class ImagePart(CheckedCopyModel):
     """Inline image bytes encoded as URL-safe base64 in JSON.
 
@@ -161,6 +166,11 @@ class UserMessage(CheckedCopyModel):
     content: MessageContent
     kind: Literal["user"] = "user"
 
+    @property
+    def content_parts(self) -> tuple[ContentPart, ...]:
+        """Return `content` as parts, with plain text as one `TextPart`."""
+        return content_parts(self.content)
+
 
 class ReasoningPart(CheckedCopyModel):
     """Provider reasoning preserved for replay.
@@ -212,11 +222,14 @@ class AssistantMessage(CheckedCopyModel):
     kind: Literal["assistant"] = "assistant"
 
     @property
+    def content_parts(self) -> tuple[AssistantPart, ...]:
+        """Return `content` as parts, with plain text as one `TextPart`."""
+        return content_parts(self.content)
+
+    @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """Return the `ToolCall` values from `content` in emission order."""
-        if isinstance(self.content, str):
-            return ()
-        return tuple(part for part in self.content if part.kind == "tool_call")
+        return tuple(part for part in self.content_parts if part.kind == "tool_call")
 
 
 class AssistantText(NamedTuple):
@@ -230,14 +243,9 @@ def assistant_text(assistant_message: AssistantMessage) -> AssistantText:
     """Select final text and commentary from the ordered assistant content.
 
     Args:
-        assistant_message: The completed assistant message; string content counts as one text part.
+        assistant_message: The completed assistant message.
     """
-    content = assistant_message.content
-    texts = (
-        (content,)
-        if isinstance(content, str)
-        else tuple(part.text for part in content if part.kind == "text")
-    )
+    texts = tuple(part.text for part in assistant_message.content_parts if part.kind == "text")
     if assistant_message.tool_calls:
         return AssistantText(None, "\n".join(texts) if texts else None)
     return AssistantText(
@@ -260,6 +268,11 @@ class ToolMessage(CheckedCopyModel):
     content: MessageContent
     is_error: bool = False
     kind: Literal["tool"] = "tool"
+
+    @property
+    def content_parts(self) -> tuple[ContentPart, ...]:
+        """Return `content` as parts, with plain text as one `TextPart`."""
+        return content_parts(self.content)
 
     @classmethod
     def error(cls, tool_call: ToolCall, content: MessageContent) -> "ToolMessage":

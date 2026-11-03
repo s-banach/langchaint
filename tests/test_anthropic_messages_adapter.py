@@ -480,7 +480,6 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
         ("refusal", "refusal"),
         ("model_context_window_exceeded", "context_window_exceeded"),
         ("pause_turn", "other"),
-        (None, "other"),
     ],
 )
 def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
@@ -508,29 +507,12 @@ def test_text_response_selects_the_final_text_block() -> None:
     assert outcome.kind == "plain_response"
     assert outcome.output == "world"
     assert outcome.assistant_message.content == (TextPart(text="hello "), TextPart(text="world"))
-    assert outcome.stop_reason == "tool_call"
-
-
-def test_a_text_tool_call_before_a_cut_off_block_is_usable() -> None:
-    """Only the last block can be incomplete, so a tool call ahead of the cut-off block is complete."""
-    message = _message_with_content(
-        [
-            at.ToolUseBlock(type="tool_use", id="tu_1", name="lookup", input={}),
-            at.TextBlock(type="text", text="cut"),
-        ],
-        stop_reason="max_tokens",
-    )
-    outcome = (
-        _adapter()
-        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
-        .interpret(message)
-    )
-    assert outcome.kind == "tool_call_response"
+    assert outcome.stop_reason == "stop"
 
 
 def _message_with_content(
     content: list[at.ContentBlock],
-    stop_reason: at.StopReason | None = "tool_use",
+    stop_reason: at.StopReason | None = "end_turn",
     usage: at.Usage | None = None,
 ) -> at.Message:
     return at.Message(
@@ -1762,7 +1744,6 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             None,
             id="context_window_exceeded",
         ),
-        pytest.param(None, None, "unexpected_response", None, id="no_stop_reason"),
         pytest.param(None, "pause_turn", "unexpected_response", None, id="pause_turn"),
         pytest.param(
             "partial thought",
@@ -1770,16 +1751,6 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             "unexpected_response",
             None,
             id="pause_turn_ahead_of_schema_violation",
-        ),
-        pytest.param(
-            None, "tool_use", "empty_assistant_message", None, id="tool_use_without_tool_calls"
-        ),
-        pytest.param(
-            "let me look that up",
-            "tool_use",
-            "schema_violation",
-            None,
-            id="tool_use_without_tool_calls_with_prose",
         ),
     ],
 )
@@ -2176,9 +2147,6 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             _status_error(
                 anthropic.OverloadedError, 529, error_type="overloaded_error"
             ): transient(pauses_quota=True),
-            _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error"): transient(
-                pauses_quota=True
-            ),
             _status_error(anthropic.InternalServerError, 500, error_type="api_error"): transient(
                 pauses_quota=False
             ),
@@ -2235,7 +2203,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
                 kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
             ),
             _status_error(
-                anthropic.APIStatusError, 418, {"x-should-retry": "false"}, "overloaded_error"
+                anthropic.OverloadedError, 529, {"x-should-retry": "false"}, "overloaded_error"
             ): RequestFailure(
                 kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
             ),

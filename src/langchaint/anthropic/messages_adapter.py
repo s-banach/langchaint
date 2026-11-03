@@ -806,7 +806,7 @@ def _ends_in_cut_off_tool_call(message: anthropic.types.Message) -> bool:
 def _unexpected_response_or_none(
     message: anthropic.types.Message, *, assistant_message: AssistantMessage
 ) -> UnexpectedResponse | None:
-    """Return `UnexpectedResponse` for `pause_turn`, a null stop reason, or an unknown stop reason."""
+    """Return `UnexpectedResponse` for `pause_turn` or an unknown stop reason."""
     stop_reason = message.stop_reason
     if stop_reason in (
         "end_turn",
@@ -1273,7 +1273,7 @@ class _AnthropicStream(AdapterStream):
 
         `input_json_delta` yields `ToolCallDelta` only for `tool_use` blocks.
         The adapter reads the id and name from the SDK message snapshot.
-        `server_tool_use` streams no delta and becomes `RawPart` in `final()`.
+        `server_tool_use` yields no `ToolCallDelta` and becomes `RawPart` in `final()`.
         `REASONING_PART_SEPARATOR` separates thinking blocks that emitted text.
         Empty deltas and redacted thinking emit no reasoning text or separator.
 

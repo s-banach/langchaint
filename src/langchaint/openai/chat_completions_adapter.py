@@ -729,6 +729,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         self._input_tokens_cache_read_from_usage = input_tokens_cache_read_from_usage
         self._state = ChatCompletionStreamState()
         self._chunk_received = False
+        self._content_filtered = False
+        """Whether an Azure annotation chunk reported `finish_reason="content_filter"`."""
 
     async def _chunks(self) -> AsyncIterator[ChatCompletionChunk]:
         """Iterate the SDK stream, rewrapping its mid-stream error raise for openai_request_failure.
@@ -740,6 +742,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
             `ChatCompletionStreamState` would take an empty id and model from the first.
             It raises `AttributeError` on the second.
             The SDK's own stream helper skips them too (openai 3.42.1 `_is_valid_chat_completion_chunk_weak`).
+            In asynchronous filter mode, a block arrives only as an annotation chunk's `content_filter` finish reason.
+            `_content_filtered` records that block (Azure content streaming docs, blocked-by-filters sample).
 
         Raises:
             openai.APIStatusError: An SSE payload contains an error object.
@@ -762,6 +766,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
                 raise
             if chunk.object == "chat.completion.chunk":
                 yield chunk
+            elif any(choice.finish_reason == "content_filter" for choice in chunk.choices or ()):
+                self._content_filtered = True
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -815,7 +821,12 @@ class _OpenAIChatCompletionsStream(AdapterStream):
                         name=event.name,
                         args_json=event.arguments,
                     )
-        if not finish_reason_seen:
+        filtered = (
+            self._content_filtered
+            and self._chunk_received
+            and bool(self._state.current_completion_snapshot.choices)
+        )
+        if not finish_reason_seen and not filtered:
             raise StreamProtocolError("stream ended without a finish reason")
 
     @override
@@ -824,6 +835,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
 
         The adapter preserves the lenient SDK snapshot without revalidation.
         Revalidation could reject partial output and billing.
+        An Azure content-filter block sets every choice's `finish_reason` to `"content_filter"`.
         `get_final_completion` raises on length and content-filter responses (openai 2.51.0).
 
         Raises:
@@ -831,7 +843,17 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         """
         if not self._chunk_received:
             raise StreamProtocolError("final() requires items() to be exhausted first")
-        return self._state.current_completion_snapshot
+        snapshot = self._state.current_completion_snapshot
+        if not self._content_filtered:
+            return snapshot
+        return snapshot.model_copy(
+            update={
+                "choices": [
+                    choice.model_copy(update={"finish_reason": "content_filter"})
+                    for choice in snapshot.choices
+                ]
+            }
+        )
 
     @override
     def provider_billing(self) -> ProviderBilling | None:

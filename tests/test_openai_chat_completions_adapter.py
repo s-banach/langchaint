@@ -853,6 +853,53 @@ def test_stream_skips_azure_content_filter_annotation_chunks() -> None:
     assert _collected_items([first, annotation, *rest]) == ["he", "y"]
 
 
+def _azure_content_filter_block() -> ChatCompletionChunk:
+    return construct_type_unchecked(
+        value={
+            "id": "",
+            "object": "",
+            "created": 0,
+            "model": "",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "content_filter",
+                    "content_filter_results": {
+                        "protected_material_text": {"detected": True, "filtered": True}
+                    },
+                }
+            ],
+        },
+        type_=ChatCompletionChunk,
+    )
+
+
+@pytest.mark.parametrize(
+    "before_block",
+    [
+        [_chunk(delta={"role": "assistant", "content": "he"})],
+        [_chunk(delta={"role": "assistant", "content": "he"}), _chunk(finish_reason="stop")],
+    ],
+)
+def test_stream_reads_an_azure_content_filter_block_from_an_annotation_chunk(
+    before_block: list[ChatCompletionChunk],
+) -> None:
+    stream = _stream([*before_block, _azure_content_filter_block()])
+
+    async def scenario() -> tuple[list[StreamItem], ChatCompletion]:
+        items = [item async for item in stream.items()]
+        return items, await stream.final()
+
+    items, final = run_with_timeout(scenario())
+    assert items == ["he"]
+    assert [choice.finish_reason for choice in final.choices] == ["content_filter"]
+
+
+def test_stream_rejects_an_azure_content_filter_block_before_any_choice() -> None:
+    with pytest.raises(StreamProtocolError, match="without a finish reason"):
+        _ = _collected_items([_azure_content_filter_block()])
+
+
 def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -> None:
     stream = _stream([
         _chunk(delta={"role": "assistant", "reasoning_content": "part a"}),

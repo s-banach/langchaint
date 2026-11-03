@@ -251,37 +251,6 @@ def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize(
-    "data",
-    [None, [None], [{"object": "embedding", "embedding": [1.0], "index": None}]],
-)
-def test_response_rejects_invalid_data_shapes(data: object) -> None:
-    def handler(_request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(
-            200,
-            json={
-                "object": "list",
-                "data": data,
-                "model": "offline",
-                "usage": {"prompt_tokens": 1, "total_tokens": 1},
-            },
-        )
-
-    client = _client(handler)
-
-    async def scenario() -> None:
-        adapter = _OpenAIEmbeddingAdapter(
-            client=client,
-            model="text-embedding-3-small",
-            dimension=1,
-        )
-        with pytest.raises(EmbeddingOutputError):
-            _ = await adapter.embed_batch(("text",), task="clustering")
-        await client.close()
-
-    run_with_timeout(scenario())
-
-
 def test_partition_splits_at_input_count_limit() -> None:
     batches = _partition_inputs_sync(["x"] * 2049)
     assert tuple(map(len, batches)) == (2048, 1)

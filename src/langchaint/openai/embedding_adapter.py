@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, override
 
 import tiktoken
 from openai import AsyncOpenAI, omit
-from openai.types import Embedding as OpenAIEmbedding
 
 from langchaint.adapter import RequestFailure, _require_provider_name
 from langchaint.common.exceptions import EmbeddingOutputError
@@ -121,24 +120,10 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
             encoding_format="float",
         )
         input_tokens_total = response.usage.prompt_tokens
-        response_data = response.data
-        if not isinstance(response_data, list):
-            raise EmbeddingOutputError(
-                "OpenAI returned invalid embedding data", input_tokens_total=input_tokens_total
-            )
         vectors_by_index: dict[int, Sequence[float]] = {}
-        for embedding in response_data:
-            if not isinstance(embedding, OpenAIEmbedding):
-                raise EmbeddingOutputError(
-                    "OpenAI returned invalid embedding data", input_tokens_total=input_tokens_total
-                )
+        for embedding in response.data:
             index = embedding.index
-            if (
-                type(index) is not int
-                or index < 0
-                or index >= len(inputs)
-                or index in vectors_by_index
-            ):
+            if index < 0 or index >= len(inputs) or index in vectors_by_index:
                 raise EmbeddingOutputError(
                     "OpenAI returned invalid embedding indexes",
                     input_tokens_total=input_tokens_total,

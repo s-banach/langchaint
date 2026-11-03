@@ -60,9 +60,7 @@ from langchaint.adapter import (
     ToolCallDelta,
     ToolCallResponse,
     ToolChoice,
-    UnexpectedResponse,
     _RejectedMessagesError,
-    _UnusableResponseBase,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
@@ -76,7 +74,6 @@ from langchaint.common.messages import (
     AssistantPart,
     ContentPart,
     Message,
-    RawPart,
     ReasoningPart,
     StopReason,
     TextPart,
@@ -297,17 +294,14 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
 def _assistant_message_param(assistant_message: AssistantMessage) -> ChatCompletionMessageParam:
     """TextPart values concatenate into content.
 
-    ToolCall values become function tool_calls entries.
-    RawPart.raw with type "custom" becomes a custom tool_calls entry unchanged.
-    RawPart.raw holding only function_call merges into the message unchanged.
-    These tool_calls entries retain their emission order.
+    ToolCall values become function tool_calls entries in emission order.
     Each ReasoningPart.raw merges into the message fields.
     This matches openai 2.51.0's ChatCompletionAssistantMessageParam variants.
     DeepSeek requires replayed `reasoning_content` during a tool loop.
     Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
 
     Raises:
-        _RejectedMessagesError: RawPart.raw matches no supported shape, or repeats function_call.
+        _RejectedMessagesError: The assistant message contains a RawPart.
     """
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
@@ -325,21 +319,10 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
                     "function": {"name": part.name, "arguments": part.args_json},
                 })
             case "raw":
-                if part.raw.get("type") == "custom":
-                    # cast: a deliberately-opaque value re-enters the typed API that serialized it.
-                    tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", part.raw))
-                elif len(part.raw) == 1 and "function_call" in part.raw:
-                    if "function_call" in param:
-                        raise _RejectedMessagesError(
-                            "an assistant message contains more than one function_call, but Chat "
-                            "Completions has one function_call field"
-                        )
-                    param.update(part.raw)
-                else:
-                    raise _RejectedMessagesError(
-                        "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
-                        "function_call can hold it; rebuild the assistant message without it"
-                    )
+                raise _RejectedMessagesError(
+                    "RawPart.raw has no Chat Completions wire form; "
+                    "rebuild the assistant message without it"
+                )
     if texts:
         param["content"] = "".join(texts)
     if tool_calls:
@@ -353,7 +336,7 @@ def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessagePar
 
     Raises:
         _RejectedMessagesError: ToolMessage contains ImagePart, ImageUrlPart, or AudioPart.
-            RawPart.raw may also have no wire form.
+            AssistantMessage contains a RawPart.
     """
     wire: list[ChatCompletionMessageParam] = []
     for message in messages:
@@ -428,11 +411,8 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     A non-empty reasoning_content becomes ReasoningPart first.
     message.content then becomes TextPart when present, including empty text.
     message.refusal then becomes TextPart when non-empty.
-    message.function_call then becomes RawPart when present.
-    Each function message.tool_calls entry becomes ToolCall.
-    Each custom message.tool_calls entry becomes RawPart.
-    The message.tool_calls entry order is preserved.
-    openai 2.51.0 defines both variants.
+    Each message.tool_calls entry then becomes ToolCall in order.
+    The request sends only function tools, so every entry is a function tool call.
     message.annotations and message.audio reach no AssistantPart.
     Read those fields from `Generation.raw`.
     """
@@ -446,23 +426,11 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
         content.append(TextPart(text=message.content))
     if message.refusal:
         content.append(TextPart(text=message.refusal))
-    if message.function_call is not None:
-        content.append(
-            RawPart(
-                raw=message.model_dump(mode="json", include={"function_call"}, exclude_none=True)
-            )
-        )
-    for tool_call in message.tool_calls or ():
-        if tool_call.type == "function":
-            content.append(
-                ToolCall(
-                    id=tool_call.id,
-                    name=tool_call.function.name,
-                    args_json=tool_call.function.arguments,
-                )
-            )
-        else:
-            content.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
+    content.extend(
+        ToolCall(id=x.id, name=x.function.name, args_json=x.function.arguments)
+        for x in message.tool_calls or ()
+        if x.type == "function"
+    )
     return AssistantMessage(content=tuple(content))
 
 
@@ -475,30 +443,13 @@ class _FinishedMessage:
     assistant_message: AssistantMessage
 
 
-def _finished_message_or_unexpected_response(
-    completion: ChatCompletion,
-) -> _FinishedMessage | UnexpectedResponse:
-    """Read the first choice as a finished assistant message, or report why none can be read.
-
-    Missing choices and `finish_reason=None` return `UnexpectedResponse`.
-    An `UnusableResponse` carries any partial assistant message.
-    """
-    if not completion.choices:
-        return UnexpectedResponse(
-            error_text="openai returned no choices, so there is no assistant message to read",
-            assistant_message=AssistantMessage(content=()),
-        )
+def _finished_message(completion: ChatCompletion) -> _FinishedMessage:
+    """Read the first choice, which a stream that ended with a finish reason always has."""
     choice = completion.choices[0]
-    assistant_message = _assistant_message_from(choice.message)
-    finish_reason: str | None = choice.finish_reason
-    if finish_reason is None:
-        return UnexpectedResponse(
-            error_text="openai returned a choice with no finish_reason, "
-            "which langchaint cannot call finished",
-            assistant_message=assistant_message,
-        )
     return _FinishedMessage(
-        finish_reason=finish_reason, message=choice.message, assistant_message=assistant_message
+        finish_reason=choice.finish_reason,
+        message=choice.message,
+        assistant_message=_assistant_message_from(choice.message),
     )
 
 
@@ -789,7 +740,6 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         self._pricing = pricing
         self._input_tokens_cache_read_from_usage = input_tokens_cache_read_from_usage
         self._state = ChatCompletionStreamState()
-        self._last_usage: CompletionUsage | None = None
         self._chunk_received = False
 
     async def _chunks(self) -> AsyncIterator[ChatCompletionChunk]:
@@ -825,7 +775,6 @@ class _OpenAIChatCompletionsStream(AdapterStream):
 
         SDK events carry answer deltas and completed tool calls.
         Each chunk supplies `reasoning_content` before its SDK events.
-        The stream tracks the last non-`None` usage because SDK accumulation may reset it.
         Argument fragments wait for their call id, then precede the next emitted fragment.
 
         Yields:
@@ -839,16 +788,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         pending_args: dict[int, str] = {}
         """Argument fragments held while their call's snapshot id is still None, keyed by index."""
         async for chunk in self._chunks():
-            self._chunk_received = True
-            if chunk.usage is not None:
-                self._last_usage = chunk.usage
             if any(choice.finish_reason for choice in chunk.choices):
                 finish_reason_seen = True
-            reasoning_delta = (
-                _reasoning_content_extra(chunk.choices[0].delta) if chunk.choices else None
-            )
-            if reasoning_delta is not None:
-                yield ReasoningDelta(text=reasoning_delta)
             try:
                 events = self._state.handle_chunk(chunk)
             except IndexError as defect:
@@ -856,6 +797,12 @@ class _OpenAIChatCompletionsStream(AdapterStream):
                     "openai sent a tool-call fragment whose index does not follow its "
                     "predecessors, which the SDK's stream state cannot place"
                 ) from defect
+            self._chunk_received = True
+            reasoning_delta = (
+                _reasoning_content_extra(chunk.choices[0].delta) if chunk.choices else None
+            )
+            if reasoning_delta is not None:
+                yield ReasoningDelta(text=reasoning_delta)
             for event in events:
                 if event.type == "content.delta":
                     yield event.delta
@@ -877,13 +824,6 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         if not finish_reason_seen:
             raise StreamProtocolError("stream ended without a finish reason")
 
-    def _snapshot_with_tracked_usage(self) -> ChatCompletion:
-        """Return the assembled snapshot, patching in the tracked usage where a trailing chunk reset it."""
-        snapshot = self._state.current_completion_snapshot
-        if snapshot.usage is None and self._last_usage is not None:
-            return snapshot.model_copy(update={"usage": self._last_usage})
-        return snapshot
-
     @override
     async def final(self) -> ChatCompletion:
         """Return the response the SDK's state assembled.
@@ -897,19 +837,22 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         """
         if not self._chunk_received:
             raise StreamProtocolError("final() requires items() to be exhausted first")
-        return self._snapshot_with_tracked_usage()
+        return self._state.current_completion_snapshot
 
     @override
     def provider_billing(self) -> ProviderBilling | None:
-        """Return what the tracked usage bills at the snapshot's tier, or None before one arrives.
+        """Return what the snapshot's usage bills at its tier, or None before usage arrives.
 
-        `stream_options` requests usage on the trailing chunk.
+        `stream_options` requests usage on the last chunk.
         An earlier cutoff returns `None`.
         """
-        if self._last_usage is None:
+        if not self._chunk_received:
+            return None
+        snapshot = self._state.current_completion_snapshot
+        if snapshot.usage is None:
             return None
         return _billing_from_chat_completion(
-            self._snapshot_with_tracked_usage(),
+            snapshot,
             pricing=self._pricing,
             input_tokens_cache_read_from_usage=self._input_tokens_cache_read_from_usage,
         )
@@ -1034,9 +977,7 @@ class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_message = _finished_message_or_unexpected_response(_as_chat_completion(raw))
-        if isinstance(finished_message, _UnusableResponseBase):
-            return finished_message
+        finished_message = _finished_message(_as_chat_completion(raw))
         return text_response(
             finished_message.assistant_message, _normalized_stop_reason(finished_message)
         )
@@ -1111,7 +1052,5 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_message = _finished_message_or_unexpected_response(_as_chat_completion(raw))
-        if isinstance(finished_message, _UnusableResponseBase):
-            return finished_message
+        finished_message = _finished_message(_as_chat_completion(raw))
         return self._parsed_outcome(finished_message)

@@ -98,17 +98,6 @@ _TOOL_CALL_WIRE: dict[str, object] = {
 
 _TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": 1}')
 
-_CUSTOM_TOOL_CALL_WIRE: dict[str, JsonValue] = {
-    "id": "c9",
-    "type": "custom",
-    "custom": {"name": "n", "input": "i"},
-}
-
-_FUNCTION_CALL_WIRE: dict[str, JsonValue] = {
-    "name": "legacy_lookup",
-    "arguments": "{}",
-}
-
 
 def _assert_plain[OutputT](outcome: ResponseOutcome[OutputT]) -> PlainResponse[OutputT]:
     assert outcome.kind == "plain_response"
@@ -179,10 +168,10 @@ def _completion(
     })
 
 
-def _lenient_completion(finish_reason: str | None) -> ChatCompletion:
+def _lenient_completion(finish_reason: str) -> ChatCompletion:
     """Build the runtime shape strict validation rejects: a finish_reason outside the SDK's Literal.
 
-    interpret handles None and unknown stop reasons from lenient SDK snapshots.
+    interpret handles unknown stop reasons from lenient SDK snapshots.
     """
     completion = construct_type_unchecked(
         value={
@@ -335,7 +324,6 @@ def test_the_reported_tier_selects_the_rates() -> None:
             "refusal",
             "I can't help with that",
         ),
-        (lambda: _completion(usage=None, finish_reason="function_call"), "other", "hey"),
         (lambda: _lenient_completion("weird"), "other", "hey"),
     ],
     ids=[
@@ -345,7 +333,6 @@ def test_the_reported_tier_selects_the_rates() -> None:
         "length",
         "content_filter",
         "refusal_field_beside_stop",
-        "function_call",
         "unknown_value",
     ],
 )
@@ -377,49 +364,6 @@ def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool
         TextPart(text="but no more"),
         _TOOL_CALL,
     )
-
-
-def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
-    """The custom.input and ToolCall.args_json fields name different provider concepts."""
-    message = ChatCompletionMessage.model_validate({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
-    })
-    assistant_message = _assistant_message_from(message)
-    assert assistant_message.content == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
-    assert _assistant_message_param(assistant_message) == {
-        "role": "assistant",
-        "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
-    }
-
-
-@pytest.mark.parametrize(
-    "function_call",
-    [
-        _FUNCTION_CALL_WIRE,
-        {**_FUNCTION_CALL_WIRE, "type": "custom"},
-        {**_FUNCTION_CALL_WIRE, "type": "future"},
-    ],
-    ids=["plain", "extra_type_custom", "extra_type_future"],
-)
-def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
-    function_call: dict[str, JsonValue],
-) -> None:
-    """The function_call field lacks the id ToolCall requires.
-
-    The function_call field identifies the replay position independently from its value.
-    """
-    message = ChatCompletionMessage.model_validate({
-        "role": "assistant",
-        "function_call": function_call,
-    })
-    assistant_message = _assistant_message_from(message)
-    assert assistant_message.content == (RawPart(raw={"function_call": function_call}),)
-    assert _assistant_message_param(assistant_message) == {
-        "role": "assistant",
-        "function_call": function_call,
-    }
 
 
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
@@ -522,17 +466,6 @@ def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() ->
         (
             [
                 AssistantMessage(
-                    content=(
-                        RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
-                        RawPart(raw={"function_call": {"name": "second", "arguments": "{}"}}),
-                    )
-                )
-            ],
-            ("more than one function_call",),
-        ),
-        (
-            [
-                AssistantMessage(
                     content=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
                 )
             ],
@@ -555,7 +488,6 @@ def test_wire_messages_maps_user_and_tool_parts_and_their_cache_breakpoints() ->
         ],
     ],
     ids=[
-        "two_function_calls",
         "raw_part_without_wire_form",
         "audio_part_media_type_without_input_audio_format",
         "image_part_in_tool_message",
@@ -839,14 +771,6 @@ def _structured_completion(
     [
         (_structured_completion(None), "empty_assistant_message"),
         (
-            _completion(
-                usage=None,
-                message={"tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
-                finish_reason="tool_calls",
-            ),
-            "empty_assistant_message",
-        ),
-        (
             _structured_completion('{"city": "Nair', finish_reason="length"),
             "max_completion_tokens_exceeded",
         ),
@@ -862,7 +786,6 @@ def _structured_completion(
     ],
     ids=[
         "no_text",
-        "custom_tool_call_only",
         "length_cut_mid_json",
         "length_cut_a_tool_call",
         "refusal_beside_a_tool_call",
@@ -878,22 +801,6 @@ def test_structured_bind_reports_why_an_assistant_message_produced_no_instance(
     outcome = _structured_bound().interpret(completion)
     assert outcome.kind == expected_kind
     assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
-
-
-@pytest.mark.parametrize(
-    ("completion", "expected_content"),
-    [
-        (_completion(usage=None, choices=[]), ()),
-        (_lenient_completion(None), (TextPart(text="hey"),)),
-    ],
-    ids=["no_choices", "no_finish_reason"],
-)
-def test_an_unfinished_completion_keeps_available_content(
-    completion: ChatCompletion, expected_content: tuple[TextPart, ...]
-) -> None:
-    outcome = _text_bound().interpret(completion)
-    assert outcome.kind == "unexpected_response"
-    assert outcome.assistant_message.content == expected_content
 
 
 def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
@@ -1083,16 +990,17 @@ def test_provider_billing_is_none_until_the_usage_chunk_arrives() -> None:
     assert after.billing.usage.input_tokens_total == 1000
 
 
-def test_final_patches_the_tracked_usage_over_a_trailing_chunks_reset() -> None:
-    """A usage-less chunk after the usage chunk resets the snapshot's usage. final() restores it."""
-    stream = _stream([*_text_stream_chunks(), _chunk(choices=[])])
+def test_provider_billing_is_none_while_the_first_chunk_yields_its_reasoning() -> None:
+    stream = _stream([
+        _chunk(delta={"role": "assistant", "reasoning_content": "think"}),
+        _chunk(finish_reason="stop"),
+    ])
 
-    async def scenario() -> ChatCompletion:
-        async for _item in stream.items():
-            pass
-        return await stream.final()
+    async def scenario() -> ProviderBilling | None:
+        _ = await anext(stream.items())
+        return stream.provider_billing()
 
-    assert run_with_timeout(scenario()).usage == _usage_with_cache()
+    assert run_with_timeout(scenario()) is None
 
 
 def test_final_before_items_are_exhausted_raises() -> None:
@@ -1261,11 +1169,8 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
 
     @override
-    def response_with_raw_part(self) -> BaseModel:
-        return _completion(
-            usage=_usage_with_cache(),
-            message={"content": "hello", "tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
-        )
+    def response_with_raw_part(self) -> None:
+        return None
 
     @override
     def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:

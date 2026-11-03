@@ -480,7 +480,7 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
 
 def _message_with_content(
     content: list[at.ContentBlock],
-    stop_reason: at.StopReason | None = "end_turn",
+    stop_reason: at.StopReason = "end_turn",
     usage: at.Usage | None = None,
 ) -> at.Message:
     return at.Message(
@@ -1620,7 +1620,7 @@ def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_
 
 def _structured_message(
     text: str | None,
-    stop_reason: at.StopReason | None = "end_turn",
+    stop_reason: at.StopReason = "end_turn",
     *,
     tool_use: bool = False,
 ) -> at.Message:
@@ -1699,7 +1699,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
     ],
 )
 def test_structured_outcome_by_text_and_stop_reason(
-    text: str | None, stop_reason: at.StopReason | None, expected_kind: str
+    text: str | None, stop_reason: at.StopReason, expected_kind: str
 ) -> None:
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind

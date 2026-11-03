@@ -785,13 +785,11 @@ _STOP_REASON_BY_ANTHROPIC_STOP_REASON: Mapping[str, StopReason] = {
 """The langchaint `StopReason` of each Anthropic `stop_reason` with a counterpart."""
 
 
-def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
-    if stop_reason is None:
-        return "other"
+def _normalized_stop_reason(stop_reason: str) -> StopReason:
     return _STOP_REASON_BY_ANTHROPIC_STOP_REASON.get(stop_reason, "other")
 
 
-def _cannot_continue(stop_reason: str | None) -> str | None:
+def _cannot_continue(stop_reason: str) -> str | None:
     """Return the error text for `pause_turn` or an unknown stop reason, or `None` for any other."""
     if stop_reason in _STOP_REASON_BY_ANTHROPIC_STOP_REASON or stop_reason == "stop_sequence":
         return None
@@ -1415,6 +1413,7 @@ class _BoundAnthropic(BoundAdapter):
     def interpret(self, raw: BaseModel) -> FinishedResponse:
         """Read the message.
 
+        `_AnthropicStream.items()` ensures that `raw` has a stop reason.
         `max_tokens` can stop a message inside its last block.
         anthropic 2.4.0 parses a cut-off `tool_use` block's partial input JSON, so its `ToolCall` looks complete.
         Anthropic says to retry such a message with a higher `max_tokens`.
@@ -1424,8 +1423,10 @@ class _BoundAnthropic(BoundAdapter):
             TypeError: `raw` is not an anthropic `Message`.
         """
         message = _as_message(raw)
+        stop_reason = message.stop_reason
+        assert stop_reason is not None
         return FinishedResponse(
             assistant_message=_assistant_message_from(message),
-            stop_reason=_normalized_stop_reason(message.stop_reason),
-            cannot_continue=_cannot_continue(message.stop_reason),
+            stop_reason=_normalized_stop_reason(stop_reason),
+            cannot_continue=_cannot_continue(stop_reason),
         )

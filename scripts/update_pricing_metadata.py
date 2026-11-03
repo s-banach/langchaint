@@ -455,8 +455,6 @@ class _LiteLLMEntry(BaseModel):
 class _MetadataValue(CheckedCopyModel):
     """The HTTPS source URL and verification date of one provider-documented value."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
     source_url: Annotated[str, StringConstraints(pattern=r"^https://")]
     verified_on: date
 
@@ -476,23 +474,17 @@ class _MetadataMultiplier(_MetadataValue):
 class _AnthropicMetadata(CheckedCopyModel):
     """Anthropic-documented values that LiteLLM omits for some priced models."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
     inference_geo_us_multiplier: _MetadataMultiplier
 
 
 class _OpenAIMetadata(CheckedCopyModel):
     """OpenAI-documented tool prices that LiteLLM lists outside the model entry."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
     file_search_usd_per_invocation: _MetadataRate
 
 
 class _ProviderMetadata(CheckedCopyModel):
     """The vendored provider documentation values required by the generated modules."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     anthropic: _AnthropicMetadata
     openai: _OpenAIMetadata

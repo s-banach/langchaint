@@ -1,59 +1,41 @@
 """Test CheckedCopyModel subclass configuration checks."""
 
+from typing import Literal
+
 import pytest
-from pydantic import ConfigDict
+from pydantic import ConfigDict, ValidationError
 
 from langchaint.common.checked_copy import CheckedCopyModel
+
+
+class _Valued(CheckedCopyModel):
+    value: int
 
 
 def test_a_subclass_defining_its_own_init_is_rejected() -> None:
     with pytest.raises(TypeError, match="custom_init"):
 
-        class CustomInitModel(CheckedCopyModel):
-            model_config = ConfigDict(extra="forbid")
-            value: int
-
+        class CustomInitModel(_Valued):
             def __init__(self, value: int) -> None:
                 super().__init__(value=value)
 
-    with pytest.raises(TypeError, match="custom_init"):
 
-        class ForwardingInitModel(CheckedCopyModel):
-            model_config = ConfigDict(extra="forbid")
-            value: int
+@pytest.mark.parametrize("extra", ["allow", "ignore"])
+def test_a_subclass_overriding_extra_is_rejected_at_class_definition(
+    extra: Literal["allow", "ignore"],
+) -> None:
+    with pytest.raises(TypeError, match=f"extra='{extra}'"):
 
-            def __init__(self, /, value: int, **extra: object) -> None:
-                super().__init__(value=value, **extra)
-
-
-def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> None:
-    with pytest.raises(TypeError, match="extra='allow'"):
-
-        class ExtraAllowModel(CheckedCopyModel):
-            model_config = ConfigDict(extra="allow")
+        class OverridingModel(CheckedCopyModel):
+            model_config = ConfigDict(extra=extra)
 
 
-def test_a_subclass_leaving_extra_unset_is_rejected_at_class_definition() -> None:
-    with pytest.raises(TypeError, match="no extra"):
+def test_a_subclass_with_its_own_config_stays_frozen_and_rejects_unknown_keys() -> None:
 
-        class DefaultExtraModel(CheckedCopyModel):
-            value: int
-
-
-def test_a_subclass_setting_extra_ignore_is_rejected_at_class_definition() -> None:
-    with pytest.raises(TypeError, match="extra='ignore'"):
-
-        class ExtraIgnoreModel(CheckedCopyModel):
-            model_config = ConfigDict(extra="ignore")
-
-
-def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it() -> None:
-
-    class Base(CheckedCopyModel):
-        model_config = ConfigDict(extra="forbid")
-        value: int
-
-    class Child(Base):
+    class Child(_Valued):
+        model_config = ConfigDict(ser_json_inf_nan="strings")
         other: int
 
-    _ = Child(value=1, other=2)
+    _ = hash(Child(value=1, other=2))
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        _ = Child.model_validate({"value": 1, "other": 2, "unknown": 3})

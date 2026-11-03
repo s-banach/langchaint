@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 type _NonnegativeFiniteFloat = Annotated[FiniteFloat, Field(ge=0)]
-_RECORD_CONFIG = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
+_RECORD_CONFIG = ConfigDict(ser_json_inf_nan="strings")
 
 
 def _less_than_or_ulp_close(left: float, right: float) -> bool:
@@ -159,10 +159,7 @@ class RequestHistory(CheckedCopyModel):
 
 
 class _InputOutcomeRecordBase(CheckedCopyModel):
-    """Share properties derived from `request_history` across every `InputOutcomeRecord` variant.
-
-    Validation rejects unknown fields.
-    """
+    """Share properties derived from `request_history` across every `InputOutcomeRecord` variant."""
 
     model_config = _RECORD_CONFIG
 
@@ -211,7 +208,6 @@ class AbandonedStreamRecord(_InputOutcomeRecordBase):
 
     The application ended the stream, so handling the input did not fail.
     The record keeps the billing and first-item time of the request the exit cut off.
-    Validation rejects unknown fields.
     """
 
     stop_reason: ClassVar[StopReason | None] = None

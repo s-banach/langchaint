@@ -22,11 +22,7 @@ from langchaint.concurrency.cancellation import await_task_cancellation_safe
 from langchaint.generation.response import GenerationOutcomeRecord
 
 _RESUME_IO_EXECUTOR = ThreadPoolExecutor(max_workers=1)
-_RESUME_MODEL_CONFIG = ConfigDict(
-    frozen=True,
-    extra="forbid",
-    ser_json_inf_nan="strings",
-)
+_RESUME_MODEL_CONFIG = ConfigDict(ser_json_inf_nan="strings")
 
 
 async def _run_resume_io[ReturnT](function: Callable[[], ReturnT]) -> ReturnT:
@@ -68,7 +64,7 @@ class _ResumeHeader(CheckedCopyModel):
 
 
 class _RecordLine[OutputT](CheckedCopyModel):
-    """Validation reconstructs the record of the input at `input_index` and rejects unknown fields."""
+    """Validation reconstructs the record of the input at `input_index`."""
 
     model_config = _RESUME_MODEL_CONFIG
 

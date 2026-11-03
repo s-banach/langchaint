@@ -6,7 +6,7 @@ A nonzero category with no configured rate costs NaN.
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 from langchaint.billing.usage import JSONFloat, Usage
 from langchaint.common.checked_copy import CheckedCopyModel
@@ -100,8 +100,6 @@ class TokenRates(CheckedCopyModel):
     Pydantic validates stored rates and serializes NaN as a string, so a stored `Billing` reproduces its token costs.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     input_tokens_cache_read: JSONFloat
     input_tokens_cache_write: JSONFloat
     input_tokens_cache_none: JSONFloat
@@ -134,8 +132,6 @@ class Billing(CheckedCopyModel):
 
     `usd_per_million_tokens` stores the applied rates, which reproduce token costs without the original rate table.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     usage: Usage
     service_tier: str

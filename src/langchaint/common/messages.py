@@ -78,8 +78,6 @@ class TextPart(CheckedCopyModel):
     `automatic_cache_breakpoints` separately controls adapter or provider placement.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     text: str
     cache_breakpoint: bool = False
     kind: Literal["text"] = "text"
@@ -92,9 +90,7 @@ class ImagePart(CheckedCopyModel):
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
-    model_config = ConfigDict(
-        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
-    )
+    model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
 
     data: bytes
     media_type: str
@@ -111,8 +107,6 @@ class ImageUrlPart(CheckedCopyModel):
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     url: str
     media_type: str | None = None
     cache_breakpoint: bool = False
@@ -126,9 +120,7 @@ class AudioPart(CheckedCopyModel):
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
-    model_config = ConfigDict(
-        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
-    )
+    model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
 
     data: bytes
     media_type: str
@@ -149,8 +141,6 @@ class ToolCall(CheckedCopyModel):
     Adapters serialize decoded provider arguments to this shared form.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     id: str
     name: str
     args_json: str
@@ -161,10 +151,8 @@ class UserMessage(CheckedCopyModel):
     """Pydantic selects each `ContentPart` variant by `kind` in one user message.
 
     Raises:
-        pydantic.ValidationError: `content` is invalid or an unknown key is passed.
+        pydantic.ValidationError: `content` is invalid.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     content: str | tuple[ContentPart, ...]
     kind: Literal["user"] = "user"
@@ -180,8 +168,6 @@ class ReasoningPart(CheckedCopyModel):
     `text=None` means the provider returned no readable reasoning.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
     raw: dict[str, JsonValue]
     text: str | None = None
     kind: Literal["reasoning"] = "reasoning"
@@ -195,8 +181,6 @@ class RawPart(CheckedCopyModel):
     Another adapter returns `RejectedMessages` or leaves validation to its provider.
     Applications inspect `Generation.raw` for the complete SDK response.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     raw: dict[str, JsonValue]
     kind: Literal["raw"] = "raw"
@@ -219,8 +203,6 @@ class AssistantMessage(CheckedCopyModel):
     Raises:
         pydantic.ValidationError: `content` has an invalid value or a `TextPart` sets `cache_breakpoint`.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     content: str | tuple[AssistantPart, ...]
     kind: Literal["assistant"] = "assistant"
@@ -283,8 +265,6 @@ class ToolMessage(CheckedCopyModel):
     `tool_call_id` must match the `ToolCall.id` it answers.
     `is_error=True` tells the model the tool failed.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     tool_call_id: str
     content: str | tuple[ContentPart, ...]

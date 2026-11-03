@@ -7,7 +7,7 @@ import math
 from collections.abc import Iterable
 from typing import Annotated
 
-from pydantic import BeforeValidator, ConfigDict, NonNegativeInt, PlainSerializer, ValidationInfo
+from pydantic import BeforeValidator, NonNegativeInt, PlainSerializer, ValidationInfo
 
 from langchaint.common.checked_copy import CheckedCopyModel
 
@@ -56,8 +56,6 @@ class Usage(CheckedCopyModel):
     `provider_executed_tool_cost_in_usd` aggregates provider-executed tool charges.
     Cost fields accept NaN and negative caller-supplied rates.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     input_tokens_cache_read: NonNegativeInt
     input_tokens_cache_write: NonNegativeInt

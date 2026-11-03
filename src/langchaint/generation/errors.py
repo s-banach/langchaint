@@ -25,10 +25,7 @@ if TYPE_CHECKING:
 
 
 class _GenerationErrorRecordBase(_InputOutcomeRecordBase):
-    """Shared normalized data and properties for terminal generation errors.
-
-    Validation rejects unknown fields.
-    """
+    """Shared normalized data and properties for terminal generation errors."""
 
     error_text: str = ""
 
@@ -156,7 +153,6 @@ class PlainErrorRecord(_GenerationErrorRecordBase):
 
     `unknown_exception_error`, `auth_error`, and `rejected_error` require `error_text`.
     So do `unfinished_assistant_message_error` and `provider_failed_terminally_error`.
-    Validation rejects unknown fields.
     """
 
     kind: _PlainErrorRecordKind
@@ -218,7 +214,6 @@ class SchemaViolationErrorRecord(_GenerationErrorRecordBase):
 
     `validation_error_json` is pydantic's error JSON for the rejected text.
     The final request is error-free, billed, and holds an assistant message.
-    Validation rejects unknown fields.
     """
 
     validation_error_json: str

@@ -1,6 +1,7 @@
-"""A strict pydantic base that rejects unknown keys during construction and `model_copy`.
+"""A strict, frozen pydantic base that rejects unknown keys during construction and `model_copy`.
 
-Subclasses must forbid extra keys and use pydantic's generated constructor.
+Subclasses inherit `strict=True`, `frozen=True`, and `extra="forbid"`.
+They must keep `extra="forbid"` and use pydantic's generated constructor.
 `model_construct` retains pydantic's unvalidated behavior.
 """
 
@@ -24,9 +25,9 @@ def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
 
 
 class CheckedCopyModel(BaseModel):
-    """Validate fields strictly and reject unknown keys during construction and `model_copy`."""
+    """Validate fields strictly, freeze instances, and reject unknown keys during construction and `model_copy`."""
 
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
 
     @classmethod
     @override
@@ -34,25 +35,15 @@ class CheckedCopyModel(BaseModel):
         """Require `extra="forbid"` and pydantic's generated constructor.
 
         Raises:
-            TypeError: The subclass permits extra keys or defines `__init__`.
+            TypeError: The subclass sets `extra` to a value other than `"forbid"`, or defines `__init__`.
         """
         super().__pydantic_init_subclass__(**kwargs)
         extra = cls.model_config.get("extra")
-        if extra == "allow":
-            raise TypeError(
-                f"{cls.__name__} sets extra='allow', under which a key that is not a field is kept "
-                "in __pydantic_extra__ as meaningful data, so CheckedCopyModel.model_copy would "
-                "reject legitimate updates; such a model must not inherit CheckedCopyModel"
-            )
         if extra != "forbid":
-            states = (
-                f"it sets extra={extra!r}"
-                if extra is not None
-                else "it sets no extra, leaving pydantic's 'ignore' default"
-            )
             raise TypeError(
-                f"{cls.__name__} must set model_config = ConfigDict(extra='forbid'); {states}, under "
-                "which a key that is not a field is dropped silently on construction instead of raising"
+                f"{cls.__name__} sets extra={extra!r}, under which a key that is not a field "
+                "is kept or dropped instead of raising; a model that accepts unknown keys "
+                "must not inherit CheckedCopyModel"
             )
         if cls.__pydantic_custom_init__:
             raise TypeError(

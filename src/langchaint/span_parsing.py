@@ -9,7 +9,6 @@ from pydantic import (
     AfterValidator,
     Base64UrlBytes,
     BaseModel,
-    ConfigDict,
     Field,
     FiniteFloat,
     TypeAdapter,
@@ -109,8 +108,6 @@ type Draft7Schema = Annotated[JsonValue, AfterValidator(_validate_draft_07_schem
 
 class OtelModel(CheckedCopyModel):
     """An OTel value before conversion to langchaint."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class OtelStructuredModel(OtelModel):

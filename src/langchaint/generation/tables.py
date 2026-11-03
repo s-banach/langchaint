@@ -157,7 +157,7 @@ def to_tables[OutputT](
             "request_params_json": None
             if live_error is None or live_error.request_params is None
             else live_error.request_params.as_json(),
-            "output": _output_cell(record.output) if is_generation else None,
+            "output": _output_cell(record.output) if record.kind == "plain" else None,
         })
         kept_index = len(request_history.records) - 1 if is_generation else None
         for request_index, request_record in enumerate(request_history.records):

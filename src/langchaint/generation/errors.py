@@ -123,6 +123,7 @@ type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_err
 - `schema_violation_error`: a structured response failed the caller's model validation.
 - `context_window_exceeded_error`: a response reported that the request exceeded the context window.
 - `unexpected_response_error`: the adapter returned `UnexpectedResponse`.
+  A response with application tool calls under a binding without a `ToolManager` also gives this kind.
 - `provider_failed_terminally_error`: a provider reported a failure that sending the request again would repeat.
   A response body or an error response can report it.
 - `auth_error`: a provider rejected the client's credentials or permissions for one request.

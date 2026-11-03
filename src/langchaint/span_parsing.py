@@ -17,7 +17,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from langchaint.adapter import text_output
+from langchaint.adapter import text_response
 from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, Billing
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
@@ -675,7 +675,7 @@ def generation_record_from_otel(
 
     An output message with a tool call returns `ToolCallGenerationRecord`.
     Any other output message returns `PlainGenerationRecord`.
-    Application tool calls give output `None` and make every text part commentary.
+    Application tool calls make every text part commentary.
     Otherwise, the final text part gives the output, with preceding text joined by newlines as commentary.
     Under `gen_ai.output.type` `"json"`, the final text part must validate as JSON.
     The record contains one synthetic request record.
@@ -707,7 +707,7 @@ def generation_record_from_otel(
     output_message = output_messages[0]
     assistant_message = _assistant_message_from_output(output_message)
     stop_reason = _stop_reason_from_otel(otel_chat_span, output_message.finish_reason)
-    output = _output_from_otel(otel_chat_span.output_type, assistant_message)
+    output_type = _supported_output_type(otel_chat_span.output_type)
     if not otel_chat_span.provider_name:
         raise _attribute_conversion_error("gen_ai.provider.name", "is required")
     if not otel_chat_span.request_model:
@@ -734,11 +734,18 @@ def generation_record_from_otel(
         records=(request_record,),
         elapsed_seconds=0.0,
     )
-    if assistant_message.tool_calls:
-        return ToolCallGenerationRecord(request_history=request_history, stop_reason=stop_reason)
-    return PlainGenerationRecord[JsonValue](
-        request_history=request_history, output=output, stop_reason=stop_reason
-    )
+    response = text_response(assistant_message, stop_reason)
+    match response.kind:
+        case "tool_call_response":
+            return ToolCallGenerationRecord(
+                request_history=request_history, stop_reason=stop_reason
+            )
+        case "plain_response":
+            return PlainGenerationRecord[JsonValue](
+                request_history=request_history,
+                output=_output_from_otel(output_type, response.output),
+                stop_reason=stop_reason,
+            )
 
 
 @overload
@@ -913,10 +920,8 @@ def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
             )
 
 
-def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
-    supported_output_type = _supported_output_type(output_type)
-    text = text_output(assistant_message)
-    if text is None or supported_output_type == "text":
+def _output_from_otel(output_type: Literal["text", "json"], text: str) -> JsonValue:
+    if output_type == "text":
         return text
     try:
         return _JSON_VALUE_ADAPTER.validate_json(text)

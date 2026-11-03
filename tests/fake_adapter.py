@@ -23,6 +23,7 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     MaxCompletionTokensExceeded,
+    PlainResponse,
     ProviderBilling,
     Refusal,
     RejectedMessages,
@@ -32,8 +33,6 @@ from langchaint.adapter import (
     ResponseOutcome,
     SchemaViolation,
     TransientError,
-    UsableResponse,
-    text_output,
 )
 from tests.helpers import stated_provider_billing, terminal, yield_until
 
@@ -90,11 +89,11 @@ def as_fake_raw(raw: BaseModel) -> FakeRawResponse:
 
 @dataclass(frozen=True, kw_only=True)
 class ScriptedResponse:
-    outcome: ResponseOutcome[str | None]
+    outcome: ResponseOutcome[str]
     usage: Usage
 
 
-def billed(outcome: ResponseOutcome[str | None]) -> ScriptedResponse:
+def billed(outcome: ResponseOutcome[str]) -> ScriptedResponse:
     return ScriptedResponse(outcome=outcome, usage=USAGE_BILLED)
 
 
@@ -110,8 +109,8 @@ MAX_COMPLETION_TOKENS_EXCEEDED: MaxCompletionTokensExceeded = MaxCompletionToken
 )
 
 
-def usable_text_response(content: str) -> UsableResponse[str]:
-    return UsableResponse(
+def plain_text_response(content: str) -> PlainResponse[str]:
+    return PlainResponse(
         output=content,
         assistant_message=AssistantMessage(content=(TextPart(text=content),)),
         stop_reason="stop",
@@ -122,7 +121,7 @@ FAKE_TOOL_CALL: ToolCall = ToolCall(id="call1", name="lookup", args_json='{"q": 
 
 
 class FakeStream(AdapterStream):
-    def __init__(self, *, outcome: ResponseOutcome[str | None] | None = None) -> None:
+    def __init__(self, *, outcome: ResponseOutcome[str] | None = None) -> None:
         self.closed: bool = False
         self.raw: FakeRawResponse = FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
@@ -142,7 +141,7 @@ class FakeStream(AdapterStream):
     def scripted_response(self) -> ScriptedResponse:
         if self._outcome is not None:
             return billed(self._outcome)
-        return ScriptedResponse(outcome=usable_text_response("ab"), usage=USAGE_STREAM)
+        return ScriptedResponse(outcome=plain_text_response("ab"), usage=USAGE_STREAM)
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -203,7 +202,7 @@ def as_fake_request_params(request_params: RequestParams) -> FakeRequestParams:
     return request_params
 
 
-class FakeBoundAdapter(BoundAdapter[str | None]):
+class FakeBoundAdapter(BoundAdapter[str]):
     """Consume scripts and count requests independently for each binding."""
 
     def __init__(self, adapter: "FakeAdapter") -> None:
@@ -232,7 +231,7 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         return self._scripted_by_raw_id[as_fake_raw(raw).id].outcome
 
     @override
@@ -281,11 +280,11 @@ class FakeBoundAdapter(BoundAdapter[str | None]):
             else "ok"
         )
         return self._request_stream(
-            ScriptedResponse(outcome=usable_text_response(content), usage=USAGE), content=content
+            ScriptedResponse(outcome=plain_text_response(content), usage=USAGE), content=content
         )
 
 
-class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None]):
+class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
     def __init__(
         self, text_bound_adapter: FakeBoundAdapter, response_format: type[ModelT]
     ) -> None:
@@ -301,19 +300,18 @@ class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT | None])
         return self._text_bound_adapter.identity_from_raw(raw, request_id=request_id)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
         outcome = self._text_bound_adapter.interpret(raw)
-        if outcome.kind != "usable_response":
+        if outcome.kind != "plain_response":
             return outcome
-        text = text_output(outcome.assistant_message)
         try:
-            output = self._response_format.model_validate_json(text) if text is not None else None
+            output = self._response_format.model_validate_json(outcome.output)
         except ValidationError as error:
             return SchemaViolation(
                 assistant_message=outcome.assistant_message,
                 validation_error_json=error.json(include_url=False),
             )
-        return UsableResponse(
+        return PlainResponse(
             output=output,
             assistant_message=outcome.assistant_message,
             stop_reason=outcome.stop_reason,
@@ -389,7 +387,7 @@ class FakeAdapter(Adapter):
         return {"automatic_cache_breakpoints_default": self.automatic_cache_breakpoints_default}
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         bound = self._bound_adapter_class(self)
         self.bound_adapters.append(bound)
         return bound
@@ -397,7 +395,7 @@ class FakeAdapter(Adapter):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         self.structured_bind_count += 1
         return FakeStructuredBoundAdapter(self._bound_adapter_class(self), response_format)
 

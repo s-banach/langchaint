@@ -48,6 +48,7 @@ from langchaint.adapter import (
     BoundAdapter,
     EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
+    PlainResponse,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     ReasoningDelta,
@@ -60,15 +61,15 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
+    ToolCallResponse,
     ToolChoice,
     UnexpectedResponse,
     UnusableResponse,
-    UsableResponse,
     _RejectedMessagesError,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
-    text_output,
+    text_response,
     validated_final_text,
     validated_provider_executed_tool_types,
 )
@@ -608,17 +609,6 @@ def _billing_from_response(
     )
 
 
-def _usable_response[OutputT](
-    response: OpenAIResponse, output: OutputT, assistant_message: AssistantMessage
-) -> UsableResponse[OutputT]:
-    """Normalize one completed request around already-extracted output and its assistant message."""
-    return UsableResponse(
-        output=output,
-        assistant_message=assistant_message,
-        stop_reason=_normalized_stop_reason(response),
-    )
-
-
 class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
@@ -769,7 +759,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -782,7 +772,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output validated into response_format without I/O.
 
         Raises:
@@ -1044,12 +1034,12 @@ class _BoundOpenAIResponses[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str | None]):
-    """Text-bound adapter: output is `text_output` of the assistant message."""
+class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str]):
+    """Text-bound adapter: `text_response` builds each usable response."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
-        """Read the assistant message's `text_output` as this binding's output, or report the run openai says failed.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Read the assistant message through `text_response`, or report the run openai says failed.
 
         A failed status returns `_provider_failure` because emitted items are fragments.
         An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
@@ -1062,10 +1052,10 @@ class _BoundOpenAIResponsesText(_BoundOpenAIResponses[str | None]):
         assistant_message = _assistant_message_from(response)
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
-        return _usable_response(response, text_output(assistant_message), assistant_message)
+        return text_response(assistant_message, _normalized_stop_reason(response))
 
 
-class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[ModelT | None]):
+class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[ModelT]):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
@@ -1124,8 +1114,8 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
 
     def _parsed_outcome(
         self, response: OpenAIResponse, assistant_message: AssistantMessage
-    ) -> ResponseOutcome[ModelT | None]:
-        """Validate the text into the instance, report tool calls as None, or report why neither exists.
+    ) -> ResponseOutcome[ModelT]:
+        """Validate the text into the instance, report tool calls as `ToolCallResponse`, or report why neither exists.
 
         Validation occurs after the request records its response and billing.
         Failed status returns `_provider_failure` even when fragment text validates.
@@ -1139,15 +1129,22 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
             return Refusal(assistant_message=assistant_message)
         if assistant_message.tool_calls:
             if response.status == "completed":
-                return _usable_response(response, None, assistant_message)
+                return ToolCallResponse(
+                    assistant_message=assistant_message,
+                    stop_reason=_normalized_stop_reason(response),
+                )
             return self._no_instance(response, None, assistant_message)
         validated = validated_final_text(assistant_message, self._response_format)
         if isinstance(validated, BaseModel):
-            return _usable_response(response, validated, assistant_message)
+            return PlainResponse(
+                output=validated,
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(response),
+            )
         return self._no_instance(response, validated, assistant_message)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
         """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:

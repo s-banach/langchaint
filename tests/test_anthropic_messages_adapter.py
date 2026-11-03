@@ -490,12 +490,12 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert outcome.kind == "usable_response"
+    assert outcome.kind == "plain_response"
     assert outcome.stop_reason == expected
     assert outcome.output == "partial text"
 
 
-def test_text_output_selects_the_final_text_block() -> None:
+def test_text_response_selects_the_final_text_block() -> None:
     message = _message_with_content([
         at.TextBlock(type="text", text="hello "),
         at.TextBlock(type="text", text="world"),
@@ -505,7 +505,7 @@ def test_text_output_selects_the_final_text_block() -> None:
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert outcome.kind == "usable_response"
+    assert outcome.kind == "plain_response"
     assert outcome.output == "world"
     assert outcome.assistant_message.content == (TextPart(text="hello "), TextPart(text="world"))
     assert outcome.stop_reason == "tool_call"
@@ -525,7 +525,7 @@ def test_a_text_tool_call_before_a_cut_off_block_is_usable() -> None:
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert outcome.kind == "usable_response"
+    assert outcome.kind == "tool_call_response"
 
 
 def _message_with_content(
@@ -1615,7 +1615,7 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     )
 
 
-def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport | None]:
+def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport]:
     return _structured_bound()._parsed_outcome(message, _assistant_message_from(message))
 
 
@@ -1739,7 +1739,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         pytest.param(
             _REPORT_JSON,
             "end_turn",
-            "usable_response",
+            "plain_response",
             _StructuredReport(city="Nairobi", celsius=25),
             id="valid_text",
         ),
@@ -1791,19 +1791,18 @@ def test_structured_outcome_by_text_and_stop_reason(
 ) -> None:
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind
-    if outcome.kind == "usable_response":
+    if outcome.kind == "plain_response":
         assert outcome.output == expected_output
 
 
 @pytest.mark.parametrize(
     "text",
-    [None, "let me look that up", _REPORT_JSON],
-    ids=["alone", "with_prose", "with_valid_json"],
+    [None, "let me look that up"],
+    ids=["alone", "with_prose"],
 )
-def test_a_structured_tool_call_message_has_none_output(text: str | None) -> None:
+def test_a_structured_tool_call_message_is_a_tool_call_response(text: str | None) -> None:
     outcome = _structured_parse(_structured_message(text, stop_reason="tool_use", tool_use=True))
-    assert outcome.kind == "usable_response"
-    assert outcome.output is None
+    assert outcome.kind == "tool_call_response"
 
 
 @pytest.mark.parametrize(

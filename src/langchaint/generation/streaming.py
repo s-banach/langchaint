@@ -80,7 +80,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         self,
         *,
         adapter: Adapter,
-        bound_adapter: BoundAdapter[OutputT | None],
+        bound_adapter: BoundAdapter[OutputT],
         messages: Sequence[Message],
         shared_backoff: SharedBackoff,
         max_requests: int,
@@ -540,7 +540,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
 
     def _outcome_from_response(
         self,
-        response_outcome: ResponseOutcome[OutputT | None],
+        response_outcome: ResponseOutcome[OutputT],
         *,
         ended_at_monotonic_seconds: float,
     ) -> GenerationOutcome[OutputT]:

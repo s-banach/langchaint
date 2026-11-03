@@ -68,6 +68,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
+    PlainResponse,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     RejectedMessages,
@@ -75,7 +76,6 @@ from langchaint.adapter import (
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
-    UsableResponse,
 )
 from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
@@ -175,8 +175,8 @@ _FILE_SEARCH_OUTPUT_ITEM: dict[str, object] = {
 }
 
 
-def _assert_usable[OutputT](outcome: ResponseOutcome[OutputT]) -> UsableResponse[OutputT]:
-    assert outcome.kind == "usable_response"
+def _assert_plain[OutputT](outcome: ResponseOutcome[OutputT]) -> PlainResponse[OutputT]:
+    assert outcome.kind == "plain_response"
     return outcome
 
 
@@ -426,11 +426,15 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
     ],
 )
 def test_stop_reason_mapping(
-    response: OpenAIResponse, expected: StopReason, expected_output: str
+    response: OpenAIResponse, expected: StopReason, expected_output: str | None
 ) -> None:
-    usable = _assert_usable(_text_bound().interpret(response))
-    assert usable.stop_reason == expected
-    assert usable.output == expected_output
+    outcome = _text_bound().interpret(response)
+    if expected_output is None:
+        assert outcome.kind == "tool_call_response"
+        assert outcome.stop_reason == expected
+    else:
+        plain = _assert_plain(outcome)
+        assert (plain.output, plain.stop_reason) == (expected_output, expected)
 
 
 def test_every_output_item_replays_as_one_input_item_in_position() -> None:
@@ -1017,7 +1021,7 @@ def _request_body_sent[OutputT](
 def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_reference() -> None:
     extra_body = {"safety_identifier": "user-7"}
 
-    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter[str | None]:
+    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter[str]:
         bound = adapter.bind_text(
             _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
         )
@@ -1431,7 +1435,7 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         async for _item in adapter_stream.items():
             pass
         assert await adapter_stream.final() is leniently_built
-        usable = _assert_usable(_text_bound().interpret(leniently_built))
+        usable = _assert_plain(_text_bound().interpret(leniently_built))
         assert usable.output == "hey"
         assert usable.stop_reason == "max_completion_tokens"
 
@@ -1479,7 +1483,7 @@ def _structured_bound() -> _BoundOpenAIResponsesStructured[_StructuredReport]:
     )
 
 
-def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport | None]:
+def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport]:
     return _structured_bound()._parsed_outcome(response, _assistant_message_from(response))
 
 
@@ -1499,7 +1503,7 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
         response_format=_CapturedAnswer,
     )
     billing = bound.billing_from_raw(response)
-    outcome = _assert_usable(bound.interpret(response))
+    outcome = _assert_plain(bound.interpret(response))
     assert outcome.output == _CapturedAnswer(value=17)
     assert outcome.assistant_message == _assistant_message_from(response)
     assert billing.usage_raw is response.usage
@@ -1524,8 +1528,8 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
 @pytest.mark.parametrize(
     ("earlier", "final", "expected_kind"),
     [
-        ("Checking the temperature", '{"city":"Lima","celsius":19}', "usable_response"),
-        ('{"city":"Nairobi","celsius":25}', '{"city":"Lima","celsius":19}', "usable_response"),
+        ("Checking the temperature", '{"city":"Lima","celsius":19}', "plain_response"),
+        ('{"city":"Nairobi","celsius":25}', '{"city":"Lima","celsius":19}', "plain_response"),
         ('{"city":"Nairobi","celsius":25}', "Invalid final answer", "schema_violation"),
         ('{"city":"Nairobi","celsius":25}', "", "schema_violation"),
     ],
@@ -1547,7 +1551,7 @@ def test_structured_binding_validates_the_final_complete_block_without_a_phase(
     outcome = _structured_parse(response)
     assert outcome.kind == expected_kind
     assert outcome.assistant_message == _assistant_message_from(response)
-    if outcome.kind == "usable_response":
+    if outcome.kind == "plain_response":
         assert outcome.output == _StructuredReport(city="Lima", celsius=19)
 
 
@@ -1585,16 +1589,6 @@ def _structured_response(
     )
 
 
-def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() -> None:
-    outcome = _assert_usable(
-        _structured_bound().interpret(_structured_response(_REPORT_JSON, tool_call=True))
-    )
-    assert outcome.output is None
-    assert outcome.assistant_message.tool_calls == (
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-    )
-
-
 def test_a_refusal_before_structured_text_is_a_refusal() -> None:
     response = _response(
         usage=None, output=[_REFUSAL_MESSAGE_ITEM, *_structured_response(_REPORT_JSON).output]
@@ -1620,11 +1614,14 @@ def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
 
 
 @pytest.mark.parametrize("text", [None, "let me look that up"])
-def test_structured_bind_reports_an_assistant_message_with_tool_calls_as_none(
+def test_structured_bind_reports_an_assistant_message_with_tool_calls_as_a_tool_call_response(
     text: str | None,
 ) -> None:
     outcome = _structured_parse(_structured_response(text, tool_call=True))
-    assert _assert_usable(outcome).output is None
+    assert outcome.kind == "tool_call_response"
+    assert outcome.assistant_message.tool_calls == (
+        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    )
 
 
 @pytest.mark.parametrize(

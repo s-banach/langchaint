@@ -51,6 +51,7 @@ from langchaint.adapter import (
     BoundAdapter,
     ContextWindowExceeded,
     EmptyAssistantMessage,
+    PlainResponse,
     ProviderBilling,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
@@ -61,6 +62,7 @@ from langchaint.adapter import (
     ResponseOutcome,
     SchemaViolation,
     StreamProtocolError,
+    ToolCallResponse,
     TransientError,
     UnexpectedResponse,
     UsableResponse,
@@ -91,7 +93,7 @@ from tests.fake_adapter import (
     assert_the_first_open_runs_alone,
     billed,
     fast_shared_backoff,
-    usable_text_response,
+    plain_text_response,
 )
 from tests.helpers import (
     TEST_TIMEOUT_SECONDS,
@@ -307,7 +309,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
         assert failed.assistant_message is None
         assert (failed.model_served, failed.response_id, failed.request_id) == (None, None, None)
         assert succeeded.error is None
-        assert succeeded.assistant_message == usable_text_response("ok").assistant_message
+        assert succeeded.assistant_message == plain_text_response("ok").assistant_message
         assert succeeded.model_served == "fake-model-served"
         assert succeeded.response_id == as_fake_raw(generation.raw).id
         assert succeeded.request_id == f"req-{as_fake_raw(generation.raw).id}"
@@ -1032,19 +1034,17 @@ class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
         return self.stream
 
 
-_STRUCTURED_TOOL_CALL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
-    output=None,
+_TOOL_CALL_RESPONSE = ToolCallResponse(
     assistant_message=AssistantMessage(content=(FAKE_TOOL_CALL,)),
     stop_reason="tool_call",
 )
 
-_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY: UsableResponse[_Answer | None] = UsableResponse(
-    output=None,
+_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY = ToolCallResponse(
     assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
     stop_reason="tool_call",
 )
 
-_STRUCTURED_FINAL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
+_STRUCTURED_FINAL_RESPONSE = PlainResponse(
     output=_Answer(value=7),
     assistant_message=AssistantMessage(content=(TextPart(text='{"value":7}'),)),
     stop_reason="stop",
@@ -1052,7 +1052,7 @@ _STRUCTURED_FINAL_RESPONSE: UsableResponse[_Answer | None] = UsableResponse(
 
 
 def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
-    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter[OutputT | None]
+    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter[OutputT]
 ) -> BoundLLM[OutputT, ToolManagerT]:
     return BoundLLM(
         adapter=bound_llm.adapter,
@@ -1067,7 +1067,7 @@ def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | No
 
 
 def _structured_tool_bound_llm(
-    outcome: ResponseOutcome[_Answer | None],
+    outcome: ResponseOutcome[_Answer],
 ) -> BoundLLM[_Answer, ToolManager]:
     """Supply structured output through a scripted adapter while preserving the binding."""
     bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
@@ -1080,18 +1080,20 @@ def _structured_tool_bound_llm(
     ("outcome", "kind"),
     [
         (_STRUCTURED_FINAL_RESPONSE, "plain"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE, "tool_call"),
+        (_TOOL_CALL_RESPONSE, "tool_call"),
     ],
     ids=["plain", "tool_call"],
 )
 def test_structured_tool_bound_generate_one_splits_on_tool_calls(
-    outcome: UsableResponse[_Answer | None], kind: str
+    outcome: UsableResponse[_Answer], kind: str
 ) -> None:
 
     async def scenario() -> None:
         result = await _structured_tool_bound_llm(outcome).generate_one("hi")
         assert result.kind == kind
-        assert result.output is outcome.output
+        assert result.assistant_message is outcome.assistant_message
+        if result.kind == "plain" and outcome.kind == "plain_response":
+            assert result.output is outcome.output
 
     run_with_timeout(scenario())
 
@@ -1100,13 +1102,13 @@ def test_structured_tool_bound_generate_one_splits_on_tool_calls(
     ("outcome", "kind"),
     [
         (_STRUCTURED_FINAL_RESPONSE, "plain"),
-        (_STRUCTURED_TOOL_CALL_RESPONSE, "tool_call"),
+        (_TOOL_CALL_RESPONSE, "tool_call"),
         (_STRUCTURED_TOOL_CALL_RESPONSE_WITH_COMMENTARY, "tool_call"),
     ],
     ids=["plain", "tool_call", "tool_call_with_commentary"],
 )
 def test_generate_many_records_restores_a_structured_record(
-    tmp_path: Path, outcome: UsableResponse[_Answer | None], kind: str
+    tmp_path: Path, outcome: UsableResponse[_Answer], kind: str
 ) -> None:
 
     async def scenario() -> None:
@@ -1120,9 +1122,9 @@ def test_generate_many_records_restores_a_structured_record(
         (restored_record,) = restored
         assert generated_record.kind == kind
         assert restored_record.kind == kind
-        # Narrows the type to the variants that have `.output`.
-        assert restored_record.kind in {"plain", "tool_call"}
-        assert restored_record.output == outcome.output
+        assert restored_record.assistant_message == outcome.assistant_message
+        if restored_record.kind == "plain" and outcome.kind == "plain_response":
+            assert restored_record.output == outcome.output
         assert structured_adapter.open_count == 1
 
     run_with_timeout(scenario())
@@ -1135,7 +1137,7 @@ def test_generate_many_records_validates_a_record_line_before_appending_it(
 
     async def scenario() -> None:
         answer = _NonRoundTrippableAnswer(value=1)
-        outcome: UsableResponse[_NonRoundTrippableAnswer] = UsableResponse(
+        outcome = PlainResponse(
             output=answer,
             assistant_message=AssistantMessage(content=(TextPart(text=answer.model_dump_json()),)),
             stop_reason="stop",
@@ -1151,36 +1153,15 @@ def test_generate_many_records_validates_a_record_line_before_appending_it(
     run_with_timeout(scenario())
 
 
-_TEXT_TOOL_CALL_RESPONSE: UsableResponse[str | None] = UsableResponse(
-    output=None,
-    assistant_message=AssistantMessage(content=(FAKE_TOOL_CALL,)),
-    stop_reason="tool_call",
-)
-
-
-def test_text_tool_bound_generate_one_returns_a_tool_call_generation() -> None:
-
-    async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
-            tools=ToolManager([])
-        )
-        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE))
-        result = await bound_llm.generate_one("hi")
-        assert result.kind == "tool_call"
-        assert result.output is None
-
-    run_with_timeout(scenario())
-
-
-def test_none_output_without_a_tool_manager_raises_an_unknown_exception_error() -> None:
+def test_tool_calls_without_a_tool_manager_raise_an_unexpected_response_error() -> None:
 
     async def scenario() -> None:
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
-        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TEXT_TOOL_CALL_RESPONSE))
+        bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TOOL_CALL_RESPONSE))
         with pytest.raises(GenerationError) as escaped:
             await bound_llm.generate_one("hi")
-        assert escaped.value.kind == "unknown_exception_error"
-        assert isinstance(escaped.value.__cause__, ValueError)
+        assert escaped.value.kind == "unexpected_response_error"
+        assert "ToolManager" in escaped.value.error_text
 
     run_with_timeout(scenario())
 
@@ -1188,7 +1169,7 @@ def test_none_output_without_a_tool_manager_raises_an_unknown_exception_error() 
 def test_structured_tool_bound_stream_final_returns_a_tool_call_generation() -> None:
 
     async def scenario() -> None:
-        bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_RESPONSE)
+        bound_llm = _structured_tool_bound_llm(_TOOL_CALL_RESPONSE)
         async with bound_llm.stream_one("hi") as handle:
             result = await handle.final()
         assert result.kind == "tool_call"

@@ -407,31 +407,50 @@ def reject_extra_body_keys_the_adapter_populates(
 
 
 @dataclass(frozen=True, kw_only=True)
-class UsableResponse[OutputT]:
-    """A response whose assistant message is usable: it gives output or has tool calls.
+class PlainResponse[OutputT]:
+    """A response whose assistant message gives output and has no application tool calls.
 
     `output` contains text or a validated `response_format` instance.
-    `output` is `None` when the assistant message has application tool calls.
     """
 
     output: OutputT
     assistant_message: AssistantMessage
     stop_reason: StopReason
-    kind: Literal["usable_response"] = "usable_response"
+    kind: Literal["plain_response"] = "plain_response"
 
 
-def text_output(assistant_message: AssistantMessage) -> str | None:
-    """Return the final text part of `assistant_message` as a text binding's output.
+@dataclass(frozen=True, kw_only=True)
+class ToolCallResponse:
+    """A response whose assistant message has application tool calls, which make all its text commentary."""
 
-    The output is `None` when the message has application tool calls.
-    A message without tool calls or text gives `""`.
+    assistant_message: AssistantMessage
+    stop_reason: StopReason
+    kind: Literal["tool_call_response"] = "tool_call_response"
+
+
+type UsableResponse[OutputT] = PlainResponse[OutputT] | ToolCallResponse
+"""Every way reading a response can end when its assistant message is usable."""
+
+
+def text_response(
+    assistant_message: AssistantMessage, stop_reason: StopReason
+) -> UsableResponse[str]:
+    """Return a text binding's response for `assistant_message`.
+
+    A message with application tool calls gives `ToolCallResponse`.
+    Any other message gives `PlainResponse` whose output is the final text, or `""` without a text part.
 
     Args:
         assistant_message: The assistant message read from one response.
+        stop_reason: The response's normalized stop reason.
     """
     if assistant_message.tool_calls:
-        return None
-    return final_text(assistant_message) or ""
+        return ToolCallResponse(assistant_message=assistant_message, stop_reason=stop_reason)
+    return PlainResponse(
+        output=final_text(assistant_message) or "",
+        assistant_message=assistant_message,
+        stop_reason=stop_reason,
+    )
 
 
 def validated_final_text[ModelT: BaseModel](
@@ -847,11 +866,11 @@ class Adapter(ABC):
         ...
 
     @abstractmethod
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
-        `text_output` gives each assistant message's output.
+        `text_response` gives each usable response.
 
         Args:
             binding: The provider-neutral binding.
@@ -864,10 +883,10 @@ class Adapter(ABC):
     @abstractmethod
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         """Bind structured output parsed into `response_format`.
 
-        An assistant message with application tool calls gives `output=None`.
+        An assistant message with application tool calls gives `ToolCallResponse`.
 
         Args:
             binding: The provider-neutral binding.
@@ -920,6 +939,7 @@ __all__ = [
     "ContextWindowExceeded",
     "EmptyAssistantMessage",
     "MaxCompletionTokensExceeded",
+    "PlainResponse",
     "ProviderBilling",
     "ProviderFailedTerminally",
     "ProviderFailedTransiently",
@@ -935,6 +955,7 @@ __all__ = [
     "StreamItem",
     "StreamProtocolError",
     "ToolCallDelta",
+    "ToolCallResponse",
     "ToolChoice",
     "TransientError",
     "UnexpectedResponse",
@@ -951,7 +972,7 @@ __all__ = [
     "require_stated_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",
-    "text_output",
+    "text_response",
     "validated_final_text",
     "validated_provider_executed_tool_types",
 ]

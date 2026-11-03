@@ -21,11 +21,9 @@ def render(event: Event) -> str:
             body = f"  turn {event.turn_number} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
         case "generation_reported":
             usage = event.usage_so_far
-            text = "\n".join(
-                text
-                for text in (event.generation.commentary, event.generation.output)
-                if text is not None
-            )
+            generation = event.generation
+            output = generation.output if generation.kind == "plain" else None
+            text = "\n".join(text for text in (generation.commentary, output) if text is not None)
             shown = text or "(no text)"
             body = f"  llm t{event.turn_number}: {shown[:40]!r} -> {usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f}"
         case "llm_input_timed_out":

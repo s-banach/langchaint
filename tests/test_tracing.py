@@ -49,13 +49,13 @@ from langchaint import (
 )
 from langchaint.adapter import (
     AdapterStream,
+    PlainResponse,
     Refusal,
     RejectedMessages,
     RequestFailure,
     RequestParams,
     TransientError,
-    UsableResponse,
-    text_output,
+    text_response,
 )
 from langchaint.common.messages import StopReason
 from langchaint.embedding import EmbeddingModel, EmbeddingTask, _EmbeddingBatchResponse
@@ -647,11 +647,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         adapter = FakeAdapter(
             scripted_requests=[
                 ScriptedResponse(
-                    outcome=UsableResponse(
-                        output=text_output(assistant_message),
-                        assistant_message=assistant_message,
-                        stop_reason=stop_reason,
-                    ),
+                    outcome=text_response(assistant_message, stop_reason),
                     usage=USAGE,
                 )
             ]
@@ -689,11 +685,12 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert output_messages_from_otel(parsed) == (generation.assistant_message,)
         record = generation_record_from_otel(parsed)
         assert record.kind == generation.kind
-        assert record.output == (
-            generation.output.model_dump(mode="json")
-            if isinstance(generation.output, BaseModel)
-            else generation.output
-        )
+        if record.kind == "plain" and generation.kind == "plain":
+            assert record.output == (
+                generation.output.model_dump(mode="json")
+                if isinstance(generation.output, BaseModel)
+                else generation.output
+            )
         assert record.stop_reason == generation.stop_reason
         assert record.assistant_message == generation.assistant_message
         assert record.request_history.provider_name == generation.request_history.provider_name
@@ -758,6 +755,7 @@ def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             response = await _generate_through(path, llm.bind())
+        assert response.kind == "plain"
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
@@ -1412,7 +1410,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             FakeAdapter(
                 scripted_requests=[
                     ScriptedResponse(
-                        outcome=UsableResponse(
+                        outcome=PlainResponse(
                             output="answer",
                             assistant_message=scripted_assistant_message,
                             stop_reason="stop",
@@ -1521,6 +1519,7 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
         bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             result = await _generate_through(path, bound)
+        assert result.kind == "plain"
         assert result.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None

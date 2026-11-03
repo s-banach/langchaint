@@ -47,6 +47,7 @@ from langchaint.adapter import (
     BoundAdapter,
     EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
+    PlainResponse,
     ReasoningDelta,
     Refusal,
     RejectedMessages,
@@ -57,15 +58,15 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
+    ToolCallResponse,
     ToolChoice,
     UnexpectedResponse,
-    UsableResponse,
     _RejectedMessagesError,
     _UnusableResponseBase,
     narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
-    text_output,
+    text_response,
     validated_final_text,
 )
 from langchaint.billing.pricing import ProviderBilling, billing_at_rates
@@ -518,16 +519,6 @@ def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
             return "other"
 
 
-def _usable_response[OutputT](
-    finished_message: _FinishedMessage, output: OutputT
-) -> UsableResponse[OutputT]:
-    return UsableResponse(
-        output=output,
-        assistant_message=finished_message.assistant_message,
-        stop_reason=_normalized_stop_reason(finished_message),
-    )
-
-
 def input_tokens_cache_read_from_usage_openai(usage: CompletionUsage) -> int:
     """Read the cache-read counter openai reports: prompt_tokens_details.cached_tokens, 0 absent.
 
@@ -745,7 +736,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -758,7 +749,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output validated into response_format without I/O.
 
         Raises:
@@ -1031,12 +1022,12 @@ class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str | None]):
-    """Text-bound adapter: output is `text_output` of the assistant message."""
+class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str]):
+    """Text-bound adapter: `text_response` builds each usable response."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
-        """Read the assistant message, whose `text_output` is this binding's output.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Read the assistant message through `text_response`.
 
         Refusals and truncations still return their text with a matching stop reason.
 
@@ -1046,11 +1037,13 @@ class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str | None]):
         finished_message = _finished_message_or_unexpected_response(_as_chat_completion(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
-        return _usable_response(finished_message, text_output(finished_message.assistant_message))
+        return text_response(
+            finished_message.assistant_message, _normalized_stop_reason(finished_message)
+        )
 
 
 class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
-    _BoundOpenAIChatCompletions[ModelT | None]
+    _BoundOpenAIChatCompletions[ModelT]
 ):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
@@ -1073,9 +1066,7 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
             ),
         )
 
-    def _parsed_outcome(
-        self, finished_message: _FinishedMessage
-    ) -> ResponseOutcome[ModelT | None]:
+    def _parsed_outcome(self, finished_message: _FinishedMessage) -> ResponseOutcome[ModelT]:
         """Validate final text after the response enters langchaint.
 
         Rejected content and billing remain available.
@@ -1083,7 +1074,7 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         message.refusal returns Refusal before validation.
         Validated output takes precedence over finish_reason.
         Without validated output, "content_filter" returns Refusal and "length" returns MaxCompletionTokensExceeded.
-        Remaining application tool calls return None.
+        Remaining application tool calls return ToolCallResponse.
         Remaining invalid content returns SchemaViolation.
         Every remaining response returns EmptyAssistantMessage.
         """
@@ -1092,13 +1083,20 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
             return Refusal(assistant_message=assistant_message)
         validated = validated_final_text(assistant_message, self._response_format)
         if isinstance(validated, BaseModel):
-            return _usable_response(finished_message, validated)
+            return PlainResponse(
+                output=validated,
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(finished_message),
+            )
         if finished_message.finish_reason == "content_filter":
             return Refusal(assistant_message=assistant_message)
         if finished_message.finish_reason == "length":
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if assistant_message.tool_calls:
-            return _usable_response(finished_message, None)
+            return ToolCallResponse(
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(finished_message),
+            )
         if isinstance(validated, ValidationError):
             return SchemaViolation(
                 validation_error_json=validated.json(include_url=False),
@@ -1107,7 +1105,7 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
         """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:

@@ -3,7 +3,7 @@
 Streamed text can contain commentary and final output.
 The completed generation separates them: `output` contains the final text part or validated caller model.
 `commentary` contains preceding plain text joined with one newline, or `None` when absent.
-Application tool calls give `output=None` and make every text part commentary.
+Application tool calls give a `ToolCallGeneration`, which has no `output`, and make every text part commentary.
 Replay `assistant_message` to preserve ordered content, including reasoning.
 """
 
@@ -62,5 +62,9 @@ async def stream_tool_call() -> Generation[str]:
             print_stream_item(item)
         generation = await handle.final()
         print("commentary:", generation.commentary)
-        print("output:", generation.output)
+        match generation.kind:
+            case "plain":
+                print("output:", generation.output)
+            case "tool_call":
+                print("tool calls:", generation.tool_calls)
         return generation

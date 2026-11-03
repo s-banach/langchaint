@@ -33,9 +33,10 @@ from langchaint import (
     Usage,
     to_tables,
 )
-from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity, text_output
+from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity
+from langchaint.common.messages import final_text
 from langchaint.generation.request_history import _less_than_or_ulp_close, _RequestLedger
-from langchaint.generation.response import _generation_variant, _timed_out_error
+from langchaint.generation.response import _timed_out_error
 from tests.helpers import StubRaw
 
 
@@ -271,7 +272,7 @@ def test_generation_record_rejects_invalid_request_shapes(
 def test_tool_call_generation_record_requires_a_tool_call() -> None:
     with pytest.raises(ValidationError, match="tool call"):
         _ = ToolCallGenerationRecord(
-            output=None, request_history=_completed_request_history(), stop_reason="tool_call"
+            request_history=_completed_request_history(), stop_reason="tool_call"
         )
     record = ToolCallGenerationRecord(
         request_history=_completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE),
@@ -279,7 +280,17 @@ def test_tool_call_generation_record_requires_a_tool_call() -> None:
     )
     restored = ToolCallGenerationRecord.model_validate_json(record.model_dump_json())
     assert restored.tool_calls == _TOOL_CALL_ASSISTANT_MESSAGE.tool_calls
-    assert restored.output is None
+
+
+def test_plain_generation_record_rejects_a_tool_call() -> None:
+    with pytest.raises(ValidationError, match="no tool calls"):
+        _ = PlainGenerationRecord(
+            output="",
+            request_history=_completed_request_history(
+                assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE
+            ),
+            stop_reason="tool_call",
+        )
 
 
 @pytest.mark.parametrize(
@@ -328,10 +339,10 @@ def test_generation_commentary_is_computed_from_preserved_content(
         restored = ToolCallGenerationRecord.model_validate_json(record.model_dump_json())
     else:
         record = PlainGenerationRecord(
-            output=text_output(assistant_message), request_history=history, stop_reason="stop"
+            output=final_text(assistant_message) or "", request_history=history, stop_reason="stop"
         )
         response = PlainGeneration(record=record, request_provider_data=_request_provider_data())
-        restored = PlainGenerationRecord[str | None].model_validate_json(record.model_dump_json())
+        restored = PlainGenerationRecord[str].model_validate_json(record.model_dump_json())
     assert response.commentary == record.commentary == restored.commentary == commentary
     assert restored.assistant_message == assistant_message
     assert '"commentary":' not in record.model_dump_json()
@@ -369,20 +380,6 @@ def test_live_generation_requires_provider_data_from_the_final_request() -> None
     )
     with pytest.raises(ValueError, match="final provider response"):
         _ = PlainGeneration(record=record, request_provider_data=request_provider_data)
-
-
-def test_generation_variant_constructs_one_normalized_record() -> None:
-    request_history = _completed_request_history(assistant_message=_TOOL_CALL_ASSISTANT_MESSAGE)
-    generation = _generation_variant(
-        splits_on_tool_calls=True,
-        output=None,
-        request_history=request_history,
-        request_provider_data=_request_provider_data(),
-        stop_reason="tool_call",
-    )
-    assert generation.kind == "tool_call"
-    assert generation.record.kind == "tool_call"
-    assert generation.record.request_history is request_history
 
 
 def _error_record_cases() -> list[tuple[GenerationErrorRecord, str]]:

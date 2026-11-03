@@ -63,6 +63,7 @@ from langchaint.adapter import (
     ContextWindowExceeded,
     EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
+    PlainResponse,
     ReasoningDelta,
     Refusal,
     RejectedMessages,
@@ -74,16 +75,16 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolCallDelta,
+    ToolCallResponse,
     ToolChoice,
     UnexpectedResponse,
-    UsableResponse,
     _RejectedMessagesError,
     narrowed_request_params,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     request_failure_from_response,
     request_params_json,
-    text_output,
+    text_response,
     validated_final_text,
     validated_provider_executed_tool_types,
 )
@@ -955,17 +956,6 @@ def _billing_from_sdk_usage(
     )
 
 
-def _usable_response[OutputT](
-    message: anthropic.types.Message, output: OutputT, assistant_message: AssistantMessage
-) -> UsableResponse[OutputT]:
-    """Normalize one completed message around already-extracted output and its assistant message."""
-    return UsableResponse(
-        output=output,
-        assistant_message=assistant_message,
-        stop_reason=_normalized_stop_reason(message.stop_reason),
-    )
-
-
 def anthropic_request_failure(error: Exception) -> RequestFailure:
     """Return the `RequestFailure` of one exception an Anthropic request raised.
 
@@ -1215,7 +1205,7 @@ class AnthropicMessagesAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1229,7 +1219,7 @@ class AnthropicMessagesAdapter(Adapter):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output validated into response_format without I/O.
 
         Raises:
@@ -1441,15 +1431,15 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundAnthropicText(_BoundAnthropic[str | None]):
-    """Text-bound adapter: output is `text_output` of the assistant message."""
+class _BoundAnthropicText(_BoundAnthropic[str]):
+    """Text-bound adapter: `text_response` builds each usable response."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
-        """Read the assistant message, whose `text_output` is this binding's output.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Read the assistant message through `text_response`.
 
         A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.
-        Every other message returns its text, including one with an unhandled stop reason.
+        Every other message returns `text_response`, including one with an unhandled stop reason.
 
         Raises:
             TypeError: `raw` is not an anthropic `Message`.
@@ -1458,10 +1448,10 @@ class _BoundAnthropicText(_BoundAnthropic[str | None]):
         assistant_message = _assistant_message_from(message)
         if _ends_in_cut_off_tool_call(message):
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
-        return _usable_response(message, text_output(assistant_message), assistant_message)
+        return text_response(assistant_message, _normalized_stop_reason(message.stop_reason))
 
 
-class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None]):
+class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT]):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
@@ -1494,8 +1484,8 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
 
     def _parsed_outcome(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage
-    ) -> ResponseOutcome[ModelT | None]:
-        """Validate text, return `None` for an assistant message with tool calls, or return a failure variant.
+    ) -> ResponseOutcome[ModelT]:
+        """Validate text, return `ToolCallResponse` for an assistant message with tool calls, or return a failure.
 
         Validation occurs after the request records its message and billing.
         Anthropic 2.3.0 parses every text block independently; this adapter validates the final text part.
@@ -1505,7 +1495,11 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         """
         validated = validated_final_text(assistant_message, self._response_format)
         if isinstance(validated, BaseModel):
-            return _usable_response(message, validated, assistant_message)
+            return PlainResponse(
+                output=validated,
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(message.stop_reason),
+            )
         unexpected_response = _unexpected_response_or_none(
             message, assistant_message=assistant_message
         )
@@ -1518,7 +1512,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         if message.stop_reason == "model_context_window_exceeded":
             return ContextWindowExceeded(assistant_message=assistant_message)
         if assistant_message.tool_calls:
-            return _usable_response(message, None, assistant_message)
+            return ToolCallResponse(
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(message.stop_reason),
+            )
         if isinstance(validated, ValidationError):
             return SchemaViolation(
                 validation_error_json=validated.json(include_url=False),
@@ -1527,7 +1524,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
         """Validate the assistant message's text into the instance, or report why the message produced none.
 
         A `max_tokens` stop whose last block is `tool_use` returns `MaxCompletionTokensExceeded`.

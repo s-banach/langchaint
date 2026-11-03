@@ -120,7 +120,7 @@ def prepare_resume_file[OutputT](
 
     Returns each reused record by its current input index.
     The replacement drops superseded lines, records that generate again, and a last line cut off by a process failure.
-    Records hold `output_type` output, or `None` output for tool calls.
+    Plain generation records hold `output_type` output.
 
     Raises:
         ValueError: Caller `input_ids` or existing resume data are invalid.

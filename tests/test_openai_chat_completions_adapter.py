@@ -39,11 +39,11 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
+    PlainResponse,
     RejectedMessages,
     RequestFailure,
     RequestParams,
     ResponseOutcome,
-    UsableResponse,
 )
 from langchaint.billing.pricing import Billing, ProviderBilling, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
@@ -110,8 +110,8 @@ _FUNCTION_CALL_WIRE: dict[str, JsonValue] = {
 }
 
 
-def _assert_usable[OutputT](outcome: ResponseOutcome[OutputT]) -> UsableResponse[OutputT]:
-    assert outcome.kind == "usable_response"
+def _assert_plain[OutputT](outcome: ResponseOutcome[OutputT]) -> PlainResponse[OutputT]:
+    assert outcome.kind == "plain_response"
     return outcome
 
 
@@ -354,9 +354,13 @@ def test_stop_reason_mapping(
     expected: StopReason,
     expected_output: str | None,
 ) -> None:
-    usable = _assert_usable(_text_bound().interpret(build_completion()))
-    assert usable.stop_reason == expected
-    assert usable.output == expected_output
+    outcome = _text_bound().interpret(build_completion())
+    if expected_output is None:
+        assert outcome.kind == "tool_call_response"
+        assert outcome.stop_reason == expected
+    else:
+        plain = _assert_plain(outcome)
+        assert (plain.output, plain.stop_reason) == (expected_output, expected)
 
 
 def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
@@ -801,7 +805,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
     assert _adapter().client.max_retries == 0
 
 
-def _text_bound() -> BoundAdapter[str | None]:
+def _text_bound() -> BoundAdapter[str]:
     return _adapter().bind_text(_binding())
 
 
@@ -810,7 +814,7 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_bound() -> BoundAdapter[_StructuredReport | None]:
+def _structured_bound() -> BoundAdapter[_StructuredReport]:
     return _adapter().bind_structured(_binding(), _StructuredReport)
 
 
@@ -828,14 +832,6 @@ def _structured_completion(
     if tool_call:
         message["tool_calls"] = [_TOOL_CALL_WIRE]
     return _completion(usage=None, message=message, finish_reason=finish_reason)
-
-
-def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() -> None:
-    outcome = _assert_usable(
-        _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
-    )
-    assert outcome.output is None
-    assert outcome.assistant_message.tool_calls == (_TOOL_CALL,)
 
 
 @pytest.mark.parametrize(
@@ -861,8 +857,8 @@ def test_structured_bind_preserves_schema_valid_commentary_beside_a_tool_call() 
         (_structured_completion(None, refusal="I can't help", tool_call=True), "refusal"),
         (_structured_completion(None, refusal=_REPORT_JSON), "refusal"),
         (_structured_completion(None, finish_reason="content_filter"), "refusal"),
-        (_structured_completion(None, tool_call=True), "usable_response"),
-        (_structured_completion("let me look that up", tool_call=True), "usable_response"),
+        (_structured_completion(None, tool_call=True), "tool_call_response"),
+        (_structured_completion("let me look that up", tool_call=True), "tool_call_response"),
     ],
     ids=[
         "no_text",
@@ -1004,7 +1000,7 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
         ReasoningDelta(text=" part b"),
         "hey",
     ]
-    usable = _assert_usable(_text_bound().interpret(final))
+    usable = _assert_plain(_text_bound().interpret(final))
     assert usable.assistant_message.content[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
@@ -1173,7 +1169,7 @@ def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> N
 
     def bind_then_edit_extra_body(
         adapter: OpenAIChatCompletionsAdapter,
-    ) -> BoundAdapter[str | None]:
+    ) -> BoundAdapter[str]:
         bound = adapter.bind_text(_binding(extra_body=extra_body))
         extra_body["safety_identifier"] = "user-8"
         return bound

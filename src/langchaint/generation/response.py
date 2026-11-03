@@ -86,10 +86,19 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
 
 
 class PlainGenerationRecord[OutputT](_GenerationRecordBase):
-    """The normalized record of one `PlainGeneration`."""
+    """The normalized record of one `PlainGeneration`.
+
+    The kept assistant message must contain no tool calls.
+    """
 
     output: OutputT
     kind: Literal["plain"] = "plain"
+
+    @model_validator(mode="after")
+    def _validate_no_tool_call(self) -> Self:
+        if self.assistant_message.tool_calls:
+            raise ValueError("a PlainGenerationRecord must contain no tool calls")
+        return self
 
 
 class ToolCallGenerationRecord(_GenerationRecordBase):
@@ -98,7 +107,6 @@ class ToolCallGenerationRecord(_GenerationRecordBase):
     The kept assistant message must contain at least one tool call.
     """
 
-    output: None = None
     kind: Literal["tool_call"] = "tool_call"
 
     @model_validator(mode="after")
@@ -199,14 +207,6 @@ class ToolCallGeneration(_LiveGenerationBase[ToolCallGenerationRecord]):
 
     kind: Literal["tool_call"] = "tool_call"
 
-    @property
-    def output(self) -> None:
-        """Return `None` because application tool calls make all text commentary.
-
-        To continue the conversation, replay `assistant_message`.
-        """
-        return self.record.output
-
 
 def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseModel:
     final_raw = request_provider_data[-1].raw
@@ -216,10 +216,7 @@ def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseMo
 
 
 type Generation[OutputT] = PlainGeneration[OutputT] | ToolCallGeneration
-"""What an input produces when it succeeds.
-
-A `ToolCallGeneration` has `None` output.
-"""
+"""What an input produces when it succeeds."""
 type GenerationRecord[OutputT] = PlainGenerationRecord[OutputT] | ToolCallGenerationRecord
 """The normalized record of one `PlainGeneration` or `ToolCallGeneration`."""
 type GenerationOutcome[OutputT] = Generation[OutputT] | GenerationError
@@ -265,45 +262,8 @@ def _generation_outcome_record[OutputT](
     raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
 
 
-def _generation_variant[OutputT](
-    *,
-    splits_on_tool_calls: bool,
-    output: OutputT | None,
-    request_history: RequestHistory,
-    request_provider_data: tuple[RequestProviderData, ...],
-    stop_reason: StopReason,
-) -> Generation[OutputT]:
-    """Build one live generation and its normalized record.
-
-    Raises:
-        ValueError: The adapter gives output for a message with application tool calls and a `ToolManager`.
-        ValueError: The adapter gives `None` output for a message that does not become a `ToolCallGeneration`.
-            The message has no tool calls, or the binding has no `ToolManager`.
-    """
-    final = request_history.records[-1]
-    assert final.kind == "settled"
-    assert final.assistant_message is not None
-    if splits_on_tool_calls and final.assistant_message.tool_calls:
-        if output is not None:
-            raise ValueError("the adapter gave output for a ToolCallGeneration")
-        return ToolCallGeneration(
-            record=ToolCallGenerationRecord(
-                request_history=request_history, stop_reason=stop_reason
-            ),
-            request_provider_data=request_provider_data,
-        )
-    if output is None:
-        raise ValueError("the adapter gave None output for a PlainGeneration")
-    return PlainGeneration(
-        record=PlainGenerationRecord(
-            output=output, request_history=request_history, stop_reason=stop_reason
-        ),
-        request_provider_data=request_provider_data,
-    )
-
-
 def _generation_outcome_from_response_outcome[OutputT](
-    outcome: ResponseOutcome[OutputT | None],
+    outcome: ResponseOutcome[OutputT],
     *,
     request_history: RequestHistory,
     request_provider_data: tuple[RequestProviderData, ...],
@@ -311,13 +271,27 @@ def _generation_outcome_from_response_outcome[OutputT](
     splits_on_tool_calls: bool,
 ) -> GenerationOutcome[OutputT]:
     match outcome.kind:
-        case "usable_response":
-            return _generation_variant(
-                splits_on_tool_calls=splits_on_tool_calls,
-                output=outcome.output,
-                request_history=request_history,
+        case "plain_response":
+            return PlainGeneration(
+                record=PlainGenerationRecord(
+                    output=outcome.output,
+                    request_history=request_history,
+                    stop_reason=outcome.stop_reason,
+                ),
                 request_provider_data=request_provider_data,
-                stop_reason=outcome.stop_reason,
+            )
+        case "tool_call_response" if splits_on_tool_calls:
+            return ToolCallGeneration(
+                record=ToolCallGenerationRecord(
+                    request_history=request_history, stop_reason=outcome.stop_reason
+                ),
+                request_provider_data=request_provider_data,
+            )
+        case "tool_call_response":
+            record = PlainErrorRecord(
+                kind="unexpected_response_error",
+                error_text="the response has application tool calls, but the binding has no ToolManager",
+                request_history=request_history,
             )
         case "refusal":
             record = PlainErrorRecord(kind="refusal_error", request_history=request_history)

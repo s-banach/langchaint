@@ -218,18 +218,18 @@ def _build_binding(
 @overload
 def _bind_adapter(
     adapter: Adapter, binding: Binding, response_format: type[str]
-) -> BoundAdapter[str | None]: ...
+) -> BoundAdapter[str]: ...
 @overload
 def _bind_adapter[ModelT: BaseModel](
     adapter: Adapter, binding: Binding, response_format: type[ModelT]
-) -> BoundAdapter[ModelT | None]: ...
+) -> BoundAdapter[ModelT]: ...
 @overload
 def _bind_adapter(
     adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
-) -> BoundAdapter[str | None] | BoundAdapter[BaseModel | None]: ...
+) -> BoundAdapter[str] | BoundAdapter[BaseModel]: ...
 def _bind_adapter(
     adapter: Adapter, binding: Binding, response_format: type[str] | type[BaseModel]
-) -> BoundAdapter[str | None] | BoundAdapter[BaseModel | None]:
+) -> BoundAdapter[str] | BoundAdapter[BaseModel]:
     if response_format is str:
         return adapter.bind_text(binding)
     if not issubclass(response_format, BaseModel):
@@ -367,7 +367,7 @@ class LLM:
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `str` for text.
                 With `str`, `output` is the kept assistant message's final text.
-                Without text, `PlainGeneration.output` is `""` and `ToolCallGeneration.output` is `None`.
+                Without text, `PlainGeneration.output` is `""`.
                 To treat an empty output as a failure, bind a `response_format` that rejects empty text.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
             reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
@@ -428,7 +428,8 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     `OutputT` is the `response_format` type: `str`, or the pydantic model that validates structured output.
     Both type parameters are covariant.
     `BoundLLM[Answer, ToolManager]` satisfies `BoundLLM[BaseModel, ToolManager | None]`.
-    With a `ToolManager`, tool calls produce `ToolCallGeneration` whose output is `None` when no output exists.
+    With a `ToolManager`, application tool calls produce `ToolCallGeneration`.
+    Without one, they produce `GenerationError` with kind `unexpected_response_error`.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
@@ -436,7 +437,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self,
         *,
         adapter: Adapter,
-        bound_adapter: BoundAdapter[OutputT | None],
+        bound_adapter: BoundAdapter[OutputT],
         response_format: type[OutputT],
         binding: Binding,
         tool_manager: ToolManagerT,
@@ -469,7 +470,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self.shared_backoff: Final[SharedBackoff] = shared_backoff
         self.max_requests: Final[int] = max_requests
         self.observer: Final[Observer | None] = observer
-        self._bound_adapter: Final[BoundAdapter[OutputT | None]] = bound_adapter
+        self._bound_adapter: Final[BoundAdapter[OutputT]] = bound_adapter
         self._adapter_class: Final[type[Adapter]] = type(adapter)
         self._adapter_model: Final[str] = adapter.model
         self._adapter_provider_name: Final[str] = adapter.provider_name
@@ -809,7 +810,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
     def _staged_interpretation(
         self, raw: BaseModel, *, request_id: str | None, ledger: _RequestLedger
-    ) -> ResponseOutcome[OutputT | None]:
+    ) -> ResponseOutcome[OutputT]:
         ledger.stage_response(
             raw=raw,
             provider_billing=self._bound_adapter.billing_from_raw(raw),

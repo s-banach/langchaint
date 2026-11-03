@@ -679,7 +679,9 @@ def _json_output_span(texts: list[str]) -> OtelChatSpan:
 
 @pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
 def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
-    assert generation_record_from_otel(_json_output_span([json.dumps(output)])).output == output
+    record = generation_record_from_otel(_json_output_span([json.dumps(output)]))
+    assert record.kind == "plain"
+    assert record.output == output
 
 
 @pytest.mark.parametrize(
@@ -691,6 +693,7 @@ def test_declared_json_output_validates_the_final_text_part(
     texts: list[str], output: JsonValue
 ) -> None:
     record = generation_record_from_otel(_json_output_span(texts))
+    assert record.kind == "plain"
     assert record.output == output
     assert record.commentary == texts[0]
 
@@ -712,21 +715,13 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
 
 
 @pytest.mark.parametrize(
-    ("output_type", "parts", "expected"),
+    ("output_type", "parts", "expected_kind"),
     [
-        ("text", [], ("plain", "")),
-        ("text", [_TOOL_CALL_OUTPUT_PART], ("tool_call", None)),
-        (
-            "text",
-            [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART],
-            ("tool_call", None),
-        ),
-        ("json", [_TOOL_CALL_OUTPUT_PART], ("tool_call", None)),
-        (
-            "json",
-            [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART],
-            ("tool_call", None),
-        ),
+        ("text", [], "plain"),
+        ("text", [_TOOL_CALL_OUTPUT_PART], "tool_call"),
+        ("text", [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART], "tool_call"),
+        ("json", [_TOOL_CALL_OUTPUT_PART], "tool_call"),
+        ("json", [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART], "tool_call"),
     ],
     ids=[
         "text_without_parts",
@@ -737,14 +732,16 @@ _TOOL_CALL_OUTPUT_PART: JsonValue = {
     ],
 )
 def test_output_without_text_matches_a_live_generation(
-    output_type: str, parts: list[JsonValue], expected: tuple[str, JsonValue]
+    output_type: str, parts: list[JsonValue], expected_kind: str
 ) -> None:
     span = _generation_chat_span({
         "gen_ai.output.type": output_type,
         "gen_ai.output.messages": [{"role": "assistant", "parts": parts}],
     })
     record = generation_record_from_otel(span)
-    assert (record.kind, record.output) == expected
+    assert record.kind == expected_kind
+    if record.kind == "plain":
+        assert record.output == ""
     assert isinstance(record.assistant_message.content, tuple)
     assert len(record.assistant_message.content) == len(parts)
 

@@ -159,8 +159,6 @@ match generation.kind:
 ```
 
 A text `PlainGeneration.output` is the assistant message's text, which is `""` for an assistant message without text.
-A text `ToolCallGeneration.output` is `None` when the assistant message has no text.
-A structured `ToolCallGeneration.output` is `None` when the assistant message has no valid `Model`.
 Append `assistant_message`, never `output`, when continuing a conversation.
 
 See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.

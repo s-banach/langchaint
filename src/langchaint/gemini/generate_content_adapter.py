@@ -22,6 +22,7 @@ from langchaint.adapter import (
     BoundAdapter,
     EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
+    PlainResponse,
     ReasoningDelta,
     Refusal,
     RejectedMessages,
@@ -32,16 +33,16 @@ from langchaint.adapter import (
     SchemaViolation,
     SpecificToolChoice,
     StreamItem,
+    ToolCallResponse,
     ToolChoice,
     UnexpectedResponse,
-    UsableResponse,
     _RejectedMessagesError,
     _UnusableResponseBase,
     narrowed_request_params,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
-    text_output,
+    text_response,
     validated_final_text,
 )
 from langchaint.billing.pricing import (
@@ -1127,7 +1128,7 @@ class GeminiGenerateContentAdapter(Adapter):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str | None]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output without I/O.
 
         Raises:
@@ -1146,7 +1147,7 @@ class GeminiGenerateContentAdapter(Adapter):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT | None]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output validated into response_format without I/O.
 
         Raises:
@@ -1489,16 +1490,6 @@ def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
     return "other"
 
 
-def _usable_response[OutputT](
-    finished_message: _FinishedMessage, output: OutputT
-) -> UsableResponse[OutputT]:
-    return UsableResponse(
-        output=output,
-        assistant_message=finished_message.assistant_message,
-        stop_reason=_normalized_stop_reason(finished_message),
-    )
-
-
 class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
     """What both gemini bindings share: the request path, and what a response says about itself."""
 
@@ -1584,14 +1575,14 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         )
 
 
-class _BoundGeminiText(_BoundGemini[str | None]):
-    """Text-bound adapter: output is `text_output` of the assistant message."""
+class _BoundGeminiText(_BoundGemini[str]):
+    """Text-bound adapter: `text_response` builds each usable response."""
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str | None]:
-        """Read the assistant message, whose `text_output` is this binding's output.
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Read the assistant message through `text_response`.
 
-        Every finished assistant message returns its text. stop_reason reports refusal or truncation.
+        Every finished assistant message returns `text_response`; stop_reason reports refusal or truncation.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
@@ -1599,10 +1590,12 @@ class _BoundGeminiText(_BoundGemini[str | None]):
         finished_message = _finished_message_or_unusable_response(_as_response(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
-        return _usable_response(finished_message, text_output(finished_message.assistant_message))
+        return text_response(
+            finished_message.assistant_message, _normalized_stop_reason(finished_message)
+        )
 
 
-class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
+class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT]):
     """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
@@ -1620,10 +1613,8 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         )
         self._response_format = response_format
 
-    def _parsed_outcome(
-        self, finished_message: _FinishedMessage
-    ) -> ResponseOutcome[ModelT | None]:
-        """Validate the text into the instance, report tool calls as None, or report why neither exists.
+    def _parsed_outcome(self, finished_message: _FinishedMessage) -> ResponseOutcome[ModelT]:
+        """Validate the text into the instance, report tool calls as `ToolCallResponse`, or report why neither exists.
 
         Local validation preserves the response and rejected text.
         Google-genai 2.33.0 parses concatenated non-thought text; this adapter validates the final complete text part.
@@ -1633,7 +1624,11 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         assistant_message = finished_message.assistant_message
         validated = validated_final_text(assistant_message, self._response_format)
         if isinstance(validated, BaseModel):
-            return _usable_response(finished_message, validated)
+            return PlainResponse(
+                output=validated,
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(finished_message),
+            )
         finish_reason = finished_message.finish_reason
         if finish_reason not in _FINISHED_FINISH_REASONS:
             return UnexpectedResponse(
@@ -1642,7 +1637,10 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
                 assistant_message=assistant_message,
             )
         if assistant_message.tool_calls:
-            return _usable_response(finished_message, None)
+            return ToolCallResponse(
+                assistant_message=assistant_message,
+                stop_reason=_normalized_stop_reason(finished_message),
+            )
         if finish_reason in _REFUSAL_FINISH_REASONS:
             return Refusal(assistant_message=assistant_message)
         if finish_reason == types.FinishReason.MAX_TOKENS:
@@ -1655,7 +1653,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
         """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:

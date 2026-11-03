@@ -927,7 +927,7 @@ def test_unsendable_messages_build_rejected_messages(case: _InvalidMessages) -> 
 
 def _interpreted_assistant_message(response: types.GenerateContentResponse) -> AssistantMessage:
     outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert outcome.kind == "usable_response"
+    assert outcome.kind in ("plain_response", "tool_call_response")
     return outcome.assistant_message
 
 
@@ -1025,25 +1025,25 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 def test_text_binding_reads_stop_reasons() -> None:
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
-    assert ended.kind == "usable_response"
+    assert ended.kind == "plain_response"
     assert (ended.output, ended.stop_reason) == ("hi", "stop")
     called = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert called.kind == "usable_response"
+    assert called.kind == "tool_call_response"
     assert called.stop_reason == "tool_call"
     truncated = bound.interpret(
         _response([types.Part(text="par")], finish_reason=types.FinishReason.MAX_TOKENS)
     )
-    assert truncated.kind == "usable_response"
+    assert truncated.kind == "plain_response"
     assert (truncated.output, truncated.stop_reason) == ("par", "max_completion_tokens")
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
-    assert refused.kind == "usable_response"
+    assert refused.kind == "plain_response"
     assert (refused.output, refused.stop_reason) == ("", "refusal")
     other = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert other.kind == "usable_response"
+    assert other.kind == "plain_response"
     assert other.stop_reason == "other"
 
 
@@ -1070,13 +1070,12 @@ def test_no_candidates_reads_the_block_reason() -> None:
 def test_structured_binding_outcomes() -> None:
     bound = _adapter().bind_structured(_binding(), _Answer)
     parsed = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert parsed.kind == "usable_response"
+    assert parsed.kind == "plain_response"
     assert parsed.output == _Answer(value=3)
     tool_call_outcome = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert tool_call_outcome.kind == "usable_response"
-    assert tool_call_outcome.output is None
+    assert tool_call_outcome.kind == "tool_call_response"
     assert tool_call_outcome.stop_reason == "tool_call"
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
     assert refused.kind == "refusal"
@@ -1105,7 +1104,7 @@ def test_a_structured_binding_ignores_thought_text_when_validating() -> None:
             types.Part(text='{"value": 7}'),
         ])
     )
-    assert outcome.kind == "usable_response"
+    assert outcome.kind == "plain_response"
     assert outcome.output == _Answer(value=7)
 
 
@@ -1528,7 +1527,7 @@ def test_close_closes_the_sdk_iterator() -> None:
     assert closed
 
 
-def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str | None]:
+def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str]:
     client = genai.Client(
         api_key="offline",
         vertexai=False,

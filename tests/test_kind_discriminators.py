@@ -111,8 +111,10 @@ def _by_dispatch_many_outcome_kind_missing_a_variant(outcome: DispatchManyItemOu
 
 def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
     match outcome.kind:
-        case "usable_response":
+        case "plain_response":
             return outcome.output
+        case "tool_call_response":
+            return outcome.assistant_message
         case "refusal":
             return outcome.assistant_message
         case "max_completion_tokens_exceeded":
@@ -133,7 +135,7 @@ def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
 
 def _by_response_outcome_kind_missing_a_variant(outcome: ResponseOutcome[str]) -> object:
     match outcome.kind:  # pyrefly: ignore[non-exhaustive-match]
-        case "usable_response":
+        case "plain_response":
             return outcome.output
 
 
@@ -147,7 +149,6 @@ def _by_generation_kind(generation: Generation[_Answer]) -> object:
             assert_type(generation.output, _Answer)
             return generation.output
         case "tool_call":
-            assert_type(generation.output, None)
             return generation.tool_calls
 
 

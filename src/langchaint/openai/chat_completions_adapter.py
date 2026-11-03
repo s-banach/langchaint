@@ -603,7 +603,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
             ValueError: `extra_body` contains a key in `_ADAPTER_POPULATED_WIRE_KEYS` or `web_search_options`.
             ValueError: `extra_body` contains `functions`, which declares tools outside `tools`.
-            ValueError: `extra_body` sets `n` to a value other than 1, because the adapter reads one choice.
+            ValueError: `extra_body` sets `n` to a value other than 1 or `None`, because the adapter reads one choice.
             ValueError: `provider_executed_tools` is nonempty.
         """
         if binding.provider_executed_tools:
@@ -621,9 +621,10 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
                 "extra_body key 'functions' declares tools outside `tools`. "
                 "Bind tools through `tools`, because result types follow the bound tools."
             )
-        if binding.extra_body is not None and binding.extra_body.get("n", 1) != 1:
+        if binding.extra_body is not None and binding.extra_body.get("n") not in (None, 1):
             raise ValueError(
-                "extra_body key 'n' must be 1 or absent, because OpenAIChatCompletionsAdapter reads one choice per response. "
+                "extra_body key 'n' must be 1, None, or absent, "
+                "because OpenAIChatCompletionsAdapter reads one choice per response. "
                 "Pass the input once per choice."
             )
         reject_extra_body_keys_the_adapter_populates(

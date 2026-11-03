@@ -8,7 +8,7 @@ import time
 from collections import Counter, deque
 from dataclasses import replace
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from langchaint.common.exceptions import GaveUpWaitingError
 from langchaint.common.request_failure import RequestFailure
@@ -149,17 +149,19 @@ class SharedBackoff:
             ValueError: `max_wait_seconds` is below `min_wait_ceiling_seconds`.
             ValueError: `max_concurrent_requests` is boolean or below one.
         """
-        self.min_wait_ceiling_seconds: float = _validated_positive_float(
+        self.min_wait_ceiling_seconds: Final[float] = _validated_positive_float(
             "min_wait_ceiling_seconds", min_wait_ceiling_seconds
         )
-        self.max_wait_seconds: float = _validated_positive_float(
+        self.max_wait_seconds: Final[float] = _validated_positive_float(
             "max_wait_seconds", max_wait_seconds
         )
-        self.wait_multiplier: float = _validated_positive_float("wait_multiplier", wait_multiplier)
-        self.quiet_seconds_per_decay_step: float = _validated_positive_float(
+        self.wait_multiplier: Final[float] = _validated_positive_float(
+            "wait_multiplier", wait_multiplier
+        )
+        self.quiet_seconds_per_decay_step: Final[float] = _validated_positive_float(
             "quiet_seconds_per_decay_step", quiet_seconds_per_decay_step
         )
-        self.max_request_starts_per_second: float = _validated_positive_float(
+        self.max_request_starts_per_second: Final[float] = _validated_positive_float(
             "max_request_starts_per_second", max_request_starts_per_second
         )
         self._seconds_between_request_starts = 1.0 / self.max_request_starts_per_second
@@ -190,7 +192,7 @@ class SharedBackoff:
                 f"max_concurrent_requests must be None or a positive int, "
                 f"got {max_concurrent_requests!r}"
             )
-        self._max_concurrent_requests = max_concurrent_requests
+        self.max_concurrent_requests: Final[int | None] = max_concurrent_requests
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
         """Quiet steps that reduce every valid ceiling to min_wait_ceiling_seconds.
 
@@ -224,11 +226,6 @@ class SharedBackoff:
         The correction tags are `"retry_after_invalid"` and `"retry_after_over_cap"`.
         The failure tag is `"gave_up_waiting"`.
         """
-
-    @property
-    def max_concurrent_requests(self) -> int | None:
-        """The number of requests allowed inside admitted() blocks at once, or None for no bound."""
-        return self._max_concurrent_requests
 
     def admitted(self, *, budget_seconds: float | None = None) -> Admission:
         """Return an `Admission` block for one request.
@@ -292,8 +289,8 @@ class SharedBackoff:
                 _ = self._queue.popleft()
                 continue
             if (
-                self._max_concurrent_requests is not None
-                and self._permits_held >= self._max_concurrent_requests
+                self.max_concurrent_requests is not None
+                and self._permits_held >= self.max_concurrent_requests
             ):
                 return
             now = self._clock()

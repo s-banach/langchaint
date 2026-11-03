@@ -367,39 +367,37 @@ class _LiteLLMEntry(BaseModel):
         self, tier: Literal["default", "flex", "priority", "ultrafast"]
     ) -> _OpenAIRateFields:
         """Collect the OpenAI token rates of one tier without requiring any of them."""
+        rates: tuple[float | None, float | None, float | None, float | None]
         match tier:
             case "default":
-                input_tokens_cache_none_usd_per_token = self.input_cost_per_token
-                output_tokens_usd_per_token = self.output_cost_per_token
-                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost
-                input_tokens_cache_write_usd_per_token = self.cache_creation_input_token_cost
+                rates = (
+                    self.input_cost_per_token,
+                    self.output_cost_per_token,
+                    self.cache_read_input_token_cost,
+                    self.cache_creation_input_token_cost,
+                )
             case "flex":
-                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_flex
-                output_tokens_usd_per_token = self.output_cost_per_token_flex
-                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_flex
-                input_tokens_cache_write_usd_per_token = self.cache_creation_input_token_cost_flex
+                rates = (
+                    self.input_cost_per_token_flex,
+                    self.output_cost_per_token_flex,
+                    self.cache_read_input_token_cost_flex,
+                    self.cache_creation_input_token_cost_flex,
+                )
             case "priority":
-                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_priority
-                output_tokens_usd_per_token = self.output_cost_per_token_priority
-                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_priority
-                input_tokens_cache_write_usd_per_token = (
-                    self.cache_creation_input_token_cost_priority
+                rates = (
+                    self.input_cost_per_token_priority,
+                    self.output_cost_per_token_priority,
+                    self.cache_read_input_token_cost_priority,
+                    self.cache_creation_input_token_cost_priority,
                 )
             case "ultrafast":
-                input_tokens_cache_none_usd_per_token = self.input_cost_per_token_ultrafast
-                output_tokens_usd_per_token = self.output_cost_per_token_ultrafast
-                input_tokens_cache_read_usd_per_token = self.cache_read_input_token_cost_ultrafast
-                input_tokens_cache_write_usd_per_token = (
-                    self.cache_creation_input_token_cost_ultrafast
+                rates = (
+                    self.input_cost_per_token_ultrafast,
+                    self.output_cost_per_token_ultrafast,
+                    self.cache_read_input_token_cost_ultrafast,
+                    self.cache_creation_input_token_cost_ultrafast,
                 )
-        return _OpenAIRateFields(
-            input_tokens_cache_none_usd_per_token=_decimal(input_tokens_cache_none_usd_per_token),
-            output_tokens_usd_per_token=_decimal(output_tokens_usd_per_token),
-            input_tokens_cache_read_usd_per_token=_decimal(input_tokens_cache_read_usd_per_token),
-            input_tokens_cache_write_usd_per_token=_decimal(
-                input_tokens_cache_write_usd_per_token
-            ),
-        )
+        return _OpenAIRateFields._make(_decimal(rate) for rate in rates)
 
     def long_context_fields(self, rendered_tiers: frozenset[str]) -> _LongContextFields | None:
         """Read the long-context pricing of the default tier and `rendered_tiers`.

@@ -756,15 +756,13 @@ def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes(
     assert [outcome.tool_message.tool_call_id for outcome in caught.completed_outcomes] == ["c2"]
 
 
-@pytest.mark.parametrize("with_defect", [False, True])
-def test_dispatch_many_propagates_cancelled_error_with_sibling_defects_as_its_cause(
-    *, with_defect: bool
-) -> None:
-    async def _self_cancelling_function(args: _EchoArgs) -> str:
-        """Produce a CancelledError without anyone cancelling the enclosing task."""
-        raise asyncio.CancelledError(args.text)
+async def _self_cancelling_function(args: _EchoArgs) -> str:
+    """Produce a CancelledError without anyone cancelling the enclosing task."""
+    raise asyncio.CancelledError(args.text)
 
-    manager = ToolManager([
+
+def _self_cancelling_manager() -> ToolManager:
+    return ToolManager([
         PydanticTool(
             name="self_cancel",
             description="Produces a CancelledError.",
@@ -774,18 +772,27 @@ def test_dispatch_many_propagates_cancelled_error_with_sibling_defects_as_its_ca
         _raiser_tool(),
         _echo_tool(),
     ])
+
+
+def test_dispatch_many_propagates_cancelled_error_without_a_cause() -> None:
     tool_calls = [
+        ToolCall(id="c1", name="self_cancel", args_json='{"text": "b"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
+    ]
+    with pytest.raises(asyncio.CancelledError) as caught:
+        _ = run_with_timeout(_self_cancelling_manager().dispatch_many(tool_calls))
+    assert caught.value.__cause__ is None
+
+
+def test_dispatch_many_propagates_cancelled_error_with_sibling_defects_as_its_cause() -> None:
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="self_cancel", args_json='{"text": "b"}'),
         ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
     ]
-    if with_defect:
-        tool_calls.insert(0, ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'))
     with pytest.raises(asyncio.CancelledError) as caught:
-        _ = run_with_timeout(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(_self_cancelling_manager().dispatch_many(tool_calls))
     cause = caught.value.__cause__
-    if not with_defect:
-        assert cause is None
-        return
     assert isinstance(cause, DispatchExceptionGroup)
     assert [str(error) for error in cause.exceptions] == ["broke on a"]
     assert [outcome.tool_message.tool_call_id for outcome in cause.completed_outcomes] == ["c3"]

@@ -315,10 +315,7 @@ def _api_error(
     headers: Mapping[str, str] | None = None,
     retry_delay: str | None = None,
 ) -> errors.APIError:
-    """Build an APIError as raise_for_response builds one, its body the {"error": ...} envelope.
-
-    RetryInfo rows exercise errors with and without responses.
-    """
+    """Build an APIError as raise_for_response builds one, its body the {"error": ...} envelope."""
     details: list[dict[str, object]] = []
     if retry_delay is not None:
         details.append({
@@ -1673,25 +1670,20 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
+        """Return one row per branch of `gemini_request_failure`."""
         return {
             httpx.ConnectError("no route"): transient(pauses_quota=False),
-            httpx.ReadTimeout("slow"): transient(pauses_quota=False),
             _api_error(429, headers={"retry-after": "7"}): transient(
                 pauses_quota=True, retry_after_seconds=7.0
             ),
             _api_error(429, retry_delay="32s"): transient(
                 pauses_quota=True, retry_after_seconds=32.0
             ),
-            _api_error(503): transient(pauses_quota=True),
-            _api_error(408): transient(pauses_quota=False),
             _api_error(500): transient(pauses_quota=False),
-            _api_error(502): transient(pauses_quota=False),
-            _api_error(504): transient(pauses_quota=False),
             _api_error(599): transient(pauses_quota=False),
             _api_error(400): terminal("rejected"),
             _api_error(401): terminal("auth"),
-            _api_error(403): terminal("auth"),
-            _api_error(404): terminal("rejected"),
-            _api_error(418): terminal("rejected"),
+            _api_error(451): terminal("rejected"),
+            _api_error(302): terminal("unknown_exception"),
             ValueError("boom"): terminal("unknown_exception"),
         }

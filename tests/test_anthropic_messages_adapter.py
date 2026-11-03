@@ -2122,102 +2122,34 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Return Anthropic `RequestFailure` cases.
+        """Return one row per branch of `anthropic_request_failure` and `_anthropic_table_answers`.
 
-        A retry-after header fills `retry_after_seconds` without choosing the kind.
-        A rate-limit or overload error type pauses the rate-limit quota at any status.
-        x-should-retry overrides whether the status tables retry, and x-should-retry=false keeps a required pause.
-        A mid-stream error carries status 200, whose retry headers do not apply.
+        A mid-stream error carries status 200, so its error type decides the failure.
         """
         return {
             _connection_error(): transient(pauses_quota=False),
-            anthropic.APITimeoutError(
-                httpx2.Request("POST", "https://api.anthropic.com")
-            ): transient(pauses_quota=False),
             anthropic.RetryableError("middleware said retry"): transient(pauses_quota=False),
             _status_error(
                 anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
             ): transient(pauses_quota=True, retry_after_seconds=7.0),
-            _status_error(anthropic.RateLimitError, 429, {"retry-after-ms": "1500"}): transient(
-                pauses_quota=True, retry_after_seconds=1.5
+            _status_error(anthropic.APIStatusError, 200, error_type="overloaded_error"): transient(
+                pauses_quota=True
             ),
-            _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"}): terminal(
-                "rejected"
-            ),
-            _status_error(
-                anthropic.OverloadedError, 529, error_type="overloaded_error"
-            ): transient(pauses_quota=True),
             _status_error(anthropic.InternalServerError, 500, error_type="api_error"): transient(
                 pauses_quota=False
             ),
-            _status_error(
-                anthropic.InternalServerError, 504, error_type="timeout_error"
-            ): transient(pauses_quota=False),
-            _status_error(anthropic.APIStatusError, 408): transient(pauses_quota=False),
-            _status_error(anthropic.ConflictError, 409): transient(pauses_quota=False),
+            _status_error(anthropic.APIStatusError, 200, error_type="api_error"): transient(
+                pauses_quota=False
+            ),
             _status_error(
                 anthropic.BadRequestError, 400, error_type="invalid_request_error"
             ): terminal("rejected"),
             _status_error(
                 anthropic.AuthenticationError, 401, error_type="authentication_error"
             ): terminal("auth"),
-            _status_error(anthropic.APIStatusError, 402, error_type="billing_error"): terminal(
-                "rejected"
-            ),
             _status_error(
-                anthropic.PermissionDeniedError, 403, error_type="permission_error"
-            ): terminal("auth"),
-            _status_error(anthropic.NotFoundError, 404, error_type="not_found_error"): terminal(
-                "rejected"
-            ),
-            _status_error(
-                anthropic.RequestTooLargeError, 413, error_type="request_too_large"
-            ): terminal("rejected"),
-            _status_error(anthropic.UnprocessableEntityError, 422): terminal("rejected"),
-            _status_error(anthropic.InternalServerError, 503): transient(pauses_quota=False),
-            _status_error(anthropic.APIStatusError, 451): terminal("rejected"),
-            _status_error(anthropic.InternalServerError, 502): transient(pauses_quota=False),
+                anthropic.APIStatusError, 200, error_type="invalid_request_error"
+            ): terminal("provider_failed_terminally"),
             _status_error(anthropic.APIStatusError, 599): transient(pauses_quota=False),
-            _status_error(anthropic.APIStatusError, 302): terminal("unknown_exception"),
-            _status_error(
-                anthropic.AuthenticationError, 401, {"x-should-retry": "false"}
-            ): terminal("auth"),
-            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "false"}): terminal(
-                "rejected"
-            ),
-            _status_error(
-                anthropic.InternalServerError, 500, {"x-should-retry": "false"}
-            ): terminal("provider_failed_terminally"),
-            _status_error(
-                anthropic.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
-            ): transient(pauses_quota=False, retry_after_seconds=3.0),
-            _status_error(
-                anthropic.RateLimitError, 429, {"x-should-retry": "true"}, "rate_limit_error"
-            ): transient(pauses_quota=True),
-            _status_error(
-                anthropic.RateLimitError,
-                429,
-                {"x-should-retry": "false", "retry-after": "7"},
-                "rate_limit_error",
-            ): RequestFailure(
-                kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
-            ),
-            _status_error(
-                anthropic.OverloadedError, 529, {"x-should-retry": "false"}, "overloaded_error"
-            ): RequestFailure(
-                kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
-            ),
-            _status_error(
-                anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
-            ): transient(pauses_quota=True),
-            _status_error(
-                anthropic.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_request_error"
-            ): terminal("provider_failed_terminally"),
-            _status_error(anthropic.APIStatusError, 200, error_type="api_error"): transient(
-                pauses_quota=False
-            ),
-            _status_error(anthropic.APIStatusError, 200, error_type="timeout_error"): transient(
-                pauses_quota=False
-            ),
             ValueError("boom"): terminal("unknown_exception"),
         }

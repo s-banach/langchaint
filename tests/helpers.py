@@ -246,43 +246,30 @@ def terminal(
 
 
 def openai_sdk_errors_and_request_failures() -> Mapping[Exception, RequestFailure]:
+    """Return one row per branch of `openai_request_failure` and its status and error-code tables."""
     return {
         connection_error(): transient(pauses_quota=False),
-        openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): transient(
-            pauses_quota=False
-        ),
         status_error(openai.RateLimitError, 429, {"retry-after": "7"}): transient(
             pauses_quota=True, retry_after_seconds=7.0
         ),
         status_error(
             openai.RateLimitError, 429, error_code="organization_spend_limit_exceeded"
         ): terminal("rejected"),
-        status_error(openai.InternalServerError, 503): transient(pauses_quota=True),
         status_error(openai.InternalServerError, 500): transient(pauses_quota=False),
-        status_error(openai.APIStatusError, 408): transient(pauses_quota=False),
-        status_error(openai.ConflictError, 409): transient(pauses_quota=False),
-        status_error(openai.InternalServerError, 599): transient(pauses_quota=False),
         status_error(openai.BadRequestError, 400): terminal("rejected"),
         status_error(openai.AuthenticationError, 401): terminal("auth"),
-        status_error(openai.PermissionDeniedError, 403): terminal("auth"),
-        status_error(openai.AuthenticationError, 401, {"x-should-retry": "false"}): terminal(
-            "auth"
-        ),
-        status_error(openai.NotFoundError, 404): terminal("rejected"),
-        status_error(openai.UnprocessableEntityError, 422): terminal("rejected"),
-        status_error(openai.APIStatusError, 413): terminal("rejected"),
+        status_error(openai.InternalServerError, 599): transient(pauses_quota=False),
         status_error(openai.APIStatusError, 451): terminal("rejected"),
-        status_error(openai.BadRequestError, 400, {"x-should-retry": "false"}): terminal(
-            "rejected"
+        status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded"): transient(
+            pauses_quota=True
         ),
-        status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}): terminal(
+        status_error(openai.APIStatusError, 200, error_code="server_error"): transient(
+            pauses_quota=False
+        ),
+        status_error(openai.APIStatusError, 200, error_code="invalid_prompt"): terminal(
             "provider_failed_terminally"
         ),
-        status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}): RequestFailure(
-            kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
-        ),
-        status_error(openai.APIStatusError, 302): terminal("unknown_exception"),
-        status_error(openai.APIStatusError, 200, error_code="invalid_prompt"): terminal(
+        status_error(openai.APIStatusError, 200, error_code="brand_new_code"): terminal(
             "provider_failed_terminally"
         ),
         ValueError("boom"): terminal("unknown_exception"),

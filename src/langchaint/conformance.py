@@ -221,9 +221,10 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Every SDK exception this adapter places, against the exact `RequestFailure` it returns.
+        """SDK exceptions against the exact `RequestFailure` that `request_failure` returns.
 
-        Cover each kind that `request_failure` can return, with and without `pauses_quota`.
+        Give one exception per branch of the adapter's mapping.
+        Cover each kind that `request_failure` can return, and `pauses_quota` both true and false.
         Include a server-stated `retry_after_seconds` and an unlisted status.
         """
         ...

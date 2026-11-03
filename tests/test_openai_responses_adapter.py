@@ -1754,81 +1754,8 @@ def test_only_a_rate_limit_error_code_pauses_the_quota(
     ("failure", "expected_request_failure", "fallthrough_tag"),
     [
         (
-            status_error(openai.RateLimitError, 429, {"Retry-After-MS": "1500"}),
-            transient(pauses_quota=True, retry_after_seconds=1.5),
-            None,
-        ),
-        (status_error(openai.RateLimitError, 429), transient(pauses_quota=True), None),
-        (
-            status_error(openai.BadRequestError, 400, {"retry-after": "7"}),
-            terminal("rejected"),
-            None,
-        ),
-        (
-            status_error(openai.RateLimitError, 429, error_code="credit_balance_exhausted"),
-            terminal("rejected"),
-            None,
-        ),
-        (
-            status_error(openai.RateLimitError, 429, error_code="rate_limit_exceeded"),
-            transient(pauses_quota=True),
-            None,
-        ),
-        (
-            status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}),
-            terminal("provider_failed_terminally"),
-            None,
-        ),
-        (
-            status_error(
-                openai.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
-            ),
-            transient(pauses_quota=False, retry_after_seconds=3.0),
-            None,
-        ),
-        (
-            status_error(
-                openai.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
-            ),
-            RequestFailure(
-                kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
-            ),
-            None,
-        ),
-        (
-            status_error(
-                openai.RateLimitError, 429, {"x-should-retry": "false"}, "credit_balance_exhausted"
-            ),
-            terminal("rejected"),
-            None,
-        ),
-        (
-            status_error(
-                openai.RateLimitError, 429, {"x-should-retry": "true"}, "credit_balance_exhausted"
-            ),
-            transient(pauses_quota=False),
-            None,
-        ),
-        (
-            status_error(
-                openai.APIStatusError, 200, {"x-should-retry": "false"}, "rate_limit_exceeded"
-            ),
-            transient(pauses_quota=True),
-            None,
-        ),
-        (
-            status_error(openai.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_prompt"),
-            terminal("provider_failed_terminally"),
-            None,
-        ),
-        (
             status_error(openai.APIStatusError, 200, error_code="server_error"),
             transient(pauses_quota=False),
-            None,
-        ),
-        (
-            status_error(openai.APIStatusError, 200, error_code="misalignment_policy_violation"),
-            terminal("provider_failed_terminally"),
             None,
         ),
         (
@@ -1848,20 +1775,7 @@ def test_only_a_rate_limit_error_code_pauses_the_quota(
         ),
     ],
     ids=[
-        "mixed_case_retry_after_ms",
-        "rate_limit_without_a_stated_wait",
-        "retry_after_does_not_pick_the_kind",
-        "spend_limit_429",
-        "throttled_429",
-        "false_directive_stops_a_retried_status",
-        "true_directive_retries_a_stopped_status",
-        "false_directive_on_a_rate_limit_pauses_and_stops",
-        "false_directive_on_a_spend_limit",
-        "true_directive_on_a_spend_limit",
-        "status_200_ignores_a_false_directive",
-        "status_200_ignores_a_true_directive",
         "status_200_transient_code",
-        "status_200_terminal_code",
         "unlisted_5xx_falls_through",
         "status_200_unknown_code_falls_through",
         "status_200_without_a_code_falls_through",

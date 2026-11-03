@@ -27,7 +27,6 @@ EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE = "execute-tool-span-attribute-names.json
 EMBEDDINGS_SPAN_ATTRIBUTE_NAMES_FILE = "embeddings-span-attribute-names.json"
 RUNTIME_STRUCTURED_ATTRIBUTES_FILE = "_semconv_genai_structured_attributes.json"
 WEAVER_TARGET = "chat-span"
-OBSOLETE_FILES = {"provider-name-values.json"}
 
 ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.system_instructions": "gen-ai-system-instructions.json",
@@ -226,15 +225,10 @@ def _replace_committed_files(staged_directory: pathlib.Path) -> None:
     The refresh workflow therefore opens no pull request for a SHA-only change.
     """
     DESTINATION.mkdir(parents=True, exist_ok=True)
-    obsolete_paths = [
-        DESTINATION / obsolete_file
-        for obsolete_file in sorted(OBSOLETE_FILES)
-        if (DESTINATION / obsolete_file).exists()
-    ]
     staged_data_paths = sorted(
         path for path in staged_directory.iterdir() if path.name != SOURCE_DOC.name
     )
-    data_changed = bool(obsolete_paths) or any(
+    data_changed = any(
         not _destination_path(path).exists()
         or _destination_path(path).read_bytes() != path.read_bytes()
         for path in staged_data_paths
@@ -242,9 +236,6 @@ def _replace_committed_files(staged_directory: pathlib.Path) -> None:
     if not data_changed:
         print("committed data matches upstream; SOURCE.md left unchanged")
         return
-    for obsolete_path in obsolete_paths:
-        obsolete_path.unlink()
-        print(f"removed {obsolete_path}")
     for staged_path in [*staged_data_paths, staged_directory / SOURCE_DOC.name]:
         destination_path = _destination_path(staged_path)
         _ = staged_path.replace(destination_path)

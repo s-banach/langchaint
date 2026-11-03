@@ -1192,17 +1192,6 @@ def test_refresh_rewrites_source_doc_when_runtime_data_changes(
     assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
 
 
-def test_refresh_removes_an_obsolete_file_and_rewrites_source_doc(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    staged, destination, _ = _stage_refresh_directories(tmp_path, monkeypatch)
-    obsolete_path = destination / "provider-name-values.json"
-    _ = obsolete_path.write_text("{}")
-    refresh_semconv_genai._replace_committed_files(staged)
-    assert not obsolete_path.exists()
-    assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
-
-
 _MULTIMODAL_USER_MESSAGE = UserMessage(
     content=(
         TextPart(text="what is this"),

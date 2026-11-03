@@ -326,13 +326,16 @@ _PROVIDER_FIELD_BY_TOOL_TYPE = {
 }
 
 
-def _all_candidate_parts(response: types.GenerateContentResponse) -> list[types.Part]:
-    """Return every part from every response candidate."""
+def _provider_executed_tool_calls(
+    response: types.GenerateContentResponse,
+) -> list[types.ToolCall]:
+    """Return the server-side tool calls among the parts of every response candidate."""
     return [
-        part
+        part.tool_call
         for candidate in response.candidates or []
         if candidate.content is not None and candidate.content.parts is not None
         for part in candidate.content.parts
+        if part.tool_call is not None
     ]
 
 
@@ -353,36 +356,26 @@ def _queries_from_tool_call(tool_call: types.ToolCall, *, maps: bool) -> list[st
 
 
 def _provider_executed_tool_cost_in_usd(
-    provider_executed_tool_parts: Sequence[types.Part],
+    provider_executed_tool_calls: Sequence[types.ToolCall],
     *,
     pricing: GeminiPricingTable,
     provider_executed_tool_fields: frozenset[str],
     billing_complete: bool,
 ) -> float:
-    """Price paired Search and Maps calls from one assembled response."""
+    """Price the Search and Maps calls in one assembled response."""
     if (
         not billing_complete
         and provider_executed_tool_fields & _CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS
     ):
         return float("nan")
-    call_keys: Counter[tuple[str, types.ToolType]] = Counter()
-    response_keys: Counter[tuple[str, types.ToolType]] = Counter()
     search_queries: set[str] = set()
     maps_query_count = 0
-    for part in provider_executed_tool_parts:
-        tool_response = part.tool_response
-        if tool_response is not None:
-            if tool_response.id is None or tool_response.tool_type is None:
-                return float("nan")
-            response_keys[(tool_response.id, tool_response.tool_type)] += 1
-        tool_call = part.tool_call
-        if tool_call is None:
-            continue
-        tool_type = tool_call.tool_type
-        if tool_call.id is None or tool_type is None:
-            return float("nan")
-        call_keys[(tool_call.id, tool_type)] += 1
-        provider_field = _PROVIDER_FIELD_BY_TOOL_TYPE.get(tool_type)
+    for tool_call in provider_executed_tool_calls:
+        provider_field = (
+            None
+            if tool_call.tool_type is None
+            else _PROVIDER_FIELD_BY_TOOL_TYPE.get(tool_call.tool_type)
+        )
         if provider_field is None or provider_field not in provider_executed_tool_fields:
             return float("nan")
         if provider_field == "google_search":
@@ -395,9 +388,6 @@ def _provider_executed_tool_cost_in_usd(
             if queries is None:
                 return float("nan")
             maps_query_count += len(queries)
-
-    if call_keys != response_keys:
-        return float("nan")
     return invocation_cost_in_usd(
         len(search_queries),
         usd_per_invocation=pricing.google_search_usd_per_query,
@@ -409,7 +399,7 @@ def _provider_executed_tool_cost_in_usd(
 
 def _billing_from_provider_evidence(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
-    provider_executed_tool_parts: Sequence[types.Part],
+    provider_executed_tool_calls: Sequence[types.ToolCall],
     pricing: GeminiPricingTable,
     *,
     provider_executed_tool_fields: frozenset[str] = frozenset(),
@@ -420,7 +410,7 @@ def _billing_from_provider_evidence(
         usage_metadata,
         pricing,
         provider_executed_tool_cost_in_usd=_provider_executed_tool_cost_in_usd(
-            provider_executed_tool_parts,
+            provider_executed_tool_calls,
             pricing=pricing,
             provider_executed_tool_fields=provider_executed_tool_fields,
             billing_complete=billing_complete,
@@ -438,7 +428,7 @@ def _billing_from_response(
     """Price token counters and provider evidence from every candidate."""
     return _billing_from_provider_evidence(
         response.usage_metadata,
-        _all_candidate_parts(response),
+        _provider_executed_tool_calls(response),
         pricing,
         provider_executed_tool_fields=provider_executed_tool_fields,
         billing_complete=billing_complete,
@@ -1185,7 +1175,7 @@ class _ResponseAccumulator:
 
     def __init__(self) -> None:
         self.parts: list[types.Part] = []
-        self.provider_executed_tool_parts: list[types.Part] = []
+        self.provider_executed_tool_calls: list[types.ToolCall] = []
         self.finish_reason: types.FinishReason | None = None
         self.usage_metadata: types.GenerateContentResponseUsageMetadata | None = None
         self.model_version: str | None = None
@@ -1197,7 +1187,7 @@ class _ResponseAccumulator:
         """Fold one chunk in: scalars take the last non-None value, parts append or merge.
 
         Only the first part can continue the last accumulated part.
-        Continuation requires text-only parts with equal thought values and no prior thought_signature.
+        Continuation requires text parts with equal thought values and no prior thought_signature.
         Their text concatenates, and the incoming thought_signature ends the merged part.
         """
         if chunk.usage_metadata is not None:
@@ -1208,17 +1198,10 @@ class _ResponseAccumulator:
             self.response_id = chunk.response_id
         if chunk.prompt_feedback is not None:
             self.prompt_feedback = chunk.prompt_feedback
+        self.provider_executed_tool_calls.extend(_provider_executed_tool_calls(chunk))
         candidates = chunk.candidates
         if not candidates:
             return
-        for streamed_candidate in candidates:
-            if streamed_candidate.content is None or streamed_candidate.content.parts is None:
-                continue
-            self.provider_executed_tool_parts.extend(
-                part
-                for part in streamed_candidate.content.parts
-                if part.tool_call is not None or part.tool_response is not None
-            )
         candidate = candidates[0]
         if candidate.finish_reason is not None:
             self.finish_reason = candidate.finish_reason
@@ -1262,21 +1245,11 @@ class _ResponseAccumulator:
         )
 
 
-def _is_text_only(part: types.Part) -> bool:
-    """Whether the part sets text and no field besides thought and thought_signature.
-
-    It is the precondition for merging the part into a neighbor.
-    Inspect the dump so any other field, such as part_metadata, prevents merging.
-    """
-    payload_keys = part.model_dump(exclude_none=True).keys() - {"thought", "thought_signature"}
-    return payload_keys == {"text"}
-
-
 def _continues_text(last: types.Part, incoming: types.Part) -> bool:
-    """Whether incoming is the next slice of last: both text-only, same thought flag, last unsigned."""
+    """Whether incoming is the next slice of last: both text, same thought flag, last unsigned."""
     return (
-        _is_text_only(last)
-        and _is_text_only(incoming)
+        last.text is not None
+        and incoming.text is not None
         and bool(last.thought) == bool(incoming.thought)
         and last.thought_signature is None
     )
@@ -1399,7 +1372,7 @@ class _GeminiStream(AdapterStream):
             return None
         return _billing_from_provider_evidence(
             self._accumulator.usage_metadata,
-            self._accumulator.provider_executed_tool_parts,
+            self._accumulator.provider_executed_tool_calls,
             self._pricing,
             provider_executed_tool_fields=self._provider_executed_tool_fields,
             billing_complete=self._billing_complete,

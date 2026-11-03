@@ -249,9 +249,8 @@ def _provider_call_parts(
     tool_call_id: str,
     tool_type: types.ToolType,
     queries: object,
-    tool_response_id: str | None = None,
 ) -> list[types.Part]:
-    """Build one server-side tool call and its response, matched unless tool_response_id differs."""
+    """Build one server-side tool call and its response."""
     return [
         types.Part(
             tool_call=types.ToolCall(
@@ -262,7 +261,7 @@ def _provider_call_parts(
         ),
         types.Part(
             tool_response=types.ToolResponse(
-                id=tool_response_id or tool_call_id,
+                id=tool_call_id,
                 tool_type=tool_type,
                 response={},
             )
@@ -1219,28 +1218,6 @@ _TOOL_COSTS = [
             (types.ToolType.GOOGLE_MAPS, "google_maps", [""]),
             (types.ToolType.GOOGLE_MAPS, "google_maps", ["valid", 1]),
         )
-    ),
-    # A server call without its matching response is incomplete billing evidence.
-    _ToolCost(
-        "call_without_response",
-        _response(_search_call(["query"])[:1], usage_metadata=_usage_metadata()),
-        frozenset({"google_search"}),
-        float("nan"),
-    ),
-    # Server call and response identifiers must match.
-    _ToolCost(
-        "mismatched_call_and_response_ids",
-        _response(
-            _provider_call_parts(
-                tool_call_id="search-1",
-                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                queries=["query"],
-                tool_response_id="search-2",
-            ),
-            usage_metadata=_usage_metadata(),
-        ),
-        frozenset({"google_search"}),
-        float("nan"),
     ),
     # A partial response cannot prove the final Search query count.
     _ToolCost(

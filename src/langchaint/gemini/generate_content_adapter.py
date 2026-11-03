@@ -1183,12 +1183,15 @@ class _ResponseAccumulator:
         self.prompt_feedback: types.GenerateContentResponsePromptFeedback | None = None
         self.grounding_metadata: types.GroundingMetadata | None = None
 
-    def add(self, chunk: types.GenerateContentResponse) -> None:
+    def add(self, chunk: types.GenerateContentResponse) -> list[int]:
         """Fold one chunk in: scalars take the last non-None value, parts append or merge.
 
         Only the first part can continue the last accumulated part.
         Continuation requires text parts with equal thought values and no prior thought_signature.
         Their text concatenates, and the incoming thought_signature ends the merged part.
+
+        Returns:
+            The `parts` index of the assembled part that holds each part of the chunk's first candidate.
         """
         if chunk.usage_metadata is not None:
             self.usage_metadata = chunk.usage_metadata
@@ -1201,12 +1204,13 @@ class _ResponseAccumulator:
         self.provider_executed_tool_calls.extend(_provider_executed_tool_calls(chunk))
         candidates = chunk.candidates
         if not candidates:
-            return
+            return []
         candidate = candidates[0]
         if candidate.finish_reason is not None:
             self.finish_reason = candidate.finish_reason
         if candidate.grounding_metadata is not None:
             self.grounding_metadata = candidate.grounding_metadata
+        assembled_indices: list[int] = []
         for index, part in enumerate(_candidate_parts(chunk)):
             last = self.parts[-1] if self.parts else None
             if index == 0 and last is not None and _continues_text(last, part):
@@ -1218,6 +1222,8 @@ class _ResponseAccumulator:
                 )
             else:
                 self.parts.append(part)
+            assembled_indices.append(len(self.parts) - 1)
+        return assembled_indices
 
     def blocked(self) -> bool:
         """Whether a prompt_feedback with a block_reason arrived, which ends a stream without candidates."""
@@ -1276,7 +1282,7 @@ def assembled_response(
     """
     accumulator = _ResponseAccumulator()
     for chunk in chunks:
-        accumulator.add(chunk)
+        _ = accumulator.add(chunk)
     return accumulator.response()
 
 
@@ -1318,8 +1324,8 @@ class _GeminiStream(AdapterStream):
         """Translate chunks into answer text, reasoning deltas, and complete tool calls.
 
         Each function call arrives whole and yields no `ToolCallDelta`.
-        A thought signature or following part ends a reasoning part.
-        `REASONING_PART_SEPARATOR` separates reasoning parts that emitted text.
+        `REASONING_PART_SEPARATOR` separates text from different assembled reasoning parts.
+        `_ResponseAccumulator.add` defines which wire parts merge into one assembled part.
 
         Yields:
             Stream items for parts langchaint models.
@@ -1328,24 +1334,19 @@ class _GeminiStream(AdapterStream):
             StreamProtocolError: The stream ends without `finish_reason` or `block_reason`.
             errors.APIError: The SDK iterator receives a mid-stream error.
         """
-        reasoning_delta_yielded = False
-        separator_pending = False
-        previous_part: types.Part | None = None
+        last_reasoning_index: int | None = None
         async for chunk in self._first_then_rest():
-            self._accumulator.add(chunk)
-            wire_parts = _candidate_parts(chunk)
-            for index, part in enumerate(wire_parts):
-                if index != 0 or previous_part is None or not _continues_text(previous_part, part):
-                    separator_pending = reasoning_delta_yielded
-                previous_part = part
+            assembled_indices = self._accumulator.add(chunk)
+            for part, assembled_index in zip(
+                _candidate_parts(chunk), assembled_indices, strict=True
+            ):
                 if part.function_call is not None:
                     yield _tool_call_from(part.function_call)
                 if part.text:
                     if part.thought:
-                        if separator_pending:
-                            separator_pending = False
+                        if last_reasoning_index not in (None, assembled_index):
                             yield ReasoningDelta(text=REASONING_PART_SEPARATOR)
-                        reasoning_delta_yielded = True
+                        last_reasoning_index = assembled_index
                         yield ReasoningDelta(text=part.text)
                     else:
                         yield part.text

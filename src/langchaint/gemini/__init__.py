@@ -178,6 +178,9 @@ class Gemini:
           google-genai 2.33.0 would send the uppercase name instead.
         - `extra_body` has a `generationConfig` key whose value is not a mapping with only string keys.
           Every letter case and underscore spelling of `generationConfig` counts.
+        - `extra_body` sets `generationConfig.candidateCount` to a value other than 1 or `None`.
+          The adapter reads one candidate per response.
+          Every letter case and underscore spelling of `candidateCount` counts.
         - `provider_executed_tools` is nonempty and `tool_choice` is not `"auto"`.
         - `provider_executed_tools` is nonempty and the model is not a Gemini 3 model.
         - A provider-executed tool sets no field or sets an unsupported field.

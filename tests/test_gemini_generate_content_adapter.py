@@ -661,6 +661,12 @@ _BIND_DEFECTS = [
         _binding(extra_body={"generationConfig": _NON_STRING_KEY_GENERATION_CONFIG}),
         "only string keys",
     ),
+    # The adapter reads one candidate per response.
+    _BindDefect(
+        "candidate_count_2",
+        _binding(extra_body={"generation_config": {"candidate_count": 2}}),
+        "candidateCount",
+    ),
 ]
 
 

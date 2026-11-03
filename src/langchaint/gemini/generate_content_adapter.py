@@ -817,15 +817,17 @@ def _is_list(value: object) -> TypeIs[list[object]]:
 
 
 def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
-    """Refuse the extra_body keys whose SDK merge would silently override the binding.
+    """Refuse the extra_body values that would override the binding or that the adapter cannot read.
 
     The SDK recursively merges extra_body into the wire body.
     extra_body wins matched terminal keys.
     _normalized_wire_key compares both mappings.
     Populated top-level keys and generationConfig terminal keys are refused.
+    candidateCount other than 1 or None is refused because the adapter reads one candidate per response.
 
     Raises:
         ValueError: extra_body has a refused key, or generationConfig has an invalid shape or key.
+        ValueError: generationConfig sets candidateCount to a value other than 1 or None.
     """
     if extra_body is None:
         return
@@ -853,6 +855,15 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
             populated_keys=_ADAPTER_POPULATED_GENERATION_CONFIG_KEYS,
             normalized_key=_normalized_wire_key,
         )
+        if any(
+            _normalized_wire_key(key) == "candidatecount" and value not in (None, 1)
+            for key, value in generation_config.items()
+        ):
+            raise ValueError(
+                "generationConfig candidateCount must be 1, None, or absent, because "
+                "GeminiGenerateContentAdapter reads one candidate per response. "
+                "Pass the input once per candidate."
+            )
 
 
 def _retry_after_seconds_from_retry_info(details: object) -> float | None:
@@ -1003,6 +1014,7 @@ class GeminiGenerateContentAdapter(Adapter):
         Raises:
             pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
             ValueError: Parallel calls are disabled, `system_prompt` is empty, or a key is reserved.
+            ValueError: `extra_body` sets `generationConfig.candidateCount` to a value other than 1 or `None`.
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A bound charged tool has no stated price.
         """

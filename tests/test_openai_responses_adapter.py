@@ -593,7 +593,6 @@ def test_wire_input_converts_each_message_kind() -> None:
             ),
             ToolMessage(tool_call_id="call1", content="r"),
         ],
-        supports_cache_breakpoints=True,
     )
     assert wire == [
         {"role": "user", "content": "q"},
@@ -627,7 +626,6 @@ def test_wire_input_converts_content_parts_and_only_their_cache_breakpoints() ->
                 ),
             ),
         ],
-        supports_cache_breakpoints=True,
     )
     data_image = {
         "type": "input_image",
@@ -666,7 +664,6 @@ def test_wire_input_sends_every_cache_breakpoint_without_a_client_side_cap() -> 
                 )
             ),
         ],
-        supports_cache_breakpoints=True,
     )
     assert wire == [
         {
@@ -716,7 +713,7 @@ def _adapter(
     pricing: OpenAIPricingTable = _PRICING,
     provider_name: str = "openai",
     reasoning_summary: ReasoningSummary | None = None,
-    supports_cache_breakpoints: bool = True,
+    supports_prompt_cache_options: bool = True,
     service_tier: OpenAIResponsesServiceTier | None = None,
 ) -> OpenAIResponsesAdapter:
     """Use a placeholder API key; request tests supply an offline HTTP transport."""
@@ -725,7 +722,7 @@ def _adapter(
         model="m",
         pricing=pricing,
         provider_name=provider_name,
-        supports_cache_breakpoints=supports_cache_breakpoints,
+        supports_prompt_cache_options=supports_prompt_cache_options,
         reasoning_summary=reasoning_summary,
         service_tier=service_tier,
     )
@@ -737,14 +734,14 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
         model="m",
         pricing=_PRICING,
         provider_name="openai",
-        supports_cache_breakpoints=False,
+        supports_prompt_cache_options=False,
         reasoning_summary="detailed",
         service_tier="ultrafast",
     )
     assert adapter.config_fingerprint_data() == {
         "reasoning_summary": "detailed",
         "service_tier": "ultrafast",
-        "supports_cache_breakpoints": False,
+        "supports_prompt_cache_options": False,
     }
 
 
@@ -798,7 +795,7 @@ def test_request_assembles_the_reasoning_object_key_by_key(
 
 
 @pytest.mark.parametrize(
-    ("supports_cache_breakpoints", "automatic_cache_breakpoints", "expected_options"),
+    ("supports_prompt_cache_options", "automatic_cache_breakpoints", "expected_options"),
     [
         (True, False, {"mode": "explicit"}),
         (True, True, None),
@@ -813,11 +810,11 @@ def test_request_assembles_the_reasoning_object_key_by_key(
 def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabled(
     expected_options: dict[str, str] | None,
     *,
-    supports_cache_breakpoints: bool,
+    supports_prompt_cache_options: bool,
     automatic_cache_breakpoints: bool,
 ) -> None:
     precomputed_fields = _adapter(
-        supports_cache_breakpoints=supports_cache_breakpoints
+        supports_prompt_cache_options=supports_prompt_cache_options
     )._precompute_fields(_binding(automatic_cache_breakpoints=automatic_cache_breakpoints))
     if expected_options is None:
         assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
@@ -826,7 +823,7 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
 
 
 def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
-    llm = LLM(_adapter(supports_cache_breakpoints=False))
+    llm = LLM(_adapter(supports_prompt_cache_options=False))
     with pytest.raises(ValueError, match="model 'm'"):
         _ = llm.bind(automatic_cache_breakpoints=False)
 
@@ -1065,37 +1062,6 @@ def test_the_structured_request_sends_a_strict_response_schema() -> None:
             }
         },
     }
-
-
-@pytest.mark.parametrize(
-    ("supports_cache_breakpoints", "automatic_cache_breakpoints"),
-    [(True, False), (True, True), (False, True)],
-)
-def test_request_cache_breakpoints_follow_capability(
-    *, supports_cache_breakpoints: bool, automatic_cache_breakpoints: bool
-) -> None:
-    bound = _adapter(supports_cache_breakpoints=supports_cache_breakpoints).bind_text(
-        _binding(
-            automatic_cache_breakpoints=automatic_cache_breakpoints,
-            system_prompt=(TextPart(text="", cache_breakpoint=True),),
-        )
-    )
-    parts = (
-        TextPart(text="context", cache_breakpoint=True),
-        ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
-        ImageUrlPart(url=_IMAGE_URL, cache_breakpoint=True),
-    )
-    params = bound.build_request_params((
-        UserMessage(content=parts),
-        ToolMessage(tool_call_id="c", content=parts),
-    ))
-    assert isinstance(params, _OpenAIResponsesRequestParams)
-    request_json = json.dumps(params.input)
-    assert request_json.count('"prompt_cache_breakpoint"') == (
-        7 if supports_cache_breakpoints else 0
-    )
-    assert ('"prompt_cache_options"' in params.as_json()) == (not automatic_cache_breakpoints)
-    assert request_json.count('"context"') == 2
 
 
 def test_request_system_parts_become_a_developer_input_message() -> None:

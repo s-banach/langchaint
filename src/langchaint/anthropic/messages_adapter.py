@@ -590,9 +590,13 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     return cast("_ContentBlockParam", dict(raw))
 
 
-def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
+def _assistant_content_blocks(
+    assistant_message: AssistantMessage,
+) -> tuple[list[_ContentBlockParam], list[TextBlockParam]]:
     """Convert one AssistantMessage to wire blocks in `content` order.
 
+    The second element holds the text blocks whose part sets cache_breakpoint in content order.
+    The caller applies `message_cache_breakpoint_budget`, so this function writes no `cache_control`.
     `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
     The API rejects modified thinking blocks and unknown `type` values.
 
@@ -601,11 +605,15 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
         _RejectedMessagesError: A stored block lacks a `type` key.
     """
     if isinstance(assistant_message.content, str):
-        return [{"type": "text", "text": assistant_message.content}]
+        return [{"type": "text", "text": assistant_message.content}], []
     blocks: list[_ContentBlockParam] = []
+    part_cache_breakpoint_blocks: list[TextBlockParam] = []
     for part in assistant_message.content:
         if part.kind == "text":
-            blocks.append({"type": "text", "text": part.text})
+            text_block: TextBlockParam = {"type": "text", "text": part.text}
+            blocks.append(text_block)
+            if part.cache_breakpoint:
+                part_cache_breakpoint_blocks.append(text_block)
         elif part.kind == "tool_call":
             blocks.append({
                 "type": "tool_use",
@@ -615,7 +623,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
             })
         else:
             blocks.append(_replayed_block(part.raw))
-    return blocks
+    return blocks, part_cache_breakpoint_blocks
 
 
 def _tool_message_has_cache_breakpoint(tool_message: ToolMessage) -> bool:
@@ -644,7 +652,8 @@ def _wire_messages(
     """Convert messages and apply the permitted cache breakpoints.
 
     `automatic_cache_breakpoints` places a cache breakpoint on the last block unless it is a thinking block.
-    A user part's cache breakpoint goes on its own block, and a tool part's on its enclosing `tool_result`.
+    A user part's or assistant text part's cache breakpoint goes on its own block.
+    A tool part's cache breakpoint goes on its enclosing `tool_result`.
     The latest cache breakpoints up to `message_cache_breakpoint_budget` are sent.
 
     Raises:
@@ -677,7 +686,8 @@ def _wire_messages(
                 cache_breakpoint_blocks.extend(part_cache_breakpoint_blocks)
                 wire.append({"role": "user", "content": last_blocks})
             case "assistant":
-                last_blocks = _assistant_content_blocks(message)
+                last_blocks, part_cache_breakpoint_blocks = _assistant_content_blocks(message)
+                cache_breakpoint_blocks.extend(part_cache_breakpoint_blocks)
                 wire.append({"role": "assistant", "content": last_blocks})
         previous_kind = message.kind
     if message_cache_breakpoint_budget > 0:
@@ -1052,7 +1062,8 @@ class AnthropicMessagesAdapter(Adapter):
 
         `provider_name` is `"anthropic"` for `AsyncAnthropic` and `"aws.bedrock"` for Bedrock clients.
         The stored client disables SDK retries and preserves custom Bedrock transports.
-        `cache_ttl` applies to top-level `cache_control` and every automatic and explicit cache breakpoint.
+        `cache_ttl` applies to top-level `cache_control` and every automatic cache breakpoint.
+        It also applies to every part with `cache_breakpoint=True`.
         `"5m"` writes bill 1.25 times base input, and `"1h"` writes bill twice base input.
         Mixed TTLs require one-hour cache breakpoints before five-minute ones.
         Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching.

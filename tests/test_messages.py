@@ -87,17 +87,6 @@ def test_cache_breakpoint_round_trips() -> None:
     assert restored == messages
 
 
-def test_assistant_message_rejects_a_text_part_cache_breakpoint() -> None:
-    breakpoint_part = TextPart(text="hey", cache_breakpoint=True)
-    with pytest.raises(ValidationError, match="cache_breakpoint"):
-        _ = AssistantMessage(content=(breakpoint_part,))
-    with pytest.raises(ValidationError, match="cache_breakpoint"):
-        _ = AssistantMessage.model_validate({
-            "kind": "assistant",
-            "content": ({"kind": "text", "text": "hey", "cache_breakpoint": True},),
-        })
-
-
 _PINNED_MESSAGES: tuple[Message, ...] = (
     UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
     AssistantMessage(

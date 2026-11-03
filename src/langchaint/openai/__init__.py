@@ -8,7 +8,7 @@ Use `OpenAIResponsesAdapter` directly for Azure.
 
 Cataloged models receive `OPENAI_PRICING`.
 Cataloged embedding models receive `OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS`.
-Uncataloged OpenAI models require `pricing` and `supports_cache_breakpoints`.
+Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
 `OpenAIBedrock.llm` always requires both parameters.
 Missing optional rates produce NaN token costs.
 
@@ -114,7 +114,7 @@ class OpenAI:
         *,
         regional_processing: bool = ...,
         pricing: OpenAIPricingTable | None = ...,
-        supports_cache_breakpoints: bool | None = ...,
+        supports_prompt_cache_options: bool | None = ...,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIResponsesServiceTier | None = ...,
     ) -> LLM: ...
@@ -126,7 +126,7 @@ class OpenAI:
         *,
         regional_processing: bool = ...,
         pricing: OpenAIPricingTable,
-        supports_cache_breakpoints: bool,
+        supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIResponsesServiceTier | None = ...,
     ) -> LLM: ...
@@ -137,7 +137,7 @@ class OpenAI:
         *,
         regional_processing: bool = False,
         pricing: OpenAIPricingTable | None = None,
-        supports_cache_breakpoints: bool | None = None,
+        supports_prompt_cache_options: bool | None = None,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIResponsesServiceTier | None = None,
     ) -> LLM:
@@ -151,16 +151,15 @@ class OpenAI:
         It multiplies every token rate by the model's `OPENAI_REGIONAL_PROCESSING_MULTIPLIER`.
         An uncataloged model has no multiplier, so every nonzero token category then costs NaN.
         State its regional rates in `pricing` and leave `regional_processing=False`.
-        `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
-        False omits explicit markers and cache-breakpoint controls while preserving content.
+        `supports_prompt_cache_options` states whether the provider API accepts `prompt_cache_options`.
         Cataloged models default to True because every cataloged model is gpt-5.6 or later.
-        OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
+        OpenAI 3.42.1 documents `prompt_cache_options` for gpt-5.6 and later models.
         `reasoning_summary` requests readable reasoning summary text.
         `service_tier` sets the requested OpenAI service tier.
         The reported service tier selects pricing.
 
         `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
-        - `automatic_cache_breakpoints=False` and `supports_cache_breakpoints` is false.
+        - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options` is false.
         - A provider-executed tool's `type` is missing or unsupported.
           The adapter supports specific versions of web search and file search.
         - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
@@ -172,13 +171,13 @@ class OpenAI:
         """
         catalog_table = _PRICING_BY_MODEL_ID.get(model)
         if catalog_table is None:
-            if pricing is None or supports_cache_breakpoints is None:
+            if pricing is None or supports_prompt_cache_options is None:
                 missing_arguments: list[str] = []
                 if pricing is None:
                     missing_arguments.append("pricing= stating its rates")
-                if supports_cache_breakpoints is None:
+                if supports_prompt_cache_options is None:
                     missing_arguments.append(
-                        "supports_cache_breakpoints= stating whether it supports explicit cache breakpoints"
+                        "supports_prompt_cache_options= stating whether it accepts prompt_cache_options"
                     )
                 raise ValueError(
                     f"model {model!r} is not in OPENAI_PRICING; pass "
@@ -186,8 +185,8 @@ class OpenAI:
                 )
         else:
             pricing = pricing or catalog_table
-            if supports_cache_breakpoints is None:
-                supports_cache_breakpoints = True
+            if supports_prompt_cache_options is None:
+                supports_prompt_cache_options = True
         if regional_processing:
             pricing = pricing.scaled(
                 _REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID.get(model, float("nan"))
@@ -197,7 +196,7 @@ class OpenAI:
             model=model,
             pricing=pricing,
             provider_name="openai",
-            supports_cache_breakpoints=supports_cache_breakpoints,
+            supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         )
@@ -337,7 +336,7 @@ class OpenAIBedrock:
         model: str,
         *,
         pricing: OpenAIPricingTable,
-        supports_cache_breakpoints: bool,
+        supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
     ) -> LLM:
         """Build an `LLM` for one OpenAI model served by Bedrock.
@@ -345,13 +344,12 @@ class OpenAIBedrock:
         `model` is sent verbatim.
         Bedrock model identifiers have no carried pricing catalog.
         `pricing` states this Bedrock model's rates.
-        `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
-        False omits explicit markers and cache-breakpoint controls while preserving content.
+        `supports_prompt_cache_options` states whether the provider API accepts `prompt_cache_options`.
         `reasoning_summary` requests readable reasoning summary text.
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
         `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
-        - `automatic_cache_breakpoints=False` and `supports_cache_breakpoints=False`.
+        - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options=False`.
         - `provider_executed_tools` is nonempty.
         """
         adapter = OpenAIResponsesAdapter(
@@ -359,7 +357,7 @@ class OpenAIBedrock:
             model=model,
             pricing=pricing,
             provider_name="aws.bedrock",
-            supports_cache_breakpoints=supports_cache_breakpoints,
+            supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)

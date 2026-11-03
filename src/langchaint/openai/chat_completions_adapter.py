@@ -185,15 +185,13 @@ def _reasoning_content_extra(model: BaseModel) -> str | None:
     return None
 
 
-def _text_part_param(
-    part: TextPart, *, supports_cache_breakpoints: bool
-) -> ChatCompletionContentPartTextParam:
+def _text_part_param(part: TextPart) -> ChatCompletionContentPartTextParam:
     """Convert one TextPart to a text content part.
 
-    Supported explicit cache breakpoints use `prompt_cache_breakpoint` without a client-side cap.
+    A cache breakpoint uses `prompt_cache_breakpoint` without a client-side cap.
     """
     wire_text: ChatCompletionContentPartTextParam = {"type": "text", "text": part.text}
-    if supports_cache_breakpoints and part.cache_breakpoint:
+    if part.cache_breakpoint:
         wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
     return wire_text
 
@@ -217,12 +215,10 @@ def _text_only_tool_message_error(part: ContentPart) -> _RejectedMessagesError:
     )
 
 
-def _user_message(
-    user_message: UserMessage, *, supports_cache_breakpoints: bool
-) -> ChatCompletionUserMessageParam:
+def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
     """Convert one UserMessage to a user-role message param.
 
-    Supported explicit cache breakpoints use `prompt_cache_breakpoint`.
+    A cache breakpoint uses `prompt_cache_breakpoint`.
 
     Raises:
         _RejectedMessagesError: AudioPart.media_type has no input_audio.format mapping.
@@ -233,21 +229,19 @@ def _user_message(
     for part in user_message.content:
         match part.kind:
             case "text":
-                wire_parts.append(
-                    _text_part_param(part, supports_cache_breakpoints=supports_cache_breakpoints)
-                )
+                wire_parts.append(_text_part_param(part))
             case "image":
                 wire_parts.append(
                     _image_part_param(
                         _image_data_uri(part),
-                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
+                        cache_breakpoint=part.cache_breakpoint,
                     )
                 )
             case "image_url":
                 wire_parts.append(
                     _image_part_param(
                         part.url,
-                        cache_breakpoint=supports_cache_breakpoints and part.cache_breakpoint,
+                        cache_breakpoint=part.cache_breakpoint,
                     )
                 )
             case "audio":
@@ -265,15 +259,13 @@ def _user_message(
                         "format": audio_format,
                     },
                 }
-                if supports_cache_breakpoints and part.cache_breakpoint:
+                if part.cache_breakpoint:
                     wire_audio["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 wire_parts.append(wire_audio)
     return {"role": "user", "content": wire_parts}
 
 
-def _tool_message(
-    tool_message: ToolMessage, *, supports_cache_breakpoints: bool
-) -> ChatCompletionToolMessageParam:
+def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
     """Convert one ToolMessage to a tool-role message param.
 
     The API has no is_error flag, so the error text in content is the only error signal.
@@ -291,9 +283,7 @@ def _tool_message(
     for part in tool_message.content:
         match part.kind:
             case "text":
-                wire_parts.append(
-                    _text_part_param(part, supports_cache_breakpoints=supports_cache_breakpoints)
-                )
+                wire_parts.append(_text_part_param(part))
             case "image" | "image_url" | "audio":
                 raise _text_only_tool_message_error(part)
     return {
@@ -359,9 +349,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     return cast("ChatCompletionMessageParam", param)
 
 
-def _wire_messages(
-    messages: Sequence[Message], *, supports_cache_breakpoints: bool
-) -> list[ChatCompletionMessageParam]:
+def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessageParam]:
     """Keep the bound system prompt outside messages.
 
     Raises:
@@ -372,13 +360,9 @@ def _wire_messages(
     for message in messages:
         match message.kind:
             case "tool":
-                wire.append(
-                    _tool_message(message, supports_cache_breakpoints=supports_cache_breakpoints)
-                )
+                wire.append(_tool_message(message))
             case "user":
-                wire.append(
-                    _user_message(message, supports_cache_breakpoints=supports_cache_breakpoints)
-                )
+                wire.append(_user_message(message))
             case "assistant":
                 wire.append(_assistant_message_param(message))
     return wire
@@ -640,7 +624,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         model: str,
         pricing: OpenAIPricingTable,
         provider_name: str,
-        supports_cache_breakpoints: bool,
+        supports_prompt_cache_options: bool,
         input_tokens_cache_read_from_usage: Callable[
             [CompletionUsage], int
         ] = input_tokens_cache_read_from_usage_openai,
@@ -652,10 +636,12 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         `provider_name` identifies the provider reached by the client.
         Bedrock and Azure clients require their fixed `provider_name` values.
         `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
-        `supports_cache_breakpoints` states whether the provider API supports explicit cache breakpoints.
-        False omits explicit markers and cache-breakpoint controls while preserving content.
-        OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
-        `supports_cache_breakpoints` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
+        `supports_prompt_cache_options` states whether the provider API accepts `prompt_cache_options`.
+        That request field carries `automatic_cache_breakpoints=False`.
+        OpenAI 3.42.1 documents `prompt_cache_options` for gpt-5.6 and later models.
+        `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
+        A user, tool, or system-prompt part with `cache_breakpoint=True` sends `prompt_cache_breakpoint`.
+        `supports_prompt_cache_options` does not change that.
         `input_tokens_cache_read_from_usage` reads provider-specific cache-read counters.
         A response without usage passes a new `CompletionUsage` with zero counters and no details.
         The reader must return 0 for it.
@@ -670,11 +656,11 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             client=client,
             model=model,
             provider_name=provider_name,
-            automatic_cache_breakpoints_default=not supports_cache_breakpoints,
+            automatic_cache_breakpoints_default=not supports_prompt_cache_options,
         )
         self.client: AsyncOpenAI = client_without_retries(client)
         self.pricing: OpenAIPricingTable = pricing
-        self.supports_cache_breakpoints: bool = supports_cache_breakpoints
+        self.supports_prompt_cache_options: bool = supports_prompt_cache_options
         self.input_tokens_cache_read_from_usage: Callable[[CompletionUsage], int] = (
             input_tokens_cache_read_from_usage
         )
@@ -685,7 +671,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         """Return stored request configuration outside `Binding`."""
         return {
             "service_tier": self.service_tier,
-            "supports_cache_breakpoints": self.supports_cache_breakpoints,
+            "supports_prompt_cache_options": self.supports_prompt_cache_options,
         }
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIChatCompletionsPrecomputedFields:
@@ -718,7 +704,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         require_prompt_cache_options_support(
             model=self.model,
             automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
-            supports_cache_breakpoints=self.supports_cache_breakpoints,
+            supports_prompt_cache_options=self.supports_prompt_cache_options,
         )
         messages_prefix: list[ChatCompletionMessageParam] = []
         if isinstance(binding.system_prompt, str):
@@ -726,12 +712,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         elif binding.system_prompt is not None:
             messages_prefix.append({
                 "role": "system",
-                "content": [
-                    _text_part_param(
-                        part, supports_cache_breakpoints=self.supports_cache_breakpoints
-                    )
-                    for part in binding.system_prompt
-                ],
+                "content": [_text_part_param(part) for part in binding.system_prompt],
             })
         tools: list[ChatCompletionFunctionToolParam] | Omit = omit
         tool_choice: _WireToolChoice | Omit = omit
@@ -1007,9 +988,7 @@ class _BoundOpenAIChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
     ) -> RequestParams | RejectedMessages:
         """Convert messages into the wire messages every request for one input sends."""
         try:
-            wire_messages = _wire_messages(
-                messages, supports_cache_breakpoints=self._adapter.supports_cache_breakpoints
-            )
+            wire_messages = _wire_messages(messages)
         except _RejectedMessagesError as rejected:
             return RejectedMessages(error_text=str(rejected))
         return _OpenAIChatCompletionsRequestParams(

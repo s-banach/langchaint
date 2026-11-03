@@ -85,7 +85,7 @@ cohere_embeddings = cohere_bedrock.embedding_model(
 
 `DeepSeek()` reads `DEEPSEEK_API_KEY` when `client` is absent.
 Uncataloged models require explicit pricing.
-`OpenAI.llm` also requires `supports_cache_breakpoints` for uncataloged models.
+`OpenAI.llm` also requires `supports_prompt_cache_options` for uncataloged models.
 `OpenAIBedrock.llm` always requires both values.
 `Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `bind`, because the Messages API requires `max_tokens`.
 
@@ -215,7 +215,7 @@ See [`09_embeddings.py`](09_embeddings.py) for both embedding tasks.
 `LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` when the argument is `None`.
 Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
 
-Explicit `cache_breakpoint=True` values remain active under either `automatic_cache_breakpoints` value.
+`automatic_cache_breakpoints` does not change which parts with `cache_breakpoint=True` send a cache breakpoint.
 
 ```python
 from langchaint import TextPart

@@ -342,11 +342,11 @@ class Binding:
     automatic_cache_breakpoints: bool
     """Whether `automatic_cache_breakpoints` is enabled.
 
-    `automatic_cache_breakpoints=True` lets the adapter or provider select cache boundaries.
-    `automatic_cache_breakpoints=False` forbids that selection where supported.
-    `cache_breakpoint=True` supplies an optional explicit placement hint under either value.
-    Adapters ignore explicit hints when the provider API lacks support.
-    OpenAI models with `supports_cache_breakpoints=False` require `automatic_cache_breakpoints=True`.
+    `automatic_cache_breakpoints=True` lets the adapter or provider place cache breakpoints.
+    `automatic_cache_breakpoints=False` forbids that placement where supported.
+    `automatic_cache_breakpoints` does not change which parts with `cache_breakpoint=True` send a cache breakpoint.
+    `TextPart` lists the adapters that ignore one.
+    OpenAI models with `supports_prompt_cache_options=False` require `automatic_cache_breakpoints=True`.
     Gemini cannot control implicit caching, so both values build identical requests.
     """
 
@@ -802,7 +802,7 @@ class Adapter(ABC):
             client: The provider SDK client.
             model: The model id to send verbatim.
             provider_name: The serving provider recorded on generations and errors.
-            automatic_cache_breakpoints_default: The default for automatic prompt-cache boundaries.
+            automatic_cache_breakpoints_default: The default for automatic cache breakpoints.
 
         Raises:
             ValueError: `client` fixes a provider that differs from `provider_name`.

@@ -179,7 +179,7 @@ class OpenAIPricingTable:
 
 
 def require_prompt_cache_options_support(
-    *, model: str, automatic_cache_breakpoints: bool, supports_cache_breakpoints: bool
+    *, model: str, automatic_cache_breakpoints: bool, supports_prompt_cache_options: bool
 ) -> None:
     """Require `prompt_cache_options` when `automatic_cache_breakpoints=False`.
 
@@ -189,12 +189,12 @@ def require_prompt_cache_options_support(
     Raises:
         ValueError: `automatic_cache_breakpoints=False` lacks `prompt_cache_options` support.
     """
-    if not automatic_cache_breakpoints and not supports_cache_breakpoints:
+    if not automatic_cache_breakpoints and not supports_prompt_cache_options:
         raise ValueError(
-            f"model {model!r} was built with supports_cache_breakpoints=False, "
+            f"model {model!r} was built with supports_prompt_cache_options=False, "
             "so prompt_cache_options is never sent. "
             "prompt_cache_options carries automatic_cache_breakpoints=False to the request. "
-            "Bind automatic_cache_breakpoints=True, or set supports_cache_breakpoints=True "
+            "Bind automatic_cache_breakpoints=True, or set supports_prompt_cache_options=True "
             "if the model accepts it."
         )
 

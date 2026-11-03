@@ -577,12 +577,20 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
         RawPart(raw=server_tool_raw),
     )
-    assert _assistant_content_blocks(assistant_message) == [
-        thinking_raw,
-        {"type": "text", "text": "hello"},
-        {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Nairobi"}},
-        server_tool_raw,
-    ]
+    assert _assistant_content_blocks(assistant_message) == (
+        [
+            thinking_raw,
+            {"type": "text", "text": "hello"},
+            {
+                "type": "tool_use",
+                "id": "tu_1",
+                "name": "get_weather",
+                "input": {"city": "Nairobi"},
+            },
+            server_tool_raw,
+        ],
+        [],
+    )
 
 
 @pytest.mark.parametrize(
@@ -605,16 +613,16 @@ def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
 ) -> None:
     assistant_message = _assistant_message_from(_message_with_content([block]))
     assert assistant_message.content == (ReasoningPart(raw=expected_raw, text=None),)
-    assert _assistant_content_blocks(assistant_message) == [expected_raw]
+    assert _assistant_content_blocks(assistant_message) == ([expected_raw], [])
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     raw: dict[str, JsonValue] = {"type": "reasoning", "id": "rs_1"}
     assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
-    assert _assistant_content_blocks(assistant_message) == [
-        raw,
-        {"type": "text", "text": "hi"},
-    ]
+    assert _assistant_content_blocks(assistant_message) == (
+        [raw, {"type": "text", "text": "hi"}],
+        [],
+    )
 
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:
@@ -775,14 +783,20 @@ def _cache_breakpoint_texts(count: int) -> tuple[TextPart, ...]:
             _CacheBreakpointCase(
                 (
                     UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
+                    AssistantMessage(
+                        content=(
+                            TextPart(text="reply", cache_breakpoint=True),
+                            TextPart(text="more"),
+                        )
+                    ),
                     ToolMessage(
                         tool_call_id="tu_1",
                         content=(TextPart(text="mid", cache_breakpoint=True),),
                     ),
                     UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
                 ),
-                2,
-                [[None], [_CACHE_CONTROL], [_CACHE_CONTROL]],
+                3,
+                [[None], [_CACHE_CONTROL, None], [_CACHE_CONTROL], [_CACHE_CONTROL]],
             ),
             id="budget_counts_across_message_kinds",
         ),

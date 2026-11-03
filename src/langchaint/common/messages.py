@@ -13,7 +13,7 @@ import math
 from collections.abc import Sequence
 from typing import Annotated, Literal, NamedTuple, TypeIs
 
-from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter, model_validator
+from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter
 
 from langchaint.common.checked_copy import CheckedCopyModel
 
@@ -72,10 +72,13 @@ type JsonValue = Annotated[_JsonValue, BeforeValidator(_require_json_runtime_sha
 
 
 class TextPart(CheckedCopyModel):
-    """Use `cache_breakpoint=True` as an optional placement hint after this text.
+    """Text, followed by a cache breakpoint when `cache_breakpoint=True`.
 
-    Adapters send explicit cache breakpoints where supported and ignore them otherwise.
-    `automatic_cache_breakpoints` separately controls adapter or provider placement.
+    OpenAI adapters send assistant text as strings, so they ignore cache breakpoints on assistant text.
+    The Gemini adapter ignores every cache breakpoint.
+    The Anthropic adapter returns `RejectedMessages` for a cache breakpoint on a `ToolMessage` part except the last.
+    It places a tool part's cache breakpoint on the enclosing `tool_result` block.
+    `automatic_cache_breakpoints` separately controls automatic cache breakpoints.
     """
 
     text: str
@@ -201,28 +204,11 @@ class AssistantMessage(CheckedCopyModel):
     `content` accepts plain text or an ordered tuple of parts.
 
     Raises:
-        pydantic.ValidationError: `content` has an invalid value or a `TextPart` sets `cache_breakpoint`.
+        pydantic.ValidationError: `content` is invalid.
     """
 
     content: str | tuple[AssistantPart, ...]
     kind: Literal["assistant"] = "assistant"
-
-    @model_validator(mode="after")
-    def _reject_cache_breakpoint(self) -> "AssistantMessage":
-        """Reject an assistant message whose `TextPart` sets `cache_breakpoint`.
-
-        Raises:
-            ValueError: A `TextPart` in `content` sets `cache_breakpoint`.
-        """
-        if isinstance(self.content, str):
-            return self
-        if any(part.kind == "text" and part.cache_breakpoint for part in self.content):
-            raise ValueError(
-                "cache_breakpoint is not supported on assistant message text. "
-                "openai has no breakpoint on assistant replay text. "
-                "Set cache_breakpoint on a part of the following user or tool message instead"
-            )
-        return self
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:

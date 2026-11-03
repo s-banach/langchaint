@@ -74,9 +74,10 @@ type JsonValue = Annotated[_JsonValue, BeforeValidator(_require_json_runtime_sha
 class TextPart(CheckedCopyModel):
     """Text, followed by a cache breakpoint when `cache_breakpoint=True`.
 
-    OpenAI adapters send assistant text as strings, so they ignore cache breakpoints on assistant text.
-    The Gemini adapter ignores every cache breakpoint.
-    The Anthropic adapter returns `RejectedMessages` for a cache breakpoint on a `ToolMessage` part except the last.
+    `OpenAIChatCompletionsAdapter` and `OpenAIResponsesAdapter` send assistant text as strings.
+    They ignore cache breakpoints on assistant text.
+    `GeminiGenerateContentAdapter` ignores every cache breakpoint.
+    `AnthropicMessagesAdapter` returns `RejectedMessages` for a cache breakpoint on any `ToolMessage` part but the last.
     It places a tool part's cache breakpoint on the enclosing `tool_result` block.
     `automatic_cache_breakpoints` separately controls automatic cache breakpoints.
     """
@@ -96,6 +97,8 @@ class ImagePart(CheckedCopyModel):
 
     `media_type` is an IANA media type such as `"image/png"`.
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
+    `AnthropicMessagesAdapter` sends only `"image/gif"`, `"image/jpeg"`, `"image/png"`, and `"image/webp"`.
+    It returns `RejectedMessages` for any other `media_type`.
     """
 
     model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
@@ -110,8 +113,8 @@ class ImageUrlPart(CheckedCopyModel):
     """An image URL sent unchanged without fetching it.
 
     `media_type` is an optional IANA media type.
-    Gemini receives `media_type` when present.
-    Other adapters receive `url` without `media_type`.
+    `GeminiGenerateContentAdapter` sends `media_type` when present.
+    The other adapters send `url` without `media_type`.
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
@@ -126,6 +129,10 @@ class AudioPart(CheckedCopyModel):
 
     `media_type` is an IANA media type, such as `"audio/wav"`.
     `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
+    `GeminiGenerateContentAdapter` sends it in `UserMessage` and `ToolMessage`.
+    `OpenAIChatCompletionsAdapter` sends it in `UserMessage` when `media_type` is `"audio/wav"` or `"audio/mpeg"`.
+    It returns `RejectedMessages` otherwise.
+    `AnthropicMessagesAdapter` and `OpenAIResponsesAdapter` return `RejectedMessages` for it.
     """
 
     model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
@@ -260,7 +267,18 @@ class ToolMessage(CheckedCopyModel):
     """Pydantic selects each `ContentPart` variant by `kind` in one tool result.
 
     `tool_call_id` must match the `ToolCall.id` it answers.
-    `is_error=True` tells the model the tool failed.
+    `is_error=True` marks the tool result as a failure.
+    `AnthropicMessagesAdapter` sends it as `tool_result.is_error`.
+    `GeminiGenerateContentAdapter` sends the text in `FunctionResponse.response`.
+    The key is `"error"` when `is_error=True` and `"output"` otherwise.
+    `OpenAIChatCompletionsAdapter` and `OpenAIResponsesAdapter` drop `is_error`, so `content` must state the failure.
+    The openai 3.42.1 SDK has no tool-result error field.
+    `OpenAIChatCompletionsAdapter` returns `RejectedMessages` for any part except `TextPart`.
+    The other adapters also send `ImagePart` and `ImageUrlPart`.
+    `ImagePart` lists the media types that `AnthropicMessagesAdapter` sends.
+    `GeminiGenerateContentAdapter` joins the text parts into one string and sends media parts after it.
+    Text-part boundaries and the order of text and media are lost.
+    `AudioPart` lists the adapters that send it.
 
     Raises:
         pydantic.ValidationError: `content` is invalid.

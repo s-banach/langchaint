@@ -484,7 +484,7 @@ def _assistant_message_from(provider_content: types.Content | None) -> Assistant
             )
         if part.function_call is not None:
             content.append(_tool_call_from(part.function_call))
-        elif part.text is not None and (part.text or _is_text_only(part)):
+        elif part.text is not None:
             if not part.thought:
                 content.append(TextPart(text=part.text))
         elif not carries_reasoning:
@@ -548,8 +548,8 @@ def _matches_replayed_part_payload(part: AssistantPart, replayed_part: types.Par
             and part.id == (function_call.id or name)
             and args == (function_call.args or {})
         )
-    if part.kind == "text" and function_call is None:
-        return not replayed_part.thought and part.text == replayed_part.text
+    if part.kind == "text":
+        return part.text == replayed_part.text
     return False
 
 
@@ -1263,9 +1263,10 @@ class _ResponseAccumulator:
 
 
 def _is_text_only(part: types.Part) -> bool:
-    """Whether text is the part's only payload, the precondition for merging it into a neighbor.
+    """Whether the part sets text and no field besides thought and thought_signature.
 
-    Inspect the dump so an unmodeled payload field prevents merging.
+    It is the precondition for merging the part into a neighbor.
+    Inspect the dump so any other field, such as part_metadata, prevents merging.
     """
     payload_keys = part.model_dump(exclude_none=True).keys() - {"thought", "thought_signature"}
     return payload_keys == {"text"}

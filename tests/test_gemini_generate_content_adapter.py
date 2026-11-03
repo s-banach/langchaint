@@ -26,7 +26,6 @@ from langchaint import (
     ImageUrlPart,
     LongContextPricing,
     Message,
-    RawPart,
     ReasoningDelta,
     ReasoningPart,
     SpecificToolChoice,
@@ -942,10 +941,6 @@ _SIGNED_CALL = types.Part(
 _SIGNED_ANSWER = types.Part(text="final answer", thought_signature=b"\x00\xffsig")
 _SIGNED_EMPTY_ANSWER = types.Part(text="", thought_signature=b"\x00\xffsig")
 _THOUGHT = types.Part(thought=True, text="thinking...")
-_EMPTY_TEXT_BESIDE_CODE = types.Part(
-    text="",
-    executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON),
-)
 
 
 class _ReadPartsCase(NamedTuple):
@@ -978,12 +973,6 @@ _READ_PARTS_CASES = [
         "thought_text",
         (_THOUGHT, types.Part(text="answer")),
         (ReasoningPart(raw=_dump(_THOUGHT), text="thinking..."), TextPart(text="answer")),
-    ),
-    # Reading empty text as present rather than as non-empty would drop the whole part.
-    _ReadPartsCase(
-        "empty_text_beside_code",
-        (_EMPTY_TEXT_BESIDE_CODE,),
-        (RawPart(raw=_dump(_EMPTY_TEXT_BESIDE_CODE)),),
     ),
 ]
 

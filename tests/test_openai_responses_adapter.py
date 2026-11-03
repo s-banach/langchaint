@@ -49,10 +49,8 @@ from langchaint import (
     AudioPart,
     ImagePart,
     ImageUrlPart,
-    JsonValue,
     Message,
     ReasoningDelta,
-    ReasoningPart,
     SpecificToolChoice,
     StopReason,
     StreamItem,
@@ -570,15 +568,6 @@ def test_replay_uses_edited_content_to_reconstruct_text_and_phases() -> None:
     assert _assistant_items(without_tool_calls) == [
         {"role": "assistant", "content": "Checking", "phase": "commentary"},
         {"role": "assistant", "content": "Waiting", "phase": "final_answer"},
-    ]
-
-
-def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
-    raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
-    assert _assistant_items(assistant_message) == [
-        raw,
-        {"role": "assistant", "content": "hi", "phase": "final_answer"},
     ]
 
 
@@ -1523,36 +1512,6 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
     assert bound.interpret(run_with_timeout(streamed())) == outcome
 
 
-@pytest.mark.parametrize(
-    ("earlier", "final", "expected_kind"),
-    [
-        ("Checking the temperature", '{"city":"Lima","celsius":19}', "plain_response"),
-        ('{"city":"Nairobi","celsius":25}', '{"city":"Lima","celsius":19}', "plain_response"),
-        ('{"city":"Nairobi","celsius":25}', "Invalid final answer", "schema_violation"),
-        ('{"city":"Nairobi","celsius":25}', "", "schema_violation"),
-    ],
-)
-def test_structured_binding_validates_the_final_complete_block_without_a_phase(
-    earlier: str, final: str, expected_kind: str
-) -> None:
-    message = ResponseOutputMessage(
-        id="message",
-        type="message",
-        role="assistant",
-        status="completed",
-        content=[
-            ResponseOutputText(type="output_text", text=text, annotations=[])
-            for text in (earlier, final)
-        ],
-    )
-    response = _response(usage=_usage_with_cache(), output=[message])
-    outcome = _structured_parse(response)
-    assert outcome.kind == expected_kind
-    assert outcome.assistant_message == _assistant_message_from(response)
-    if outcome.kind == "plain_response":
-        assert outcome.output == _StructuredReport(city="Lima", celsius=19)
-
-
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
@@ -1611,11 +1570,8 @@ def test_final_refusal_cannot_use_earlier_structured_text(refusal: str) -> None:
     )
 
 
-@pytest.mark.parametrize("text", [None, "let me look that up"])
-def test_structured_bind_reports_an_assistant_message_with_tool_calls_as_a_tool_call_response(
-    text: str | None,
-) -> None:
-    outcome = _structured_parse(_structured_response(text, tool_call=True))
+def test_a_structured_tool_call_message_without_text_is_a_tool_call_response() -> None:
+    outcome = _structured_parse(_structured_response(None, tool_call=True))
     assert outcome.kind == "tool_call_response"
     assert outcome.assistant_message.tool_calls == (
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),

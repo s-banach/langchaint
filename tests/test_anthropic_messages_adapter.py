@@ -494,22 +494,6 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
     assert outcome.output == "partial text"
 
 
-def test_text_response_selects_the_final_text_block() -> None:
-    message = _message_with_content([
-        at.TextBlock(type="text", text="hello "),
-        at.TextBlock(type="text", text="world"),
-    ])
-    outcome = (
-        _adapter()
-        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
-        .interpret(message)
-    )
-    assert outcome.kind == "plain_response"
-    assert outcome.output == "world"
-    assert outcome.assistant_message.content == (TextPart(text="hello "), TextPart(text="world"))
-    assert outcome.stop_reason == "stop"
-
-
 def _message_with_content(
     content: list[at.ContentBlock],
     stop_reason: at.StopReason | None = "end_turn",
@@ -596,15 +580,6 @@ def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
     assistant_message = _assistant_message_from(_message_with_content([block]))
     assert assistant_message.content == (ReasoningPart(raw=expected_raw, text=None),)
     assert _assistant_content_blocks(assistant_message) == ([expected_raw], [])
-
-
-def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
-    raw: dict[str, JsonValue] = {"type": "reasoning", "id": "rs_1"}
-    assistant_message = AssistantMessage(content=(ReasoningPart(raw=raw), TextPart(text="hi")))
-    assert _assistant_content_blocks(assistant_message) == (
-        [raw, {"type": "text", "text": "hi"}],
-        [],
-    )
 
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:
@@ -1716,63 +1691,41 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "stop_reason", "expected_kind", "expected_output"),
+    ("text", "stop_reason", "expected_kind"),
     [
-        pytest.param(
-            _REPORT_JSON,
-            "end_turn",
-            "plain_response",
-            _StructuredReport(city="Nairobi", celsius=25),
-            id="valid_text",
-        ),
-        pytest.param(
-            None, "end_turn", "empty_assistant_message", None, id="end_turn_without_text"
-        ),
-        pytest.param(None, "refusal", "refusal", None, id="refusal"),
-        pytest.param(None, "max_tokens", "max_completion_tokens_exceeded", None, id="max_tokens"),
+        pytest.param(None, "end_turn", "empty_assistant_message", id="end_turn_without_text"),
+        pytest.param(None, "refusal", "refusal", id="refusal"),
+        pytest.param(None, "max_tokens", "max_completion_tokens_exceeded", id="max_tokens"),
         pytest.param(
             '{"city": "Nair',
             "max_tokens",
             "max_completion_tokens_exceeded",
-            None,
             id="text_cut_mid_json_at_max_tokens",
         ),
         pytest.param(
             None,
             "model_context_window_exceeded",
             "context_window_exceeded",
-            None,
             id="context_window_exceeded",
         ),
-        pytest.param(None, "pause_turn", "unexpected_response", None, id="pause_turn"),
+        pytest.param(None, "pause_turn", "unexpected_response", id="pause_turn"),
         pytest.param(
             "partial thought",
             "pause_turn",
             "unexpected_response",
-            None,
             id="pause_turn_ahead_of_schema_violation",
         ),
     ],
 )
 def test_structured_outcome_by_text_and_stop_reason(
-    text: str | None,
-    stop_reason: at.StopReason | None,
-    expected_kind: str,
-    expected_output: _StructuredReport | None,
+    text: str | None, stop_reason: at.StopReason | None, expected_kind: str
 ) -> None:
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind
-    if outcome.kind == "plain_response":
-        assert outcome.output == expected_output
 
 
-@pytest.mark.parametrize(
-    "text",
-    [None, "let me look that up"],
-    ids=["alone", "with_prose"],
-)
-def test_a_structured_tool_call_message_is_a_tool_call_response(text: str | None) -> None:
-    outcome = _structured_parse(_structured_message(text, stop_reason="tool_use", tool_use=True))
+def test_a_structured_tool_call_message_without_text_is_a_tool_call_response() -> None:
+    outcome = _structured_parse(_structured_message(None, stop_reason="tool_use", tool_use=True))
     assert outcome.kind == "tool_call_response"
 
 

@@ -37,7 +37,6 @@ from langchaint.adapter import (
     ToolChoice,
     UnexpectedResponse,
     _RejectedMessagesError,
-    _UnusableResponseBase,
     narrowed_request_params,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
@@ -1418,38 +1417,25 @@ class _FinishedMessage:
     assistant_message: AssistantMessage
 
 
-def _finished_message_or_unusable_response(
+def _finished_message_or_refusal(
     response: types.GenerateContentResponse,
-) -> _FinishedMessage | Refusal | UnexpectedResponse:
-    """Read the first candidate as a finished assistant message, or report why none can be read.
+) -> _FinishedMessage | Refusal:
+    """Read the first candidate as a finished assistant message, or a blocked prompt as a refusal.
 
-    No candidates with block_reason becomes Refusal with an assistant message without parts.
-    No candidates without block_reason becomes UnexpectedResponse.
-    A candidate without finish_reason also becomes UnexpectedResponse.
-    That UnexpectedResponse preserves the candidate's partial assistant message.
+    `response` is assembled by a `_GeminiStream` whose `items` finished, so a finish_reason or a block_reason arrived.
+    A response without candidates received neither parts nor a finish_reason, so its prompt was blocked.
+    It becomes Refusal with an assistant message without parts.
     """
     candidates = response.candidates
     if not candidates:
-        if (
-            response.prompt_feedback is not None
-            and response.prompt_feedback.block_reason is not None
-        ):
-            return Refusal(assistant_message=AssistantMessage(content=()))
-        return UnexpectedResponse(
-            error_text="gemini returned no candidates and no block reason, so there is no assistant message to read",
-            assistant_message=AssistantMessage(content=()),
-        )
+        return Refusal(assistant_message=AssistantMessage(content=()))
     candidate = candidates[0]
-    assistant_message = _assistant_message_from(candidate.content)
-    if candidate.finish_reason is None:
-        return UnexpectedResponse(
-            error_text="gemini returned a candidate with no finish_reason, "
-            "which langchaint cannot call finished",
-            assistant_message=assistant_message,
-        )
+    # Gemini returns no candidates for a blocked prompt, so a stream with a candidate ended with a finish_reason.
+    # Source: https://aistudio.google.com/api-reference/generate-content, read 2026-11-02.
+    assert candidate.finish_reason is not None
     return _FinishedMessage(
         finish_reason=candidate.finish_reason,
-        assistant_message=assistant_message,
+        assistant_message=_assistant_message_from(candidate.content),
     )
 
 
@@ -1562,8 +1548,8 @@ class _BoundGeminiText(_BoundGemini[str]):
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
-        finished_message = _finished_message_or_unusable_response(_as_response(raw))
-        if isinstance(finished_message, _UnusableResponseBase):
+        finished_message = _finished_message_or_refusal(_as_response(raw))
+        if isinstance(finished_message, Refusal):
             return finished_message
         return text_response(
             finished_message.assistant_message, _normalized_stop_reason(finished_message)
@@ -1634,7 +1620,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT]):
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
-        finished_message = _finished_message_or_unusable_response(_as_response(raw))
-        if isinstance(finished_message, _UnusableResponseBase):
+        finished_message = _finished_message_or_refusal(_as_response(raw))
+        if isinstance(finished_message, Refusal):
             return finished_message
         return self._parsed_outcome(finished_message)

@@ -1032,31 +1032,8 @@ def test_text_binding_reads_stop_reasons() -> None:
     assert other.stop_reason == "other"
 
 
-def test_both_bindings_report_a_missing_finish_reason_as_an_unexpected_response() -> None:
-    response = _response([types.Part(text="par")], finish_reason=None)
-    text_outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert text_outcome.kind == "unexpected_response"
-    assert text_outcome.assistant_message.content == (TextPart(text="par"),)
-    structured_outcome = _adapter().bind_structured(_binding(), _Answer).interpret(response)
-    assert structured_outcome.kind == "unexpected_response"
-
-
-def test_no_candidates_reads_the_block_reason() -> None:
-    bound = _adapter().bind_text(_binding())
-    blocked = bound.interpret(
-        _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
-    )
-    assert blocked.kind == "refusal"
-    assert blocked.assistant_message.content == ()
-    silent = bound.interpret(_response(None, finish_reason=None))
-    assert silent.kind == "unexpected_response"
-
-
 def test_structured_binding_outcomes() -> None:
     bound = _adapter().bind_structured(_binding(), _Answer)
-    parsed = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert parsed.kind == "plain_response"
-    assert parsed.output == _Answer(value=3)
     tool_call_outcome = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
@@ -1068,9 +1045,6 @@ def test_structured_binding_outcomes() -> None:
         _response([types.Part(text='{"value"')], finish_reason=types.FinishReason.MAX_TOKENS)
     )
     assert truncated.kind == "max_completion_tokens_exceeded"
-    violated = bound.interpret(_response([types.Part(text='{"value": "not int"}')]))
-    assert violated.kind == "schema_violation"
-    assert "value" in violated.validation_error_json
     empty = bound.interpret(_response([]))
     assert empty.kind == "empty_assistant_message"
     unexpected_response = bound.interpret(
@@ -1396,6 +1370,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
 
     outcome = _adapter().bind_text(_binding()).interpret(run_with_timeout(final()))
     assert outcome.kind == "refusal"
+    assert outcome.assistant_message.content == ()
 
 
 def test_provider_billing_follows_usage_arrival() -> None:

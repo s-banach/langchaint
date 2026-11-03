@@ -269,29 +269,6 @@ def _provider_call_parts(
     ]
 
 
-def _search_candidates_response(
-    queries_per_candidate: Sequence[Sequence[str]],
-) -> types.GenerateContentResponse:
-    """Build one finished candidate per query list, each holding one Search call and response."""
-    return types.GenerateContentResponse(
-        candidates=[
-            types.Candidate(
-                content=types.Content(
-                    role="model",
-                    parts=_provider_call_parts(
-                        tool_call_id=f"search-{index}",
-                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                        queries=list(queries),
-                    ),
-                ),
-                finish_reason=types.FinishReason.STOP,
-            )
-            for index, queries in enumerate(queries_per_candidate)
-        ],
-        usage_metadata=_usage_metadata(),
-    )
-
-
 def _gemini_stream(chunks: Sequence[types.GenerateContentResponse]) -> _GeminiStream:
 
     async def chunk_iterator() -> AsyncIterator[types.GenerateContentResponse]:
@@ -1109,7 +1086,21 @@ _TOOL_COSTS = [
     # Gemini bills unique nonempty Search queries across the complete response.
     _ToolCost(
         "search_counts_unique_nonempty_queries",
-        _search_candidates_response([["first", "", "second"], ["second", "third"]]),
+        _response(
+            [
+                *_provider_call_parts(
+                    tool_call_id="search-1",
+                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                    queries=["first", "", "second"],
+                ),
+                *_provider_call_parts(
+                    tool_call_id="search-2",
+                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                    queries=["second", "third"],
+                ),
+            ],
+            usage_metadata=_usage_metadata(),
+        ),
         frozenset({"google_search"}),
         3 * 0.014,
     ),
@@ -1416,10 +1407,18 @@ def test_cutoff_gemini_provider_executed_tool_billing_is_nan() -> None:
     assert math.isnan(billing.billing.usage.provider_executed_tool_cost_in_usd)
 
 
-def test_stream_billing_collects_every_candidate_provider_query() -> None:
+def test_stream_billing_collects_provider_queries_from_every_chunk() -> None:
 
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
-        yield _search_candidates_response([["first"], ["second"]])
+        yield _response(_search_call(["first"]), finish_reason=None)
+        yield _response(
+            _provider_call_parts(
+                tool_call_id="search-2",
+                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                queries=["second"],
+            ),
+            usage_metadata=_usage_metadata(),
+        )
 
     async def scenario() -> ProviderBilling | None:
         stream = _GeminiStream(

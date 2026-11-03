@@ -316,17 +316,9 @@ _PROVIDER_FIELD_BY_TOOL_TYPE = {
 }
 
 
-def _provider_executed_tool_calls(
-    response: types.GenerateContentResponse,
-) -> list[types.ToolCall]:
-    """Return the server-side tool calls among the parts of every response candidate."""
-    return [
-        part.tool_call
-        for candidate in response.candidates or []
-        if candidate.content is not None and candidate.content.parts is not None
-        for part in candidate.content.parts
-        if part.tool_call is not None
-    ]
+def _provider_executed_tool_calls(parts: Sequence[types.Part]) -> list[types.ToolCall]:
+    """Return the server-side tool calls among `parts`."""
+    return [part.tool_call for part in parts if part.tool_call is not None]
 
 
 _QUERIES_ADAPTER: TypeAdapter[list[str]] = TypeAdapter(list[str])
@@ -415,10 +407,10 @@ def _billing_from_response(
     provider_executed_tool_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
 ) -> ProviderBilling:
-    """Price token counters and provider evidence from every candidate."""
+    """Price token counters and provider evidence from the response's candidate."""
     return _billing_from_provider_evidence(
         response.usage_metadata,
-        _provider_executed_tool_calls(response),
+        _provider_executed_tool_calls(_candidate_parts(response)),
         pricing,
         provider_executed_tool_fields=provider_executed_tool_fields,
         billing_complete=billing_complete,
@@ -1177,7 +1169,6 @@ class _ResponseAccumulator:
 
     def __init__(self) -> None:
         self.parts: list[types.Part] = []
-        self.provider_executed_tool_calls: list[types.ToolCall] = []
         self.finish_reason: types.FinishReason | None = None
         self.usage_metadata: types.GenerateContentResponseUsageMetadata | None = None
         self.model_version: str | None = None
@@ -1203,7 +1194,6 @@ class _ResponseAccumulator:
             self.response_id = chunk.response_id
         if chunk.prompt_feedback is not None:
             self.prompt_feedback = chunk.prompt_feedback
-        self.provider_executed_tool_calls.extend(_provider_executed_tool_calls(chunk))
         candidates = chunk.candidates
         if not candidates:
             return []
@@ -1263,9 +1253,9 @@ def _continues_text(last: types.Part, incoming: types.Part) -> bool:
     )
 
 
-def _candidate_parts(chunk: types.GenerateContentResponse) -> list[types.Part]:
+def _candidate_parts(response: types.GenerateContentResponse) -> list[types.Part]:
     """Read the first candidate's parts, empty wherever the walk finds None."""
-    candidates = chunk.candidates
+    candidates = response.candidates
     if not candidates:
         return []
     content = candidates[0].content
@@ -1375,7 +1365,7 @@ class _GeminiStream(AdapterStream):
             return None
         return _billing_from_provider_evidence(
             self._accumulator.usage_metadata,
-            self._accumulator.provider_executed_tool_calls,
+            _provider_executed_tool_calls(self._accumulator.parts),
             self._pricing,
             provider_executed_tool_fields=self._provider_executed_tool_fields,
             billing_complete=self._billing_complete,

@@ -135,7 +135,8 @@ type ContentPart = Annotated[
     TextPart | ImagePart | ImageUrlPart | AudioPart, Field(discriminator="kind")
 ]
 
-type MessageContent = str | Sequence[ContentPart]
+type MessageContent = str | tuple[ContentPart, ...]
+"""The model-facing content of a user or tool message: plain text or ordered parts."""
 
 
 class ToolCall(CheckedCopyModel):
@@ -157,7 +158,7 @@ class UserMessage(CheckedCopyModel):
         pydantic.ValidationError: `content` is invalid.
     """
 
-    content: str | tuple[ContentPart, ...]
+    content: MessageContent
     kind: Literal["user"] = "user"
 
 
@@ -250,15 +251,18 @@ class ToolMessage(CheckedCopyModel):
 
     `tool_call_id` must match the `ToolCall.id` it answers.
     `is_error=True` tells the model the tool failed.
+
+    Raises:
+        pydantic.ValidationError: `content` is invalid.
     """
 
     tool_call_id: str
-    content: str | tuple[ContentPart, ...]
+    content: MessageContent
     is_error: bool = False
     kind: Literal["tool"] = "tool"
 
     @classmethod
-    def error(cls, tool_call: ToolCall, content: str | tuple[ContentPart, ...]) -> "ToolMessage":
+    def error(cls, tool_call: ToolCall, content: MessageContent) -> "ToolMessage":
         """Build a `ToolMessage` with `is_error=True` that answers `tool_call`.
 
         Args:

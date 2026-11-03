@@ -81,8 +81,8 @@ from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
-    ContentPart,
     Message,
+    MessageContent,
     RawPart,
     ReasoningPart,
     StopReason,
@@ -266,7 +266,7 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
 
 
 def _function_call_output(
-    content: str | tuple[ContentPart, ...],
+    content: MessageContent,
 ) -> str | ResponseFunctionCallOutputItemListParam:
     """Preserve tool-result content order and cache breakpoints.
 

@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, assert_type
 
 import pytest
@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field, ValidationError
 
 from langchaint import (
     CaptureTool,
-    ContentPart,
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
@@ -19,6 +18,7 @@ from langchaint import (
     InvalidToolArgsDetail,
     InvalidToolArgsError,
     JSONSchemaTool,
+    MessageContent,
     PydanticTool,
     TextPart,
     ToolCall,
@@ -226,8 +226,8 @@ def test_dispatch_wraps_success_in_a_tool_message() -> None:
 def test_dispatch_carries_content_parts_into_tool_message_content(*, explicit: bool) -> None:
     async def _content_parts_function(
         args: _EchoArgs,
-    ) -> Sequence[ContentPart] | ToolReturnExplicit[None]:
-        content = [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
+    ) -> MessageContent | ToolReturnExplicit[None]:
+        content = (TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png"))
         return ToolReturnExplicit(content=content, is_error=True) if explicit else content
 
     tool = PydanticTool(

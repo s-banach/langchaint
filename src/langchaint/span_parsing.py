@@ -29,6 +29,7 @@ from langchaint.common.messages import (
     ImageUrlPart,
     JsonValue,
     Message,
+    MessageContent,
     StopReason,
     TextPart,
     ToolCall,
@@ -963,7 +964,7 @@ def _tool_message_from_otel(message: OtelInputMessage) -> ToolMessage:
         raise _unsupported(part, "tool response without id")
     _require_no_additional_properties(part)
     if isinstance(part.response, str):
-        content: str | tuple[ContentPart, ...] = part.response
+        content: MessageContent = part.response
     else:
         try:
             response_parts = _MESSAGE_PARTS_ADAPTER.validate_python(part.response)

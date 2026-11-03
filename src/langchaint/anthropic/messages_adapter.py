@@ -101,6 +101,7 @@ from langchaint.common.messages import (
     AssistantPart,
     ContentPart,
     Message,
+    MessageContent,
     RawPart,
     ReasoningPart,
     StopReason,
@@ -556,9 +557,7 @@ def _user_content_blocks(
     return blocks, part_cache_breakpoint_blocks
 
 
-def _tool_result_content(
-    content: str | tuple[ContentPart, ...],
-) -> str | list[TextBlockParam | ImageBlockParam]:
+def _tool_result_content(content: MessageContent) -> str | list[TextBlockParam | ImageBlockParam]:
     """Convert one ToolMessage's content to the tool_result content field.
 
     A bare string passes through.

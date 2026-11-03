@@ -102,6 +102,7 @@ from langchaint.common.messages import (
     ContentPart,
     JsonValue,
     Message,
+    MessageContent,
     StopReason,
     TextPart,
     ToolCall,
@@ -331,7 +332,7 @@ def _content_part(part: ContentPart) -> dict[str, object]:
 
 
 def _recorded_content(
-    content: str | tuple[ContentPart, ...], content_filter: ContentFilter, attribute_name: str
+    content: MessageContent, content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
     """Filter content parts and render the kept ones as the convention's parts array.
 

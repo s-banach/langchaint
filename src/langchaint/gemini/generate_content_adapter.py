@@ -56,8 +56,8 @@ from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
-    ContentPart,
     Message,
+    MessageContent,
     RawPart,
     ReasoningPart,
     StopReason,
@@ -600,7 +600,7 @@ def _inline_function_response_part(data: bytes, media_type: str) -> types.Functi
     )
 
 
-def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
+def _user_parts(content: MessageContent) -> list[types.Part]:
     """Convert one UserMessage's content to wire parts.
 
     ImagePart and AudioPart use Part.inline_data.

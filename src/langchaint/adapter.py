@@ -456,7 +456,7 @@ def validated_final_text[ModelT: BaseModel](
 
 @dataclass(frozen=True, kw_only=True)
 class _UnusableResponseBase:
-    """The base of every `UnusableResponse` variant: a response whose `assistant_message` is not usable."""
+    """The base of every `UnusableResponse` variant, with the response's assistant message."""
 
     assistant_message: AssistantMessage
 
@@ -536,14 +536,15 @@ class ContextWindowExceeded(_UnusableResponseBase):
 
 
 @dataclass(frozen=True, kw_only=True)
-class UnfinishedAssistantMessage(_UnusableResponseBase):
-    """A response whose partial content is not a finished answer.
+class UnexpectedResponse(_UnusableResponseBase):
+    """A response that langchaint cannot turn into an output or a tool call, for a reason with no dedicated kind.
 
-    `error_text` preserves the provider's description.
+    Examples are a response the provider reports as unfinished and a response with an unknown stop reason.
+    `error_text` names the reason, quoting the stop reason, finish reason, or status the provider returned, if any.
     """
 
     error_text: str
-    kind: Literal["unfinished_assistant_message"] = "unfinished_assistant_message"
+    kind: Literal["unexpected_response"] = "unexpected_response"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -638,11 +639,9 @@ type UnusableResponse = (
     | ProviderFailedTerminally
     | ProviderFailedTransiently
     | SchemaViolation
-    | UnfinishedAssistantMessage
+    | UnexpectedResponse
 )
-"""Every way reading a billable 200 can end when its assistant message is not usable.
-
-Such an assistant message gives no output and has no tool calls.
+"""Every way reading a billable 200 can end when langchaint cannot turn its response into an output or a tool call.
 
 The concrete variants make a `kind` match over `UnusableResponse` or `ResponseOutcome` exhaustive.
 Each variant has distinct retry-loop behavior.
@@ -938,7 +937,7 @@ __all__ = [
     "ToolCallDelta",
     "ToolChoice",
     "TransientError",
-    "UnfinishedAssistantMessage",
+    "UnexpectedResponse",
     "UnusableResponse",
     "UsableResponse",
     "billing_at_rates",

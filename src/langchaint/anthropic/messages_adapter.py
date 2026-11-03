@@ -75,7 +75,7 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedAssistantMessage,
+    UnexpectedResponse,
     UsableResponse,
     _RejectedMessagesError,
     narrowed_request_params,
@@ -802,10 +802,10 @@ def _ends_in_cut_off_tool_call(message: anthropic.types.Message) -> bool:
     )
 
 
-def _unfinished_message_or_none(
+def _unexpected_response_or_none(
     message: anthropic.types.Message, *, assistant_message: AssistantMessage
-) -> UnfinishedAssistantMessage | None:
-    """Return `UnfinishedAssistantMessage` for `pause_turn`, a null stop reason, or an unknown stop reason."""
+) -> UnexpectedResponse | None:
+    """Return `UnexpectedResponse` for `pause_turn`, a null stop reason, or an unknown stop reason."""
     stop_reason = message.stop_reason
     if stop_reason in (
         "end_turn",
@@ -816,7 +816,7 @@ def _unfinished_message_or_none(
         "model_context_window_exceeded",
     ):
         return None
-    return UnfinishedAssistantMessage(
+    return UnexpectedResponse(
         error_text=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
         assistant_message=assistant_message,
     )
@@ -1506,11 +1506,11 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         validated = validated_final_text(assistant_message, self._response_format)
         if isinstance(validated, BaseModel):
             return _usable_response(message, validated, assistant_message)
-        unfinished_message = _unfinished_message_or_none(
+        unexpected_response = _unexpected_response_or_none(
             message, assistant_message=assistant_message
         )
-        if unfinished_message is not None:
-            return unfinished_message
+        if unexpected_response is not None:
+            return unexpected_response
         if message.stop_reason == "refusal":
             return Refusal(assistant_message=assistant_message)
         if message.stop_reason == "max_tokens":

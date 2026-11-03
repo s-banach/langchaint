@@ -58,7 +58,7 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedAssistantMessage,
+    UnexpectedResponse,
     UsableResponse,
     _RejectedMessagesError,
     _UnusableResponseBase,
@@ -474,16 +474,16 @@ class _FinishedMessage:
     assistant_message: AssistantMessage
 
 
-def _finished_message_or_unfinished(
+def _finished_message_or_unexpected_response(
     completion: ChatCompletion,
-) -> _FinishedMessage | UnfinishedAssistantMessage:
+) -> _FinishedMessage | UnexpectedResponse:
     """Read the first choice as a finished assistant message, or report why none can be read.
 
-    Missing choices and `finish_reason=None` return `UnfinishedAssistantMessage`.
+    Missing choices and `finish_reason=None` return `UnexpectedResponse`.
     An `UnusableResponse` carries any partial assistant message.
     """
     if not completion.choices:
-        return UnfinishedAssistantMessage(
+        return UnexpectedResponse(
             error_text="openai returned no choices, so there is no assistant message to read",
             assistant_message=AssistantMessage(content=()),
         )
@@ -491,7 +491,7 @@ def _finished_message_or_unfinished(
     assistant_message = _assistant_message_from(choice.message)
     finish_reason: str | None = choice.finish_reason
     if finish_reason is None:
-        return UnfinishedAssistantMessage(
+        return UnexpectedResponse(
             error_text="openai returned a choice with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
@@ -1043,7 +1043,7 @@ class _BoundOpenAIChatCompletionsText(_BoundOpenAIChatCompletions[str | None]):
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_message = _finished_message_or_unfinished(_as_chat_completion(raw))
+        finished_message = _finished_message_or_unexpected_response(_as_chat_completion(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
         return _usable_response(finished_message, text_output(finished_message.assistant_message))
@@ -1113,7 +1113,7 @@ class _BoundOpenAIChatCompletionsStructured[ModelT: BaseModel](
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_message = _finished_message_or_unfinished(_as_chat_completion(raw))
+        finished_message = _finished_message_or_unexpected_response(_as_chat_completion(raw))
         if isinstance(finished_message, _UnusableResponseBase):
             return finished_message
         return self._parsed_outcome(finished_message)

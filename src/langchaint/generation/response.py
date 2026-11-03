@@ -338,9 +338,9 @@ def _generation_outcome_from_response_outcome[OutputT](
             record = PlainErrorRecord(
                 kind="context_window_exceeded_error", request_history=request_history
             )
-        case "unfinished_assistant_message":
+        case "unexpected_response":
             record = PlainErrorRecord(
-                kind="unfinished_assistant_message_error",
+                kind="unexpected_response_error",
                 error_text=outcome.error_text,
                 request_history=request_history,
             )

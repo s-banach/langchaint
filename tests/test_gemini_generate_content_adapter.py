@@ -1047,14 +1047,13 @@ def test_text_binding_reads_stop_reasons() -> None:
     assert other.stop_reason == "other"
 
 
-def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
-    """A candidate without a finish_reason is an unfinished assistant message that carries its partial content."""
+def test_both_bindings_report_a_missing_finish_reason_as_an_unexpected_response() -> None:
     response = _response([types.Part(text="par")], finish_reason=None)
     text_outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert text_outcome.kind == "unfinished_assistant_message"
+    assert text_outcome.kind == "unexpected_response"
     assert text_outcome.assistant_message.content == (TextPart(text="par"),)
     structured_outcome = _adapter().bind_structured(_binding(), _Answer).interpret(response)
-    assert structured_outcome.kind == "unfinished_assistant_message"
+    assert structured_outcome.kind == "unexpected_response"
 
 
 def test_no_candidates_reads_the_block_reason() -> None:
@@ -1065,7 +1064,7 @@ def test_no_candidates_reads_the_block_reason() -> None:
     assert blocked.kind == "refusal"
     assert blocked.assistant_message.content == ()
     silent = bound.interpret(_response(None, finish_reason=None))
-    assert silent.kind == "unfinished_assistant_message"
+    assert silent.kind == "unexpected_response"
 
 
 def test_structured_binding_outcomes() -> None:
@@ -1090,11 +1089,11 @@ def test_structured_binding_outcomes() -> None:
     assert "value" in violated.validation_error_json
     empty = bound.interpret(_response([]))
     assert empty.kind == "empty_assistant_message"
-    unfinished = bound.interpret(
+    unexpected_response = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert unfinished.kind == "unfinished_assistant_message"
-    assert "LANGUAGE" in unfinished.error_text
+    assert unexpected_response.kind == "unexpected_response"
+    assert "LANGUAGE" in unexpected_response.error_text
 
 
 def test_a_structured_binding_ignores_thought_text_when_validating() -> None:

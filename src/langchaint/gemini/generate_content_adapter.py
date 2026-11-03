@@ -33,7 +33,7 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    UnfinishedAssistantMessage,
+    UnexpectedResponse,
     UsableResponse,
     _RejectedMessagesError,
     _UnusableResponseBase,
@@ -118,7 +118,7 @@ _FINISHED_FINISH_REASONS = (
 )
 """The finish reasons langchaint can read a finished assistant message from.
 
-All other values produce `UnfinishedAssistantMessage` for a structured binding.
+All other values produce `UnexpectedResponse` for a structured binding.
 """
 
 _SUPPORTED_PROVIDER_EXECUTED_TOOL_FIELDS = frozenset({
@@ -1444,13 +1444,13 @@ class _FinishedMessage:
 
 def _finished_message_or_unusable_response(
     response: types.GenerateContentResponse,
-) -> _FinishedMessage | Refusal | UnfinishedAssistantMessage:
+) -> _FinishedMessage | Refusal | UnexpectedResponse:
     """Read the first candidate as a finished assistant message, or report why none can be read.
 
     No candidates with block_reason becomes Refusal with an assistant message without parts.
-    No candidates without block_reason becomes UnfinishedAssistantMessage.
-    A candidate without finish_reason also becomes UnfinishedAssistantMessage.
-    That UnfinishedAssistantMessage preserves the candidate's partial assistant message.
+    No candidates without block_reason becomes UnexpectedResponse.
+    A candidate without finish_reason also becomes UnexpectedResponse.
+    That UnexpectedResponse preserves the candidate's partial assistant message.
     """
     candidates = response.candidates
     if not candidates:
@@ -1459,14 +1459,14 @@ def _finished_message_or_unusable_response(
             and response.prompt_feedback.block_reason is not None
         ):
             return Refusal(assistant_message=AssistantMessage(content=()))
-        return UnfinishedAssistantMessage(
+        return UnexpectedResponse(
             error_text="gemini returned no candidates and no block reason, so there is no assistant message to read",
             assistant_message=AssistantMessage(content=()),
         )
     candidate = candidates[0]
     assistant_message = _assistant_message_from(candidate.content)
     if candidate.finish_reason is None:
-        return UnfinishedAssistantMessage(
+        return UnexpectedResponse(
             error_text="gemini returned a candidate with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
@@ -1636,7 +1636,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
             return _usable_response(finished_message, validated)
         finish_reason = finished_message.finish_reason
         if finish_reason not in _FINISHED_FINISH_REASONS:
-            return UnfinishedAssistantMessage(
+            return UnexpectedResponse(
                 error_text=f"gemini returned finish_reason {finish_reason.value!r}, "
                 f"which langchaint cannot continue",
                 assistant_message=assistant_message,

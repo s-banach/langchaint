@@ -896,7 +896,7 @@ def test_an_unfinished_completion_keeps_available_content(
     completion: ChatCompletion, expected_content: tuple[TextPart, ...]
 ) -> None:
     outcome = _text_bound().interpret(completion)
-    assert outcome.kind == "unfinished_assistant_message"
+    assert outcome.kind == "unexpected_response"
     assert outcome.assistant_message.content == expected_content
 
 

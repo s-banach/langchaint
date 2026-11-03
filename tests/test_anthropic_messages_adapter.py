@@ -1762,12 +1762,12 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             None,
             id="context_window_exceeded",
         ),
-        pytest.param(None, None, "unfinished_assistant_message", None, id="no_stop_reason"),
-        pytest.param(None, "pause_turn", "unfinished_assistant_message", None, id="pause_turn"),
+        pytest.param(None, None, "unexpected_response", None, id="no_stop_reason"),
+        pytest.param(None, "pause_turn", "unexpected_response", None, id="pause_turn"),
         pytest.param(
             "partial thought",
             "pause_turn",
-            "unfinished_assistant_message",
+            "unexpected_response",
             None,
             id="pause_turn_ahead_of_schema_violation",
         ),
@@ -1823,9 +1823,9 @@ def test_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(
     assert bound.interpret(message).kind == "max_completion_tokens_exceeded"
 
 
-def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> None:
+def test_an_unexpected_structured_response_names_the_stop_reason() -> None:
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
-    assert outcome.kind == "unfinished_assistant_message"
+    assert outcome.kind == "unexpected_response"
     assert "pause_turn" in outcome.error_text
 
 

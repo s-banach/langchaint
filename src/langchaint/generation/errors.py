@@ -101,7 +101,7 @@ type _PlainErrorRecordKind = Literal[
     "max_completion_tokens_exceeded_error",
     "empty_assistant_message_error",
     "context_window_exceeded_error",
-    "unfinished_assistant_message_error",
+    "unexpected_response_error",
     "provider_failed_terminally_error",
     "auth_error",
     "rejected_error",
@@ -122,7 +122,7 @@ type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_err
 - `empty_assistant_message_error`: a structured response produced no output or tool call.
 - `schema_violation_error`: a structured response failed the caller's model validation.
 - `context_window_exceeded_error`: a response reported that the request exceeded the context window.
-- `unfinished_assistant_message_error`: a provider returned an unfinished assistant message.
+- `unexpected_response_error`: the adapter returned `UnexpectedResponse`.
 - `provider_failed_terminally_error`: a provider reported a failure that sending the request again would repeat.
   A response body or an error response can report it.
 - `auth_error`: a provider rejected the client's credentials or permissions for one request.
@@ -152,7 +152,7 @@ class PlainErrorRecord(_GenerationErrorRecordBase):
       - Every remaining kind: the final request is billed and holds an assistant message.
 
     `unknown_exception_error`, `auth_error`, and `rejected_error` require `error_text`.
-    So do `unfinished_assistant_message_error` and `provider_failed_terminally_error`.
+    So do `unexpected_response_error` and `provider_failed_terminally_error`.
     """
 
     kind: _PlainErrorRecordKind
@@ -190,7 +190,7 @@ class PlainErrorRecord(_GenerationErrorRecordBase):
                 | "context_window_exceeded_error"
             ):
                 _require_finished_assistant_message(self.request_history)
-            case "unfinished_assistant_message_error":
+            case "unexpected_response_error":
                 _require_error_text(self)
                 _require_finished_assistant_message(self.request_history)
             case "provider_failed_terminally_error":

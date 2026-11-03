@@ -438,7 +438,7 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, str]]:
         ),
         (
             PlainErrorRecord(
-                kind="unfinished_assistant_message_error",
+                kind="unexpected_response_error",
                 request_history=completed,
                 error_text="unfinished",
             ),

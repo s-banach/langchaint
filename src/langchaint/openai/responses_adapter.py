@@ -61,7 +61,7 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedAssistantMessage,
+    UnexpectedResponse,
     UnusableResponse,
     UsableResponse,
     _RejectedMessagesError,
@@ -1099,7 +1099,7 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
         Refusal and truncation take precedence over validation.
         Completed text with `validation_error` returns `SchemaViolation`.
         Completed output without text returns `EmptyAssistantMessage`.
-        Other statuses return `UnfinishedAssistantMessage`.
+        Other statuses return `UnexpectedResponse`.
         Every variant carries `assistant_message`.
         """
         if _normalized_stop_reason(response) == "refusal":
@@ -1117,7 +1117,7 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
                     assistant_message=assistant_message,
                 )
             return EmptyAssistantMessage(assistant_message=assistant_message)
-        return UnfinishedAssistantMessage(
+        return UnexpectedResponse(
             error_text=f"openai returned status {response.status!r}",
             assistant_message=assistant_message,
         )

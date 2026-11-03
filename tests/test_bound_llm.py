@@ -62,7 +62,7 @@ from langchaint.adapter import (
     SchemaViolation,
     StreamProtocolError,
     TransientError,
-    UnfinishedAssistantMessage,
+    UnexpectedResponse,
     UsableResponse,
 )
 from langchaint.common.observed_operation import ObservedOperation
@@ -140,7 +140,7 @@ def _resume_header(resume_path: Path) -> _ResumeHeader:
     return _ResumeHeader.model_validate_json(header_json)
 
 
-_UNFINISHED_ASSISTANT_MESSAGE = UnfinishedAssistantMessage(
+_UNEXPECTED_RESPONSE = UnexpectedResponse(
     error_text="anthropic returned stop_reason 'pause_turn'",
     assistant_message=REJECTED_ASSISTANT_MESSAGE,
 )
@@ -490,10 +490,10 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         (_CONTEXT_WINDOW_EXCEEDED, "context_window_exceeded_error", "context_window_exceeded", ""),
         (_SCHEMA_VIOLATION, "schema_violation_error", "stop", ""),
         (
-            _UNFINISHED_ASSISTANT_MESSAGE,
-            "unfinished_assistant_message_error",
+            _UNEXPECTED_RESPONSE,
+            "unexpected_response_error",
             None,
-            _UNFINISHED_ASSISTANT_MESSAGE.error_text,
+            _UNEXPECTED_RESPONSE.error_text,
         ),
         (
             _PROVIDER_FAILED_TERMINALLY,
@@ -508,7 +508,7 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         "empty_assistant_message",
         "context_window_exceeded",
         "schema_violation",
-        "unfinished_assistant_message",
+        "unexpected_response",
         "provider_failed_terminally",
     ],
 )

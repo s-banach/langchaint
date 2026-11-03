@@ -123,7 +123,7 @@ def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
             return outcome.assistant_message
         case "schema_violation":
             return outcome.validation_error_json
-        case "unfinished_assistant_message":
+        case "unexpected_response":
             return outcome.error_text
         case "provider_failed_terminally":
             return outcome.error_text

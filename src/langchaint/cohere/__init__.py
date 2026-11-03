@@ -7,7 +7,7 @@ Each `EmbeddingModel` shares that client and one `SharedBackoff`.
 AWS v4 documentation shows list and float-keyed response forms.
 Cohere v4 and v3 `invoke_model` responses carry the billed input token count.
 Its header is `x-amzn-bedrock-input-token-count`, observed on 2026-10-13.
-botocore 1.43.112 does not model that header.
+botocore 1.43.123 does not model that header.
 The adapter reads it from `ResponseMetadata.HTTPHeaders`, which holds lowercased header names.
 Cataloged models receive `COHERE_BEDROCK_EMBEDDING_USD_PER_MILLION_TOKENS`.
 An identifier with a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix resolves through the unprefixed identifier.
@@ -117,10 +117,10 @@ _DIMENSION_UNSET = object()
 def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
     """Return the `RequestFailure` of one exception a Bedrock request raised.
 
-    `botocore==1.43.67` maps Bedrock errors to `ClientError`.
-    Its service model marks `ThrottlingException` as throttling, which is transient and pauses the quota.
-    It marks `ModelNotReadyException` as transient without throttling.
-    Statuses 408, 429, and 500 or above are transient without a pause.
+    botocore 1.43.123 maps Bedrock errors to `ClientError`.
+    `ThrottlingException` is transient and pauses the quota.
+    botocore's standard retry mode lists it as a throttling error code.
+    Statuses 408, 429, and 500 or above are transient without a pause, which covers `ModelNotReadyException` at 429.
     A botocore connection failure is transient without a pause.
     Every other exception is `unknown_exception`, including a `ClientError` without response metadata.
     """
@@ -136,7 +136,7 @@ def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
         return unknown_exception
     status_code = metadata["HTTPStatusCode"]
     error_code = error.response.get("Error", {}).get("Code")
-    retry_after_seconds = retry_after_seconds_from_headers(metadata.get("HTTPHeaders", {}))
+    retry_after_seconds = retry_after_seconds_from_headers(metadata["HTTPHeaders"])
     if error_code == "ThrottlingException":
         return RequestFailure(
             kind="transient", pauses_quota=True, retry_after_seconds=retry_after_seconds
@@ -213,9 +213,9 @@ class _CohereBedrockClientCache:
         """Store client creation inputs without creating a client."""
         self._aws_region = aws_region
         self._client = client
-        self._creation_task: asyncio.Task[BedrockRuntimeClient] | None = None
+        self._creation_task: asyncio.Task[None] | None = None
 
-    async def _create(self) -> BedrockRuntimeClient:
+    async def _create(self) -> None:
         """Create the default client.
 
         Raises:
@@ -229,7 +229,6 @@ class _CohereBedrockClientCache:
             )
         )
         self._client = client
-        return client
 
     async def prepare(self) -> None:
         """Create the default client once before request admission.

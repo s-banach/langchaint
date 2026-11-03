@@ -69,15 +69,10 @@ def input_tokens_cache_read_from_usage_deepseek(usage: CompletionUsage) -> int:
 
     DeepSeek documents that cache-hit and cache-miss counters sum to `prompt_tokens`.
     Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
-    `CompletionUsage` omits both counters in openai 2.53.0.
+    `CompletionUsage` omits both counters in openai 3.42.1.
     """
-    extra = usage.model_extra
-    if extra is None:
-        return 0
-    hit_tokens = extra.get("prompt_cache_hit_tokens")
-    if isinstance(hit_tokens, int):
-        return hit_tokens
-    return 0
+    hit_tokens = (usage.model_extra or {}).get("prompt_cache_hit_tokens")
+    return hit_tokens if isinstance(hit_tokens, int) else 0
 
 
 class DeepSeek:

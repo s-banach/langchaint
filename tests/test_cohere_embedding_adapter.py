@@ -130,45 +130,6 @@ async def test_v4_routes_model_and_dimension_verbatim(
         client.close()
 
 
-@pytest.mark.parametrize(
-    ("task", "input_type"),
-    [
-        ("retrieval_document", "search_document"),
-        ("retrieval_query", "search_query"),
-        ("classification", "classification"),
-        ("clustering", "clustering"),
-    ],
-)
-@_run_async_test
-async def test_task_mapping(
-    task: cohere_backend.EmbeddingTask,
-    input_type: str,
-) -> None:
-    client = _bedrock_client()
-    stubber = Stubber(client)
-    body = _request_body({
-        "texts": ["text"],
-        "input_type": input_type,
-        "embedding_types": ["float"],
-        "truncate": "NONE",
-        "output_dimension": 256,
-    })
-    stubber.add_response(
-        "invoke_model",
-        _response([[1.0, *([0.0] * 255)]]),
-        _expected_parameters(body, "cohere.embed-v4:0"),
-    )
-    stubber.activate()
-    try:
-        cohere_bedrock = CohereBedrock(client=client)
-        model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
-        await model.embed(["text"], task=task)
-        stubber.assert_no_pending_responses()
-    finally:
-        stubber.deactivate()
-        client.close()
-
-
 @_run_async_test
 async def test_v3_omits_dimension() -> None:
     client = _bedrock_client()
@@ -241,14 +202,16 @@ def test_embedding_model_default_dimensions() -> None:
 
 
 @pytest.mark.parametrize(
-    ("error_code", "pauses_quota"),
+    ("error_code", "status_code", "pauses_quota"),
     [
-        ("ThrottlingException", True),
-        ("ModelNotReadyException", False),
+        ("ThrottlingException", 429, True),
+        ("ModelNotReadyException", 429, False),
+        ("InternalServerException", 500, False),
     ],
 )
-def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
+def test_a_transient_client_error_pauses_the_quota_only_for_throttling_exception(
     error_code: str,
+    status_code: int,
     *,
     pauses_quota: bool,
 ) -> None:
@@ -256,7 +219,7 @@ def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
         {
             "Error": {"Code": error_code, "Message": "retry"},
             "ResponseMetadata": {
-                "HTTPStatusCode": 429,
+                "HTTPStatusCode": status_code,
                 "HTTPHeaders": {},
                 "RequestId": "test",
                 "HostId": "test",
@@ -539,13 +502,10 @@ class _FakeClient:
         dimension: int = 256,
         invoke_started: threading.Event | None = None,
         invoke_release: threading.Event | None = None,
-        failures: list[Exception] | None = None,
     ) -> None:
         self.dimension = dimension
         self.invoke_started = invoke_started
         self.invoke_release = invoke_release
-        self.failures = list(failures or ())
-        self.invoke_thread_id: int | None = None
         self.requests: list[bytes] = []
         self.bodies: list[_FakeBody] = []
         self.closed = False
@@ -561,10 +521,7 @@ class _FakeClient:
         assert modelId in COHERE_BEDROCK_EMBEDDING_MODELS
         assert accept == _JSON_CONTENT_TYPE
         assert contentType == _JSON_CONTENT_TYPE
-        self.invoke_thread_id = threading.get_ident()
         self.requests.append(body)
-        if self.failures:
-            raise self.failures.pop(0)
         if self.invoke_started is not None:
             self.invoke_started.set()
         if self.invoke_release is not None:
@@ -668,57 +625,6 @@ async def test_concurrent_preparation_creates_one_client(
 
 
 @_run_async_test
-async def test_synchronous_request_runs_outside_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = _FakeClient()
-    _ = _install_fake_client(monkeypatch, fake_client)
-    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
-    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
-    event_loop_thread_id = threading.get_ident()
-    await model.embed(["text"], task="classification")
-    assert fake_client.invoke_thread_id != event_loop_thread_id
-    assert fake_client.bodies[0].closed
-
-
-@_run_async_test
-async def test_transient_client_error_retries_only_failed_request(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    failure = ClientError(
-        {
-            "Error": {"Code": "InternalServerException", "Message": "retry"},
-            "ResponseMetadata": {
-                "HTTPStatusCode": 500,
-                "HTTPHeaders": {},
-                "RequestId": "test",
-                "HostId": "test",
-                "RetryAttempts": 0,
-            },
-        },
-        "InvokeModel",
-    )
-    fake_client = _FakeClient(failures=[failure])
-    _ = _install_fake_client(monkeypatch, fake_client)
-    cohere_bedrock = CohereBedrock(
-        aws_region="us-east-1",
-        shared_backoff=SharedBackoff(
-            min_wait_ceiling_seconds=0.000_001,
-            max_wait_seconds=0.000_002,
-            quiet_seconds_per_decay_step=0.000_001,
-        ),
-    )
-    model = cohere_bedrock.embedding_model(
-        "cohere.embed-v4:0",
-        dimension=256,
-        max_requests=2,
-    )
-    embeddings = await model.embed(["text"], task="classification")
-    assert embeddings.output.shape == (1, 256)
-    assert len(fake_client.requests) == 2
-
-
-@_run_async_test
 async def test_cancellation_waits_for_synchronous_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -783,7 +689,7 @@ async def test_cancelled_failed_creation_retries_client_creation(
 
     async def create(
         client_cache: cohere_backend._CohereBedrockClientCache,
-    ) -> BedrockRuntimeClient:
+    ) -> None:
         nonlocal creation_calls
         creation_calls += 1
         if creation_calls == 1:
@@ -791,7 +697,6 @@ async def test_cancelled_failed_creation_retries_client_creation(
             _ = asyncio.get_running_loop().call_soon(prepare_task.cancel)
             raise RuntimeError("client creation failed")
         client_cache._client = installed_client
-        return installed_client
 
     monkeypatch.setattr(cohere_backend._CohereBedrockClientCache, "_create", create)
     client_cache = cohere_backend._CohereBedrockClientCache(

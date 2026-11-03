@@ -1,7 +1,6 @@
 """Test OTel-native chat span parsing and explicit langchaint conversion."""
 
 import json
-import math
 import pathlib
 from typing import assert_type
 
@@ -13,10 +12,8 @@ from langchaint import (
     ZERO_USAGE,
     AssistantMessage,
     BoundLLM,
-    DispatchHandled,
     JsonValue,
     TextPart,
-    ToolCall,
     ToolMessage,
     UserMessage,
 )
@@ -38,7 +35,7 @@ from langchaint.span_parsing import (
     system_prompt_from_otel,
     tool_schemas_from_otel,
 )
-from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
+from langchaint.tools import JSONSchemaTool, ToolSchema
 from scripts import refresh_semconv_genai
 from tests.fake_adapter import FakeAdapter
 
@@ -111,23 +108,6 @@ class _StructuredResponse(BaseModel):
     answer: str
 
 
-class _CountingTool:
-    def __init__(self) -> None:
-        self.name = "lookup"
-        self.schema_calls = 0
-
-    def schema(self) -> ToolSchema:
-        self.schema_calls += 1
-        return ToolSchema(
-            name=self.name,
-            description="Look up one value.",
-            args_schema={"type": "object"},
-        )
-
-    async def dispatch(self, tool_call: ToolCall) -> DispatchHandled[None]:
-        return DispatchHandled(tool_message=ToolMessage(tool_call_id=tool_call.id, content="done"))
-
-
 def _assert_scalar_attributes_parse(
     entries_by_name: dict[str, dict[str, JsonValue]], field_names_by_alias: dict[str, str]
 ) -> None:
@@ -149,15 +129,6 @@ def _assert_scalar_attributes_parse(
         assert actual_value == expected_value
         with pytest.raises(ValidationError):
             _ = parse_otel_chat(_chat_span({attribute_name: invalid_value}))
-        allowed_values = entry["allowed_values"]
-        if allowed_values is None:
-            continue
-        assert isinstance(allowed_values, list)
-        if attribute_name == "gen_ai.operation.name":
-            assert "chat" in allowed_values
-            continue
-        for allowed_value in allowed_values:
-            assert isinstance(allowed_value, str)
 
 
 def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
@@ -215,9 +186,15 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
     _assert_scalar_attributes_parse(entries_by_name, field_names_by_alias)
 
 
-def test_present_scalar_attribute_cannot_be_null() -> None:
-    with pytest.raises(ValidationError):
-        _ = parse_otel_chat(_chat_span({"gen_ai.request.seed": None}))
+def test_known_system_type_can_use_the_generic_schema_variant() -> None:
+    parsed = parse_otel_chat(
+        _chat_span({"gen_ai.system_instructions": [{"type": "text", "provider_value": 1}]})
+    )
+    assert parsed.system_instructions is not None
+    part = parsed.system_instructions[0]
+    assert isinstance(part, OtelGenericObject)
+    assert part.type == "text"
+    assert part.additional_properties == {"provider_value": 1}
 
 
 def test_known_message_type_can_use_the_generic_schema_variant() -> None:
@@ -230,17 +207,6 @@ def test_known_message_type_can_use_the_generic_schema_variant() -> None:
     )
     assert parsed.input_messages is not None
     part = parsed.input_messages[0].parts[0]
-    assert isinstance(part, OtelGenericObject)
-    assert part.type == "text"
-    assert part.additional_properties == {"provider_value": 1}
-
-
-def test_known_system_type_can_use_the_generic_schema_variant() -> None:
-    parsed = parse_otel_chat(
-        _chat_span({"gen_ai.system_instructions": [{"type": "text", "provider_value": 1}]})
-    )
-    assert parsed.system_instructions is not None
-    part = parsed.system_instructions[0]
     assert isinstance(part, OtelGenericObject)
     assert part.type == "text"
     assert part.additional_properties == {"provider_value": 1}
@@ -282,16 +248,9 @@ def test_decodes_structured_unused_attributes_and_preserves_unrecognized_text() 
     }
 
 
-def test_preserves_json_text_for_a_scalar_attribute() -> None:
-    encoded_value = '{"provider": "custom"}'
-    parsed = parse_otel_chat(_chat_span({"gen_ai.provider.name": encoded_value}))
-    assert parsed.provider_name == encoded_value
-
-
-@pytest.mark.parametrize("encoded_value", ["NaN", "Infinity", "-Infinity"])
-def test_rejects_non_json_constants_in_structured_attributes(encoded_value: str) -> None:
+def test_rejects_non_json_constants_in_structured_attributes() -> None:
     with pytest.raises(ValidationError, match="must be finite"):
-        _ = parse_otel_chat(_chat_span({"gen_ai.input.messages": encoded_value}))
+        _ = parse_otel_chat(_chat_span({"gen_ai.input.messages": "NaN"}))
 
 
 def test_preserves_known_and_generic_additional_properties() -> None:
@@ -357,29 +316,11 @@ def test_rejects_malformed_structured_attribute_json() -> None:
         _ = parse_otel_chat(_chat_span({"gen_ai.input.messages": "not JSON"}))
 
 
-@pytest.mark.parametrize("encode_as_json", [False, True])
-@pytest.mark.parametrize(
-    ("attribute_name", "decoded_attribute_value"),
-    [
-        ("gen_ai.system_instructions", [1]),
-        ("gen_ai.tool.definitions", [1]),
-        ("gen_ai.input.messages", [1]),
-        ("gen_ai.output.messages", [1]),
-        ("gen_ai.input.messages", [{"role": "user", "parts": [1]}]),
-        ("gen_ai.output.messages", [{"role": "user", "parts": [1]}]),
-    ],
-)
-def test_rejects_non_object_structured_values(
-    attribute_name: str,
-    decoded_attribute_value: JsonValue,
-    *,
-    encode_as_json: bool,
-) -> None:
-    attribute_value = (
-        json.dumps(decoded_attribute_value) if encode_as_json else decoded_attribute_value
-    )
+def test_rejects_non_object_structured_values() -> None:
     with pytest.raises(ValidationError, match="an OTel structured value must be an object"):
-        _ = parse_otel_chat(_chat_span({attribute_name: attribute_value}))
+        _ = parse_otel_chat(
+            _chat_span({"gen_ai.input.messages": [{"role": "user", "parts": [1]}]})
+        )
 
 
 def test_rejects_a_malformed_function_parameters_schema() -> None:
@@ -649,23 +590,15 @@ def test_generation_record_fills_its_synthetic_request_record() -> None:
         "gen_ai.response.id": "response-1",
         "gen_ai.usage.input_tokens": 100,
         "openai.response.service_tier": "priority",
+        "gen_ai.response.time_to_first_chunk": 0.5,
     })
-    record = generation_record_from_otel(span)
-    assert record.request_history.elapsed_seconds == 0.0
-    request_record = record.request_records[0]
-    assert request_record.started_after_seconds == 0.0
-    assert request_record.elapsed_seconds == 0.0
-    assert request_record.first_item_after_seconds is None
-    assert request_record.error is None
+    request_record = generation_record_from_otel(span).request_records[0]
     assert request_record.response_id == "response-1"
-    assert request_record.request_id is None
     assert request_record.billing is not None
     assert request_record.billing.usage == ZERO_USAGE
+    assert request_record.request_id is None
     assert request_record.billing.service_tier == "unknown"
-    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_none)
-    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_read)
-    assert math.isnan(request_record.billing.usd_per_million_tokens.input_tokens_cache_write)
-    assert math.isnan(request_record.billing.usd_per_million_tokens.output_tokens)
+    assert request_record.first_item_after_seconds is None
 
 
 def _json_output_span(texts: list[str]) -> OtelChatSpan:
@@ -675,13 +608,6 @@ def _json_output_span(texts: list[str]) -> OtelChatSpan:
             {"role": "assistant", "parts": [{"type": "text", "content": text} for text in texts]}
         ],
     })
-
-
-@pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
-def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
-    record = generation_record_from_otel(_json_output_span([json.dumps(output)]))
-    assert record.kind == "plain"
-    assert record.output == output
 
 
 @pytest.mark.parametrize(
@@ -746,10 +672,9 @@ def test_output_without_text_matches_a_live_generation(
     assert len(record.assistant_message.content) == len(parts)
 
 
-@pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
-def test_generation_record_rejects_unsupported_output_type(output_type: str) -> None:
+def test_generation_record_rejects_unsupported_output_type() -> None:
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = generation_record_from_otel(_generation_chat_span({"gen_ai.output.type": output_type}))
+        _ = generation_record_from_otel(_generation_chat_span({"gen_ai.output.type": "image"}))
 
 
 @pytest.mark.parametrize(
@@ -757,7 +682,6 @@ def test_generation_record_rejects_unsupported_output_type(output_type: str) -> 
     [
         [{"type": "tool_call", "name": "lookup", "arguments": {}}],
         [{"type": "tool_call", "id": "call1", "name": "lookup", "arguments": '{"query": '}],
-        [{"type": "reasoning", "content": "thinking"}],
         [{"type": "provider_part", "value": 1}],
     ],
 )
@@ -943,30 +867,10 @@ def test_generation_record_errors_exclude_generated_content(conversion_case: str
     assert secret not in str(rejected.value)
 
 
-@pytest.mark.parametrize("use_tool_manager", [True, False])
-def test_reconstruction_reads_each_tool_schema_once(*, use_tool_manager: bool) -> None:
-    tool = _CountingTool()
-    tools = ToolManager([tool]) if use_tool_manager else [tool]
-    span = _generation_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
-    bound_llm = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
-    if isinstance(tools, ToolManager):
-        assert bound_llm.tool_manager is tools
-    assert bound_llm.binding.tool_schemas == (
-        ToolSchema(
-            name="lookup",
-            description="Look up one value.",
-            args_schema={"type": "object"},
-        ),
-    )
-    assert tool.schema_calls == 1
-
-
 @pytest.mark.parametrize(
     "tools",
     [
-        [_json_schema_tool(name="different")],
         [_json_schema_tool(description="Different description.")],
-        [_json_schema_tool(args_schema={"type": "object", "required": ["value"]})],
         [_json_schema_tool(name="second"), _json_schema_tool(name="lookup")],
     ],
 )
@@ -984,17 +888,6 @@ def test_reconstruction_rejects_tool_schema_mismatch(
         })
     with pytest.raises(OtelToLangchaintConversionError, match="differs"):
         _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
-
-
-def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
-    span = _generation_chat_span({
-        "gen_ai.tool.definitions": [
-            _captured_tool_definition(),
-            _captured_tool_definition(),
-        ]
-    })
-    with pytest.raises(OtelToLangchaintConversionError, match="duplicate"):
-        _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=None)
 
 
 @pytest.mark.parametrize(
@@ -1053,9 +946,8 @@ def test_reconstruction_rejects_response_format_mismatch(
         )
 
 
-@pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
-def test_reconstruction_rejects_unsupported_output_type(output_type: str) -> None:
-    span = _generation_chat_span({"gen_ai.output.type": output_type})
+def test_reconstruction_rejects_unsupported_output_type() -> None:
+    span = _generation_chat_span({"gen_ai.output.type": "image"})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()))
 

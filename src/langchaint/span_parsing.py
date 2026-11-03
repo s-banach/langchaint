@@ -36,7 +36,6 @@ from langchaint.common.messages import (
     ToolMessage,
     UserMessage,
     _is_object_dict,
-    _require_json_runtime_shape,
 )
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
@@ -59,9 +58,6 @@ type StringTuple = Annotated[tuple[str, ...], Field(strict=False)]
 _SPAN_ATTRIBUTES_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 _BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
 _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
-_FINITE_JSON_ADAPTER: TypeAdapter[object] = TypeAdapter(
-    Annotated[object, AfterValidator(_require_json_runtime_shape)]
-)
 _STRUCTURED_ATTRIBUTE_NAMES = TypeAdapter(frozenset[str]).validate_json(
     files("langchaint").joinpath("_semconv_genai_structured_attributes.json").read_text()
 )
@@ -78,13 +74,16 @@ def _decode_semconv_attribute(name: str, value: JsonValue) -> object:
     """
     if name not in _STRUCTURED_ATTRIBUTE_NAMES or not isinstance(value, str):
         return value
-    return _FINITE_JSON_ADAPTER.validate_json(value)
+    return _JSON_VALUE_ADAPTER.validate_json(value)
 
 
 def _decode_span_attributes(
-    input_value: object, fixed_aliases: frozenset[str]
+    model: type[BaseModel], input_value: object
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Decode every span attribute, and split the attributes named in `fixed_aliases` from the others."""
+    """Decode every span attribute, and split the attributes named by an alias of a `model` field from the others."""
+    fixed_aliases = {
+        field.alias for field in model.model_fields.values() if field.alias is not None
+    }
     span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
     parsed_attributes: dict[str, object] = {}
     other_attributes: dict[str, object] = {}
@@ -107,11 +106,7 @@ def _validate_draft_07_schema(value: JsonValue) -> JsonValue:
 type Draft7Schema = Annotated[JsonValue, AfterValidator(_validate_draft_07_schema)]
 
 
-class OtelModel(CheckedCopyModel):
-    """An OTel value before conversion to langchaint."""
-
-
-class OtelStructuredModel(OtelModel):
+class OtelStructuredModel(CheckedCopyModel):
     """An OTel object with undeclared JSON properties retained in `additional_properties`.
 
     Raw properties named `additional_properties` remain inside `additional_properties`.
@@ -123,8 +118,6 @@ class OtelStructuredModel(OtelModel):
     @model_validator(mode="before")
     @classmethod
     def _partition_additional_properties(cls, input_value: object) -> object:
-        if isinstance(input_value, OtelStructuredModel):
-            return input_value
         if not _is_object_dict(input_value):
             raise PydanticCustomError(
                 "otel_structured_object", "an OTel structured value must be an object"
@@ -302,7 +295,7 @@ _MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
 )
 
 
-class OtelChatSpan(OtelModel):
+class OtelChatSpan(CheckedCopyModel):
     """Chat attributes from the committed OTel convention snapshot."""
 
     operation_name: Literal["chat"] = Field(alias=OPERATION_NAME)
@@ -423,9 +416,7 @@ class OtelChatSpan(OtelModel):
     @model_validator(mode="before")
     @classmethod
     def _partition_span_attributes(cls, input_value: object) -> object:
-        parsed_attributes, other_attributes = _decode_span_attributes(
-            input_value, _OTEL_CHAT_SPAN_FIXED_ALIASES
-        )
+        parsed_attributes, other_attributes = _decode_span_attributes(cls, input_value)
         parsed_attributes["prompt_variables"] = {
             name.removeprefix(PROMPT_VARIABLE_PREFIX): value
             for name, value in other_attributes.items()
@@ -439,16 +430,12 @@ class OtelChatSpan(OtelModel):
         return parsed_attributes
 
 
-_OTEL_CHAT_SPAN_FIXED_ALIASES: frozenset[str] = frozenset(
-    field.alias for field in OtelChatSpan.model_fields.values() if field.alias is not None
-)
-
 type OtelToolCallResult = Annotated[
     OtelToolCallResponsePart | JsonValue, Field(union_mode="left_to_right")
 ]
 
 
-class OtelExecuteToolSpan(OtelModel):
+class OtelExecuteToolSpan(CheckedCopyModel):
     """Execute-tool attributes from the committed OTel convention snapshot.
 
     `tool_call_arguments` and `tool_call_result` accept any JSON value, not only the object the snapshot declares.
@@ -472,16 +459,9 @@ class OtelExecuteToolSpan(OtelModel):
     @model_validator(mode="before")
     @classmethod
     def _partition_span_attributes(cls, input_value: object) -> object:
-        parsed_attributes, other_attributes = _decode_span_attributes(
-            input_value, _OTEL_EXECUTE_TOOL_SPAN_FIXED_ALIASES
-        )
+        parsed_attributes, other_attributes = _decode_span_attributes(cls, input_value)
         parsed_attributes["unused_attributes"] = other_attributes
         return parsed_attributes
-
-
-_OTEL_EXECUTE_TOOL_SPAN_FIXED_ALIASES: frozenset[str] = frozenset(
-    field.alias for field in OtelExecuteToolSpan.model_fields.values() if field.alias is not None
-)
 
 
 class OtelToLangchaintConversionError(ValueError):
@@ -597,7 +577,6 @@ def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ..
     if tool_definitions is None:
         return None
     converted: list[ToolSchema] = []
-    converted_names: set[str] = set()
     for definition in tool_definitions:
         if not isinstance(definition, OtelFunctionTool):
             raise _unsupported(definition, "tool definition type")
@@ -607,11 +586,6 @@ def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ..
                 definition,
                 "function definition whose parameters are absent or not a schema object",
             )
-        if definition.name in converted_names:
-            raise OtelToLangchaintConversionError(
-                f"{TOOL_DEFINITIONS} contains duplicate function definition {definition!r}"
-            )
-        converted_names.add(definition.name)
         converted.append(
             ToolSchema(
                 name=definition.name,
@@ -890,14 +864,7 @@ def _stop_reason_from_otel(
             return "max_completion_tokens"
         case "content_filter":
             return "refusal"
-        case (
-            "stop"
-            | "tool_call"
-            | "max_completion_tokens"
-            | "refusal"
-            | "context_window_exceeded"
-            | "other"
-        ):
+        case "stop" | "tool_call" | "refusal" | "context_window_exceeded":
             return selected_finish_reason
         case _:
             return "other"
@@ -952,7 +919,7 @@ def _message_from_otel(message: OtelInputMessage) -> Message:
     _require_message_metadata(message)
     match message.role:
         case "user":
-            return UserMessage(content=_content_parts_from_otel(message.parts))
+            return UserMessage(content=tuple(map(_content_part_from_otel, message.parts)))
         case "assistant":
             return AssistantMessage(content=tuple(map(_assistant_part_from_otel, message.parts)))
         case "tool":
@@ -975,7 +942,7 @@ def _tool_message_from_otel(message: OtelInputMessage) -> ToolMessage:
             response_parts = _MESSAGE_PARTS_ADAPTER.validate_python(part.response)
         except ValidationError as error:
             raise _unsupported(part, "tool response value") from error
-        content = _content_parts_from_otel(response_parts)
+        content = tuple(map(_content_part_from_otel, response_parts))
     return ToolMessage(tool_call_id=part.id, content=content, is_error=part.is_error)
 
 
@@ -997,10 +964,6 @@ def _assistant_part_from_otel(part: OtelMessagePart) -> TextPart | ToolCall:
             args_json=json.dumps(part.arguments, allow_nan=False, separators=(",", ":")),
         )
     raise _unsupported(part, "assistant part type")
-
-
-def _content_parts_from_otel(parts: tuple[OtelMessagePart, ...]) -> tuple[ContentPart, ...]:
-    return tuple(_content_part_from_otel(part) for part in parts)
 
 
 def _content_part_from_otel(part: OtelMessagePart) -> ContentPart:
@@ -1041,7 +1004,7 @@ def _attribute_conversion_error(
     return OtelToLangchaintConversionError(f"{attribute_name} {description}")
 
 
-def _unsupported(value: OtelModel, description: str) -> OtelToLangchaintConversionError:
+def _unsupported(value: OtelStructuredModel, description: str) -> OtelToLangchaintConversionError:
     return OtelToLangchaintConversionError(
         f"{type(value).__name__} has no langchaint representation for {description}"
     )

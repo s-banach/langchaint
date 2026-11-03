@@ -22,12 +22,9 @@ _NEVER = float("-inf")
 """The moment before every other: the initial pause end and the initial admission time."""
 
 
-def _random_up_to(ceiling: float, draw: float) -> float:
-    """Map `draw` from `[0, 1)` to a wait at most `ceiling`.
-
-    Callers pass `random.random()` as `draw` and a positive finite `ceiling`.
-    """
-    return ceiling * (1.0 - draw)
+def _random_up_to(ceiling: float) -> float:
+    """Draw a wait at most `ceiling`, which callers keep positive and finite."""
+    return ceiling * (1.0 - random.random())
 
 
 def _validated_positive_float(name: str, value: float) -> float:
@@ -426,7 +423,7 @@ class SharedBackoff:
         """Return the provider-specified wait or draw under the current ceiling."""
         if request_failure.retry_after_seconds is not None:
             return request_failure.retry_after_seconds
-        return _random_up_to(self._wait_ceiling, random.random())
+        return _random_up_to(self._wait_ceiling)
 
     def _set_wait_ceiling(self, now: float, previous_pause_end: float) -> None:
         """Set _wait_ceiling from activity since previous_pause_end.
@@ -479,7 +476,7 @@ class PrivateBackoff:
         `retry_after_seconds` raises that wait when present.
         The normalized `retry_after_seconds` is capped at `max_wait_seconds`.
         """
-        wait = _random_up_to(self._wait_ceiling, random.random())
+        wait = _random_up_to(self._wait_ceiling)
         if retry_after_seconds is not None:
             wait = max(wait, retry_after_seconds)
         self._wait_ceiling = min(

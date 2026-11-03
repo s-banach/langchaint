@@ -7,18 +7,12 @@ from functools import partial
 
 import pytest
 
-from langchaint.concurrency.run_many import max_pending_for_requests, run_many
+from langchaint.concurrency.run_many import run_many
 from tests.helpers import run_with_timeout
 
 
 class _RunManyFailure(BaseException):
     """Identify a run_many task failure."""
-
-
-@pytest.mark.parametrize("invalid", [True, False, 0, -1])
-def test_max_pending_for_requests_rejects_invalid_concurrency(invalid: int) -> None:
-    with pytest.raises(ValueError, match="max_concurrent_requests"):
-        _ = max_pending_for_requests(invalid)
 
 
 def test_run_many_validates_max_pending_before_running_run_ones() -> None:

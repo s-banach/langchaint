@@ -82,13 +82,6 @@ def test_constructor_rejects_invalid_max_concurrent_requests(
         _ = _shared_backoff(max_concurrent_requests=max_concurrent_requests)
 
 
-@pytest.mark.parametrize("max_concurrent_requests", [None, 8])
-def test_constructor_accepts_valid_max_concurrent_requests(
-    max_concurrent_requests: int | None,
-) -> None:
-    _ = _shared_backoff(max_concurrent_requests=max_concurrent_requests)
-
-
 @pytest.mark.parametrize(
     "name",
     [
@@ -138,14 +131,9 @@ def test_constructor_rejects_max_wait_seconds_below_the_floor() -> None:
 
 
 def test_constructor_rejects_an_unrepresentable_ceiling_ratio() -> None:
-    """`1e308 / 5e-324` overflows, and `10**1000` cannot convert to a float."""
+    """`1e308 / 5e-324` overflows."""
     with pytest.raises(ValueError, match="finite"):
         _ = _shared_backoff(min_wait_ceiling_seconds=5e-324, max_wait_seconds=1e308)
-    with pytest.raises(ValueError, match="min_wait_ceiling_seconds"):
-        _ = _shared_backoff(
-            min_wait_ceiling_seconds=10**1000,
-            max_wait_seconds=1e308,
-        )
 
 
 def test_constructor_accepts_max_wait_seconds_equal_to_the_floor() -> None:

@@ -215,15 +215,11 @@ def _validated_embeddings(
     """
     try:
         vectors = np.array(values, dtype=np.float32, order="C")
-    except (OverflowError, TypeError, ValueError) as error:
+    except ValueError as error:
         raise EmbeddingOutputError(
             "Embedding response is not a rectangular float matrix",
             input_tokens_total=input_tokens_total,
         ) from error
-    if vectors.ndim != 2:
-        raise EmbeddingOutputError(
-            "Embedding response must have two axes", input_tokens_total=input_tokens_total
-        )
     if vectors.shape != (expected_rows, dimension):
         raise EmbeddingOutputError(
             f"Embedding response shape must be ({expected_rows}, {dimension})",
@@ -240,11 +236,6 @@ def _validated_embeddings(
             "Embedding response contains a zero-norm row", input_tokens_total=input_tokens_total
         )
     vectors /= norms[:, np.newaxis]
-    normalized_norms = np.linalg.vector_norm(vectors.astype(np.float64), axis=1)
-    if not np.allclose(normalized_norms, 1.0, rtol=1e-6, atol=1e-6):
-        raise EmbeddingOutputError(
-            "Embedding response normalization failed", input_tokens_total=input_tokens_total
-        )
     return vectors
 
 

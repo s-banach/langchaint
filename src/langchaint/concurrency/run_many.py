@@ -18,17 +18,9 @@ def max_pending_for_requests(max_concurrent_requests: int | None) -> int:
 
     Args:
         max_concurrent_requests: The request concurrency bound, or `None` when unbounded.
-
-    Raises:
-        ValueError: `max_concurrent_requests` is boolean or below one.
     """
     if max_concurrent_requests is None:
         return _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
-    if isinstance(max_concurrent_requests, bool) or max_concurrent_requests < 1:
-        raise ValueError(
-            "max_concurrent_requests must be None or a positive int, "
-            f"got {max_concurrent_requests!r}"
-        )
     return max_concurrent_requests * _PENDING_TASKS_PER_CONCURRENT_REQUEST + _SPARE_PENDING_TASKS
 
 

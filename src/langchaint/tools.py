@@ -121,9 +121,8 @@ type DispatchManyItemOutcome = DispatchOutcome | DispatchPrecomputed
 class InvalidToolArgsError(Exception):
     """A tool call's `args_json` failed validation against the tool's `args_model`.
 
-    `PydanticTool._validated_args` raises this error.
+    `PydanticTool.validate_and_run` raises this error.
     A tool function does not cause langchaint to raise this error.
-    `ToolManager.dispatch` catches this error and returns `DispatchInvalidToolArgs`.
     """
 
     validation_error: ValidationError
@@ -211,17 +210,6 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
             args_schema=self.args_model.model_json_schema(),
         )
 
-    def _validated_args(self, args_json: str) -> ArgsT:
-        """Validate `args_json` against `args_model`.
-
-        Raises:
-            InvalidToolArgsError: `args_json` fails validation.
-        """
-        try:
-            return self.args_model.model_validate_json(args_json)
-        except ValidationError as exc:
-            raise InvalidToolArgsError(exc) from exc
-
     async def validate_and_run(self, args_json: str) -> ToolReturn[AppDataT]:
         """Validate `args_json` with `args_model`, then run `function`.
 
@@ -232,7 +220,11 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
             InvalidToolArgsError: `args_json` fails validation.
             BaseException: `function` raises it.
         """
-        return await self.function(self._validated_args(args_json))
+        try:
+            args = self.args_model.model_validate_json(args_json)
+        except ValidationError as exc:
+            raise InvalidToolArgsError(exc) from exc
+        return await self.function(args)
 
     async def dispatch(
         self, tool_call: ToolCall
@@ -248,9 +240,9 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
             BaseException: `function` raises it.
         """
         try:
-            args = self._validated_args(tool_call.args_json)
-        except InvalidToolArgsError as error:
-            return _invalid_args_outcome(tool_call, _details_from_pydantic(error.validation_error))
+            args = self.args_model.model_validate_json(tool_call.args_json)
+        except ValidationError as error:
+            return _invalid_args_outcome(tool_call, _details_from_pydantic(error))
         return _handled_outcome(tool_call, await self.function(args))
 
 
@@ -485,12 +477,7 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
     Args:
         tool_name: The tool name to include in the content.
         details: The argument-validation failures.
-
-    Raises:
-        ValueError: `details` is empty.
     """
-    if not details:
-        raise ValueError(f"render_invalid_tool_args for {tool_name} received no details to render")
     lines = [f"invalid arguments for {tool_name}:"]
     for detail in details:
         joined_path = (

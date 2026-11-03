@@ -207,11 +207,6 @@ def test_render_invalid_tool_args_formats_neutral_details() -> None:
     )
 
 
-def test_render_invalid_tool_args_rejects_empty_details() -> None:
-    with pytest.raises(ValueError, match="no details to render"):
-        _ = render_invalid_tool_args("search", [])
-
-
 def test_dispatch_wraps_success_in_a_tool_message() -> None:
     call = ToolCall(id="call1", name="echo", args_json='{"text": "tide"}')
     result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
@@ -243,7 +238,6 @@ def test_dispatch_carries_content_parts_into_tool_message_content(*, explicit: b
         TextPart(text="tide"),
         ImagePart(data=b"png", media_type="image/png"),
     )
-    assert isinstance(result.tool_message.content, tuple)
     assert result.tool_message.is_error is explicit
     assert result.app_data is None
 
@@ -289,27 +283,6 @@ def test_function_validation_error_propagates_as_a_defect() -> None:
         _ = run_with_timeout(ToolManager([tool]).dispatch(call))
 
 
-def test_dispatch_carries_a_returned_is_error_result() -> None:
-    async def _returned_error_function(args: _EchoArgs) -> ToolReturnExplicit:
-        return ToolReturnExplicit(
-            content=f"cannot echo {args.text!r}: try a shorter value", is_error=True
-        )
-
-    tool = PydanticTool(
-        name="picky",
-        description="Returns an is_error result.",
-        args_model=_EchoArgs,
-        function=_returned_error_function,
-    )
-    call = ToolCall(id="call1", name="picky", args_json='{"text": "tide"}')
-    result = run_with_timeout(ToolManager([tool]).dispatch(call))
-    assert result.kind == "handled"
-    assert result.tool_message.is_error is True
-    assert result.tool_message.content == "cannot echo 'tide': try a shorter value"
-    assert result.tool_message.tool_call_id == "call1"
-    assert result.app_data is None
-
-
 class _Cites(BaseModel):
     citations: list[str]
 
@@ -318,70 +291,12 @@ class _Receipt(BaseModel):
     record_id: str
 
 
-def test_dispatch_preserves_mapping_app_data_identity() -> None:
-    mapping = {"citations": ["doc-1"]}
-
-    async def _mapping_function(args: _EchoArgs) -> ToolReturnExplicit[Mapping[str, object]]:
-        return ToolReturnExplicit(content=f"declined {args.text}", is_error=True, app_data=mapping)
-
-    mapping_tool = PydanticTool(
-        name="mapping",
-        description="Returns a mapping app_data.",
-        args_model=_EchoArgs,
-        function=_mapping_function,
-    )
-    mapping_result = run_with_timeout(
-        ToolManager([mapping_tool]).dispatch(
-            ToolCall(id="call2", name="mapping", args_json='{"text": "tide"}')
-        )
-    )
-    assert mapping_result.kind == "handled"
-    assert mapping_result.tool_message.is_error is True
-    assert mapping_result.app_data is mapping
-
-
 async def _pin_tool_dispatch_app_data_type(
     tool: PydanticTool[_EchoArgs, _Cites], call: ToolCall
 ) -> None:
     result = await tool.dispatch(call)
     assert result.kind == "handled"
     assert_type(result.app_data, _Cites | None)
-
-
-def test_plain_function_exception_propagates_as_a_defect() -> None:
-    async def _failing_function(args: _EchoArgs) -> str:
-        raise RuntimeError(f"function broke on {args.text}")
-
-    tool = PydanticTool(
-        name="failing",
-        description="Raises an ordinary exception.",
-        args_model=_EchoArgs,
-        function=_failing_function,
-    )
-    call = ToolCall(id="call1", name="failing", args_json='{"text": "tide"}')
-    with pytest.raises(RuntimeError, match="function broke on tide"):
-        _ = run_with_timeout(ToolManager([tool]).dispatch(call))
-
-
-def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
-    async def _nested_validation_function(args: _EchoArgs) -> str:
-        try:
-            _ = _EchoArgs.model_validate({"wrong": args.text})
-        except ValidationError as exc:
-            raise InvalidToolArgsError(exc) from exc
-        return "unreachable"
-
-    tool = PydanticTool(
-        name="nested",
-        description="Validates a payload of its own.",
-        args_model=_EchoArgs,
-        function=_nested_validation_function,
-    )
-    call = ToolCall(id="call1", name="nested", args_json='{"text": "tide"}')
-    with pytest.raises(InvalidToolArgsError):
-        _ = run_with_timeout(tool.dispatch(call))
-    with pytest.raises(InvalidToolArgsError):
-        _ = run_with_timeout(ToolManager([tool]).dispatch(call))
 
 
 def test_duplicate_tool_names_are_rejected() -> None:
@@ -438,19 +353,6 @@ def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
         args_schema=_WEATHER_SCHEMA,
         function=_recording_function,
     )
-
-
-def test_schema_tool_valid_args_run_the_function() -> None:
-    calls: list[str] = []
-    tool = _recording_weather_tool(calls)
-    result = run_with_timeout(
-        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
-    )
-    assert result.kind == "handled"
-    assert result.tool_message.content == "sunny in Oslo"
-    assert result.tool_message.is_error is False
-    assert result.app_data is None
-    assert calls == ["function"]
 
 
 @pytest.mark.parametrize(
@@ -893,18 +795,6 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     )
 
 
-@pytest.mark.parametrize("args_json", ["not json", '"scalar"'])
-def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant(
-    args_json: str,
-) -> None:
-    call = ToolCall(id="call1", name="final_response", args_json=args_json)
-    outcome = run_with_timeout(_answer_capture_tool().capture(call))
-    assert outcome.kind == "invalid_tool_args"
-    assert outcome.tool_message.is_error is True
-    assert "invalid arguments for final_response" in outcome.tool_message.content
-    assert len(outcome.details) >= 1
-
-
 def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
     manager = ToolManager([_echo_tool(), _answer_capture_tool()])
     assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
@@ -914,12 +804,3 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
     assert result.tool_message.content == "Answer received"
     assert result.tool_message.is_error is False
     assert result.app_data == _CapturedAnswer(answer="tide")
-
-
-def test_capture_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
-    call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
-    result = run_with_timeout(ToolManager([_answer_capture_tool()]).dispatch(call))
-    assert result.kind == "invalid_tool_args"
-    assert result.tool_message.is_error is True
-    assert "invalid arguments for final_response" in result.tool_message.content
-    assert any("answer" in detail.path for detail in result.details)

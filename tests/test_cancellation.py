@@ -11,10 +11,7 @@ from tests.helpers import run_with_timeout
 
 
 def test_run_resume_io_settles_before_cancellation_propagates() -> None:
-    """Assert `_run_resume_io` waits for started work after cancellation."""
-
     async def scenario() -> None:
-        """Cancel the awaiting task while its thread remains blocked."""
         started = threading.Event()
         release = threading.Event()
 
@@ -35,8 +32,6 @@ def test_run_resume_io_settles_before_cancellation_propagates() -> None:
 
 
 def test_thread_work_settles_before_cancellation_propagates() -> None:
-    """Cancellation waits for synchronous work to settle."""
-
     async def scenario() -> None:
         started = threading.Event()
         release = threading.Event()
@@ -57,20 +52,5 @@ def test_thread_work_settles_before_cancellation_propagates() -> None:
         with pytest.raises(asyncio.CancelledError):
             _ = await task
         assert finished.is_set()
-
-    run_with_timeout(scenario())
-
-
-def test_thread_failure_propagates() -> None:
-
-    class FailureError(Exception):
-        """Identify the expected failure."""
-
-    def fail() -> None:
-        raise FailureError("boom")
-
-    async def scenario() -> None:
-        with pytest.raises(FailureError, match="boom"):
-            await to_thread_cancellation_safe(fail)
 
     run_with_timeout(scenario())

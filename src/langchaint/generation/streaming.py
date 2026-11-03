@@ -359,7 +359,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                         ledger=self._ledger,
                         provider_billing=None,
                         request_params=request_params,
-                        stream_opened=self._adapter_stream is not None,
+                        stream_opened=False,
                     ) from exc
                 self._ledger.record(
                     error=_transient_error_for(exc, str(exc), request_failure),
@@ -367,9 +367,6 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 )
                 await self._backoff_or_exhaust(exc, request_failure)
                 continue
-            except BaseException:
-                self._exit_admission()
-                raise
             self._items = self._adapter_stream.items()
 
     @overload
@@ -448,7 +445,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 ledger=self._ledger,
                 provider_billing=provider_billing_in_flight,
                 request_params=self._request_params,
-                stream_opened=self._adapter_stream is not None,
+                stream_opened=True,
             )
             error.__cause__ = exc
         else:
@@ -499,11 +496,8 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 pass
             adapter_stream = self._adapter_stream
             assert adapter_stream is not None
-            ended_at_monotonic_seconds = (
-                time.monotonic()
-                if self._ended_at_monotonic_seconds is None
-                else self._ended_at_monotonic_seconds
-            )
+            ended_at_monotonic_seconds = self._ended_at_monotonic_seconds
+            assert ended_at_monotonic_seconds is not None
             try:
                 self._outcome = await self._assembled_outcome(
                     adapter_stream, ended_at_monotonic_seconds=ended_at_monotonic_seconds

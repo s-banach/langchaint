@@ -87,7 +87,6 @@ class CutOffRequestRecord(RequestRecord):
     """One request whose ending langchaint did not observe.
 
     `first_item_after_seconds` is `None` when no streamed item arrived before the cut-off.
-    Its default keeps records saved without it valid.
     """
 
     started_after_seconds: _NonnegativeFiniteFloat
@@ -320,11 +319,6 @@ class _RequestLedger:
     def request_count(self) -> int:
         """Return the settled request count."""
         return len(self._request_records)
-
-    @property
-    def request_records(self) -> tuple[SettledRequestRecord, ...]:
-        """Return the settled normalized request records."""
-        return tuple(self._request_records)
 
     @property
     def request_provider_data(self) -> tuple[RequestProviderData, ...]:

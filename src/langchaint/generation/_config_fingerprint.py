@@ -94,10 +94,6 @@ def _canonical_json(value: _CanonicalValue) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
 
-def _is_base_model_class(class_: type[object]) -> TypeIs[type[BaseModel]]:
-    return issubclass(class_, BaseModel)
-
-
 def _is_config_container(value: object) -> TypeIs[_ConfigContainer]:
     if isinstance(value, Mapping):
         return True
@@ -114,7 +110,7 @@ class _Canonicalizer:
         """Encode `str` as text, or a response format's class identity and JSON Schema."""
         if response_format is str:
             return ["text"]
-        if not _is_base_model_class(response_format):
+        if not issubclass(response_format, BaseModel):
             raise TypeError("response_format must be str or a pydantic.BaseModel subclass")
         try:
             response_json_schema = response_format.model_json_schema()
@@ -266,8 +262,7 @@ class _Canonicalizer:
     def _sorted_string_keys(value: Mapping[object, object], *, path: str) -> list[str]:
         keys: list[str] = []
         for key in value:
-            if not isinstance(key, str) or type(key) is not str:
+            if type(key) is not str:
                 raise TypeError(f"{path} contains a non-string mapping key")
             keys.append(key)
-        keys.sort()
-        return keys
+        return sorted(keys)

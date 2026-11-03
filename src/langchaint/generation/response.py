@@ -10,7 +10,6 @@ from langchaint.billing.pricing import ProviderBilling
 from langchaint.billing.usage import Usage
 from langchaint.common.messages import AssistantMessage, StopReason, ToolCall, final_text_index
 from langchaint.generation.errors import (
-    _GENERATION_ERROR_RECORD_CLASSES,
     GenerationError,
     PlainErrorRecord,
     SchemaViolationErrorRecord,
@@ -236,30 +235,6 @@ type GenerationOutcomeRecord[OutputT] = Annotated[
 
 type InputOutcomeRecord[OutputT] = GenerationOutcomeRecord[OutputT] | AbandonedStreamRecord
 """Every record of an input's outcome, including a stream the application abandoned."""
-
-
-def _generation_outcome_record[OutputT](
-    generation_outcome: GenerationOutcome[OutputT] | GenerationOutcomeRecord[OutputT],
-) -> GenerationOutcomeRecord[OutputT]:
-    if isinstance(generation_outcome, (PlainGeneration, ToolCallGeneration, GenerationError)):
-        if type(generation_outcome) not in (
-            PlainGeneration,
-            ToolCallGeneration,
-            GenerationError,
-        ):
-            raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
-        record = generation_outcome.record
-        if (
-            isinstance(record, _GenerationRecordBase)
-            or type(record) in _GENERATION_ERROR_RECORD_CLASSES
-        ):
-            return record
-        raise TypeError(f"unsupported generation outcome record: {type(record).__name__}")
-    if isinstance(generation_outcome, _GenerationRecordBase):
-        return generation_outcome
-    if type(generation_outcome) in _GENERATION_ERROR_RECORD_CLASSES:
-        return generation_outcome
-    raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
 
 
 def _generation_outcome_from_response_outcome[OutputT](

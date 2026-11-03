@@ -101,11 +101,7 @@ def _reuses[OutputT](outcome_record: GenerationOutcomeRecord[OutputT]) -> bool:
 
     Retry exhaustion, a timeout, and an auth failure can end differently when sent again.
     """
-    match outcome_record.kind:
-        case "retries_exhausted_error" | "timed_out_error" | "auth_error":
-            return False
-        case _:
-            return True
+    return outcome_record.kind not in ("retries_exhausted_error", "timed_out_error", "auth_error")
 
 
 def prepare_resume_file[OutputT](

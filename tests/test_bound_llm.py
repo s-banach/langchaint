@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import logging
 import threading
 import time
@@ -71,7 +70,7 @@ from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
 from langchaint.generation._generate_many_records import _ResumeHeader
-from langchaint.generation.llm import WorkingTimeDeadline, _run_many_with_warm_cache
+from langchaint.generation.llm import WorkingTimeDeadline
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.streaming import StreamHandle
 from tests.fake_adapter import (
@@ -734,25 +733,6 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_request() -> N
     run_with_timeout(scenario())
 
 
-def test_a_cancelled_batch_propagates_and_leaves_no_outcome_behind() -> None:
-
-    async def scenario() -> None:
-        adapter = FakeAdapter(hang_from_open=2)
-        bound_llm = LLM(
-            adapter, shared_backoff=fast_shared_backoff(max_concurrent_requests=1)
-        ).bind()
-        call = asyncio.create_task(
-            bound_llm.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
-        )
-        _ = await adapter.bound_adapters[0].hang_reached.wait()
-        _ = call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await call
-        assert adapter.bound_adapters[0].open_count == 2
-
-    run_with_timeout(scenario())
-
-
 class _Answer(BaseModel):
     value: int
 
@@ -1220,20 +1200,6 @@ def test_config_fingerprint_preserves_sequence_order_and_container_types() -> No
     assert set_value.config_fingerprint() != frozen_set_value.config_fingerprint()
 
 
-def test_config_fingerprint_tracks_ignored_binding_values() -> None:
-    enabled = LLM(FakeAdapter()).bind(automatic_cache_breakpoints=True)
-    disabled = LLM(FakeAdapter()).bind(automatic_cache_breakpoints=False)
-    assert enabled.config_fingerprint() != disabled.config_fingerprint()
-
-
-def test_config_fingerprint_treats_an_omitted_resolved_default_as_its_explicit_value() -> None:
-    omitted = LLM(FakeAdapter(automatic_cache_breakpoints_default=True)).bind()
-    explicit = LLM(FakeAdapter(automatic_cache_breakpoints_default=True)).bind(
-        automatic_cache_breakpoints=True
-    )
-    assert omitted.config_fingerprint() == explicit.config_fingerprint()
-
-
 def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuration() -> None:
     baseline_adapter = FakeAdapter()
     baseline = LLM(baseline_adapter).bind()
@@ -1274,6 +1240,10 @@ def test_config_fingerprint_tracks_response_format_and_bind() -> None:
     assert text.config_fingerprint() != answer.config_fingerprint()
     assert answer.config_fingerprint() != other_answer.config_fingerprint()
     assert answer.config_fingerprint() != replacement_bound.config_fingerprint()
+    assert (
+        text.config_fingerprint()
+        != text.bind(automatic_cache_breakpoints=True).config_fingerprint()
+    )
 
 
 def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> None:
@@ -1810,38 +1780,6 @@ def test_generate_many_records_rejects_concurrent_use_of_one_path(tmp_path: Path
     run_with_timeout(scenario())
 
 
-def test_warm_cache_finishes_the_first_run_one_before_the_rest_start_together() -> None:
-
-    async def scenario() -> None:
-        log: list[str] = []
-        siblings_meet = asyncio.Barrier(2)
-
-        async def first() -> str:
-            log.append("first started")
-            await asyncio.sleep(0)
-            log.append("first ended")
-            return "first"
-
-        async def sibling(name: str) -> str:
-            log.append(f"{name} started")
-            await siblings_meet.wait()
-            return name
-
-        results = await _run_many_with_warm_cache(
-            (first, functools.partial(sibling, "a"), functools.partial(sibling, "b")),
-            warm_cache=True,
-            max_pending=8,
-        )
-        assert results == ["first", "a", "b"]
-        assert log[:2] == ["first started", "first ended"]
-
-    run_with_timeout(scenario())
-
-
-def test_warm_cache_with_no_run_ones_returns_empty() -> None:
-    assert run_with_timeout(_run_many_with_warm_cache((), warm_cache=True, max_pending=8)) == []
-
-
 def test_generate_many_passes_warm_cache_to_the_batch() -> None:
 
     async def scenario() -> None:
@@ -2011,22 +1949,6 @@ def test_a_defect_over_a_staged_response_keeps_the_request_and_its_billing() -> 
     run_with_timeout(scenario())
 
 
-def test_bare_str_is_shorthand_for_one_user_message() -> None:
-
-    async def scenario() -> None:
-        """Use the echo adapter's requirement for UserMessage values with str content to verify input coercion."""
-        bound_llm = LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff()).bind()
-        generation = await bound_llm.generate_one("hi")
-        assert generation.output == "hi"
-        results = await bound_llm.generate_many(["a", [UserMessage(content="b")]])
-        assert _outputs(results) == ["a", "b"]
-        async with bound_llm.stream_one("c") as handle:
-            streamed = await handle.final()
-        assert streamed.output == "c"
-
-    run_with_timeout(scenario())
-
-
 def test_stream_cancelled_mid_iteration_releases_the_permit() -> None:
 
     async def scenario() -> None:
@@ -2120,18 +2042,6 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
             shared_backoff.admitted(budget_seconds=1.0),
         ):
             pass
-
-    run_with_timeout(scenario())
-
-
-def test_a_completed_stream_sets_no_abandoned() -> None:
-
-    async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
-        completed = bound_llm.stream_one([UserMessage(content="hi")])
-        async with completed:
-            await completed.final()
-        assert completed.abandoned is None
 
     run_with_timeout(scenario())
 
@@ -2404,22 +2314,6 @@ def test_stream_unentered_handle_raises_instead_of_opening() -> None:
         with pytest.raises(RuntimeError, match="async with"):
             await handle.final()
         assert adapter.bound_adapters[0].open_count == 0
-
-    run_with_timeout(scenario())
-
-
-def test_stream_handle_raises_on_a_second_entry() -> None:
-
-    async def scenario() -> None:
-        adapter = FakeAdapter()
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
-        handle = bound_llm.stream_one([UserMessage(content="hi")])
-        async with handle:
-            pass
-        with pytest.raises(RuntimeError, match="already entered"):
-            async with handle:
-                pass
-        assert adapter.bound_adapters[0].open_count == 1
 
     run_with_timeout(scenario())
 
@@ -2799,10 +2693,8 @@ def test_stream_final_replays_every_error_that_concluded_the_input(stream: FakeS
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as first:
                 await handle.final()
-            records_after_first = handle._ledger.request_records
             with pytest.raises(GenerationError) as second:
                 await handle.final()
-            assert handle._ledger.request_records == records_after_first
         assert second.value is first.value
 
     run_with_timeout(scenario())

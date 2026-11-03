@@ -59,7 +59,6 @@ from langchaint.generation.response import (
     ToolCallGeneration,
     _escaped_error,
     _generation_outcome_from_response_outcome,
-    _generation_outcome_record,
     _timed_out_error,
 )
 from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
@@ -818,26 +817,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         )
         return self._bound_adapter.interpret(raw)
 
-    async def _generate_with_retries(
-        self,
-        messages: Sequence[Message],
-        *,
-        ledger: _RequestLedger,
-        deadline: Deadline,
-    ) -> Generation[OutputT]:
-        timeout_scope = deadline.scope
-        try:
-            async with timeout_scope:
-                return await self._request_until_budget_runs_out(
-                    messages, ledger=ledger, deadline=deadline
-                )
-        except TimeoutError:
-            if not timeout_scope.expired():
-                raise
-            # The ledger retains billing that the interrupted stream reported.
-            # A settled request record clears this value to `None`.
-            raise _timed_out_error(ledger, ledger.provider_billing_in_flight) from None
-
     async def _request_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _RequestLedger, deadline: Deadline
     ) -> Generation[OutputT]:
@@ -999,11 +978,19 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         self, messages: Sequence[Message], *, deadline: Deadline
     ) -> Generation[OutputT]:
         ledger = _RequestLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
+        timeout_scope = deadline.scope
         try:
-            return await self._generate_with_retries(messages, ledger=ledger, deadline=deadline)
+            async with timeout_scope:
+                return await self._request_until_budget_runs_out(
+                    messages, ledger=ledger, deadline=deadline
+                )
         except GenerationError:
             raise
         except Exception as escaped:
+            if isinstance(escaped, TimeoutError) and timeout_scope.expired():
+                # The ledger retains billing that the interrupted stream reported.
+                # A settled request record clears this value to `None`.
+                raise _timed_out_error(ledger, ledger.provider_billing_in_flight) from None
             raise _escaped_error(ledger, escaped) from escaped
 
     def _generation_started(
@@ -1211,7 +1198,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                 generation_outcome = await self._generate_one_or_failure(
                     generation_input, deadline=WorkingTimeDeadline(max_working_seconds_per_input)
                 )
-                return _generation_outcome_record(generation_outcome)
+                return generation_outcome.record
 
             return await _run_many_with_warm_cache(
                 tuple(
@@ -1252,7 +1239,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                     input_snapshots[input_index],
                     deadline=WorkingTimeDeadline(max_working_seconds_per_input),
                 )
-                outcome_record = _generation_outcome_record(generation_outcome)
+                outcome_record = generation_outcome.record
                 await _run_resume_io(
                     partial(
                         append_outcome_record,

@@ -23,6 +23,7 @@ from openai.types.responses import (
     ResponseInputTextParam,
     ResponseReasoningItem,
     ResponseTextConfigParam,
+    ResponseUsage,
     ToolChoiceAllowedParam,
     ToolChoiceFunctionParam,
     ToolParam,
@@ -35,6 +36,7 @@ from openai.types.responses.response_input_param import (
     FunctionCallOutput,
     ResponseInputItemParam,
 )
+from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from openai.types.shared_params.reasoning import Reasoning
 from pydantic import BaseModel, ValidationError
 
@@ -585,7 +587,14 @@ def _billing_from_response(
     """
     service_tier = _priced_tier(response.service_tier)
     usage_raw = response.usage
-    input_tokens_total = 0 if usage_raw is None else usage_raw.input_tokens
+    counters = usage_raw or ResponseUsage(
+        input_tokens=0,
+        input_tokens_details=InputTokensDetails(cache_write_tokens=0, cached_tokens=0),
+        output_tokens=0,
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        total_tokens=0,
+    )
+    input_tokens_total = counters.input_tokens
     rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)
     web_search_invocations = sum(
         1
@@ -602,12 +611,8 @@ def _billing_from_response(
     )
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = float("nan")
-    input_tokens_cache_read = (
-        0 if usage_raw is None else usage_raw.input_tokens_details.cached_tokens
-    )
-    input_tokens_cache_write = (
-        0 if usage_raw is None else usage_raw.input_tokens_details.cache_write_tokens
-    )
+    input_tokens_cache_read = counters.input_tokens_details.cached_tokens
+    input_tokens_cache_write = counters.input_tokens_details.cache_write_tokens
     return ProviderBilling(
         billing=billing_at_rates(
             rates,
@@ -617,10 +622,8 @@ def _billing_from_response(
             input_tokens_cache_none=(
                 input_tokens_total - input_tokens_cache_read - input_tokens_cache_write
             ),
-            output_tokens=0 if usage_raw is None else usage_raw.output_tokens,
-            output_tokens_reasoning=(
-                0 if usage_raw is None else usage_raw.output_tokens_details.reasoning_tokens
-            ),
+            output_tokens=counters.output_tokens,
+            output_tokens_reasoning=counters.output_tokens_details.reasoning_tokens,
             provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         ),
         usage_raw=usage_raw,

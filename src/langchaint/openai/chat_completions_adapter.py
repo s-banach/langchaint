@@ -580,16 +580,15 @@ def _billing_from_chat_completion(
     """
     service_tier = _priced_tier(completion.service_tier)
     usage_raw = completion.usage
-    input_tokens_total = 0 if usage_raw is None else usage_raw.prompt_tokens
+    counters = usage_raw or CompletionUsage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
+    input_tokens_total = counters.prompt_tokens
     rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)
     provider_executed_tool_cost_in_usd = (
         float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
-    prompt_details = usage_raw.prompt_tokens_details if usage_raw is not None else None
-    completion_details = usage_raw.completion_tokens_details if usage_raw is not None else None
-    input_tokens_cache_read = (
-        input_tokens_cache_read_from_usage(usage_raw) if usage_raw is not None else 0
-    )
+    prompt_details = counters.prompt_tokens_details
+    completion_details = counters.completion_tokens_details
+    input_tokens_cache_read = input_tokens_cache_read_from_usage(counters)
     input_tokens_cache_write = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
@@ -602,7 +601,7 @@ def _billing_from_chat_completion(
             input_tokens_cache_none=input_tokens_total
             - input_tokens_cache_read
             - input_tokens_cache_write,
-            output_tokens=usage_raw.completion_tokens if usage_raw is not None else 0,
+            output_tokens=counters.completion_tokens,
             output_tokens_reasoning=(
                 completion_details.reasoning_tokens or 0 if completion_details is not None else 0
             ),
@@ -658,6 +657,8 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         OpenAI 3.42.1 documents explicit cache breakpoints for gpt-5.6-and-later models.
         `supports_cache_breakpoints` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
         `input_tokens_cache_read_from_usage` reads provider-specific cache-read counters.
+        A response without usage passes a new `CompletionUsage` with zero counters and no details.
+        The reader must return 0 for it.
         The default reads `prompt_tokens_details.cached_tokens`.
         `pricing` supplies rates and modifiers.
         `service_tier` requests a tier, while the reported tier selects pricing.

@@ -93,7 +93,6 @@ COHERE_BEDROCK_EMBEDDING_MODELS: frozenset[_CohereBedrockEmbeddingModelId] = (
 
 `CohereBedrock` also accepts each under a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix.
 """
-_COHERE_EMBED_V4_DIMENSIONS: frozenset[CohereEmbedV4Dimension] = frozenset({256, 512, 1024, 1536})
 _COHERE_INPUT_TYPE_BY_TASK: dict[EmbeddingTask, _CohereInputType] = {
     "retrieval_document": "search_document",
     "retrieval_query": "search_query",
@@ -111,7 +110,6 @@ _FLOAT_EMBEDDINGS: TypeAdapter[_CohereEmbeddings] = TypeAdapter(
     _CohereEmbeddings,
     config=ConfigDict(strict=True),
 )
-_DIMENSION_UNSET = object()
 
 
 def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
@@ -475,7 +473,7 @@ class CohereBedrock:
         self,
         model: str,
         *,
-        dimension: CohereEmbedV4Dimension | object = _DIMENSION_UNSET,
+        dimension: CohereEmbedV4Dimension | None = None,
         max_requests: int = 3,
         usd_per_million_tokens: float | None = None,
     ) -> EmbeddingModel:
@@ -484,14 +482,14 @@ class CohereBedrock:
         `model` is sent verbatim.
         An exact catalog identifier selects the model and its rate.
         Otherwise a `COHERE_BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped before the catalog lookups.
-        The type checker accepts `dimension` for a prefixed v3 identifier, which is typed as `str`.
+        The type checker accepts `dimension` for every v3 identifier, because the v4 overload accepts any `str`.
         V4 models default to 1536 dimensions.
         V3 models always return 1024 dimensions.
         `usd_per_million_tokens` prices input tokens and replaces the catalog rate.
         A NaN prefix multiplier makes the catalog rate NaN.
 
         Raises:
-            ValueError: `model`, `dimension`, or `max_requests` is invalid.
+            ValueError: `model` is not cataloged, `dimension` accompanies a v3 model, or `max_requests` is invalid.
         """
         resolution = resolve_bedrock_catalog_id(
             model,
@@ -500,11 +498,9 @@ class CohereBedrock:
         )
         is_embed_v4 = resolution.catalog_id in _COHERE_EMBED_V4_MODELS
         if is_embed_v4:
-            dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
-            if type(dimension) is not int or dimension not in _COHERE_EMBED_V4_DIMENSIONS:
-                raise ValueError(f"dimension is invalid for Cohere Embed v4: {dimension!r}")
+            dimension = 1536 if dimension is None else dimension
         elif resolution.catalog_id in _COHERE_EMBED_V3_MODELS:
-            if dimension is not _DIMENSION_UNSET:
+            if dimension is not None:
                 raise ValueError("Cohere Embed v3 accepts no dimension argument")
             dimension = 1024
         else:

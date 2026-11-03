@@ -3,6 +3,8 @@
 Subclass `AdapterConformance` and implement its fixture methods.
 The inherited tests validate each neutral adapter invariant against SDK response objects.
 Return degenerate fixtures for unsupported capabilities so each invariant still runs.
+Where a fixture method permits `None`, returning `None` skips the tests that need that fixture.
+Importing this module requires pytest.
 """
 
 import asyncio
@@ -10,6 +12,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
+import pytest
 from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
@@ -155,6 +158,7 @@ class AdapterConformance(ABC):
         """Construct a finished SDK response with separate complete text parts in order.
 
         Return `None` when the provider represents response text as one string.
+        Tests that need separate text parts then skip.
 
         Args:
             texts: The complete text parts, including empty text.
@@ -188,7 +192,7 @@ class AdapterConformance(ABC):
         Beside it, include at least one other AssistantPart.
         Each AssistantPart must map to one wire part.
         Return None when one wire message holds the whole assistant message.
-        Such a wire has no RawPart position.
+        Such a wire has no RawPart position, so the RawPart test skips.
         Returning None on a part-based wire hides a dropped RawPart.
         """
         ...
@@ -295,7 +299,7 @@ class AdapterConformance(ABC):
         """
         response = self.response_with_raw_part()
         if response is None:
-            return
+            pytest.skip("One wire message holds the whole assistant message.")
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(response)
         assert outcome.kind == "usable_response"
@@ -377,7 +381,7 @@ class AdapterConformance(ABC):
         for earlier in ("Checking the temperature.", '{"city":"Nairobi","celsius":25}'):
             raw = self.response_with_text_parts((earlier, final))
             if raw is None:
-                return
+                pytest.skip("The provider represents response text as one string.")
             text_outcome = self._bound_adapter().interpret(raw)
             assert text_outcome.kind == "usable_response"
             assert text_outcome.output == final
@@ -398,7 +402,7 @@ class AdapterConformance(ABC):
         for final in ("Invalid final answer", ""):
             raw = self.response_with_text_parts((earlier, final))
             if raw is None:
-                return
+                pytest.skip("The provider represents response text as one string.")
             outcome = bound.interpret(raw)
             assert outcome.kind == "schema_violation"
             assert outcome.validation_error_json == _validation_error_json(_WeatherReport, final)

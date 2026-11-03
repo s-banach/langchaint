@@ -90,7 +90,7 @@ class CutOffRequestRecord(RequestRecord):
     """
 
     started_after_seconds: _NonnegativeFiniteFloat
-    first_item_after_seconds: _NonnegativeFiniteFloat | None = None
+    first_item_after_seconds: _NonnegativeFiniteFloat | None
     billing: Billing | None
     kind: Literal["cut_off"] = "cut_off"
 

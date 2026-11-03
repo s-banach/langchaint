@@ -224,7 +224,9 @@ def test_less_than_or_ulp_close_accepts_the_documented_rounding_boundary() -> No
         ((_settled(),), 0.5, "within the request history"),
         (
             (
-                CutOffRequestRecord(started_after_seconds=0.0, billing=None),
+                CutOffRequestRecord(
+                    started_after_seconds=0.0, first_item_after_seconds=None, billing=None
+                ),
                 _settled(started_after_seconds=1.0),
             ),
             2.0,
@@ -262,7 +264,12 @@ def test_response_record_round_trips_with_concrete_output_type() -> None:
     ("request_record", "match"),
     [
         (_settled(billing=None), "final request must contain billing"),
-        (CutOffRequestRecord(started_after_seconds=0.0, billing=None), "cut-off"),
+        (
+            CutOffRequestRecord(
+                started_after_seconds=0.0, first_item_after_seconds=None, billing=None
+            ),
+            "cut-off",
+        ),
     ],
 )
 def test_generation_record_rejects_invalid_request_shapes(
@@ -408,7 +415,11 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, str]]:
         ),
     )
     terminal = _request_history(_settled(billing=None, assistant_message=None))
-    cut_off = _request_history(CutOffRequestRecord(started_after_seconds=0.0, billing=_BILLING))
+    cut_off = _request_history(
+        CutOffRequestRecord(
+            started_after_seconds=0.0, first_item_after_seconds=None, billing=_BILLING
+        )
+    )
     return [
         (
             PlainErrorRecord(kind="retries_exhausted_error", request_history=multiline_failed),
@@ -642,7 +653,9 @@ def test_to_tables_emits_one_row_for_a_cut_off_request() -> None:
     record = PlainErrorRecord(
         kind="timed_out_error",
         request_history=_request_history(
-            CutOffRequestRecord(started_after_seconds=0.25, billing=_BILLING)
+            CutOffRequestRecord(
+                started_after_seconds=0.25, first_item_after_seconds=None, billing=_BILLING
+            )
         ),
     )
     tables = to_tables(record)

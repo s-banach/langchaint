@@ -23,11 +23,11 @@ _NEVER = float("-inf")
 
 
 def _random_up_to(ceiling: float, draw: float) -> float:
-    """Map `draw` from `[0, 1)` to a wait between the smallest positive float and `ceiling`.
+    """Map `draw` from `[0, 1)` to a wait at most `ceiling`.
 
     Callers pass `random.random()` as `draw` and a positive finite `ceiling`.
     """
-    return max(math.ulp(0.0), ceiling * (1.0 - draw))
+    return ceiling * (1.0 - draw)
 
 
 def _validated_positive_float(name: str, value: float) -> float:
@@ -475,7 +475,7 @@ class PrivateBackoff:
     def next_wait_seconds(self, retry_after_seconds: float | None) -> float:
         """Return one failure's wait in seconds, then grow the ceiling one step.
 
-        The wait is a positive random draw bounded by `_wait_ceiling`.
+        The wait is a random draw bounded by `_wait_ceiling`.
         `retry_after_seconds` raises that wait when present.
         The normalized `retry_after_seconds` is capped at `max_wait_seconds`.
         """

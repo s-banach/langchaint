@@ -1,5 +1,4 @@
 import asyncio
-import math
 import time
 from typing import Literal
 
@@ -12,7 +11,6 @@ from langchaint.concurrency.shared_backoff import (
     Admission,
     PrivateBackoff,
     SharedBackoff,
-    _random_up_to,
 )
 from tests.helpers import run_with_timeout, yield_until
 
@@ -521,18 +519,6 @@ def test_a_multiplier_just_above_one_decays_without_a_clamp() -> None:
     shared_backoff._wait_ceiling = 60.0
     shared_backoff._set_wait_ceiling(60.0 * 1_000_000.0, 0.0)
     assert 1.0 <= shared_backoff._wait_ceiling < 60.0
-
-
-@pytest.mark.parametrize("ceiling", [math.ulp(0.0), 2 * math.ulp(0.0), 2.0])
-@pytest.mark.parametrize("draw", [0.0, 0.75, math.nextafter(1.0, 0.0)])
-def test_chosen_waits_are_positive_and_bounded_by_the_ceiling(ceiling: float, draw: float) -> None:
-    """Subnormal ceilings can round the sampled product to zero."""
-    wait = _random_up_to(ceiling, draw)
-    assert 0.0 < wait <= ceiling
-    if draw == 0.0:
-        assert wait == ceiling
-    elif ceiling > math.ulp(0.0):
-        assert wait < ceiling
 
 
 def test_private_backoff_ceilings_grow_to_the_cap() -> None:

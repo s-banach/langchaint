@@ -136,21 +136,35 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 _PAUSE_STATUSES = frozenset({429, 529})
 """429 rate_limit_error and 529 overloaded_error pause every request sharing the rate-limit quota."""
 
-_PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error"})
-"""The two _PAUSE_STATUSES error types, which pause at any status carrying them."""
+_PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error", "throttlingException"})
+"""The error types of 429 and 529, which pause at any status carrying them.
+
+`throttlingException` is Bedrock's 429 exception in a stream.
+"""
 
 _RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 503, 504})
 """One request's failure, retried without pausing siblings.
 
 500 api_error and 504 timeout_error come from the errors page.
-408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 0.120.2 _should_retry).
-503 is the status AsyncAnthropicBedrock raises ServiceUnavailableError for (anthropic 0.120.2).
+408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 2.4.0 _should_retry).
+503 is the status AsyncAnthropicBedrock raises ServiceUnavailableError for (anthropic 2.4.0).
 No errors page states that a Bedrock 503 throttles the rate-limit quota.
 It therefore retries without pausing every request.
 """
 
-_RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})
-"""The 500 and 504 error types, which retry at any status carrying them."""
+_RETRY_THIS_ONE_ERROR_TYPES = frozenset({
+    "api_error",
+    "timeout_error",
+    "modelTimeoutException",
+    "modelStreamErrorException",
+    "internalServerException",
+    "serviceUnavailableException",
+})
+"""The error types that retry at any status carrying them.
+
+`api_error` and `timeout_error` are the 500 and 504 error types.
+The others are Bedrock's 408, 424, 500, and 503 exceptions in a stream.
+"""
 
 _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
 """The statuses that reject this request. A resend fails again."""
@@ -984,7 +998,9 @@ def _anthropic_table_answers(error: anthropic.APIStatusError) -> tuple[bool, boo
     """Return whether one `APIStatusError` retries and whether it pauses the quota, by status and error type.
 
     Source: https://platform.claude.com/docs/en/api/errors, read 2026-08-01.
-    Error types override status because stream errors may carry the live response's 200 status.
+    Error types override status because stream errors carry the live response's 200 status.
+    AsyncAnthropicBedrock sets `.type` of each stream exception's APIStatusError to the ResponseStream variant name.
+    Sources: anthropic 2.4.0 `_stream_decoder` and botocore 1.43.123 bedrock-runtime `ResponseStream`.
     `_PAUSE_STATUSES` and `_PAUSE_ERROR_TYPES` retry and pause.
     `_RETRY_THIS_ONE_STATUSES` and `_RETRY_THIS_ONE_ERROR_TYPES` retry without a pause.
     Unlisted 5xx statuses retry without a pause.

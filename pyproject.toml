@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=1.0.0"]
-anthropic-bedrock = ["anthropic[bedrock]>=1.0.0"]
+anthropic = ["anthropic>=2.0.0"]
+anthropic-bedrock = ["anthropic[bedrock]>=2.0.0"]
 cohere-bedrock = ["boto3>=1.42", "numpy>=2.5.0"]
 deepseek = ["openai>=3.0.0"]
 gemini = ["google-genai>=2.18.0"]
@@ -37,7 +37,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "anthropic>=1.0.0",
+    "anthropic>=2.0.0",
     "coverage>=7.10.0",
     "numpy>=2.5.0",
     "openai>=3.0.0",

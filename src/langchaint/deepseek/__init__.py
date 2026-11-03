@@ -32,10 +32,7 @@ from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
 from langchaint.generation.observer import Observer
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
-from langchaint.openai.shared import (
-    OpenAIPricingTable,
-    client_without_retries,
-)
+from langchaint.openai.shared import OpenAIPricingTable
 
 type DeepSeekModelId = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
@@ -105,12 +102,8 @@ class DeepSeek:
                     f"client is None and {_API_KEY_ENVIRONMENT_VARIABLE} is unset; set it, or pass "
                     f"client=AsyncOpenAI(base_url={_DEEPSEEK_BASE_URL!r}, api_key=...)."
                 )
-            client = AsyncOpenAI(
-                base_url=_DEEPSEEK_BASE_URL,
-                api_key=api_key,
-                max_retries=0,
-            )
-        self.client: AsyncOpenAI = client_without_retries(client)
+            client = AsyncOpenAI(base_url=_DEEPSEEK_BASE_URL, api_key=api_key)
+        self.client: AsyncOpenAI = client
 
     @overload
     def llm(

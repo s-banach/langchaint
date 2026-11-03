@@ -57,7 +57,6 @@ from langchaint.openai.shared import (
     OpenAIPricingTable,
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
-    client_without_retries,
 )
 
 if TYPE_CHECKING:
@@ -103,9 +102,7 @@ class OpenAI:
         """
         self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
-        self.client: AsyncOpenAI = (
-            client_without_retries(client) if client is not None else AsyncOpenAI(max_retries=0)
-        )
+        self.client: AsyncOpenAI = client if client is not None else AsyncOpenAI()
 
     @overload
     def llm(
@@ -326,9 +323,7 @@ class OpenAIBedrock:
         self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.client: AsyncBedrockOpenAI = (
-            client_without_retries(client)
-            if client is not None
-            else AsyncBedrockOpenAI(aws_region=aws_region, max_retries=0)
+            client if client is not None else AsyncBedrockOpenAI(aws_region=aws_region)
         )
 
     def llm(

@@ -27,7 +27,6 @@ from tests.helpers import in_memory_tracer_provider, run_with_timeout
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key="offline",
-        max_retries=0,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
 

@@ -450,9 +450,14 @@ def test_openai_shares_client_and_shared_backoff() -> None:
     assert isinstance(terra.adapter, OpenAIResponsesAdapter)
     assert isinstance(sol.adapter, OpenAIResponsesAdapter)
     assert isinstance(embedding_model._adapter, _OpenAIEmbeddingAdapter)
-    assert terra.adapter.client is openai.client
-    assert sol.adapter.client is openai.client
-    assert embedding_model._adapter.client is openai.client
+    assert openai.client is client
+    for adapter_client in (
+        terra.adapter.client,
+        sol.adapter.client,
+        embedding_model._adapter.client,
+    ):
+        assert adapter_client.max_retries == 0
+        assert adapter_client._client is client._client
     assert terra.shared_backoff is shared_backoff
     assert sol.shared_backoff is shared_backoff
     assert embedding_model._shared_backoff is shared_backoff

@@ -24,6 +24,7 @@ from langchaint.embedding import (
 )
 from langchaint.openai.shared import (
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
+    client_without_retries,
     openai_request_failure,
 )
 
@@ -70,6 +71,8 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
     def __init__(self, *, client: AsyncOpenAI, model: str, dimension: int) -> None:
         """Store one client, cataloged model, and validated output dimension.
 
+        The stored client disables SDK retries.
+
         Raises:
             ValueError: The client reaches another known provider.
         """
@@ -79,7 +82,7 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
             provider_name=self.provider_name,
             provider_name_by_client_class=PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
         )
-        self.client = client
+        self.client: AsyncOpenAI = client_without_retries(client)
         self.model = model
         self.dimension = dimension
 

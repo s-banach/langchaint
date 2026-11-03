@@ -55,7 +55,6 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicRates,
     AnthropicServiceTier,
     CacheTTL,
-    client_without_retries,
 )
 from langchaint.common.bedrock import BedrockCatalogResolution, resolve_bedrock_catalog_id
 from langchaint.concurrency.shared_backoff import SharedBackoff
@@ -112,9 +111,7 @@ class Anthropic:
         """
         self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
-        self.client: AsyncAnthropic = (
-            client_without_retries(client) if client is not None else AsyncAnthropic(max_retries=0)
-        )
+        self.client: AsyncAnthropic = client if client is not None else AsyncAnthropic()
 
     @overload
     def llm(
@@ -231,9 +228,9 @@ class AnthropicBedrock:
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.apply_cross_region_multiplier: bool = apply_cross_region_multiplier
         self.client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle = (
-            client_without_retries(client)
+            client
             if client is not None
-            else client_class(aws_region=aws_region, http_client=http_client, max_retries=0)
+            else client_class(aws_region=aws_region, http_client=http_client)
         )
 
     def llm(

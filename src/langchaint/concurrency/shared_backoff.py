@@ -105,11 +105,7 @@ class Admission:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> Literal[False]:
-        """Return the permit.
-
-        Raises:
-            BaseException: The admitted block raises it.
-        """
+        """Return the permit."""
         self._release()
         return False
 

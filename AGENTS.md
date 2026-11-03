@@ -9,12 +9,14 @@ Keep AGENTS.md to cross-module principles and architecture required to edit lang
 Put symbol behavior in the implementing code's docstring.
 Never cite internal documents, design deliberation, dead alternatives, or prior code.
 State current behavior and its reason without requiring historical context.
-Document each exception relevant to the public interface and its condition in `Raises:`, regardless of where it originates.
+List in `Raises:` each exception that a public function or method raises, with its condition, wherever the exception originates.
+Omit an exception that propagates unchanged from a function the caller supplied.
 Omit incidental exceptions and source details that do not affect caller handling.
 Verify an SDK fact from the installed SDK before writing dependent code.
 Put a verified SDK fact only in a docstring where the caller acts on the outcome.
 Include the SDK version when an SDK fact can drift.
-Document every public parameter and cross-provider difference.
+Document every cross-provider difference.
+Document a public parameter exactly when its name and type leave its meaning or a constraint unclear.
 
 ## Terms
 

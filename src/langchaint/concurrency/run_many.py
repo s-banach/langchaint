@@ -35,15 +35,10 @@ async def run_many[OutputT](
     A failure cancels and settles pending tasks before propagating.
     Concurrent failures propagate by the lowest input index.
 
-    Args:
-        run_ones: The zero-argument async callables to run.
-        max_pending: The pending-task bound, or `None` to start every callable concurrently.
-
     Raises:
         ValueError: `max_pending` is boolean or below one.
         TypeError: A `run_one` returns a non-coroutine.
         asyncio.CancelledError: The caller cancels this function.
-        BaseException: A `run_one` raises it.
     """
     # Reject `bool` explicitly because it subclasses `int`.
     if max_pending is not None and (isinstance(max_pending, bool) or max_pending < 1):

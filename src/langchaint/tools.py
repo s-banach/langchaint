@@ -213,12 +213,8 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     async def validate_and_run(self, args_json: str) -> ToolReturn[AppDataT]:
         """Validate `args_json` with `args_model`, then run `function`.
 
-        Args:
-            args_json: The model-generated argument JSON.
-
         Raises:
             InvalidToolArgsError: `args_json` fails validation.
-            BaseException: `function` raises it.
         """
         try:
             args = self.args_model.model_validate_json(args_json)
@@ -232,12 +228,6 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         """Return a handled call or its argument-validation failure.
 
         The caller must match `tool_call.name` before calling this method.
-
-        Args:
-            tool_call: The tool call to dispatch.
-
-        Raises:
-            BaseException: `function` raises it.
         """
         try:
             args = self.args_model.model_validate_json(tool_call.args_json)
@@ -345,9 +335,6 @@ class CaptureTool[CapturedT: BaseModel]:
         """Validate `tool_call.args_json` and return its capture or failure.
 
         The caller must match `tool_call.name` before calling this method.
-
-        Args:
-            tool_call: The tool call to validate.
         """
         try:
             captured = self.args_model.model_validate_json(tool_call.args_json)
@@ -361,11 +348,7 @@ class CaptureTool[CapturedT: BaseModel]:
     async def dispatch(
         self, tool_call: ToolCall
     ) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
-        """Return `capture` as `DispatchHandled.app_data` after validation.
-
-        Args:
-            tool_call: The tool call to dispatch.
-        """
+        """Return `capture` as `DispatchHandled.app_data` after validation."""
         outcome = await self.capture(tool_call)
         match outcome.kind:
             case "captured":
@@ -407,12 +390,6 @@ class JSONSchemaTool[AppDataT = None]:
         """Validate `tool_call.args_json`, then run `function`.
 
         Validation failures skip `function`.
-
-        Args:
-            tool_call: The tool call to dispatch.
-
-        Raises:
-            BaseException: `function` raises it.
         """
         try:
             args = _ARGS_OBJECT.validate_json(tool_call.args_json)
@@ -442,14 +419,7 @@ class Tool[AppDataT](Protocol):
     async def dispatch(
         self, tool_call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Run this tool on `tool_call` and wrap the outcome.
-
-        Args:
-            tool_call: The tool call to dispatch.
-
-        Raises:
-            BaseException: The tool implementation raises it.
-        """
+        """Run this tool on `tool_call` and wrap the outcome."""
         ...
 
 
@@ -601,12 +571,6 @@ class ToolManager:
 
         The observer follows the dispatch and is current while the tool function runs.
         An observer failure is logged and never reaches the caller.
-
-        Args:
-            tool_call: The tool call to dispatch.
-
-        Raises:
-            BaseException: The matched tool raises it.
         """
         operation = (
             UNOBSERVED_OPERATION
@@ -626,11 +590,7 @@ class ToolManager:
             operation.end()
 
     async def _dispatch_unobserved(self, tool_call: ToolCall) -> DispatchOutcome:
-        """Run the matched tool, or return `DispatchUnknownTool`.
-
-        Raises:
-            BaseException: The matched tool raises it.
-        """
+        """Run the matched tool, or return `DispatchUnknownTool`."""
         tool = self._tools.get(tool_call.name)
         if tool is None:
             tool_message = ToolMessage.error(
@@ -650,17 +610,13 @@ class ToolManager:
 
         `precomputed` runs for every call before any tool function starts.
         A returned `ToolMessage` skips that call's dispatch.
-
-        Args:
-            tool_calls: The tool calls to dispatch.
-            precomputed: The optional function that supplies a `ToolMessage` without dispatch.
+        After every call settles, `dispatch_many` raises the first non-`Exception` value in `tool_calls` order.
+        When other tool functions raise `Exception` values, its cause is their `DispatchExceptionGroup`.
 
         Raises:
             ValueError: `precomputed` returns a `ToolMessage` for another `tool_call_id`.
-            DispatchExceptionGroup: Tool functions raise `Exception` values after sibling calls settle.
+            DispatchExceptionGroup: Tool functions raise only `Exception` values, after sibling calls settle.
             asyncio.CancelledError: The caller cancels this function after sibling calls settle.
-            BaseException: `precomputed` raises it before any tool function starts.
-            BaseException: A tool function raises a non-`Exception` value after every call settles.
         """
         tasks = [
             asyncio.ensure_future(self.dispatch(x) if x.kind == "tool_call" else _resolved(x))

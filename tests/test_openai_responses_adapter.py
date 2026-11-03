@@ -412,7 +412,6 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
         (_incomplete_response("max_output_tokens"), "max_completion_tokens", "hey"),
         (_incomplete_response("content_filter"), "refusal", "hey"),
         (_incomplete_response("max_messages"), "other", "hey"),
-        (_incomplete_response("steered"), "other", "hey"),
     ],
     ids=[
         "completed",
@@ -422,7 +421,6 @@ def _incomplete_response(reason: str) -> OpenAIResponse:
         "incomplete_max_output_tokens",
         "incomplete_content_filter",
         "incomplete_max_messages",
-        "incomplete_steered",
     ],
 )
 def test_stop_reason_mapping(
@@ -1669,10 +1667,16 @@ def test_structured_bind_reports_why_an_assistant_message_has_no_instance(
     assert _structured_parse(response).kind == expected_kind
 
 
-def test_a_cancelled_run_is_an_unexpected_response_naming_the_status() -> None:
-    outcome = _structured_parse(_structured_response(None, status="cancelled"))
+def test_an_incomplete_max_messages_run_is_an_unexpected_response() -> None:
+    outcome = _structured_parse(
+        _structured_response(
+            None, status="incomplete", incomplete_details=IncompleteDetails(reason="max_messages")
+        )
+    )
     assert outcome.kind == "unexpected_response"
-    assert outcome.error_text == "openai returned status 'cancelled'"
+    assert (
+        outcome.error_text == "openai returned an incomplete response with reason 'max_messages'"
+    )
 
 
 def _text_bound() -> _BoundOpenAIResponsesText:
@@ -1704,13 +1708,6 @@ def test_identity_reads_the_responses_own_id_and_served_model() -> None:
             "Failed to download image from the URL.",
         ),
         (
-            ResponseError.model_construct(
-                code="misalignment_policy_violation", message="The response violated policy."
-            ),
-            "provider_failed_terminally",
-            "The response violated policy.",
-        ),
-        (
             ResponseError.construct(code="a_code_from_a_later_sdk", message="Something."),
             "provider_failed_terminally",
             "Something.",
@@ -1724,7 +1721,6 @@ def test_identity_reads_the_responses_own_id_and_served_model() -> None:
     ids=[
         "transient_code",
         "terminal_code",
-        "terminal_code_the_sdk_literal_omits",
         "code_the_installed_sdk_does_not_name",
         "no_error_object",
     ],

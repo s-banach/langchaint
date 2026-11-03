@@ -498,12 +498,9 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
         return "tool_call"
     if response.status == "completed":
         return "stop"
-    if response.status != "incomplete" or response.incomplete_details is None:
+    if response.incomplete_details is None or response.incomplete_details.reason is None:
         return "other"
-    reason = response.incomplete_details.reason
-    if reason is None:
-        return "other"
-    return _STOP_REASON_BY_INCOMPLETE_REASON.get(reason, "other")
+    return _STOP_REASON_BY_INCOMPLETE_REASON.get(response.incomplete_details.reason, "other")
 
 
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
@@ -1089,7 +1086,7 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
         Refusal and truncation take precedence over validation.
         Completed text with `validation_error` returns `SchemaViolation`.
         Completed output without text returns `EmptyAssistantMessage`.
-        Other statuses return `UnexpectedResponse`.
+        An incomplete response for any other reason returns `UnexpectedResponse`.
         Every variant carries `assistant_message`.
         """
         if _normalized_stop_reason(response) == "refusal":
@@ -1107,8 +1104,11 @@ class _BoundOpenAIResponsesStructured[ModelT: BaseModel](_BoundOpenAIResponses[M
                     assistant_message=assistant_message,
                 )
             return EmptyAssistantMessage(assistant_message=assistant_message)
+        reason = (
+            None if response.incomplete_details is None else response.incomplete_details.reason
+        )
         return UnexpectedResponse(
-            error_text=f"openai returned status {response.status!r}",
+            error_text=f"openai returned an incomplete response with reason {reason!r}",
             assistant_message=assistant_message,
         )
 

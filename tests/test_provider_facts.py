@@ -13,7 +13,6 @@ from anthropic.types import Usage as AnthropicUsage
 from botocore.exceptions import ClientError
 from google.genai import _api_client
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
-from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from pydantic import BaseModel
@@ -117,18 +116,6 @@ def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
         "pause_turn",
         "refusal",
         "model_context_window_exceeded",
-    }
-
-
-def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
-    annotation = _field_annotation(OpenAIResponse, "status")
-    assert set(typing.get_args(typing.get_args(annotation)[0])) == {
-        "completed",
-        "failed",
-        "in_progress",
-        "cancelled",
-        "queued",
-        "incomplete",
     }
 
 

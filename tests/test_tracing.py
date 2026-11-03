@@ -1232,8 +1232,7 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
             FakeAdapter(),
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
-                capture_message_content=True,
-                content_filter=content_filter,
+                capture_message_content=content_filter,
             ),
         )
         await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
@@ -1281,8 +1280,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         )
         observer = OtelObserver(
             tracer_provider=tracer_provider,
-            capture_message_content=True,
-            content_filter=_scrub_marker,
+            capture_message_content=_scrub_marker,
         )
         llm = LLM(
             FakeAdapter(
@@ -1390,8 +1388,7 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
             FakeAdapter(),
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
-                capture_message_content=True,
-                content_filter=content_filter,
+                capture_message_content=content_filter,
             ),
         )
         bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
@@ -1435,8 +1432,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
             [_echo_tool()],
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
-                capture_message_content=True,
-                content_filter=text_for_tool_call,
+                capture_message_content=text_for_tool_call,
             ),
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):

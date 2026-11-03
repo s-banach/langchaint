@@ -31,7 +31,7 @@ An execute_tool span's attribute groups are `gen_ai.tool.call.arguments` and the
 An embeddings span has one attribute group, its request record's attributes.
 `error.type` follows the attribute groups.
 A key of a later attribute group replaces a matching earlier key.
-A `content_filter` that raises or returns a part of another kind is logged, and its attribute group is omitted.
+A `ContentFilter` that raises or returns a part of another kind is logged, and its attribute group is omitted.
 Each span kind's attribute transform, such as `chat_attribute_transform`, edits the attributes when the span ends.
 Each transform receives the outcome and every attribute, including the start attributes.
 The span records the returned attributes, and a returned key replaces the attribute of the same name.
@@ -75,7 +75,7 @@ import json
 import logging
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Literal, overload
+from typing import overload
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -710,34 +710,10 @@ class OtelObserver:
     A chat span's duration includes request admission and backoff between requests.
     """
 
-    @overload
     def __init__(
         self,
         *,
-        capture_message_content: Literal[True],
-        content_filter: ContentFilter | None = None,
-        chat_attribute_transform: ChatAttributeTransform | None = None,
-        execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
-        embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
-        extra_attributes: SpanAttributes | None = None,
-        tracer_provider: TracerProvider | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        *,
-        capture_message_content: bool,
-        chat_attribute_transform: ChatAttributeTransform | None = None,
-        execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
-        embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
-        extra_attributes: SpanAttributes | None = None,
-        tracer_provider: TracerProvider | None = None,
-    ) -> None: ...
-    def __init__(
-        self,
-        *,
-        capture_message_content: bool,
-        content_filter: ContentFilter | None = None,
+        capture_message_content: bool | ContentFilter,
         chat_attribute_transform: ChatAttributeTransform | None = None,
         execute_tool_attribute_transform: ExecuteToolAttributeTransform | None = None,
         embeddings_attribute_transform: EmbeddingsAttributeTransform | None = None,
@@ -747,12 +723,13 @@ class OtelObserver:
         """Resolve the tracer once, at construction.
 
         `capture_message_content` has no default because content capture affects privacy.
+        `capture_message_content=False` records no message content.
         `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant messages.
         It also records tool arguments and tool results.
-        `content_filter` decides per part what those attributes record.
-        `content_filter` never sees `gen_ai.tool.definitions`, because a tool schema is not a message part.
-        The overloads accept `content_filter` only with `capture_message_content=True`.
-        `content_filter=None` records every part unchanged, including image and audio bytes.
+        It records every part unchanged, including image and audio bytes.
+        A `ContentFilter` passed as `capture_message_content` selects the same attributes.
+        Each of them records the parts the filter returns.
+        The filter never sees `gen_ai.tool.definitions`, because a tool schema is not a message part.
         A filter that keeps everything except inline bytes:
 
             def drop_binary(name: str, part: ContentPart | AssistantPart) -> ContentPart | AssistantPart | None:
@@ -781,12 +758,12 @@ class OtelObserver:
             embeddings_attribute_transform or _keep_every_attribute
         )
         self._extra_attributes = extra_attributes or {}
-        self._content_filter = (
+        self._content_filter: ContentFilter | None = (
             None
-            if not capture_message_content
+            if capture_message_content is False
             else _record_every_part
-            if content_filter is None
-            else content_filter
+            if capture_message_content is True
+            else capture_message_content
         )
 
     def generation_started(
@@ -825,7 +802,7 @@ class OtelObserver:
         The identity attributes are gen_ai.operation.name, gen_ai.tool.name, gen_ai.tool.type, and gen_ai.tool.call.id.
         gen_ai.tool.type is "function", the convention's type for a tool the client application executes.
         With capture on, gen_ai.tool.call.arguments is built when the span starts, and the span records it when it ends.
-        `content_filter` sees the `ToolCall` under gen_ai.tool.call.arguments.
+        A `ContentFilter` sees the `ToolCall` under gen_ai.tool.call.arguments.
         It sees each `ToolMessage` content part under gen_ai.tool.call.result.
         gen_ai.tool.call.arguments uses best-effort JSON deserialization.
         Unparseable text is preserved as a quoted JSON string.

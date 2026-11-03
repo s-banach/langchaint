@@ -890,6 +890,27 @@ def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
     assert _collected_items(_text_stream_chunks()) == ["he", "y"]
 
 
+def test_stream_skips_azure_content_filter_annotation_chunks() -> None:
+    annotation = construct_type_unchecked(
+        value={
+            "id": "",
+            "object": "",
+            "created": 0,
+            "model": "",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": None,
+                    "content_filter_results": {"hate": {"filtered": False, "severity": "safe"}},
+                }
+            ],
+        },
+        type_=ChatCompletionChunk,
+    )
+    first, *rest = _text_stream_chunks()
+    assert _collected_items([first, annotation, *rest]) == ["he", "y"]
+
+
 def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -> None:
     stream = _stream([
         _chunk(delta={"role": "assistant", "reasoning_content": "part a"}),

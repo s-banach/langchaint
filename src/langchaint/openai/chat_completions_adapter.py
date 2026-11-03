@@ -752,7 +752,12 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         """Iterate the SDK stream, rewrapping its mid-stream error raise for openai_request_failure.
 
         Yields:
-            Every chunk the SDK stream yields.
+            Every chunk whose `object` is `chat.completion.chunk`.
+            Azure also sends content-filter annotation chunks with an empty `object`, `id`, and `model`.
+            Its first chunk carries prompt-filter results, and its asynchronous filter sends choices without `delta`.
+            `ChatCompletionStreamState` would take an empty id and model from the first.
+            It raises `AttributeError` on the second.
+            The SDK's own stream helper skips them too (openai 3.42.1 `_is_valid_chat_completion_chunk_weak`).
 
         Raises:
             openai.APIStatusError: An SSE payload contains an error object.
@@ -773,7 +778,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
                         body=error.body,
                     ) from error
                 raise
-            yield chunk
+            if chunk.object == "chat.completion.chunk":
+                yield chunk
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:

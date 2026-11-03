@@ -511,15 +511,12 @@ class EmbeddingModel:
             task: The embedding purpose to send to the provider.
 
         Raises:
-            TypeError: `inputs` is a bare `str`.
             ValueError: An input cannot form a provider request.
             EmbeddingError: A request batch failed.
             asyncio.CancelledError: The caller cancelled this operation.
             Exception: Adapter preparation failed, such as creating the Bedrock client.
                 Also raised when the adapter's `request_failure` raises.
         """
-        if isinstance(inputs, str):
-            raise TypeError("inputs is a bare str; wrap one input in a list")
         embed_started_at = time.monotonic()
         input_snapshot = tuple(inputs)
         if not input_snapshot:

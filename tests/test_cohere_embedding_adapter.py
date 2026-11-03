@@ -270,35 +270,56 @@ def test_a_429_pauses_the_quota_only_for_the_service_model_throttling_error(
     )
 
 
-@pytest.mark.parametrize(
-    ("model", "body_target_bytes", "body_limit_bytes", "input_length"),
-    [
-        pytest.param("cohere.embed-v4:0", 500, 2000, 300, id="v4-local-target"),
-        pytest.param("cohere.embed-english-v3", 500, 1000, 500, id="v3-body-limit"),
-    ],
-)
-@_run_async_test
-async def test_request_body_size_splits_before_the_next_input(
-    monkeypatch: pytest.MonkeyPatch,
-    model: str,
-    body_target_bytes: int,
-    body_limit_bytes: int,
-    input_length: int,
+@pytest.mark.parametrize("texts", [("ab", "cd"), ("\u00e9", 'q"\n')])
+def test_request_body_size_splits_before_the_input_that_passes_the_target(
+    texts: tuple[str, str],
 ) -> None:
-    monkeypatch.setattr(cohere_backend, "_COHERE_V4_BODY_TARGET_BYTES", body_target_bytes)
-    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", body_limit_bytes)
-    client = _bedrock_client()
-    try:
-        cohere_bedrock = CohereBedrock(client=client)
-        embedding_model = cohere_bedrock.embedding_model(model)
-        texts = ("x" * input_length, "y" * input_length)
-        batches = await embedding_model._adapter.partition_inputs(
-            texts,
-            task="retrieval_document",
+    def body_bytes(batch: tuple[str, ...]) -> int:
+        return len(
+            _request_body({
+                "texts": list(batch),
+                "input_type": "search_document",
+                "embedding_types": ["float"],
+                "truncate": "NONE",
+            })
         )
-        assert batches == ((texts[0],), (texts[1],))
-    finally:
-        client.close()
+
+    whole_body_bytes = body_bytes(texts)
+
+    def partitioned(target_body_bytes: int) -> tuple[tuple[str, ...], ...]:
+        return cohere_backend._partitioned_by_body_size(
+            texts,
+            empty_body_bytes=body_bytes(()),
+            max_inputs=cohere_backend._COHERE_MAX_INPUTS,
+            target_body_bytes=target_body_bytes,
+            max_body_bytes=whole_body_bytes,
+        )
+
+    assert partitioned(whole_body_bytes) == (texts,)
+    assert partitioned(whole_body_bytes - 1) == ((texts[0],), (texts[1],))
+
+
+@pytest.mark.parametrize("texts", [("x" * 10,), ("s", "x" * 10)])
+def test_an_input_whose_body_alone_passes_the_limit_is_rejected(texts: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="body limit"):
+        _ = cohere_backend._partitioned_by_body_size(
+            texts,
+            empty_body_bytes=2,
+            max_inputs=cohere_backend._COHERE_MAX_INPUTS,
+            target_body_bytes=8,
+            max_body_bytes=13,
+        )
+
+
+def test_an_input_whose_body_alone_reaches_the_limit_is_accepted() -> None:
+    texts = ("x" * 10,)
+    assert cohere_backend._partitioned_by_body_size(
+        texts,
+        empty_body_bytes=2,
+        max_inputs=cohere_backend._COHERE_MAX_INPUTS,
+        target_body_bytes=8,
+        max_body_bytes=14,
+    ) == (texts,)
 
 
 @_run_async_test
@@ -345,14 +366,11 @@ async def test_batching_uses_ninety_six_inputs() -> None:
         client.close()
 
 
-@pytest.mark.parametrize("inputs", [("x" * 200,), ("small", "x" * 200)])
 @_run_async_test
-async def test_oversized_singleton_fails_before_client_creation(
+async def test_oversized_input_fails_before_client_creation(
     monkeypatch: pytest.MonkeyPatch,
-    inputs: tuple[str, ...],
 ) -> None:
-    monkeypatch.setattr(cohere_backend, "_COHERE_V4_BODY_TARGET_BYTES", 150)
-    monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 200)
+    inputs = ("x" * cohere_backend._INVOKE_MODEL_MAX_BODY_BYTES,)
     creation_calls = 0
 
     def create_client(

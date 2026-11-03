@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from functools import partial
 from typing import TYPE_CHECKING, Literal, overload, override
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
@@ -158,6 +159,48 @@ def _require_one_sdk_request(client: BedrockRuntimeClient) -> None:
         raise ValueError("client.meta.config.retries must set total_max_attempts to 1")
 
 
+def _json_bytes(value: object) -> bytes:
+    """Serialize `value` as the compact UTF-8 JSON that request bodies use."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _partitioned_by_body_size(
+    inputs: tuple[str, ...],
+    *,
+    empty_body_bytes: int,
+    max_inputs: int,
+    target_body_bytes: int,
+    max_body_bytes: int,
+) -> tuple[tuple[str, ...], ...]:
+    """Partition inputs in order into batches of at most `max_inputs` whose body stays within `target_body_bytes`.
+
+    `empty_body_bytes` is the size of the request body with an empty `texts` array.
+    A batch body adds each input's JSON string bytes and one comma between inputs.
+    An input whose body alone exceeds `target_body_bytes` forms its own batch.
+
+    Raises:
+        ValueError: One input's body alone exceeds `max_body_bytes`.
+    """
+    batches: list[tuple[str, ...]] = []
+    batch: list[str] = []
+    batch_body_bytes = empty_body_bytes
+    for input_text in inputs:
+        input_bytes = len(_json_bytes(input_text))
+        if empty_body_bytes + input_bytes > max_body_bytes:
+            raise ValueError("A Cohere input exceeds InvokeModel's body limit")
+        if batch and (
+            len(batch) == max_inputs or batch_body_bytes + 1 + input_bytes > target_body_bytes
+        ):
+            batches.append(tuple(batch))
+            batch = []
+            batch_body_bytes = empty_body_bytes
+        batch_body_bytes += input_bytes + (1 if batch else 0)
+        batch.append(input_text)
+    if batch:
+        batches.append(tuple(batch))
+    return tuple(batches)
+
+
 class _CohereBedrockClientCache:
     """Share one Bedrock Runtime client across embedding models."""
 
@@ -254,39 +297,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         }
         if self.is_embed_v4:
             payload["output_dimension"] = self.dimension
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode()
-
-    def _partition_inputs(
-        self, inputs: tuple[str, ...], task: EmbeddingTask
-    ) -> tuple[tuple[str, ...], ...]:
-        """Partition inputs under Cohere and InvokeModel limits.
-
-        Raises:
-            ValueError: One input exceeds InvokeModel's body limit.
-        """
-        batches: list[tuple[str, ...]] = []
-        current: tuple[str, ...] = ()
-        target_bytes = (
-            _COHERE_V4_BODY_TARGET_BYTES if self.is_embed_v4 else _INVOKE_MODEL_MAX_BODY_BYTES
-        )
-        for input_text in inputs:
-            candidate = (*current, input_text)
-            body_size_bytes = len(self._request_body(candidate, task=task))
-            if current and (len(candidate) > _COHERE_MAX_INPUTS or body_size_bytes > target_bytes):
-                batches.append(current)
-                current = (input_text,)
-                body_size_bytes = len(self._request_body(current, task=task))
-            else:
-                current = candidate
-            if len(current) == 1 and body_size_bytes > _INVOKE_MODEL_MAX_BODY_BYTES:
-                raise ValueError("A Cohere input exceeds InvokeModel's body limit")
-        if current:
-            batches.append(current)
-        return tuple(batches)
+        return _json_bytes(payload)
 
     @override
     async def prepare(self) -> None:
@@ -311,7 +322,20 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             ValueError: One input exceeds InvokeModel's body limit.
             asyncio.CancelledError: Cancellation follows completed partitioning.
         """
-        return await to_thread_cancellation_safe(lambda: self._partition_inputs(inputs, task))
+        return await to_thread_cancellation_safe(
+            partial(
+                _partitioned_by_body_size,
+                inputs,
+                empty_body_bytes=len(self._request_body((), task=task)),
+                max_inputs=_COHERE_MAX_INPUTS,
+                target_body_bytes=(
+                    _COHERE_V4_BODY_TARGET_BYTES
+                    if self.is_embed_v4
+                    else _INVOKE_MODEL_MAX_BODY_BYTES
+                ),
+                max_body_bytes=_INVOKE_MODEL_MAX_BODY_BYTES,
+            )
+        )
 
     def _invoke(
         self,

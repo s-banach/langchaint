@@ -428,7 +428,6 @@ class ToolCallResponse:
 
 
 type UsableResponse[OutputT] = PlainResponse[OutputT] | ToolCallResponse
-"""Every way reading a response can end when its assistant message is usable."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -625,7 +624,6 @@ Each variant has distinct retry-loop behavior.
 """
 
 type ResponseOutcome[OutputT] = UsableResponse[OutputT] | UnusableResponse
-"""Every way reading one response can end: a usable response, or the reason it is not usable."""
 
 
 @dataclass(frozen=True, kw_only=True)

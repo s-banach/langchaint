@@ -19,11 +19,8 @@ Document every public parameter and cross-provider difference.
 ## Terms
 
 - input: one value the application passes in to be handled: a `GenerationInput`, or one text passed to `EmbeddingModel.embed`.
-- output: what application code reads from a finished assistant message.
-- usable: an assistant message that gives output or has tool calls.
-- kept assistant message: the usable assistant message that ends handling an input.
-- generation: what handling a `GenerationInput` produces when it succeeds. `GenerationError` is its failure.
-- outcome: one way that handling a `GenerationInput`, reading one response, or dispatching a tool call ends. An `*Outcome` type is the union of them.
+- kept assistant message: the assistant message of a `Generation`.
+- outcome: one way that handling a `GenerationInput`, reading one response, or dispatching a tool call ends.
 - Use these terms, and never give one of these concepts a second name.
 
 ## Vocabulary

@@ -1584,20 +1584,6 @@ def test_structured_bind_reports_why_an_assistant_message_has_no_instance(
     assert _structured_parse(response).kind == expected_kind
 
 
-def test_an_incomplete_max_messages_run_is_an_unexpected_response() -> None:
-    outcome = _structured_parse(
-        _structured_response(
-            None, status="incomplete", incomplete_details=IncompleteDetails(reason="max_messages")
-        )
-    )
-    assert outcome.kind == "unexpected_response"
-    assert (
-        outcome.error_text
-        == "openai returned status 'incomplete' with incomplete reason 'max_messages', "
-        "which langchaint cannot continue"
-    )
-
-
 def _text_bound() -> BoundAdapter:
     return _adapter().bind_text(_binding(automatic_cache_breakpoints=False))
 

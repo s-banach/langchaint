@@ -612,8 +612,12 @@ def _json_output_span(texts: list[str]) -> OtelChatSpan:
 
 @pytest.mark.parametrize(
     ("texts", "output"),
-    [(["1", "2"], 2), (["Checking.", '{"answer":true}'], {"answer": True})],
-    ids=["earlier_valid_json", "commentary"],
+    [
+        (["1", "2"], 2),
+        (["Checking.", '{"answer":true}'], {"answer": True}),
+        (["Checking.", "null"], None),
+    ],
+    ids=["earlier_valid_json", "commentary", "null"],
 )
 def test_declared_json_output_validates_the_final_text_part(
     texts: list[str], output: JsonValue
@@ -625,10 +629,11 @@ def test_declared_json_output_validates_the_final_text_part(
 
 
 @pytest.mark.parametrize(
-    "texts", [["not json", " either"], ["1", "invalid"], ["1", ""], ['{"answer":', "true}"]]
+    "texts",
+    [["not json", " either"], ["1", "invalid"], ["1", ""], ['{"answer":', "true}"]],
 )
 def test_rejects_invalid_declared_json_output(texts: list[str]) -> None:
-    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
+    with pytest.raises(OtelToLangchaintConversionError, match="schema_violation"):
         _ = generation_record_from_otel(_json_output_span(texts))
 
 
@@ -668,14 +673,24 @@ def test_tool_calls_without_output_match_a_live_generation(
     assert len(record.assistant_message.content) == len(parts)
 
 
-def test_a_text_span_without_parts_reads_as_empty_output() -> None:
+@pytest.mark.parametrize(
+    ("finish_reason", "parts", "outcome_kind"),
+    [
+        ("stop", [], "empty_assistant_message"),
+        ("length", [_TOOL_CALL_OUTPUT_PART], "max_completion_tokens_exceeded"),
+        ("content_filter", [], "refusal"),
+    ],
+    ids=["no_parts", "length_at_a_final_tool_call", "refusal_without_text"],
+)
+def test_rejects_a_message_that_gives_no_generation(
+    finish_reason: str, parts: list[JsonValue], outcome_kind: str
+) -> None:
     span = _generation_chat_span({
-        "gen_ai.output.type": "text",
-        "gen_ai.output.messages": [{"role": "assistant", "parts": []}],
+        "gen_ai.response.finish_reasons": [finish_reason],
+        "gen_ai.output.messages": [{"role": "assistant", "parts": parts}],
     })
-    record = generation_record_from_otel(span)
-    assert record.kind == "plain"
-    assert record.output == ""
+    with pytest.raises(OtelToLangchaintConversionError, match=outcome_kind):
+        _ = generation_record_from_otel(span)
 
 
 def test_generation_record_rejects_unsupported_output_type() -> None:

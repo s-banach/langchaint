@@ -172,7 +172,7 @@ type CacheTTL = Literal["5m", "1h"]
 """Cache TTLs with write rates of 1.25x ("5m") or 2x ("1h") base input."""
 
 type AnthropicServiceTier = Literal["auto", "standard_only"]
-"""What a request may ask for (anthropic 0.120.0).
+"""What a request may ask for (anthropic 2.4.0).
 
 "auto" permits priority capacity when available or standard capacity otherwise.
 No request value selects priority capacity.
@@ -583,7 +583,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     A block from another provider passes through when it has a `type` key.
 
     Raises:
-        _RejectedMessagesError: `raw` lacks the `type` key required by anthropic 0.120.2 block parameters.
+        _RejectedMessagesError: `raw` lacks the `type` key required by anthropic 2.4.0 block parameters.
     """
     if "type" not in raw:
         raise _RejectedMessagesError(
@@ -1226,7 +1226,7 @@ class AnthropicMessagesAdapter(Adapter):
     def request_id_from_error(self, error: Exception) -> str | None:
         """Read the request-id header off the SDK exception.
 
-        `APIStatusError` alone carries `request_id` from response headers in anthropic 0.120.0.
+        `APIStatusError` alone carries `request_id` from response headers in anthropic 2.4.0.
         """
         if isinstance(error, anthropic.APIStatusError):
             return error.request_id
@@ -1309,7 +1309,7 @@ class _AnthropicStream(AdapterStream):
     def provider_billing(self) -> ProviderBilling | None:
         """Return snapshot billing after the first event, or `None` before it.
 
-        Anthropic 0.120.0 provides required input tokens from `message_start`.
+        Anthropic 2.4.0 provides required input tokens from `message_start`.
         Optional cache counters arrive with `message_delta`.
         """
         if not self._snapshot_started:
@@ -1325,7 +1325,7 @@ class _AnthropicStream(AdapterStream):
     def request_id(self) -> str | None:
         """Read the request-id header off the response the SDK stream is reading.
 
-        `AsyncMessageStream.request_id` is readable when the stream opens in anthropic 0.120.0.
+        `AsyncMessageStream.request_id` is readable when the stream opens in anthropic 2.4.0.
         """
         return self._sdk_stream.request_id
 

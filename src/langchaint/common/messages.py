@@ -272,7 +272,7 @@ class ToolMessage(CheckedCopyModel):
     `GeminiGenerateContentAdapter` sends the text in `FunctionResponse.response`.
     The key is `"error"` when `is_error=True` and `"output"` otherwise.
     `OpenAIChatCompletionsAdapter` and `OpenAIResponsesAdapter` drop `is_error`, so `content` must state the failure.
-    The openai 3.42.1 SDK has no tool-result error field.
+    The openai 3.44.0 SDK has no tool-result error field.
     `OpenAIChatCompletionsAdapter` returns `RejectedMessages` for any part except `TextPart`.
     The other adapters also send `ImagePart` and `ImageUrlPart`.
     `ImagePart` lists the media types that `AnthropicMessagesAdapter` sends.

@@ -79,7 +79,10 @@ Such an error has a status in none of `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUS
 """
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
-"""What a request may ask for: the SDK ServiceTier wire values (google-genai 2.16.0)."""
+"""What a request may ask for: the SDK ServiceTier wire values except "unspecified" (google-genai 2.34.0).
+
+"unspecified" is the SDK's "Default service tier, which is standard."
+"""
 
 type GeminiReportedServiceTier = Literal[
     "ON_DEMAND", "ON_DEMAND_PRIORITY", "ON_DEMAND_FLEX", "PROVISIONED_THROUGHPUT"
@@ -276,12 +279,12 @@ def _billing_from_usage(
 ) -> ProviderBilling:
     """Price the reported counters at the rates the served tier selects.
 
-    prompt_token_count includes cached_content_token_count (google-genai 2.16.0 field description).
+    prompt_token_count includes cached_content_token_count (google-genai 2.34.0 field description).
     This includes implicit cache reads (https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03).
     Their difference is input_tokens_cache_none.
     thoughts_token_count is outside candidates_token_count.
     output_tokens is their sum, and output_tokens_reasoning is thoughts_token_count.
-    Source: google-genai 2.16.0 total_token_count field description.
+    Source: google-genai 2.34.0 total_token_count field description.
     tool_use_prompt_token_count is outside prompt_token_count and uses the uncached input rate.
     Long-context pricing compares prompt_token_count with its threshold, so tool-use input does not count toward it.
     None usage_metadata bills zero counters at the "ON_DEMAND" rates.
@@ -791,7 +794,7 @@ Unlisted terminal keys such as topK, seed, and stopSequences pass through.
 def _normalized_wire_key(key: str) -> str:
     """Normalize a wire-body key the way the SDK matches extra_body keys to wire keys.
 
-    google-genai 2.16.0 _normalize_key_for_matching ignores case and underscores.
+    google-genai 2.34.0 _normalize_key_for_matching ignores case and underscores.
     """
     return key.replace("_", "").lower()
 
@@ -864,7 +867,7 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
 def _retry_after_seconds_from_retry_info(details: object) -> float | None:
     """Read the RetryInfo-stated wait from an APIError's details, None on any shape mismatch.
 
-    google-genai 2.16.0 errors.py supplies the error envelope or its inner error dict.
+    google-genai 2.34.0 errors.py supplies the error envelope or its inner error dict.
     RetryInfo uses the google/rpc/error_details.proto shape.
     retryDelay is a protobuf Duration encoded as decimal seconds plus "s".
     """
@@ -1376,7 +1379,10 @@ class _GeminiStream(AdapterStream):
 
     @override
     def request_id(self) -> str | None:
-        """Return None: the SDK models no request-id header on a streamed response (google-genai 2.16.0)."""
+        """Return None: google-genai 2.34.0 names no request-id header.
+
+        Each streamed chunk carries the response headers as `sdk_http_response.headers`, a `dict[str, str]`.
+        """
         return None
 
     @override
@@ -1488,7 +1494,7 @@ class _BoundGemini(BoundAdapter):
     async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open one generate_content_stream and return the live stream.
 
-        In google-genai 2.16.0, awaiting generate_content_stream returns an unstarted async generator.
+        In google-genai 2.34.0, awaiting generate_content_stream returns an unstarted async generator.
         Pulling first_chunk performs connection I/O before any event is yielded.
         _GeminiStream yields first_chunk first.
 

@@ -351,7 +351,7 @@ def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
     """Convert messages to input items.
 
     The system prompt is separate.
-    Tool-result content must carry error signals because openai 3.41.0 has no `is_error` field.
+    Tool-result content must carry error signals because openai 3.44.0 has no `is_error` field.
 
     Raises:
         _RejectedMessagesError: A ContentPart has no Responses wire form.
@@ -509,7 +509,7 @@ def _cannot_continue(response: OpenAIResponse, stop_reason: StopReason) -> str |
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
     """Join non-empty reasoning parts with `REASONING_PART_SEPARATOR`.
 
-    Reasoning content takes precedence over its summary in openai 2.48.0.
+    Reasoning content takes precedence over its summary.
     Empty content and summary parts produce `None`.
     """
     summary = REASONING_PART_SEPARATOR.join(part.text for part in item.summary if part.text)
@@ -829,7 +829,7 @@ class _OpenAIResponsesStream(AdapterStream):
         Raises:
             openai.APIStatusError: The stream ends after an error event without a terminal response.
                 It carries status 200, request headers, and the event body.
-                OpenAI 2.51.0 does not raise this event itself.
+                OpenAI 3.44.0 does not raise this event itself.
             StreamProtocolError: The stream ends without a terminal response or error event.
         """
         error_event: ResponseErrorEvent | None = None
@@ -914,7 +914,7 @@ class _OpenAIResponsesStream(AdapterStream):
     def provider_billing(self) -> ProviderBilling | None:
         """Return terminal billing or NaN for incomplete charged provider-executed tools.
 
-        OpenAI 2.45.0 stream state accumulates output items without counters.
+        OpenAI 3.44.0 stream state accumulates output items without counters.
         `ResponseUsage` arrives only with the terminal response.
         """
         if self._terminal_response is not None:

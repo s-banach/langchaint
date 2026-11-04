@@ -288,7 +288,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
 
     ToolCall values become function tool_calls entries in emission order.
     Each ReasoningPart.raw merges into the message fields.
-    This matches openai 2.51.0's ChatCompletionAssistantMessageParam variants.
+    The text content and function tool_calls match openai 3.44.0's ChatCompletionAssistantMessageParam.
     DeepSeek requires replayed `reasoning_content` during a tool loop.
     Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
 
@@ -708,7 +708,7 @@ def _snapshot_tool_call_id(state: ChatCompletionStreamState, index: int) -> str:
     """Read the id of the assembled tool call at index, which the state's events do not carry.
 
     A tool_calls.function.arguments.done event for index means the state assembled a call there.
-    The snapshot is built leniently (openai 2.51.0 construct_type).
+    The snapshot is built leniently (openai 3.44.0 construct_type).
     The declared str therefore reads None until the fragment carrying the id arrives.
     """
     tool_calls = state.current_completion_snapshot.choices[0].message.tool_calls or ()
@@ -742,7 +742,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
             Its first chunk carries prompt-filter results, and its asynchronous filter sends choices without `delta`.
             `ChatCompletionStreamState` would take an empty id and model from the first.
             It raises `AttributeError` on the second.
-            The SDK's own stream helper skips them too (openai 3.42.1 `_is_valid_chat_completion_chunk_weak`).
+            The SDK's own stream helper skips them too (openai 3.44.0 `_is_valid_chat_completion_chunk_weak`).
             In asynchronous filter mode, a block arrives only as an annotation chunk's `content_filter` finish reason.
             `_content_filtered` records that block (Azure content streaming docs, blocked-by-filters sample).
 
@@ -837,7 +837,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         The adapter preserves the lenient SDK snapshot without revalidation.
         Revalidation could reject partial output and billing.
         An Azure content-filter block sets every choice's `finish_reason` to `"content_filter"`.
-        `get_final_completion` raises on length and content-filter responses (openai 2.51.0).
+        `get_final_completion` raises on length and content-filter responses (openai 3.44.0).
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so there is nothing assembled.

@@ -123,8 +123,7 @@ def request_failure_from_response(
     `retries` and `pauses_quota` are the table answers.
     Status 200 identifies a mid-stream error event, and the table answers stand.
     On every other status, the provider's `x-should-retry` directive decides whether the request retries.
-    Both SDK clients read `x-should-retry` before status rules.
-    Anthropic 0.120.2 and OpenAI 2.51.0 verify this behavior.
+    Both SDK clients read `x-should-retry` before status rules (anthropic 2.4.0 and openai 3.44.0 `_should_retry`).
     `pauses_quota` stands whatever the directive says.
     A failure that pauses the quota and does not retry is `provider_failed_terminally`.
     Another failure that does not retry takes the first kind that applies:

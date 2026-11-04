@@ -288,7 +288,7 @@ def _openai_error_code_answers(error: openai.APIStatusError) -> tuple[bool, bool
 def request_id_from_openai_error(error: Exception) -> str | None:
     """Read the request-id header off the SDK exception.
 
-    `APIStatusError` alone carries `request_id` from response headers in openai 2.48.0.
+    `APIStatusError` alone carries `request_id` from response headers in openai 3.44.0.
     """
     if isinstance(error, openai.APIStatusError):
         return error.request_id

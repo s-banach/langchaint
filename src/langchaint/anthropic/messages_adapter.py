@@ -159,7 +159,11 @@ _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
 """The statuses that reject this request. A resend fails again."""
 
 REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
+"""`record_request_failure_fallthrough` increments this counter for each `APIStatusError` that matches no listed row.
+
+Such an error has a type in neither `_PAUSE_ERROR_TYPES` nor `_RETRY_THIS_ONE_ERROR_TYPES`.
+Its status is also in none of `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
+"""
 
 _MAX_CACHE_BREAKPOINTS_PER_REQUEST = 4
 """The API allows at most 4 cache breakpoints per request, the binding's own included."""

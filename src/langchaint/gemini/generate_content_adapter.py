@@ -73,7 +73,10 @@ _DO_NOT_RETRY_STATUSES = frozenset({400, 403, 404})
 """The request-rejection statuses from the troubleshooting page. A resend fails again."""
 
 REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
+"""`record_request_failure_fallthrough` increments this counter for each `APIError` that matches no listed row.
+
+Such an error has a status in none of `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
+"""
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
 """What a request may ask for: the SDK ServiceTier wire values (google-genai 2.16.0)."""

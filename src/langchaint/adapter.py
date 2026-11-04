@@ -179,10 +179,9 @@ def record_request_failure_fallthrough(
     status_code: object,
     error_type: object,
 ) -> None:
-    """Count and log one request failure that fell through to a status-family default.
+    """Count and log one request failure that matched no listed row of its provider's tables.
 
-    A provider's `request_failure` function calls this when no listed row matched the failure.
-    The count and the warning make a new provider status or error type visible.
+    The count and the warning make a new provider status, error type, or error code visible.
 
     Args:
         fallthrough_counts: The counter to increment by failure description.
@@ -192,7 +191,7 @@ def record_request_failure_fallthrough(
     """
     tag = f"status={status_code} type={error_type}"
     fallthrough_counts[tag] += 1
-    _logger.warning("%s fell through to a status-family default for %s", function_name, tag)
+    _logger.warning("%s matched no listed row for %s", function_name, tag)
 
 
 REASONING_PART_SEPARATOR = "\n\n"

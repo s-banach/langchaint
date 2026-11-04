@@ -50,7 +50,12 @@ A resend fails the same way.
 """
 
 REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each status-family default."""
+"""`record_request_failure_fallthrough` increments this counter for each `APIStatusError` that matches no listed row.
+
+An error whose status is not 200 matches no listed row when no status table lists its status.
+The status tables are `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
+A status-200 mid-stream error matches no listed row when its code is missing or `_DISPOSITION_BY_ERROR_CODE` lacks it.
+"""
 
 type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 """What a Chat Completions request may ask for (openai 3.1.0)."""
@@ -240,8 +245,8 @@ def _openai_status_answers(error: openai.APIStatusError) -> tuple[bool, bool]:
     Some rows come from the SDK.
     Each table's docstring names the source and reason.
     `error.code` separates spend-limit 429 errors because `error.type` may still be `insufficient_quota`.
-    Failures outside the rows take a default, counted in REQUEST_FAILURE_FALLTHROUGH_COUNTS and logged:
-    unlisted 5xx statuses retry without a pause, and other unlisted statuses neither retry nor pause.
+    Failures that match no listed row are counted in `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and logged.
+    Of those, unlisted 5xx statuses retry without a pause, and other unlisted statuses neither retry nor pause.
     """
     if error.status_code in _PAUSE_STATUSES:
         if error.code in _SPEND_LIMIT_CODES:
@@ -264,8 +269,8 @@ def _openai_error_code_answers(error: openai.APIStatusError) -> tuple[bool, bool
     """Return whether a status-200 mid-stream error retries and whether it pauses the quota, by its code.
 
     Transient codes retry, and `rate_limit_exceeded` also pauses the quota.
-    Terminal and unknown codes neither retry nor pause.
-    Unknown codes increment `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and are logged.
+    Terminal, unknown, and missing codes neither retry nor pause.
+    Unknown and missing codes increment `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and are logged.
     """
     disposition = None if error.code is None else _DISPOSITION_BY_ERROR_CODE.get(error.code)
     if disposition is None:

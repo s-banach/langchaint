@@ -41,6 +41,7 @@ from langchaint import (
     ReasoningDelta,
     ReasoningPart,
     SpecificToolChoice,
+    StopReason,
     StreamItem,
     TextPart,
     ToolCall,
@@ -60,7 +61,6 @@ from langchaint.adapter import (
     RequestFailure,
     RequestParams,
     ResponseIdentity,
-    ResponseOutcome,
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK_PRICING,
@@ -91,10 +91,9 @@ from langchaint.anthropic.messages_adapter import (
 from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
 from tests.helpers import (
+    finished_response,
     run_with_timeout,
-    structured_outcome,
     terminal,
-    text_outcome,
     transient,
 )
 
@@ -1553,14 +1552,6 @@ def _structured_bound() -> BoundAdapter:
     )
 
 
-def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport]:
-    return structured_outcome(_structured_bound(), message, _StructuredReport)
-
-
-_REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
-"""Text that validates into _StructuredReport."""
-
-
 @pytest.mark.parametrize(
     ("build_llm", "uses_top_level_cache_control"),
     [
@@ -1672,56 +1663,29 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "stop_reason", "expected_kind"),
+    ("anthropic_stop_reason", "expected"),
     [
-        pytest.param(None, "end_turn", "empty_assistant_message", id="end_turn_without_text"),
-        pytest.param(None, "refusal", "refusal", id="refusal"),
-        pytest.param(None, "max_tokens", "max_completion_tokens_exceeded", id="max_tokens"),
-        pytest.param(
-            '{"city": "Nair',
-            "max_tokens",
-            "max_completion_tokens_exceeded",
-            id="text_cut_mid_json_at_max_tokens",
-        ),
-        pytest.param(
-            None,
-            "model_context_window_exceeded",
-            "context_window_exceeded",
-            id="context_window_exceeded",
-        ),
-        pytest.param(None, "pause_turn", "unexpected_response", id="pause_turn"),
-        pytest.param(
-            "partial thought",
-            "pause_turn",
-            "unexpected_response",
-            id="pause_turn_ahead_of_schema_violation",
-        ),
+        ("tool_use", "tool_call"),
+        ("refusal", "refusal"),
+        ("max_tokens", "max_completion_tokens"),
+        ("model_context_window_exceeded", "context_window_exceeded"),
     ],
 )
-def test_structured_outcome_by_text_and_stop_reason(
-    text: str | None, stop_reason: at.StopReason, expected_kind: str
+def test_a_stop_reason_gives_its_neutral_stop_reason(
+    anthropic_stop_reason: at.StopReason, expected: StopReason
 ) -> None:
-    outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
-    assert outcome.kind == expected_kind
+    """Each message ends in a tool_use block, because a token limit or refusal can cut off the final tool call."""
+    finished = finished_response(
+        _structured_bound(), _structured_message(None, anthropic_stop_reason, tool_use=True)
+    )
+    assert finished.stop_reason == expected
+    assert finished.cannot_continue is None
 
 
-def test_a_structured_tool_call_message_without_text_is_a_tool_call_response() -> None:
-    outcome = _structured_parse(_structured_message(None, stop_reason="tool_use", tool_use=True))
-    assert outcome.kind == "tool_call_response"
-
-
-@pytest.mark.parametrize("text", ["let me look", None, _REPORT_JSON])
-def test_tool_call_cut_off_by_max_tokens_exceeds_max_completion_tokens(text: str | None) -> None:
-    """The SDK can parse a partial tool input into a complete-looking object."""
-    message = _structured_message(text, stop_reason="max_tokens", tool_use=True)
-    outcome = text_outcome(_adapter().bind_text(_UNSET_BINDING), message)
-    assert outcome.kind == "max_completion_tokens_exceeded"
-
-
-def test_an_unexpected_structured_response_names_the_stop_reason() -> None:
-    outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
-    assert outcome.kind == "unexpected_response"
-    assert "pause_turn" in outcome.error_text
+def test_pause_turn_cannot_continue_and_names_the_stop_reason() -> None:
+    finished = finished_response(_structured_bound(), _structured_message(None, "pause_turn"))
+    assert finished.cannot_continue is not None
+    assert "pause_turn" in finished.cannot_continue
 
 
 def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -> None:

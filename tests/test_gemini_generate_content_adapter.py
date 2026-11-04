@@ -29,6 +29,7 @@ from langchaint import (
     ReasoningDelta,
     ReasoningPart,
     SpecificToolChoice,
+    StopReason,
     StreamItem,
     TextPart,
     ToolCall,
@@ -67,7 +68,7 @@ from langchaint.gemini.generate_content_adapter import (
     _GeminiStream,
 )
 from langchaint.tools import ToolSchema
-from tests.helpers import run_with_timeout, structured_outcome, terminal, transient
+from tests.helpers import finished_response, run_with_timeout, terminal, transient
 
 
 def _billing_from_usage(
@@ -904,9 +905,7 @@ def test_unsendable_messages_build_rejected_messages(case: _InvalidMessages) -> 
 
 
 def _interpreted_assistant_message(response: types.GenerateContentResponse) -> AssistantMessage:
-    interpretation = _adapter().bind_text(_binding()).interpret(response)
-    assert interpretation.kind == "finished_response"
-    return interpretation.assistant_message
+    return finished_response(_adapter().bind_text(_binding()), response).assistant_message
 
 
 def _dump(part: types.Part) -> dict[str, JsonValue]:
@@ -990,49 +989,42 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 # --- interpret ---
 
 
-def test_structured_binding_outcomes() -> None:
-    bound = _adapter().bind_structured(_binding(), _Answer)
-    tool_call_outcome = structured_outcome(
-        bound,
-        _response([types.Part(function_call=types.FunctionCall(name="f", args={}))]),
-        _Answer,
-    )
-    assert tool_call_outcome.kind == "tool_call_response"
-    assert tool_call_outcome.stop_reason == "tool_call"
-    refused = structured_outcome(
-        bound, _response(None, finish_reason=types.FinishReason.SAFETY), _Answer
-    )
-    assert refused.kind == "refusal"
-    truncated = structured_outcome(
-        bound,
-        _response([types.Part(text='{"value"')], finish_reason=types.FinishReason.MAX_TOKENS),
-        _Answer,
-    )
-    assert truncated.kind == "max_completion_tokens_exceeded"
-    empty = structured_outcome(bound, _response([]), _Answer)
-    assert empty.kind == "empty_assistant_message"
-    unexpected_response = structured_outcome(
-        bound,
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            _response([types.Part(function_call=types.FunctionCall(name="f", args={}))]),
+            "tool_call",
+        ),
+        (_response(None, finish_reason=types.FinishReason.SAFETY), "refusal"),
+        (
+            _response(
+                [
+                    types.Part(text="hey"),
+                    types.Part(function_call=types.FunctionCall(name="f", args={})),
+                ],
+                finish_reason=types.FinishReason.MAX_TOKENS,
+            ),
+            "max_completion_tokens",
+        ),
+    ],
+    ids=["function_call", "safety", "max_tokens"],
+)
+def test_a_finished_candidate_gives_its_stop_reason(
+    response: types.GenerateContentResponse, expected: StopReason
+) -> None:
+    finished = finished_response(_adapter().bind_text(_binding()), response)
+    assert finished.stop_reason == expected
+    assert finished.cannot_continue is None
+
+
+def test_an_unfinished_finish_reason_cannot_continue_and_names_the_finish_reason() -> None:
+    finished = finished_response(
+        _adapter().bind_text(_binding()),
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE),
-        _Answer,
     )
-    assert unexpected_response.kind == "unexpected_response"
-    assert "LANGUAGE" in unexpected_response.error_text
-
-
-def test_a_structured_binding_ignores_thought_text_when_validating() -> None:
-    """Only non-thought text is the candidate instance."""
-    bound = _adapter().bind_structured(_binding(), _Answer)
-    outcome = structured_outcome(
-        bound,
-        _response([
-            types.Part(thought=True, text="let me think"),
-            types.Part(text='{"value": 7}'),
-        ]),
-        _Answer,
-    )
-    assert outcome.kind == "plain_response"
-    assert outcome.output == _Answer(value=7)
+    assert finished.cannot_continue is not None
+    assert "LANGUAGE" in finished.cannot_continue
 
 
 def test_identity_reads_the_response_fields() -> None:

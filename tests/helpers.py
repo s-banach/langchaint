@@ -37,12 +37,12 @@ from langchaint import (
 )
 from langchaint.adapter import (
     BoundAdapter,
+    FinishedResponse,
     ProviderBilling,
     RequestFailure,
     ResponseOutcome,
     TransientError,
 )
-from langchaint.common.messages import final_text
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
 from langchaint.generation.observer import GenerationStart
@@ -54,9 +54,11 @@ class StubRaw(BaseModel):
     """Stand-in for the SDK's own response model a generation carries on raw."""
 
 
-def text_outcome(bound_adapter: BoundAdapter, raw: BaseModel) -> ResponseOutcome[str]:
-    """Read `raw` as `BoundLLM` does for a text binding."""
-    return response_outcome(bound_adapter.interpret(raw), final_text)
+def finished_response(bound_adapter: BoundAdapter, raw: BaseModel) -> FinishedResponse:
+    """Interpret `raw`, asserting that the provider finished it."""
+    interpretation = bound_adapter.interpret(raw)
+    assert interpretation.kind == "finished_response"
+    return interpretation
 
 
 def structured_outcome[ModelT: BaseModel](

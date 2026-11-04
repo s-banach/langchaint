@@ -39,11 +39,9 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    PlainResponse,
     RejectedMessages,
     RequestFailure,
     RequestParams,
-    ResponseOutcome,
 )
 from langchaint.billing.pricing import Billing, ProviderBilling, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
@@ -68,10 +66,9 @@ from langchaint.openai.chat_completions_adapter import (
 from langchaint.tools import ToolSchema
 from tests.helpers import (
     connection_error,
+    finished_response,
     openai_sdk_errors_and_request_failures,
     run_with_timeout,
-    structured_outcome,
-    text_outcome,
     transient,
 )
 
@@ -100,11 +97,6 @@ _TOOL_CALL_WIRE: dict[str, object] = {
 }
 
 _TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": 1}')
-
-
-def _assert_plain[OutputT](outcome: ResponseOutcome[OutputT]) -> PlainResponse[OutputT]:
-    assert outcome.kind == "plain_response"
-    return outcome
 
 
 def _usage(
@@ -293,10 +285,9 @@ def test_the_reported_tier_selects_the_rates() -> None:
 def test_a_stop_finish_reason_defers_to_tool_calls_and_the_refusal_field(
     completion: ChatCompletion, expected: StopReason, expected_output: str | None
 ) -> None:
-    interpretation = _text_bound().interpret(completion)
-    assert interpretation.kind == "finished_response"
-    assert interpretation.stop_reason == expected
-    assert final_text(interpretation.assistant_message) == expected_output
+    finished = finished_response(_text_bound(), completion)
+    assert finished.stop_reason == expected
+    assert final_text(finished.assistant_message) == expected_output
 
 
 def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
@@ -695,54 +686,28 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_bound() -> BoundAdapter:
-    return _adapter().bind_structured(_binding(), _StructuredReport)
-
-
-def _structured_completion(
-    text: str | None,
-    *,
-    refusal: str | None = None,
-    finish_reason: str = "stop",
-    tool_call: bool = False,
+def _text_completion(
+    text: str, *, finish_reason: str = "stop", tool_call: bool = False
 ) -> ChatCompletion:
-    message: dict[str, object] = {"content": text, "refusal": refusal}
+    message: dict[str, object] = {"content": text}
     if tool_call:
         message["tool_calls"] = [_TOOL_CALL_WIRE]
     return _completion(usage=None, message=message, finish_reason=finish_reason)
 
 
 @pytest.mark.parametrize(
-    ("completion", "expected_kind"),
-    [
-        (_structured_completion(None), "empty_assistant_message"),
-        (
-            _structured_completion('{"city": "Nair', finish_reason="length"),
-            "max_completion_tokens_exceeded",
-        ),
-        (
-            _structured_completion(None, finish_reason="length", tool_call=True),
-            "max_completion_tokens_exceeded",
-        ),
-        (_structured_completion(None, finish_reason="content_filter"), "refusal"),
-        (_structured_completion(None, tool_call=True), "tool_call_response"),
-        (_structured_completion("let me look that up", tool_call=True), "tool_call_response"),
-    ],
-    ids=[
-        "no_text",
-        "length_cut_mid_json",
-        "length_cut_a_tool_call",
-        "content_filter",
-        "tool_call",
-        "tool_call_beside_prose",
-    ],
+    ("finish_reason", "expected"),
+    [("length", "max_completion_tokens"), ("content_filter", "refusal")],
 )
-def test_structured_bind_reports_why_an_assistant_message_produced_no_instance(
-    completion: ChatCompletion, expected_kind: str
+def test_a_finish_reason_without_a_refusal_field_gives_its_stop_reason(
+    finish_reason: str, expected: StopReason
 ) -> None:
-    outcome = structured_outcome(_structured_bound(), completion, _StructuredReport)
-    assert outcome.kind == expected_kind
-    assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
+    """Each completion carries a tool call, because a token limit or filter can cut off the final tool call."""
+    finished = finished_response(
+        _text_bound(), _text_completion("hey", finish_reason=finish_reason, tool_call=True)
+    )
+    assert finished.stop_reason == expected
+    assert finished.cannot_continue is None
 
 
 def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
@@ -917,8 +882,8 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
         ReasoningDelta(text=" part b"),
         "hey",
     ]
-    usable = _assert_plain(text_outcome(_text_bound(), final))
-    assert usable.assistant_message.content[0] == ReasoningPart(
+    finished = finished_response(_text_bound(), final)
+    assert finished.assistant_message.content[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
 
@@ -1164,7 +1129,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_with_text(self, text: str) -> BaseModel:
-        return _structured_completion(text)
+        return _text_completion(text)
 
     @override
     def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel | None:
@@ -1172,7 +1137,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_with_tool_call(self, text: str) -> BaseModel:
-        return _structured_completion(text, tool_call=True, finish_reason="tool_calls")
+        return _text_completion(text, tool_call=True, finish_reason="tool_calls")
 
     @override
     def response_with_reasoning(self) -> BaseModel:

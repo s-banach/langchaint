@@ -2,7 +2,7 @@ import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import override
+from typing import Literal, override
 
 import httpx2
 import openai
@@ -33,7 +33,6 @@ from openai.types.responses import (
     ResponseReasoningSummaryTextDoneEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
-    ResponseStatus,
     ResponseUsage,
 )
 from openai.types.responses.parsed_response import ParsedResponse
@@ -99,12 +98,12 @@ from langchaint.openai.responses_adapter import (
 from langchaint.openai.shared import REQUEST_FAILURE_FALLTHROUGH_COUNTS, openai_request_failure
 from langchaint.tools import ToolSchema
 from tests.helpers import (
+    finished_response,
     openai_sdk_errors_and_request_failures,
     run_with_timeout,
     status_error,
     structured_outcome,
     terminal,
-    text_outcome,
     transient,
 )
 
@@ -399,16 +398,25 @@ _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
             "refusal",
             None,
         ),
+        (
+            _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _REFUSAL_MESSAGE_ITEM]),
+            "refusal",
+            "I can't help with that",
+        ),
     ],
-    ids=["function_call_item", "refusal_block", "refusal_block_beside_a_function_call"],
+    ids=[
+        "function_call_item",
+        "refusal_block",
+        "refusal_block_beside_a_function_call",
+        "refusal_block_after_text",
+    ],
 )
 def test_a_completed_response_derives_its_stop_reason_from_its_items(
     response: OpenAIResponse, expected: StopReason, expected_output: str | None
 ) -> None:
-    interpretation = _text_bound().interpret(response)
-    assert interpretation.kind == "finished_response"
-    assert interpretation.stop_reason == expected
-    assert final_text(interpretation.assistant_message) == expected_output
+    finished = finished_response(_text_bound(), response)
+    assert finished.stop_reason == expected
+    assert final_text(finished.assistant_message) == expected_output
 
 
 def test_every_output_item_replays_as_one_input_item_in_position() -> None:
@@ -1400,9 +1408,9 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         async for _item in adapter_stream.items():
             pass
         assert await adapter_stream.final() is leniently_built
-        usable = _assert_plain(text_outcome(_text_bound(), leniently_built))
-        assert usable.output == "hey"
-        assert usable.stop_reason == "max_completion_tokens"
+        finished = finished_response(_text_bound(), leniently_built)
+        assert final_text(finished.assistant_message) == "hey"
+        assert finished.stop_reason == "max_completion_tokens"
 
     run_with_timeout(scenario())
 
@@ -1436,13 +1444,6 @@ def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -
         assert openai_request_failure(caught.value) == transient(pauses_quota=False)
 
     run_with_timeout(scenario())
-
-
-def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport]:
-    bound = _adapter().bind_structured(
-        _binding(automatic_cache_breakpoints=False, system_prompt="sys"), _StructuredReport
-    )
-    return structured_outcome(bound, response, _StructuredReport)
 
 
 class _CapturedAnswer(BaseModel):
@@ -1480,108 +1481,35 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
     assert structured_outcome(bound, run_with_timeout(streamed()), _CapturedAnswer) == outcome
 
 
-_REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
-"""Text that validates into _StructuredReport."""
-
-
-def _structured_response(
-    text: str | None,
-    *,
-    refusal: bool = False,
-    status: ResponseStatus = "completed",
-    incomplete_details: IncompleteDetails | None = None,
-    tool_call: bool = False,
-    error: ResponseError | None = None,
-) -> OpenAIResponse:
-    content: list[object] = []
-    if refusal:
-        content.append({"type": "refusal", "refusal": "I can't help with that"})
-    elif text is not None:
-        content.append({"type": "output_text", "text": text, "annotations": []})
+def _text_response(text: str, *, tool_call: bool = False) -> OpenAIResponse:
     message: dict[str, object] = {
         "id": "m1",
         "role": "assistant",
         "status": "completed",
         "type": "message",
-        "content": content,
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
     }
     return _response(
-        usage=None,
-        output=[message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])],
-        status=status,
-        incomplete_details=incomplete_details,
-        error=error,
-    )
-
-
-def test_final_refusal_cannot_use_earlier_structured_text() -> None:
-    refusal = "I can't help with that"
-    response = _response(
-        usage=None,
-        output=[
-            *_structured_response(_REPORT_JSON).output,
-            {**_REFUSAL_MESSAGE_ITEM, "content": [{"type": "refusal", "refusal": refusal}]},
-        ],
-    )
-    outcome = _structured_parse(response)
-    assert outcome.kind == "refusal"
-    assert outcome.assistant_message.content == (
-        TextPart(text=_REPORT_JSON),
-        TextPart(text=refusal),
-    )
-
-
-def test_a_structured_tool_call_message_without_text_is_a_tool_call_response() -> None:
-    outcome = _structured_parse(_structured_response(None, tool_call=True))
-    assert outcome.kind == "tool_call_response"
-    assert outcome.assistant_message.tool_calls == (
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+        usage=None, output=[message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])]
     )
 
 
 @pytest.mark.parametrize(
-    ("response", "expected_kind"),
-    [
-        (_structured_response(None), "empty_assistant_message"),
-        (
-            _structured_response(
-                '{"city": "Nair',
-                status="incomplete",
-                incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-            ),
-            "max_completion_tokens_exceeded",
-        ),
-        (_structured_response(None, refusal=True), "refusal"),
-        (
-            _structured_response(
-                None,
-                status="incomplete",
-                incomplete_details=IncompleteDetails(reason="content_filter"),
-            ),
-            "refusal",
-        ),
-        (
-            _structured_response(_REPORT_JSON, status="failed", error=_SERVER_ERROR),
-            "provider_failed_transiently",
-        ),
-        (
-            _structured_response(None, refusal=True, status="failed", error=_SERVER_ERROR),
-            "provider_failed_transiently",
-        ),
-    ],
-    ids=[
-        "completed_without_text_is_an_empty_assistant_message",
-        "json_cut_at_max_output_tokens_is_truncation",
-        "refusal_block",
-        "content_filter_blocks_without_retry",
-        "failed_status_wins_over_text_that_validates",
-        "failed_status_wins_over_a_refusal",
-    ],
+    ("reason", "expected"),
+    [("max_output_tokens", "max_completion_tokens"), ("content_filter", "refusal")],
 )
-def test_structured_bind_reports_why_an_assistant_message_has_no_instance(
-    response: OpenAIResponse, expected_kind: str
+def test_an_incomplete_response_gives_the_stop_reason_of_its_reason(
+    reason: Literal["max_output_tokens", "content_filter"], expected: StopReason
 ) -> None:
-    assert _structured_parse(response).kind == expected_kind
+    response = _response(
+        usage=None,
+        output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM],
+        status="incomplete",
+        incomplete_details=IncompleteDetails(reason=reason),
+    )
+    finished = finished_response(_text_bound(), response)
+    assert finished.stop_reason == expected
+    assert finished.cannot_continue is None
 
 
 def _text_bound() -> BoundAdapter:
@@ -1748,7 +1676,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def response_with_text(self, text: str) -> BaseModel:
-        return _structured_response(text)
+        return _text_response(text)
 
     @override
     def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
@@ -1768,7 +1696,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def response_with_tool_call(self, text: str) -> BaseModel:
-        return _structured_response(text, tool_call=True)
+        return _text_response(text, tool_call=True)
 
     @override
     def response_with_reasoning(self) -> BaseModel:

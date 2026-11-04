@@ -42,7 +42,7 @@ class _ResumeHeader(CheckedCopyModel):
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[7] = 7
+    format_version: Literal[8] = 8
     """Restoring a file of this version gives the records that rerunning its binding and inputs would give.
 
     That equality assumes the provider answers the same way both times.

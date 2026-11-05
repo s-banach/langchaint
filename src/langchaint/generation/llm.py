@@ -368,12 +368,13 @@ class LLM:
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
             reasoning_level: The provider's reasoning value, sent unchanged, or `None` to send none.
                 `None` leaves reasoning at the model default, which is on for some models and off for others.
-                The Anthropic adapter sends it as `output_config.effort` with `thinking` set to `{"type": "adaptive"}`.
+                The Anthropic adapter sends it as `output_config.effort`.
+                The Anthropic adapter also sends adaptive `thinking` unless `extra_body` sets `thinking`.
                 The OpenAI Responses adapter sends it as `reasoning.effort`.
                 The OpenAI Chat Completions adapter sends it as `reasoning_effort`.
                 The Gemini adapter sends it as `generationConfig.thinkingConfig.thinkingLevel`.
                 The Gemini adapter also sets `includeThoughts` to `true`.
-                With `None`, `extra_body` may set Anthropic `thinking` or Gemini `generationConfig.thinkingConfig`.
+                With `None`, `extra_body` may set Gemini `generationConfig.thinkingConfig`.
                 Each LLM backend subpackage docstring links the provider's reasoning values.
             temperature: The sampling temperature, or `None` for the provider default.
             tool_choice: The provider-neutral tool choice.

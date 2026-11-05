@@ -475,10 +475,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "messages",
     "stream",
 })
-"""The wire keys an extra_body must not hold because the adapter owns their values.
-
-A binding with `reasoning_level` also owns `thinking`.
-"""
+"""The wire keys an extra_body must not hold because the adapter owns their values."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1051,8 +1048,9 @@ class AnthropicMessagesAdapter(Adapter):
         Direct and Mantle clients also send top-level `cache_control` for the final cacheable message block.
         Legacy Bedrock places that cache breakpoint on the last message block.
         Binding cache breakpoints count toward the limit of four before message cache breakpoints.
-        `reasoning_level` sends `output_config.effort` with adaptive thinking and preserves the given string.
-        Without `reasoning_level`, `extra_body` may set `thinking`, such as `{"type": "disabled"}`.
+        `reasoning_level` sends `output_config.effort` and preserves the given string.
+        `thinking` comes from `extra_body` when present, such as `{"type": "disabled"}`.
+        Otherwise `reasoning_level` also sends adaptive thinking.
 
         Raises:
             ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
@@ -1066,12 +1064,7 @@ class AnthropicMessagesAdapter(Adapter):
                 "Anthropic requires max_completion_tokens; pass max_completion_tokens= to bind"
             )
         reject_extra_body_keys_the_adapter_populates(
-            binding.extra_body,
-            populated_keys=(
-                _ADAPTER_POPULATED_WIRE_KEYS
-                if binding.reasoning_level is None
-                else _ADAPTER_POPULATED_WIRE_KEYS | {"thinking"}
-            ),
+            binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
         provider_executed_tools = _provider_executed_tools(binding.provider_executed_tools)
         if binding.provider_executed_tools and self.provider_name != "anthropic":
@@ -1137,7 +1130,8 @@ class AnthropicMessagesAdapter(Adapter):
         if binding.reasoning_level is not None:
             # cast: `reasoning_level` deliberately exceeds the SDK effort literal.
             output_config = cast("OutputConfigParam", {"effort": binding.reasoning_level})
-            thinking = {"type": "adaptive"}
+            if binding.extra_body is None or "thinking" not in binding.extra_body:
+                thinking = {"type": "adaptive"}
 
         # Set the legacy Bedrock API version unless extra_body overrides it.
         extra_body = (

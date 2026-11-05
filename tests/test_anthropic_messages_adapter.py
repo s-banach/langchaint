@@ -1653,32 +1653,18 @@ def test_the_structured_request_merges_the_schema_into_the_output_config() -> No
     }
 
 
-@pytest.mark.parametrize(
-    ("binding", "colliding_key"),
-    [
-        (replace(_UNSET_BINDING, extra_body={"max_tokens": 10}), "max_tokens"),
-        (
-            replace(
-                _UNSET_BINDING,
-                reasoning_level="low",
-                extra_body={"thinking": {"type": "disabled"}},
-            ),
-            "thinking",
-        ),
-    ],
-)
-def test_request_rejects_an_extra_body_key_the_adapter_populates(
-    binding: Binding, colliding_key: str
-) -> None:
-    with pytest.raises(ValueError, match=colliding_key):
-        _ = _adapter()._precompute_fields(binding)
+def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
+    with pytest.raises(ValueError, match="max_tokens"):
+        _ = _adapter()._precompute_fields(replace(_UNSET_BINDING, extra_body={"max_tokens": 10}))
 
 
-def test_extra_body_sets_thinking_without_reasoning_level() -> None:
+def test_extra_body_thinking_replaces_the_adaptive_thinking_of_reasoning_level() -> None:
     extra_body = {"thinking": {"type": "disabled"}}
     precomputed_fields = _adapter()._precompute_fields(
-        replace(_UNSET_BINDING, extra_body=extra_body)
+        replace(_UNSET_BINDING, reasoning_level="low", extra_body=extra_body)
     )
+    assert precomputed_fields.output_config == {"effort": "low"}
+    assert isinstance(precomputed_fields.thinking, anthropic.Omit)
     assert precomputed_fields.extra_body is extra_body
 
 

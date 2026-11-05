@@ -14,6 +14,7 @@ Uncataloged Bedrock models require `pricing`.
 Missing optional rates produce NaN token costs.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 `AnthropicBedrock` accepts `http_client` directly.
+Per-model `thinking` and effort values: https://platform.claude.com/docs/en/build-with-claude/thinking.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.

@@ -5,6 +5,8 @@ Importing this subpackage requires `google-genai`.
 `Gemini.llm` reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
 Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
 Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
+Per-model thinking defaults and levels: https://aistudio.google.com/docs/thinking.
+`generationConfig.thinkingConfig` fields: https://aistudio.google.com/api-reference/generate-content.
 
 Cataloged models receive `GEMINI_PRICING`, which states `ON_DEMAND` rates.
 Uncataloged Gemini models require `pricing`.

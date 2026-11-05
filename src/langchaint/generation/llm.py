@@ -366,7 +366,15 @@ class LLM:
                 A response without a text part or tool call gives `GenerationError`.
                 An empty final text part gives `""`.
             max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
-            reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
+            reasoning_level: The provider's reasoning value, sent unchanged, or `None` to send none.
+                `None` leaves reasoning at the model default, which is on for some models and off for others.
+                The Anthropic adapter sends it as `output_config.effort` with `thinking` set to `{"type": "adaptive"}`.
+                The OpenAI Responses adapter sends it as `reasoning.effort`.
+                The OpenAI Chat Completions adapter sends it as `reasoning_effort`.
+                The Gemini adapter sends it as `generationConfig.thinkingConfig.thinkingLevel`.
+                The Gemini adapter also sets `includeThoughts` to `true`.
+                With `None`, `extra_body` may set Anthropic `thinking` or Gemini `generationConfig.thinkingConfig`.
+                Each LLM backend subpackage docstring links the provider's reasoning values.
             temperature: The sampling temperature, or `None` for the provider default.
             tool_choice: The provider-neutral tool choice.
             parallel_tool_calls: Whether the provider may request parallel tool calls.

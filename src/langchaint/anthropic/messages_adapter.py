@@ -470,13 +470,15 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "tools",
     "tool_choice",
     "output_config",
-    "thinking",
     "service_tier",
     "inference_geo",
     "messages",
     "stream",
 })
-"""The wire keys an extra_body must not hold because the adapter owns their values."""
+"""The wire keys an extra_body must not hold because the adapter owns their values.
+
+A binding with `reasoning_level` also owns `thinking`.
+"""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1050,6 +1052,7 @@ class AnthropicMessagesAdapter(Adapter):
         Legacy Bedrock places that cache breakpoint on the last message block.
         Binding cache breakpoints count toward the limit of four before message cache breakpoints.
         `reasoning_level` sends `output_config.effort` with adaptive thinking and preserves the given string.
+        Without `reasoning_level`, `extra_body` may set `thinking`, such as `{"type": "disabled"}`.
 
         Raises:
             ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
@@ -1063,7 +1066,12 @@ class AnthropicMessagesAdapter(Adapter):
                 "Anthropic requires max_completion_tokens; pass max_completion_tokens= to bind"
             )
         reject_extra_body_keys_the_adapter_populates(
-            binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
+            binding.extra_body,
+            populated_keys=(
+                _ADAPTER_POPULATED_WIRE_KEYS
+                if binding.reasoning_level is None
+                else _ADAPTER_POPULATED_WIRE_KEYS | {"thinking"}
+            ),
         )
         provider_executed_tools = _provider_executed_tools(binding.provider_executed_tools)
         if binding.provider_executed_tools and self.provider_name != "anthropic":

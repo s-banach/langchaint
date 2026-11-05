@@ -5,6 +5,7 @@ Importing this subpackage requires `openai`.
 `OpenAIBedrock.llm` uses Responses and reports `provider_name="aws.bedrock"`.
 Use `OpenAIChatCompletionsAdapter` directly for compatible endpoints.
 Use `OpenAIResponsesAdapter` directly for Azure.
+Per-model reasoning effort values: https://developers.openai.com/api/docs/guides/reasoning.
 
 Cataloged models receive `OPENAI_PRICING`.
 Cataloged embedding models receive `OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS`.

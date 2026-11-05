@@ -765,12 +765,12 @@ _ADAPTER_POPULATED_TOP_LEVEL_WIRE_KEYS = frozenset({
 _ADAPTER_POPULATED_GENERATION_CONFIG_KEYS = frozenset({
     "temperature",
     "maxoutputtokens",
-    "thinkingconfig",
     "responsemimetype",
     "responsejsonschema",
 })
 """The generationConfig terminal keys the adapter populates, normalized by _normalized_wire_key.
 
+A binding with `reasoning_level` also populates thinkingConfig.
 Unlisted terminal keys such as topK, seed, and stopSequences pass through.
 """
 
@@ -798,13 +798,16 @@ def _is_list(value: object) -> TypeIs[list[object]]:
     return isinstance(value, list)
 
 
-def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
+def _reject_extra_body_keys(
+    extra_body: Mapping[str, object] | None, *, reasoning_level: str | None
+) -> None:
     """Refuse the extra_body values that would override the binding or that the adapter cannot read.
 
     The SDK recursively merges extra_body into the wire body.
     extra_body wins matched terminal keys.
     _normalized_wire_key compares both mappings.
     Populated top-level keys and generationConfig terminal keys are refused.
+    thinkingConfig is refused when `reasoning_level` is set, because the adapter then populates it.
     candidateCount other than 1 or None is refused because the adapter reads one candidate per response.
 
     Raises:
@@ -831,10 +834,15 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
         populated_keys=_ADAPTER_POPULATED_TOP_LEVEL_WIRE_KEYS,
         normalized_key=_normalized_wire_key,
     )
+    populated_generation_config_keys = (
+        _ADAPTER_POPULATED_GENERATION_CONFIG_KEYS
+        if reasoning_level is None
+        else _ADAPTER_POPULATED_GENERATION_CONFIG_KEYS | {"thinkingconfig"}
+    )
     for generation_config in generation_configs:
         reject_extra_body_keys_the_adapter_populates(
             generation_config,
-            populated_keys=_ADAPTER_POPULATED_GENERATION_CONFIG_KEYS,
+            populated_keys=populated_generation_config_keys,
             normalized_key=_normalized_wire_key,
         )
         if any(
@@ -995,7 +1003,7 @@ class GeminiGenerateContentAdapter(Adapter):
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A bound charged tool has no stated price.
         """
-        _reject_extra_body_keys(binding.extra_body)
+        _reject_extra_body_keys(binding.extra_body, reasoning_level=binding.reasoning_level)
         if not binding.parallel_tool_calls:
             raise ValueError(
                 "parallel_tool_calls False has no Gemini wire form: generateContent has no "

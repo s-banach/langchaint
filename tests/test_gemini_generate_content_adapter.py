@@ -394,13 +394,22 @@ _CONFIG_CASES = [
         ),
     ),
     # Unmapped wire fields stay reachable as per-request HttpOptions.extra_body.
+    # Without reasoning_level, generationConfig.thinkingConfig is a caller field.
     _ConfigCase(
         "extra_body",
-        _binding(extra_body={"cachedContent": "caches/abc", "generationConfig": {"topK": 5}}),
+        _binding(
+            extra_body={
+                "cachedContent": "caches/abc",
+                "generationConfig": {"topK": 5, "thinkingConfig": {"thinkingBudget": 0}},
+            }
+        ),
         types.GenerateContentConfig(
             http_options=types.HttpOptions(
                 retry_options=types.HttpRetryOptions(attempts=1),
-                extra_body={"cachedContent": "caches/abc", "generationConfig": {"topK": 5}},
+                extra_body={
+                    "cachedContent": "caches/abc",
+                    "generationConfig": {"topK": 5, "thinkingConfig": {"thinkingBudget": 0}},
+                },
             )
         ),
     ),
@@ -625,6 +634,14 @@ _BIND_DEFECTS = [
             "collide",
         )
         for extra_body in _COLLIDING_EXTRA_BODIES
+    ),
+    _BindDefect(
+        "thinking_config_with_reasoning_level",
+        _binding(
+            reasoning_level="HIGH",
+            extra_body={"generationConfig": {"thinking_config": {"thinkingBudget": 0}}},
+        ),
+        "collide",
     ),
     # A non-object generationConfig, None included, would replace the adapter's own wholesale.
     _BindDefect(

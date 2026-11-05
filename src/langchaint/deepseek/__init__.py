@@ -2,6 +2,7 @@
 
 Importing this subpackage requires `openai`.
 DeepSeek serves Chat Completions at https://api.deepseek.com.
+Thinking mode `thinking` values for `extra_body`: https://api-docs.deepseek.com/guides/thinking_mode.
 
 Prices use USD per one million tokens.
 Source: https://api-docs.deepseek.com/quick_start/pricing, read 2026-08-03.

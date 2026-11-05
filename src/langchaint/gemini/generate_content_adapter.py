@@ -1,7 +1,7 @@
 """Implement Gemini `generateContent` through the google-genai SDK."""
 
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeGuard, TypeIs, override
 
@@ -889,6 +889,18 @@ def _retry_after_seconds_from_error(failure: errors.APIError) -> float | None:
     return _retry_after_seconds_from_retry_info(failure.details)
 
 
+def _sdk_retries(error: Exception) -> bool:
+    """Return whether the google-genai retry predicate for default `HttpRetryOptions` retries `error`.
+
+    google-genai types the `retry_args` result as `dict[str, Any]`.
+    Its "retry" entry is a tenacity `retry_if_exception`, whose `predicate` takes an exception and returns a bool.
+    """
+    predicate: Callable[[BaseException], bool] = _api_client.retry_args(types.HttpRetryOptions())[
+        "retry"
+    ].predicate
+    return predicate(error)
+
+
 def gemini_request_failure(error: Exception) -> RequestFailure:
     """Return the `RequestFailure` using the SDK retry predicate and the provider's quota pause rule.
 
@@ -903,9 +915,7 @@ def gemini_request_failure(error: Exception) -> RequestFailure:
     An `APIError` without a code, other exceptions, and failed SDK retry decisions are `unknown_exception`.
     google-genai 2.34.0 reads a missing code from the response body, so `code` may be None.
     """
-    retries = sdk_retry_decision(
-        lambda: bool(_api_client.retry_args(types.HttpRetryOptions())["retry"].predicate(error))
-    )
+    retries = sdk_retry_decision(lambda: _sdk_retries(error))
     if isinstance(retries, RequestFailure):
         return retries
     if not isinstance(error, errors.APIError) or error.code is None:

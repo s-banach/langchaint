@@ -13,7 +13,7 @@ import httpx
 import httpx2
 import pytest
 from google import genai
-from google.genai import _api_client, errors, types
+from google.genai import errors, types
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
@@ -67,6 +67,7 @@ from langchaint.gemini.generate_content_adapter import (
 from langchaint.gemini.generate_content_adapter import (
     _GeminiRequestParams,
     _GeminiStream,
+    _sdk_retries,
 )
 from langchaint.tools import ToolSchema
 from tests.helpers import finished_response, run_with_timeout, terminal, with_sdk_retry_decisions
@@ -1629,7 +1630,6 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
         """Combine the SDK's retry answer with expected neutral names, pauses, and waits."""
-        predicate = _api_client.retry_args(types.HttpRetryOptions())["retry"].predicate
         return with_sdk_retry_decisions(
             {
                 httpx2.ConnectError("no route"): terminal("unknown_exception"),
@@ -1648,5 +1648,5 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
                 ),
                 ValueError("boom"): terminal("unknown_exception"),
             },
-            lambda error: bool(predicate(error)),
+            _sdk_retries,
         )

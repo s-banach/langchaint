@@ -8,6 +8,7 @@ import pathlib
 import pkgutil
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from types import ModuleType
 from typing import Literal, override
 
@@ -270,21 +271,69 @@ def terminal(
     return RequestFailure(kind=kind, pauses_quota=False, retry_after_seconds=None)
 
 
-def openai_sdk_errors_and_request_failures() -> Mapping[Exception, RequestFailure]:
-    """Return one row per branch of `openai_request_failure` and its status and error-code tables."""
+def with_sdk_retry_decisions(
+    failures_when_not_retried: Mapping[Exception, RequestFailure],
+    sdk_retries: Callable[[Exception], bool],
+) -> dict[Exception, RequestFailure]:
+    """Return each failure as `transient` where the SDK retries its error.
+
+    Each row states the failure the adapter returns when the SDK declines the retry.
+    The rows then name failures without encoding the SDK's retry policy.
+    A row whose SDK decision raises expects `unknown_exception`.
+    """
+
+    def expected(error: Exception, failure: RequestFailure) -> RequestFailure:
+        try:
+            retries = sdk_retries(error)
+        except Exception:  # noqa: BLE001 - Every SDK decision failure must map to unknown_exception.
+            return terminal("unknown_exception")
+        return replace(failure, kind="transient") if retries else failure
+
+    return {
+        error: expected(error, failure) for error, failure in failures_when_not_retried.items()
+    }
+
+
+def openai_sdk_errors_and_request_failures(
+    client: openai.AsyncOpenAI,
+) -> Mapping[Exception, RequestFailure]:
+    """Return request failures from the adapter's own rules and from `client`'s retry decisions.
+
+    The `x-should-retry` rows make the SDK retry a 400 and decline a 500.
+    The overflowing `Retry-After` date makes openai 3.46.0 raise inside its retry decision.
+    """
+    pause_without_retry = RequestFailure(
+        kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=None
+    )
+    delegated = with_sdk_retry_decisions(
+        {
+            status_error(openai.APIStatusError, 400): terminal("rejected"),
+            status_error(openai.APIStatusError, 400, {"x-should-retry": "true"}): terminal(
+                "rejected"
+            ),
+            status_error(openai.APIStatusError, 401): terminal("auth"),
+            status_error(openai.APIStatusError, 500, {"x-should-retry": "false"}): terminal(
+                "provider_failed_terminally"
+            ),
+            status_error(openai.APIStatusError, 501): terminal("provider_failed_terminally"),
+            status_error(openai.APIStatusError, 429, {"retry-after": "7"}): replace(
+                pause_without_retry, retry_after_seconds=7.0
+            ),
+            status_error(openai.APIStatusError, 503, {"retry-after": "300"}): replace(
+                pause_without_retry, retry_after_seconds=300.0
+            ),
+            status_error(
+                openai.APIStatusError,
+                429,
+                {"retry-after": "Mon, 01 Jan 2026 00:00:00 -" + "9" * 400 + " GMT"},
+            ): pause_without_retry,
+        },
+        lambda error: (
+            isinstance(error, openai.APIStatusError) and client._should_retry(error.response)
+        ),
+    )
     return {
         connection_error(): transient(pauses_quota=False),
-        status_error(openai.RateLimitError, 429, {"retry-after": "7"}): transient(
-            pauses_quota=True, retry_after_seconds=7.0
-        ),
-        status_error(
-            openai.RateLimitError, 429, error_code="organization_spend_limit_exceeded"
-        ): terminal("rejected"),
-        status_error(openai.InternalServerError, 500): transient(pauses_quota=False),
-        status_error(openai.BadRequestError, 400): terminal("rejected"),
-        status_error(openai.AuthenticationError, 401): terminal("auth"),
-        status_error(openai.InternalServerError, 599): transient(pauses_quota=False),
-        status_error(openai.APIStatusError, 451): terminal("rejected"),
         status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded"): transient(
             pauses_quota=True
         ),
@@ -297,6 +346,7 @@ def openai_sdk_errors_and_request_failures() -> Mapping[Exception, RequestFailur
         status_error(openai.APIStatusError, 200, error_code="brand_new_code"): terminal(
             "provider_failed_terminally"
         ),
+        **delegated,
         ValueError("boom"): terminal("unknown_exception"),
     }
 

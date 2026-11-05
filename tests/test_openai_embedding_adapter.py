@@ -21,7 +21,11 @@ from langchaint.openai.embedding_adapter import (
     _partition_inputs_sync,
 )
 from langchaint.tracing import OtelObserver
-from tests.helpers import in_memory_tracer_provider, run_with_timeout
+from tests.helpers import (
+    in_memory_tracer_provider,
+    openai_sdk_errors_and_request_failures,
+    run_with_timeout,
+)
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
@@ -29,6 +33,14 @@ def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI
         api_key="offline",
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
+
+
+def test_embedding_request_failures_follow_the_sdk() -> None:
+    client = _client(lambda _request: _response([[1.0]]))
+    adapter = _OpenAIEmbeddingAdapter(client=client, model="text-embedding-3-small", dimension=1)
+    for error, expected in openai_sdk_errors_and_request_failures(client).items():
+        assert adapter.request_failure(error) == expected
+    run_with_timeout(client.close())
 
 
 def _response(

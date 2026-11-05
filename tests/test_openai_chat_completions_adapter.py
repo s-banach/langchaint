@@ -1041,7 +1041,7 @@ def _request_body_sent(
     bound = bind(_adapter(client=client))
     request = bound.build_request_params([UserMessage(content="q")])
     assert not isinstance(request, RejectedMessages)
-    _ = run_with_timeout(bound.open_stream(request))
+    _ = run_with_timeout(bound.open_stream(request, request_count=0))
     (body,) = bodies
     decoded_body: object = json.loads(body)
     return decoded_body
@@ -1191,4 +1191,4 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        return openai_sdk_errors_and_request_failures()
+        return openai_sdk_errors_and_request_failures(_adapter().client)

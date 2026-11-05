@@ -836,7 +836,9 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                     try:
                         deadline.resume_on_admission()
                         ledger.start_request()
-                        adapter_stream = await self._bound_adapter.open_stream(request_params)
+                        adapter_stream = await self._bound_adapter.open_stream(
+                            request_params, request_count=ledger.request_count
+                        )
                         stream_opened = True
                         try:
                             request_id = adapter_stream.request_id()

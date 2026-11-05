@@ -1,18 +1,15 @@
 """Implement Gemini `generateContent` through the google-genai SDK."""
 
 import json
-from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeGuard, TypeIs, override
 
-import httpx
 from google import genai
-from google.genai import errors, types
+from google.genai import _api_client, errors, types
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
-    AUTH_STATUSES,
     REASONING_PART_SEPARATOR,
     Adapter,
     AdapterStream,
@@ -31,9 +28,10 @@ from langchaint.adapter import (
     ToolChoice,
     _RejectedMessagesError,
     narrowed_request_params,
-    record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
+    request_failure_from_response,
     retry_after_seconds_from_headers,
+    sdk_retry_decision,
 )
 from langchaint.billing.pricing import (
     UNPRICED_TOKEN_RATES,
@@ -59,23 +57,9 @@ from langchaint.common.messages import (
 )
 
 _PAUSE_STATUSES = frozenset({429, 503})
-"""429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE pause every request sharing the rate-limit quota."""
+"""429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE pause every request sharing the rate-limit quota.
 
-_RETRY_THIS_ONE_STATUSES = frozenset({408, 500, 502, 504})
-"""One request's failure, retried without pausing siblings.
-
-500 INTERNAL and 504 DEADLINE_EXCEEDED come from the troubleshooting page.
-408 and 502 are unlisted there.
-The google-genai 2.19.0 retryable set is `(408, 429, 500, 502, 503, 504)`.
-"""
-
-_DO_NOT_RETRY_STATUSES = frozenset({400, 403, 404})
-"""The request-rejection statuses from the troubleshooting page. A resend fails again."""
-
-REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each `APIError` that matches no listed row.
-
-Such an error has a status in none of `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
+Source: https://ai.google.dev/gemini-api/docs/troubleshooting, read 2026-08-03.
 """
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
@@ -87,10 +71,10 @@ type GeminiServiceTier = Literal["flex", "standard", "priority"]
 type GeminiReportedServiceTier = Literal[
     "ON_DEMAND", "ON_DEMAND_PRIORITY", "ON_DEMAND_FLEX", "PROVISIONED_THROUGHPUT"
 ]
-"""What a response's usage_metadata.traffic_type reports having been served at (google-genai 2.16.0).
+"""The `usage_metadata.traffic_type` values with pricing fields in `GeminiPricingTable`.
 
 `GeminiPricingTable` has one rates field per value.
-The SDK's open enum also constructs unknown values.
+The SDK's open enum also constructs unknown values (google-genai 2.34.0).
 The request and response tier vocabularies share no value.
 """
 
@@ -906,51 +890,36 @@ def _retry_after_seconds_from_error(failure: errors.APIError) -> float | None:
 
 
 def gemini_request_failure(error: Exception) -> RequestFailure:
-    """Return the `RequestFailure` of one exception a Gemini request raised, by the documented status table.
+    """Return the `RequestFailure` using the SDK retry predicate and the provider's quota pause rule.
 
-    Source: https://ai.google.dev/gemini-api/docs/troubleshooting, read 2026-08-03.
-    google-genai 2.16.0 retry_args retries `httpx.TimeoutException` and `httpx.ConnectError` as transport failures.
-    Both are transient and pause nothing.
-    An `APIError` takes its failure from its status:
-    - `_PAUSE_STATUSES` are transient and pause the quota.
-    - `_RETRY_THIS_ONE_STATUSES` are transient without a pause.
-      Statuses 408 and 502 come from the SDK retryable set.
-    - Unlisted statuses of 500 or above are transient without a pause.
-    - Other statuses are `auth` for `AUTH_STATUSES`, `rejected` for another 4xx, and `unknown_exception` otherwise.
-    Unlisted statuses increment `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and are logged.
-    Response headers take precedence over body `RetryInfo` for a transient failure's `retry_after_seconds`.
-    Other exceptions are `unknown_exception`.
+    google-genai 2.34.0 retries statuses 408, 429, 500, 502, 503, and 504.
+    Its predicate also retries transport failures from httpx, httpx2, and aiohttp.
+    Statuses 429 and 503 pause the quota.
+    Other failures pause nothing.
+    The predicate uses default `HttpRetryOptions`, so retry options configured on the caller's client do not apply.
+    Response headers take precedence over body `RetryInfo` for the server-stated wait.
+    The SDK reads neither on generateContent.
+    `request_failure_from_response` names each `APIError` failure.
+    An `APIError` without a code, other exceptions, and failed SDK retry decisions are `unknown_exception`.
+    google-genai 2.34.0 reads a missing code from the response body, so `code` may be None.
     """
-    if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
-        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
-    if not isinstance(error, errors.APIError):
+    retries = sdk_retry_decision(
+        lambda: bool(_api_client.retry_args(types.HttpRetryOptions())["retry"].predicate(error))
+    )
+    if isinstance(retries, RequestFailure):
+        return retries
+    if not isinstance(error, errors.APIError) or error.code is None:
         return RequestFailure(
-            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+            kind="transient" if retries else "unknown_exception",
+            pauses_quota=False,
+            retry_after_seconds=None,
         )
-    if error.code in _PAUSE_STATUSES or error.code in _RETRY_THIS_ONE_STATUSES:
-        return RequestFailure(
-            kind="transient",
-            pauses_quota=error.code in _PAUSE_STATUSES,
-            retry_after_seconds=_retry_after_seconds_from_error(error),
-        )
-    if error.code not in _DO_NOT_RETRY_STATUSES:
-        record_request_failure_fallthrough(
-            REQUEST_FAILURE_FALLTHROUGH_COUNTS,
-            function_name="gemini_request_failure",
-            status_code=error.code,
-            error_type=error.status,
-        )
-        if error.code is not None and error.code >= 500:
-            return RequestFailure(
-                kind="transient",
-                pauses_quota=False,
-                retry_after_seconds=_retry_after_seconds_from_error(error),
-            )
-    if error.code in AUTH_STATUSES:
-        return RequestFailure(kind="auth", pauses_quota=False, retry_after_seconds=None)
-    if error.code is not None and 400 <= error.code < 500:
-        return RequestFailure(kind="rejected", pauses_quota=False, retry_after_seconds=None)
-    return RequestFailure(kind="unknown_exception", pauses_quota=False, retry_after_seconds=None)
+    return request_failure_from_response(
+        status_code=error.code,
+        retry_after_seconds=_retry_after_seconds_from_error(error),
+        retries=retries,
+        pauses_quota=error.code in _PAUSE_STATUSES,
+    )
 
 
 class GeminiGenerateContentAdapter(Adapter):
@@ -1158,7 +1127,7 @@ class GeminiGenerateContentAdapter(Adapter):
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Delegate to gemini_request_failure, whose docstring names the table and the defaults.
+        """Delegate to gemini_request_failure.
 
         A mid-stream error chunk raises `APIError`, as an error status does.
         """
@@ -1491,7 +1460,9 @@ class _BoundGemini(BoundAdapter):
         )
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         """Open one generate_content_stream and return the live stream.
 
         In google-genai 2.34.0, awaiting generate_content_stream returns an unstarted async generator.

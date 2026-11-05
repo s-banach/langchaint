@@ -43,6 +43,7 @@ from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
 from langchaint.adapter import (
     RequestFailure,
+    request_failure_from_response,
     retry_after_seconds_from_headers,
 )
 from langchaint.cohere._generated_pricing import (
@@ -120,6 +121,7 @@ def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
     botocore's standard retry mode lists it as a throttling error code.
     Statuses 408, 429, and 500 or above are transient without a pause, which covers `ModelNotReadyException` at 429.
     A botocore connection failure is transient without a pause.
+    `request_failure_from_response` names each `ClientError` failure.
     Every other exception is `unknown_exception`, including a `ClientError` without response metadata.
     """
     if isinstance(error, BotocoreConnectionError | HTTPClientError):
@@ -134,16 +136,13 @@ def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
         return unknown_exception
     status_code = metadata["HTTPStatusCode"]
     error_code = error.response.get("Error", {}).get("Code")
-    retry_after_seconds = retry_after_seconds_from_headers(metadata["HTTPHeaders"])
-    if error_code == "ThrottlingException":
-        return RequestFailure(
-            kind="transient", pauses_quota=True, retry_after_seconds=retry_after_seconds
-        )
-    if status_code in (408, 429) or status_code >= 500:
-        return RequestFailure(
-            kind="transient", pauses_quota=False, retry_after_seconds=retry_after_seconds
-        )
-    return unknown_exception
+    throttled = error_code == "ThrottlingException"
+    return request_failure_from_response(
+        status_code=status_code,
+        retry_after_seconds=retry_after_seconds_from_headers(metadata["HTTPHeaders"]),
+        retries=throttled or status_code in (408, 429) or status_code >= 500,
+        pauses_quota=throttled,
+    )
 
 
 def _require_one_sdk_request(client: BedrockRuntimeClient) -> None:

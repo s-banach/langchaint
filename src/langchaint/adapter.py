@@ -46,6 +46,22 @@ AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
 """The HTTP statuses for failed authentication and denied permission."""
 
 
+def sdk_retry_decision[DecisionT](
+    decide: Callable[[], DecisionT],
+) -> DecisionT | RequestFailure:
+    """Call the SDK retry rule, returning `unknown_exception` if it raises.
+
+    Log the exception because a failed SDK retry decision ends the request.
+    """
+    try:
+        return decide()
+    except Exception:
+        _logger.exception("SDK retry decision failed")
+        return RequestFailure(
+            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+        )
+
+
 def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None:
     """Parse provider wait headers.
 
@@ -99,50 +115,28 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
     return None
 
 
-def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
-    """Read the provider's own retry directive from response headers.
-
-    `None` defers the decision to the status.
-
-    Args:
-        headers: The provider response headers.
-    """
-    should_retry_header = headers.get("x-should-retry")
-    if should_retry_header == "true":
-        return True
-    if should_retry_header == "false":
-        return False
-    return None
-
-
 def request_failure_from_response(
-    *, status_code: int, headers: Mapping[str, str], retries: bool, pauses_quota: bool
+    *, status_code: int, retry_after_seconds: float | None, retries: bool, pauses_quota: bool
 ) -> RequestFailure:
-    """Build the `RequestFailure` of one error response from what the provider's tables give its status.
+    """Build the `RequestFailure` from the retry decision and the provider's quota pause rule.
 
-    `retries` and `pauses_quota` are the table answers.
-    Status 200 identifies a mid-stream error event, and the table answers stand.
-    On every other status, the provider's `x-should-retry` directive decides whether the request retries.
-    Both SDK clients read `x-should-retry` before status rules (anthropic 2.4.0 and openai 3.44.0 `_should_retry`).
-    `pauses_quota` stands whatever the directive says.
+    `retries` comes from the SDK, a mid-stream error table, or the adapter's own rule where the SDK has none.
+    `pauses_quota` applies independently of the retry decision.
     A failure that pauses the quota and does not retry is `provider_failed_terminally`.
     Another failure that does not retry takes the first kind that applies:
-    - `provider_failed_terminally` for status 200.
+    - `provider_failed_terminally` for status 200 or a 5xx status.
     - `auth` for `AUTH_STATUSES`.
     - `rejected` for another 4xx status.
-    - `provider_failed_terminally` when the directive forbids a retry.
     - `unknown_exception` otherwise.
-    `retry_after_seconds` comes from the headers when the failure retries or pauses the quota.
+    The failure keeps `retry_after_seconds` only when it retries or pauses the quota.
 
     Args:
         status_code: The response status code.
-        headers: The provider response headers.
-        retries: Whether the tables retry this status.
-        pauses_quota: Whether the tables pause the rate-limit quota for this status.
+        retry_after_seconds: The server-stated wait, or None.
+        retries: Whether this failed request should retry.
+        pauses_quota: Whether this failure pauses the rate-limit quota.
     """
-    retry_after_seconds = retry_after_seconds_from_headers(headers)
-    directive = None if status_code == 200 else should_retry_from_headers(headers)
-    if directive is True or (directive is None and retries):
+    if retries:
         return RequestFailure(
             kind="transient", pauses_quota=pauses_quota, retry_after_seconds=retry_after_seconds
         )
@@ -153,21 +147,19 @@ def request_failure_from_response(
             retry_after_seconds=retry_after_seconds,
         )
     return RequestFailure(
-        kind=_terminal_kind(status_code=status_code, directive=directive),
+        kind=_terminal_kind(status_code=status_code),
         pauses_quota=False,
         retry_after_seconds=None,
     )
 
 
-def _terminal_kind(*, status_code: int, directive: bool | None) -> _TerminalRequestFailureKind:
-    if status_code == 200:
+def _terminal_kind(*, status_code: int) -> _TerminalRequestFailureKind:
+    if status_code == 200 or 500 <= status_code < 600:
         return "provider_failed_terminally"
     if status_code in AUTH_STATUSES:
         return "auth"
     if 400 <= status_code < 500:
         return "rejected"
-    if directive is False:
-        return "provider_failed_terminally"
     return "unknown_exception"
 
 
@@ -180,7 +172,7 @@ def record_request_failure_fallthrough(
 ) -> None:
     """Count and log one request failure that matched no listed row of its provider's tables.
 
-    The count and the warning make a new provider status, error type, or error code visible.
+    The count and the warning make a new mid-stream error type or error code visible.
 
     Args:
         fallthrough_counts: The counter to increment by failure description.
@@ -740,11 +732,14 @@ class BoundAdapter(ABC):
         ...
 
     @abstractmethod
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         """Open a streaming request.
 
         Args:
             request_params: The adapter-specific request params.
+            request_count: The number of requests already made for this input.
 
         Raises:
             TypeError: `request_params` has the wrong `RequestParams` subclass.
@@ -871,7 +866,8 @@ class Adapter(ABC):
         A `StreamProtocolError` is transient and pauses nothing.
         Return `kind="unknown_exception"` for an exception the adapter cannot place.
         Never raise, because a raise escapes the retry loop as an adapter defect.
-        Each provider's function documents its tables and defaults for unknown statuses and error types.
+        Each provider's function documents where its retry decision comes from and its quota pause rules.
+        An SDK retry decision may have side effects, such as clearing a token cache.
 
         Args:
             error: The exception the failed request raised.
@@ -935,6 +931,6 @@ __all__ = [
     "request_params_json",
     "require_stated_rate",
     "retry_after_seconds_from_headers",
-    "should_retry_from_headers",
+    "sdk_retry_decision",
     "validated_provider_executed_tool_types",
 ]

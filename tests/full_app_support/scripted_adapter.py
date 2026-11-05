@@ -228,7 +228,9 @@ class _ScriptedBoundAdapter(BoundAdapter):
         return _ScriptedRequestParams(messages=tuple(messages))
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         """Open the next scripted turn after its delay.
 
         Raises:

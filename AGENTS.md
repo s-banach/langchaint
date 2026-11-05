@@ -57,6 +57,7 @@ Document a public parameter exactly when its name and type leave its meaning or 
 - Create one `SharedBackoff` per rate-limit quota.
 - Gate every request start through its `admitted()` block.
 - Disable SDK retries so langchaint accounts for every request.
+- Take each request's retry decision from the SDK's own retry rule where the SDK exposes one. Keep only pausing, failure names, mid-stream errors, and server-stated waits the SDK ignores.
 - Wrap official SDK clients.
 - Let the SDK assemble streams.
 - Do not define wire `TypedDict` types.

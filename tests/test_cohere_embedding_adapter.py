@@ -16,7 +16,6 @@ from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
 from langchaint import EmbeddingError, SharedBackoff
-from langchaint.adapter import RequestFailure
 from langchaint.cohere import (
     COHERE_BEDROCK_CROSS_REGION_MULTIPLIER,
     COHERE_BEDROCK_EMBEDDING_MODELS,
@@ -24,13 +23,14 @@ from langchaint.cohere import (
     CohereBedrock,
 )
 from langchaint.tracing import OtelObserver
-from tests.helpers import in_memory_tracer_provider, run_with_timeout
+from tests.helpers import in_memory_tracer_provider, run_with_timeout, terminal, transient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
+    from langchaint.adapter import RequestFailure
     from langchaint.cohere import CohereEmbedV4Dimension, CohereEmbedV4ModelId
 
 
@@ -202,18 +202,19 @@ def test_embedding_model_default_dimensions() -> None:
 
 
 @pytest.mark.parametrize(
-    ("error_code", "status_code", "pauses_quota"),
+    ("error_code", "status_code", "expected"),
     [
-        ("ThrottlingException", 429, True),
-        ("ModelNotReadyException", 429, False),
-        ("InternalServerException", 500, False),
+        ("ThrottlingException", 429, transient(pauses_quota=True)),
+        ("ModelNotReadyException", 429, transient(pauses_quota=False)),
+        ("InternalServerException", 500, transient(pauses_quota=False)),
+        ("AccessDeniedException", 403, terminal("auth")),
+        ("ValidationException", 400, terminal("rejected")),
     ],
 )
-def test_a_transient_client_error_pauses_the_quota_only_for_throttling_exception(
+def test_client_error_failure_names_and_quota_pauses(
     error_code: str,
     status_code: int,
-    *,
-    pauses_quota: bool,
+    expected: RequestFailure,
 ) -> None:
     failure = ClientError(
         {
@@ -228,9 +229,7 @@ def test_a_transient_client_error_pauses_the_quota_only_for_throttling_exception
         },
         "InvokeModel",
     )
-    assert cohere_backend._cohere_bedrock_request_failure(failure) == RequestFailure(
-        kind="transient", pauses_quota=pauses_quota, retry_after_seconds=None
-    )
+    assert cohere_backend._cohere_bedrock_request_failure(failure) == expected
 
 
 @pytest.mark.parametrize("texts", [("ab", "cd"), ("\u00e9", 'q"\n')])

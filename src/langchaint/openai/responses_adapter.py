@@ -91,7 +91,6 @@ from langchaint.openai.shared import (
     _image_data_uri,
     _OpenAIGenerationAdapterBase,
     _priced_tier,
-    client_without_retries,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -658,7 +657,6 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             provider_name=provider_name,
             automatic_cache_breakpoints_default=not supports_prompt_cache_options,
         )
-        self.client: AsyncOpenAI = client_without_retries(client)
         self.pricing: OpenAIPricingTable = pricing
         self.supports_prompt_cache_options: bool = supports_prompt_cache_options
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
@@ -1002,7 +1000,9 @@ class _BoundOpenAIResponses(BoundAdapter):
         )
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         """Open one responses.stream and return the live stream.
 
         Raises:

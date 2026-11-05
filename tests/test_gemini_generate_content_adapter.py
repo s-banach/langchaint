@@ -10,9 +10,10 @@ from dataclasses import replace
 from typing import NamedTuple, override
 
 import httpx
+import httpx2
 import pytest
 from google import genai
-from google.genai import errors, types
+from google.genai import _api_client, errors, types
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
@@ -68,7 +69,7 @@ from langchaint.gemini.generate_content_adapter import (
     _GeminiStream,
 )
 from langchaint.tools import ToolSchema
-from tests.helpers import finished_response, run_with_timeout, terminal, transient
+from tests.helpers import finished_response, run_with_timeout, terminal, with_sdk_retry_decisions
 
 
 def _billing_from_usage(
@@ -1484,11 +1485,11 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     async def open_refused() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http_client:
             with pytest.raises(httpx.ConnectError):
-                _ = await _bound_over(http_client).open_stream(request)
+                _ = await _bound_over(http_client).open_stream(request, request_count=0)
 
     async def served_items() -> list[StreamItem]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as http_client:
-            stream = await _bound_over(http_client).open_stream(request)
+            stream = await _bound_over(http_client).open_stream(request, request_count=0)
             return [item async for item in stream.items()]
 
     run_with_timeout(open_refused())
@@ -1627,20 +1628,25 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Return one row per branch of `gemini_request_failure`."""
-        return {
-            httpx.ConnectError("no route"): transient(pauses_quota=False),
-            _api_error(429, headers={"retry-after": "7"}): transient(
-                pauses_quota=True, retry_after_seconds=7.0
-            ),
-            _api_error(429, retry_delay="32s"): transient(
-                pauses_quota=True, retry_after_seconds=32.0
-            ),
-            _api_error(500): transient(pauses_quota=False),
-            _api_error(599): transient(pauses_quota=False),
-            _api_error(400): terminal("rejected"),
-            _api_error(401): terminal("auth"),
-            _api_error(451): terminal("rejected"),
-            _api_error(302): terminal("unknown_exception"),
-            ValueError("boom"): terminal("unknown_exception"),
-        }
+        """Combine the SDK's retry answer with expected neutral names, pauses, and waits."""
+        predicate = _api_client.retry_args(types.HttpRetryOptions())["retry"].predicate
+        return with_sdk_retry_decisions(
+            {
+                httpx2.ConnectError("no route"): terminal("unknown_exception"),
+                _api_error(429, headers={"retry-after": "7"}): RequestFailure(
+                    kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
+                ),
+                _api_error(429, retry_delay="32s"): RequestFailure(
+                    kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=32.0
+                ),
+                _api_error(501): terminal("provider_failed_terminally"),
+                _api_error(400): terminal("rejected"),
+                _api_error(401): terminal("auth"),
+                _api_error(302): terminal("unknown_exception"),
+                errors.APIError(0, {"error": {"message": "provider text"}}): terminal(
+                    "unknown_exception"
+                ),
+                ValueError("boom"): terminal("unknown_exception"),
+            },
+            lambda error: bool(predicate(error)),
+        )

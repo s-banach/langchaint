@@ -16,6 +16,7 @@ from anthropic import (
     AsyncAnthropicBedrock,
     AsyncAnthropicBedrockMantle,
 )
+from anthropic.lib.credentials import AccessToken
 from anthropic.lib.streaming import (
     AsyncMessageStream,
     ParsedContentBlockStopEvent,
@@ -31,6 +32,7 @@ from langchaint import (
     AssistantMessage,
     AudioPart,
     Billing,
+    GenerationError,
     ImagePart,
     ImageUrlPart,
     JsonValue,
@@ -83,18 +85,19 @@ from langchaint.anthropic.messages_adapter import (
     _extra_body_with_temperature,
     _wire_messages,
     _wire_tool_choice,
-    anthropic_request_failure,
 )
 from langchaint.anthropic.messages_adapter import (
     _billing_from_sdk_usage as _provider_billing_from_sdk_usage,
 )
 from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
+from tests.fake_adapter import fast_shared_backoff
 from tests.helpers import (
     finished_response,
     run_with_timeout,
     terminal,
     transient,
+    with_sdk_retry_decisions,
 )
 
 
@@ -1011,7 +1014,7 @@ def test_open_stream_sends_the_built_request() -> None:
     request = bound.build_request_params([UserMessage(content="q")])
     assert not isinstance(request, RejectedMessages)
     with pytest.raises(anthropic.BadRequestError):
-        _ = run_with_timeout(bound.open_stream(request))
+        _ = run_with_timeout(bound.open_stream(request, request_count=0))
     assert sent_bodies == [
         {
             "model": "m",
@@ -1688,17 +1691,112 @@ def test_pause_turn_cannot_continue_and_names_the_stop_reason() -> None:
     assert "pause_turn" in finished.cannot_continue
 
 
-def test_anthropic_request_failure_counts_each_fallthrough_and_no_listed_row() -> None:
+def test_anthropic_request_failure_counts_unlisted_mid_stream_error_types() -> None:
+    adapter = _adapter()
     before = dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS)
-    _ = anthropic_request_failure(_status_error(anthropic.RateLimitError, 429))
-    _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 408))
-    _ = anthropic_request_failure(
+    _ = adapter.request_failure(_status_error(anthropic.APIStatusError, 599))
+    _ = adapter.request_failure(
         _status_error(anthropic.APIStatusError, 200, error_type="api_error")
     )
     assert dict(REQUEST_FAILURE_FALLTHROUGH_COUNTS) == before
-    _ = anthropic_request_failure(_status_error(anthropic.APIStatusError, 599))
-    tag = "status=599 type=None"
+    _ = adapter.request_failure(_status_error(anthropic.APIStatusError, 200))
+    tag = "status=200 type=None"
     assert REQUEST_FAILURE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
+
+
+class _RetryingAnthropic(AsyncAnthropic):
+    @override
+    def _should_retry_exception(self, err: BaseException) -> tuple[bool, httpx2.Response | None]:
+        return True, None
+
+
+@pytest.mark.parametrize("path", ["generate", "stream"])
+def test_retry_count_header_counts_prior_requests(path: Literal["generate", "stream"]) -> None:
+    sent_headers: list[str] = []
+
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        sent_headers.append(request.headers["x-stainless-retry-count"])
+        return httpx2.Response(
+            401,
+            json={
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "expired"},
+            },
+        )
+
+    async def scenario() -> None:
+        async with _RetryingAnthropic(
+            api_key="offline",
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
+        ) as client:
+            bound = LLM(_adapter(client=client), shared_backoff=fast_shared_backoff()).bind(
+                max_completion_tokens=16, max_requests=2
+            )
+            if path == "generate":
+                with pytest.raises(GenerationError) as caught:
+                    await bound.generate_one("hello")
+            else:
+                with pytest.raises(GenerationError) as caught:
+                    async with bound.stream_one("hello"):
+                        pass
+            assert caught.value.kind == "retries_exhausted_error"
+
+    run_with_timeout(scenario())
+    assert sent_headers == ["0", "1"]
+
+
+def test_a_persistent_401_on_a_token_cache_client_ends_as_auth_error() -> None:
+    """Regression: the SDK retries a token-cache client's 401 when `x-stainless-retry-count` is "0".
+
+    Without a per-input retry count every request sends "0", so every 401 retries until `max_requests` runs out.
+    """
+
+    async def provider(*, force_refresh: bool = False) -> AccessToken:  # noqa: ARG001 - AsyncAccessTokenProvider requires it.
+        return AccessToken(token="offline-token-0000")
+
+    def reject(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            401,
+            json={
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "expired"},
+            },
+        )
+
+    async def scenario() -> None:
+        async with AsyncAnthropic(
+            credentials=provider,
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
+        ) as client:
+            bound = LLM(_adapter(client=client), shared_backoff=fast_shared_backoff()).bind(
+                max_completion_tokens=16, max_requests=10
+            )
+            with pytest.raises(GenerationError) as caught:
+                await bound.generate_one("hello")
+            assert caught.value.kind == "auth_error"
+
+    run_with_timeout(scenario())
+
+
+def test_anthropic_wrapped_failures_use_the_sdk_judged_cause() -> None:
+    adapter = _adapter()
+    connection_error = RuntimeError("middleware failed")
+    connection_error.__cause__ = _connection_error()
+    retries, _ = adapter.client._should_retry_exception(connection_error)
+    failure = adapter.request_failure(connection_error)
+    assert (failure.kind == "transient") == retries
+    assert not failure.pauses_quota
+    status_error = RuntimeError("middleware failed")
+    status_error.__cause__ = _status_error(
+        anthropic.APIStatusError, 429, {"retry-after": "7"}, "rate_limit_error"
+    )
+    retries, _ = adapter.client._should_retry_exception(status_error)
+    failure = adapter.request_failure(status_error)
+    assert (failure.kind == "transient") == retries
+    assert failure.pauses_quota
+    assert failure.retry_after_seconds == 7.0
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
@@ -2008,34 +2106,47 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        """Return one row per branch of `anthropic_request_failure` and `_anthropic_table_answers`.
+        """Return request failures from the adapter's mid-stream error rules and the SDK's retry decisions.
 
         A mid-stream error carries status 200, so its error type decides the failure.
+        The `x-should-retry` rows make the SDK retry a 400 and decline a 500.
         """
+        client = _adapter().client
+        pause_without_retry = RequestFailure(
+            kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
+        )
+        delegated = with_sdk_retry_decisions(
+            {
+                _status_error(anthropic.BadRequestError, 400): terminal("rejected"),
+                _status_error(
+                    anthropic.BadRequestError, 400, {"x-should-retry": "true"}
+                ): terminal("rejected"),
+                _status_error(anthropic.AuthenticationError, 401): terminal("auth"),
+                _status_error(
+                    anthropic.InternalServerError, 500, {"x-should-retry": "false"}
+                ): terminal("provider_failed_terminally"),
+                _status_error(anthropic.APIStatusError, 501): terminal(
+                    "provider_failed_terminally"
+                ),
+                _status_error(
+                    anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
+                ): pause_without_retry,
+                _status_error(
+                    anthropic.OverloadedError, 529, {"retry-after": "7"}, "overloaded_error"
+                ): pause_without_retry,
+            },
+            lambda error: client._should_retry_exception(error)[0],
+        )
         return {
-            _connection_error(): transient(pauses_quota=False),
-            anthropic.RetryableError("middleware said retry"): transient(pauses_quota=False),
-            _status_error(
-                anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
-            ): transient(pauses_quota=True, retry_after_seconds=7.0),
+            **delegated,
             _status_error(anthropic.APIStatusError, 200, error_type="overloaded_error"): transient(
                 pauses_quota=True
-            ),
-            _status_error(anthropic.InternalServerError, 500, error_type="api_error"): transient(
-                pauses_quota=False
             ),
             _status_error(anthropic.APIStatusError, 200, error_type="api_error"): transient(
                 pauses_quota=False
             ),
             _status_error(
-                anthropic.BadRequestError, 400, error_type="invalid_request_error"
-            ): terminal("rejected"),
-            _status_error(
-                anthropic.AuthenticationError, 401, error_type="authentication_error"
-            ): terminal("auth"),
-            _status_error(
                 anthropic.APIStatusError, 200, error_type="invalid_request_error"
             ): terminal("provider_failed_terminally"),
-            _status_error(anthropic.APIStatusError, 599): transient(pauses_quota=False),
             ValueError("boom"): terminal("unknown_exception"),
         }

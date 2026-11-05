@@ -253,7 +253,9 @@ class FakeBoundAdapter(BoundAdapter):
         return ScriptedRequestStream(raw=raw, content=content)
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         messages = as_fake_request_params(request_params).messages
         self.open_count += 1
         open_call = self.open_count

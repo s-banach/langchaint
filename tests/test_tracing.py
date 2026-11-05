@@ -219,9 +219,11 @@ class _CurrentSpanRecordingBoundAdapter(FakeBoundAdapter):
         self.spans_current_at_open: list[trace.Span] = []
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         self.spans_current_at_open.append(trace.get_current_span())
-        return await super().open_stream(request_params)
+        return await super().open_stream(request_params, request_count=request_count)
 
 
 class _CurrentSpanRecordingAdapter(FakeAdapter):

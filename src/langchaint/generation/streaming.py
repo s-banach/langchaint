@@ -353,7 +353,9 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             self._admission = await self._shared_backoff.admitted().__aenter__()
             self._ledger.start_request()
             try:
-                self._adapter_stream = await self._bound_adapter.open_stream(request_params)
+                self._adapter_stream = await self._bound_adapter.open_stream(
+                    request_params, request_count=self._ledger.request_count
+                )
             except Exception as exc:
                 request_failure = self._request_failure_exiting_admission(exc)
                 if request_failure.kind != "transient":

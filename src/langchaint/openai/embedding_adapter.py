@@ -149,4 +149,4 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        return openai_request_failure(error)
+        return openai_request_failure(error, client=self.client)

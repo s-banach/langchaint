@@ -19,6 +19,8 @@ from langchaint.adapter import (
     RequestFailure,
     record_request_failure_fallthrough,
     request_failure_from_response,
+    retry_after_seconds_from_headers,
+    sdk_retry_decision,
 )
 from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, LongContextPricing, TokenRates
 from langchaint.common.messages import ImagePart
@@ -32,30 +34,8 @@ two error statuses on chat completions, responses, and embeddings.
 It describes both as retryable after an optional integer-seconds `Retry-After` header.
 """
 
-_SPEND_LIMIT_CODES = frozenset({
-    "credit_balance_exhausted",
-    "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded",
-    "organization_usage_limit_exceeded",
-})
-"""The error.code values whose 429 no wait restores: credits or a set spend limit ran out."""
-
-_RETRY_THIS_ONE_STATUSES = frozenset({500, 408, 409})
-"""One request's server-side failure or collision, retried without pausing siblings."""
-
-_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404, 422})
-"""The statuses that reject this request.
-
-A resend fails the same way.
-"""
-
 REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each `APIStatusError` that matches no listed row.
-
-An error whose status is not 200 matches no listed row when no status table lists its status.
-The status tables are `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
-A status-200 mid-stream error matches no listed row when its code is missing or `_DISPOSITION_BY_ERROR_CODE` lacks it.
-"""
+"""Counts mid-stream errors whose code is missing or absent from `_DISPOSITION_BY_ERROR_CODE`."""
 
 type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 """What a Chat Completions request may ask for (openai 3.1.0)."""
@@ -204,14 +184,16 @@ def require_prompt_cache_options_support(
         )
 
 
-def openai_request_failure(error: Exception) -> RequestFailure:
+def openai_request_failure(error: Exception, *, client: openai.AsyncOpenAI) -> RequestFailure:
     """Return the `RequestFailure` of one exception an OpenAI request raised.
 
     `APIConnectionError` is a transient transport failure without a response, and pauses nothing.
     `APITimeoutError` is an `APIConnectionError` subclass.
     Status 200 identifies a mid-stream error, so `_openai_error_code_answers` reads its code.
-    `_openai_status_answers` reads every other status.
-    `request_failure_from_response` builds the failure from those answers.
+    The client's `_should_retry` decides retries for every other status.
+    openai 3.46.0 declines retries when `Retry-After` exceeds 120 seconds, and retries spend-limit 429s.
+    Statuses 429 and 503 pause the quota independently of the retry decision.
+    A failed SDK retry decision is logged and returns `unknown_exception`.
     Other exceptions are `unknown_exception`.
     """
     if isinstance(error, openai.APIConnectionError):
@@ -220,49 +202,19 @@ def openai_request_failure(error: Exception) -> RequestFailure:
         return RequestFailure(
             kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
         )
-    retries, pauses_quota = (
-        _openai_error_code_answers(error)
-        if error.status_code == 200
-        else _openai_status_answers(error)
-    )
+    if error.status_code == 200:
+        retries, pauses_quota = _openai_error_code_answers(error)
+    else:
+        retries = sdk_retry_decision(lambda: client._should_retry(error.response))
+        if isinstance(retries, RequestFailure):
+            return retries
+        pauses_quota = error.status_code in _PAUSE_STATUSES
     return request_failure_from_response(
         status_code=error.status_code,
-        headers=error.response.headers,
+        retry_after_seconds=retry_after_seconds_from_headers(error.response.headers),
         retries=retries,
         pauses_quota=pauses_quota,
     )
-
-
-def _openai_status_answers(error: openai.APIStatusError) -> tuple[bool, bool]:
-    """Return whether one error-status failure retries and whether it pauses the quota, by status and code.
-
-    Source: https://developers.openai.com/api/docs/guides/error-codes.
-    Read 2026-08-01.
-    `_PAUSE_STATUSES` retry and pause unless `_SPEND_LIMIT_CODES` forbids a retry.
-    Retrying spend-limit errors cannot restore access.
-    `_RETRY_THIS_ONE_STATUSES` retry without a pause.
-    `_DO_NOT_RETRY_STATUSES` neither retry nor pause.
-    Some rows come from the SDK.
-    Each table's docstring names the source and reason.
-    `error.code` separates spend-limit 429 errors because `error.type` may still be `insufficient_quota`.
-    Failures that match no listed row are counted in `REQUEST_FAILURE_FALLTHROUGH_COUNTS` and logged.
-    Of those, unlisted 5xx statuses retry without a pause, and other unlisted statuses neither retry nor pause.
-    """
-    if error.status_code in _PAUSE_STATUSES:
-        if error.code in _SPEND_LIMIT_CODES:
-            return False, False
-        return True, True
-    if error.status_code in _RETRY_THIS_ONE_STATUSES:
-        return True, False
-    if error.status_code in _DO_NOT_RETRY_STATUSES:
-        return False, False
-    record_request_failure_fallthrough(
-        REQUEST_FAILURE_FALLTHROUGH_COUNTS,
-        function_name="openai_request_failure",
-        status_code=error.status_code,
-        error_type=error.type,
-    )
-    return error.status_code >= 500, False
 
 
 def _openai_error_code_answers(error: openai.APIStatusError) -> tuple[bool, bool]:
@@ -313,9 +265,30 @@ class _OpenAIGenerationAdapterBase(Adapter, ABC):
         PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
     )
 
+    def __init__(
+        self,
+        *,
+        client: openai.AsyncOpenAI,
+        model: str,
+        provider_name: str,
+        automatic_cache_breakpoints_default: bool,
+    ) -> None:
+        """Validate the provider and store the SDK client with retries disabled.
+
+        Raises:
+            ValueError: The client reaches another known provider.
+        """
+        super().__init__(
+            client=client,
+            model=model,
+            provider_name=provider_name,
+            automatic_cache_breakpoints_default=automatic_cache_breakpoints_default,
+        )
+        self.client: openai.AsyncOpenAI = client_without_retries(client)
+
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        return openai_request_failure(error)
+        return openai_request_failure(error, client=self.client)
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:

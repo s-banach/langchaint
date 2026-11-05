@@ -95,7 +95,7 @@ from langchaint.openai.responses_adapter import (
 from langchaint.openai.responses_adapter import (
     _billing_from_response as _provider_billing_from_response,
 )
-from langchaint.openai.shared import REQUEST_FAILURE_FALLTHROUGH_COUNTS, openai_request_failure
+from langchaint.openai.shared import REQUEST_FAILURE_FALLTHROUGH_COUNTS
 from langchaint.tools import ToolSchema
 from tests.helpers import (
     finished_response,
@@ -985,7 +985,7 @@ def _request_body_sent(
     )
     request = bound.build_request_params([UserMessage(content="q")])
     assert isinstance(request, RequestParams)
-    _ = run_with_timeout(bound.open_stream(request))
+    _ = run_with_timeout(bound.open_stream(request, request_count=0))
     (body,) = bodies
     decoded_body: object = json.loads(body)
     return decoded_body
@@ -1441,7 +1441,7 @@ def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -
         assert caught.value.status_code == 200
         assert caught.value.code == "server_error"
         assert "The server had an error." in str(caught.value)
-        assert openai_request_failure(caught.value) == transient(pauses_quota=False)
+        assert _adapter().request_failure(caught.value) == transient(pauses_quota=False)
 
     run_with_timeout(scenario())
 
@@ -1588,11 +1588,6 @@ def test_only_a_rate_limit_error_code_pauses_the_quota(
             None,
         ),
         (
-            status_error(openai.APIStatusError, 599),
-            transient(pauses_quota=False),
-            "status=599 type=None",
-        ),
-        (
             status_error(openai.APIStatusError, 200, error_code="brand_new_code"),
             terminal("provider_failed_terminally"),
             "status=200 type=brand_new_code",
@@ -1605,7 +1600,6 @@ def test_only_a_rate_limit_error_code_pauses_the_quota(
     ],
     ids=[
         "status_200_transient_code",
-        "unlisted_5xx_falls_through",
         "status_200_unknown_code_falls_through",
         "status_200_without_a_code_falls_through",
     ],
@@ -1616,7 +1610,7 @@ def test_openai_request_failure_and_counts_only_fallthroughs(
     fallthrough_tag: str | None,
 ) -> None:
     before = REQUEST_FAILURE_FALLTHROUGH_COUNTS.copy()
-    assert openai_request_failure(failure) == expected_request_failure
+    assert _adapter().request_failure(failure) == expected_request_failure
     if fallthrough_tag is not None:
         before[fallthrough_tag] += 1
     assert before == REQUEST_FAILURE_FALLTHROUGH_COUNTS
@@ -1722,4 +1716,4 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_request_failures(self) -> Mapping[Exception, RequestFailure]:
-        return openai_sdk_errors_and_request_failures()
+        return openai_sdk_errors_and_request_failures(_adapter().client)

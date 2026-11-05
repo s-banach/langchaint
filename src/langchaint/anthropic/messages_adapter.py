@@ -75,6 +75,8 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_failure_from_response,
     request_params_json,
+    retry_after_seconds_from_headers,
+    sdk_retry_decision,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -123,22 +125,17 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 
 
 _PAUSE_STATUSES = frozenset({429, 529})
-"""429 rate_limit_error and 529 overloaded_error pause every request sharing the rate-limit quota."""
+"""429 rate_limit_error and 529 overloaded_error pause every request sharing the rate-limit quota.
+
+Source: https://platform.claude.com/docs/en/api/errors, read 2026-08-01.
+"""
 
 _PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error", "throttlingException"})
 """The error types of 429 and 529, which pause at any status carrying them.
 
 `throttlingException` is Bedrock's 429 exception in a stream.
-"""
-
-_RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 503, 504})
-"""One request's failure, retried without pausing siblings.
-
-500 api_error and 504 timeout_error come from the errors page.
-408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 2.4.0 _should_retry).
-503 is the status AsyncAnthropicBedrock raises ServiceUnavailableError for (anthropic 2.4.0).
-No errors page states that a Bedrock 503 throttles the rate-limit quota.
-It therefore retries without pausing every request.
+AsyncAnthropicBedrock sets each stream exception's `.type` to its ResponseStream variant name.
+Sources: anthropic 2.5.0 `_stream_decoder` and botocore 1.43.123 bedrock-runtime `ResponseStream`.
 """
 
 _RETRY_THIS_ONE_ERROR_TYPES = frozenset({
@@ -149,21 +146,14 @@ _RETRY_THIS_ONE_ERROR_TYPES = frozenset({
     "internalServerException",
     "serviceUnavailableException",
 })
-"""The error types that retry at any status carrying them.
+"""The mid-stream error types that retry without pausing the quota.
 
 `api_error` and `timeout_error` are the 500 and 504 error types.
 The others are Bedrock's 408, 424, 500, and 503 exceptions in a stream.
 """
 
-_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
-"""The statuses that reject this request. A resend fails again."""
-
 REQUEST_FAILURE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""`record_request_failure_fallthrough` increments this counter for each `APIStatusError` that matches no listed row.
-
-Such an error has a type in neither `_PAUSE_ERROR_TYPES` nor `_RETRY_THIS_ONE_ERROR_TYPES`.
-Its status is also in none of `_PAUSE_STATUSES`, `_RETRY_THIS_ONE_STATUSES`, and `_DO_NOT_RETRY_STATUSES`.
-"""
+"""Counts mid-stream error types absent from the retry and pause tables."""
 
 _MAX_CACHE_BREAKPOINTS_PER_REQUEST = 4
 """The API allows at most 4 cache breakpoints per request, the binding's own included."""
@@ -933,57 +923,53 @@ def _billing_from_sdk_usage(
     )
 
 
-def anthropic_request_failure(error: Exception) -> RequestFailure:
+def anthropic_request_failure(error: Exception, *, client: AnthropicClient) -> RequestFailure:
     """Return the `RequestFailure` of one exception an Anthropic request raised.
 
-    `APIConnectionError` and `RetryableError` are transient transport failures that pause nothing.
-    `APITimeoutError` is an `APIConnectionError` subclass.
-    `request_failure_from_response` builds an `APIStatusError`'s failure from `_anthropic_table_answers`.
-    It applies `x-should-retry` on every status except 200, which identifies a mid-stream error.
-    Other exceptions are `unknown_exception`.
+    anthropic 2.5.0 `_should_retry_exception` decides retries through the exception's cause chain.
+    A client with credentials from `credentials`, `config`, `profile`, or `default_credentials` holds a token cache.
+    A 401 clears that cache and retries when `x-stainless-retry-count` is "0"; otherwise the SDK's status rule decides.
+    The judged response's status and error type decide the quota pause.
+    Status 200 identifies a mid-stream error, whose type decides the retry.
+    A failed SDK retry decision is logged and returns `unknown_exception`.
     """
-    if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
-        return RequestFailure(kind="transient", pauses_quota=False, retry_after_seconds=None)
-    if not isinstance(error, anthropic.APIStatusError):
+    decision = sdk_retry_decision(lambda: client._should_retry_exception(error))
+    if isinstance(decision, RequestFailure):
+        return decision
+    retries, response = decision
+    if response is None:
         return RequestFailure(
-            kind="unknown_exception", pauses_quota=False, retry_after_seconds=None
+            kind="transient" if retries else "unknown_exception",
+            pauses_quota=False,
+            retry_after_seconds=None,
         )
-    retries, pauses_quota = _anthropic_table_answers(error)
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, anthropic.APIStatusError) and current.response is response:
+            return _anthropic_response_failure(current, retries=retries)
+        current = current.__cause__
+    return RequestFailure(kind="unknown_exception", pauses_quota=False, retry_after_seconds=None)
+
+
+def _anthropic_response_failure(
+    error: anthropic.APIStatusError, *, retries: bool
+) -> RequestFailure:
+    pauses_quota = error.status_code in _PAUSE_STATUSES or error.type in _PAUSE_ERROR_TYPES
+    if error.status_code == 200:
+        retries = pauses_quota or error.type in _RETRY_THIS_ONE_ERROR_TYPES
+        if not retries:
+            record_request_failure_fallthrough(
+                REQUEST_FAILURE_FALLTHROUGH_COUNTS,
+                function_name="anthropic_request_failure",
+                status_code=error.status_code,
+                error_type=error.type,
+            )
     return request_failure_from_response(
         status_code=error.status_code,
-        headers=error.response.headers,
+        retry_after_seconds=retry_after_seconds_from_headers(error.response.headers),
         retries=retries,
         pauses_quota=pauses_quota,
     )
-
-
-def _anthropic_table_answers(error: anthropic.APIStatusError) -> tuple[bool, bool]:
-    """Return whether one `APIStatusError` retries and whether it pauses the quota, by status and error type.
-
-    Source: https://platform.claude.com/docs/en/api/errors, read 2026-08-01.
-    Error types override status because stream errors carry the live response's 200 status.
-    AsyncAnthropicBedrock sets `.type` of each stream exception's APIStatusError to the ResponseStream variant name.
-    Sources: anthropic 2.4.0 `_stream_decoder` and botocore 1.43.123 bedrock-runtime `ResponseStream`.
-    `_PAUSE_STATUSES` and `_PAUSE_ERROR_TYPES` retry and pause.
-    `_RETRY_THIS_ONE_STATUSES` and `_RETRY_THIS_ONE_ERROR_TYPES` retry without a pause.
-    Unlisted 5xx statuses retry without a pause.
-    Other unlisted statuses neither retry nor pause.
-    """
-    for error_types, statuses, pauses_quota in (
-        (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, True),
-        (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, False),
-    ):
-        if error.type in error_types or error.status_code in statuses:
-            return True, pauses_quota
-    if error.status_code in _DO_NOT_RETRY_STATUSES:
-        return False, False
-    record_request_failure_fallthrough(
-        REQUEST_FAILURE_FALLTHROUGH_COUNTS,
-        function_name="anthropic_request_failure",
-        status_code=error.status_code,
-        error_type=error.type,
-    )
-    return error.status_code >= 500, False
 
 
 class AnthropicMessagesAdapter(Adapter):
@@ -1219,8 +1205,8 @@ class AnthropicMessagesAdapter(Adapter):
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
-        """Delegate to anthropic_request_failure, whose docstring names the tables and the defaults."""
-        return anthropic_request_failure(error)
+        """Apply the client's retry rule, including token-cache invalidation on a 401."""
+        return anthropic_request_failure(error, client=self.client)
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:
@@ -1384,8 +1370,13 @@ class _BoundAnthropic(BoundAdapter):
         )
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         """Open one messages.stream and return the live stream.
+
+        `request_count` counts prior requests for this input and sets `x-stainless-retry-count`.
+        For a client with a token cache, anthropic 2.5.0 retries a 401 when that header is "0".
 
         Raises:
             TypeError: request was built by another adapter.
@@ -1406,6 +1397,7 @@ class _BoundAnthropic(BoundAdapter):
             cache_control=precomputed.cache_control,
             messages=params.messages,
             extra_body=_extra_body_with_temperature(precomputed),
+            extra_headers={"x-stainless-retry-count": str(request_count)},
         )
         return _AnthropicStream(
             sdk_stream=await manager.__aenter__(),

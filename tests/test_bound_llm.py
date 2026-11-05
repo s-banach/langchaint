@@ -1007,7 +1007,9 @@ class _ScriptedBoundAdapter(BoundAdapter):
         return FakeRequestParams(messages=tuple(messages))
 
     @override
-    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+    async def open_stream(
+        self, request_params: RequestParams, *, request_count: int
+    ) -> AdapterStream:
         self.open_count += 1
         return self.stream
 

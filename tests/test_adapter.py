@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field
-from typing import NamedTuple, override
+from typing import override
 
 import pytest
 from pydantic import BaseModel
@@ -11,6 +11,7 @@ from langchaint.adapter import (
     request_failure_from_response,
     request_params_json,
     retry_after_seconds_from_headers,
+    sdk_retry_decision,
 )
 from langchaint.common.request_failure import RequestFailure
 from tests.helpers import terminal, transient
@@ -66,80 +67,50 @@ def test_retry_after_seconds_from_headers(
     assert retry_after_seconds_from_headers(headers) == expected
 
 
-class _TableAnswers(NamedTuple):
-    retries: bool
-    pauses_quota: bool
-
-
-_RETRY_THIS_ONE = _TableAnswers(retries=True, pauses_quota=False)
-_PAUSE = _TableAnswers(retries=True, pauses_quota=True)
-_DO_NOT_RETRY = _TableAnswers(retries=False, pauses_quota=False)
-
-
 @pytest.mark.parametrize(
-    ("status_code", "headers", "table_answers", "expected"),
+    ("status_code", "retries", "pauses_quota", "expected"),
     [
-        (
-            500,
-            {"retry-after": "7"},
-            _RETRY_THIS_ONE,
-            transient(pauses_quota=False, retry_after_seconds=7.0),
-        ),
-        (400, {"retry-after": "7"}, _DO_NOT_RETRY, terminal("rejected")),
-        (
-            400,
-            {"x-should-retry": "true", "retry-after": "3"},
-            _DO_NOT_RETRY,
-            transient(pauses_quota=False, retry_after_seconds=3.0),
-        ),
-        (
-            500,
-            {"x-should-retry": "false"},
-            _RETRY_THIS_ONE,
-            terminal("provider_failed_terminally"),
-        ),
+        (400, True, True, transient(pauses_quota=True, retry_after_seconds=7.0)),
+        (400, False, False, terminal("rejected")),
+        (500, False, False, terminal("provider_failed_terminally")),
         (
             429,
-            {"x-should-retry": "false", "retry-after": "7"},
-            _PAUSE,
+            False,
+            True,
             RequestFailure(
                 kind="provider_failed_terminally", pauses_quota=True, retry_after_seconds=7.0
             ),
         ),
-        (401, {"x-should-retry": "false"}, _DO_NOT_RETRY, terminal("auth")),
-        (400, {"x-should-retry": "false"}, _DO_NOT_RETRY, terminal("rejected")),
-        (200, {"x-should-retry": "false"}, _PAUSE, transient(pauses_quota=True)),
-        (200, {"x-should-retry": "true"}, _DO_NOT_RETRY, terminal("provider_failed_terminally")),
-        (302, {}, _DO_NOT_RETRY, terminal("unknown_exception")),
-    ],
-    ids=[
-        "retry_reads_retry_after",
-        "no_retry_drops_retry_after",
-        "directive_true_overrides_the_table",
-        "directive_false_overrides_the_table",
-        "directive_false_keeps_the_pause",
-        "auth_status_before_directive_false",
-        "client_status_before_directive_false",
-        "mid_stream_error_ignores_directive_false",
-        "mid_stream_error_ignores_directive_true",
-        "unlisted_status",
+        (401, False, False, terminal("auth")),
+        (200, False, False, terminal("provider_failed_terminally")),
+        (302, False, False, terminal("unknown_exception")),
     ],
 )
 def test_request_failure_from_response(
     status_code: int,
-    headers: dict[str, str],
-    table_answers: _TableAnswers,
     expected: RequestFailure,
+    *,
+    retries: bool,
+    pauses_quota: bool,
 ) -> None:
     assert (
         request_failure_from_response(
             status_code=status_code,
-            headers=headers,
-            retries=table_answers.retries,
-            pauses_quota=table_answers.pauses_quota,
+            retry_after_seconds=7.0,
+            retries=retries,
+            pauses_quota=pauses_quota,
         )
         == expected
     )
+
+
+def test_sdk_retry_decision_failure_is_unknown_exception(caplog: pytest.LogCaptureFixture) -> None:
+    def decide() -> bool:
+        raise OverflowError("retry date overflow")
+
+    assert sdk_retry_decision(decide) == terminal("unknown_exception")
+    assert "SDK retry decision failed" in caplog.text
+    assert "retry date overflow" in caplog.text
 
 
 class _Omit:

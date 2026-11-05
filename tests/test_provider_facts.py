@@ -6,51 +6,17 @@ import anthropic
 import boto3
 import botocore.session
 import httpx2
-import openai
-from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from anthropic.types import Message as AnthropicMessage
 from anthropic.types import Usage as AnthropicUsage
 from botocore.exceptions import ClientError
-from google.genai import _api_client
-from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from pydantic import BaseModel
 
 from langchaint.anthropic import messages_adapter
 from langchaint.cohere import _INVOKE_MODEL_MAX_BODY_BYTES
-from langchaint.gemini import generate_content_adapter
 from langchaint.openai import responses_adapter as openai_responses
 from langchaint.openai import shared as openai_shared
-from tests.helpers import terminal, transient
-
-_ANTHROPIC_LISTED_STATUSES = (
-    messages_adapter._PAUSE_STATUSES
-    | messages_adapter._RETRY_THIS_ONE_STATUSES
-    | messages_adapter._DO_NOT_RETRY_STATUSES
-)
-"""Every status the three tables of `anthropic_request_failure` list, whatever each gives it."""
-
-_OPENAI_LISTED_STATUSES = (
-    openai_shared._PAUSE_STATUSES
-    | openai_shared._RETRY_THIS_ONE_STATUSES
-    | openai_shared._DO_NOT_RETRY_STATUSES
-)
-"""Every status the three tables of `openai_request_failure` list, whatever each gives it."""
-
-type _SupportedClient = (
-    AsyncAnthropic
-    | AsyncAnthropicBedrock
-    | AsyncAnthropicBedrockMantle
-    | AsyncOpenAI
-    | AsyncAzureOpenAI
-    | AsyncBedrockOpenAI
-)
-"""Every client class the anthropic and openai adapters accept.
-
-The gemini adapter's genai.Client is absent: google-genai has no _make_status_error and gives no
-status its own exception class, so its tables are checked against the SDK's retryable set instead.
-"""
 
 
 def _field_annotation(model: type[BaseModel], name: str) -> object:
@@ -149,100 +115,21 @@ def _anthropic_response_with(status_code: int, headers: dict[str, str]) -> httpx
     )
 
 
-def _openai_response_with(status_code: int, headers: dict[str, str]) -> httpx2.Response:
-    """Build the httpx2.Response read by openai error constructors."""
-    return httpx2.Response(
-        status_code=status_code,
-        headers=headers,
-        request=httpx2.Request("POST", "https://example.invalid/v1"),
-    )
-
-
 def test_anthropic_status_error_reads_the_error_type_request_failure_branches_on() -> None:
     """APIStatusError.type is the body's error.type, and None where the body is not that shape.
 
-    `anthropic_request_failure()` checks `error.type` before status.
-    This lets an unlisted `overloaded_error` pause the rate-limit quota.
+    `anthropic_request_failure()` uses `error.type` to pause the rate-limit quota.
+    An `overloaded_error` pauses even when the SDK declines to retry its status.
     """
-    client = anthropic.Anthropic(api_key="k")
+    client = anthropic.AsyncAnthropic(api_key="k")
     body = {"type": "error", "error": {"type": "overloaded_error", "message": "boom"}}
     error = client._make_status_error(
         "boom", body=body, response=_anthropic_response_with(418, {})
     )
     assert isinstance(error, anthropic.APIStatusError)
-    assert messages_adapter.anthropic_request_failure(error) == transient(pauses_quota=True)
+    assert messages_adapter.anthropic_request_failure(error, client=client).pauses_quota
     bodyless = client._make_status_error(
         "boom", body=None, response=_anthropic_response_with(418, {})
     )
     assert isinstance(bodyless, anthropic.APIStatusError)
-    assert messages_adapter.anthropic_request_failure(bodyless) == terminal("rejected")
-
-
-def test_openai_status_error_reads_the_code_request_failure_branches_on() -> None:
-    """APIStatusError.code is the body's code, and None where the body is not a dict.
-
-    `openai_request_failure()` checks `error.code` within status 429.
-    This keeps spend-limit responses terminal without pausing the rate-limit quota.
-    """
-    client = openai.OpenAI(api_key="k")
-    body = {"code": "credit_balance_exhausted", "type": "insufficient_quota", "message": "boom"}
-    error = client._make_status_error("boom", body=body, response=_openai_response_with(429, {}))
-    assert isinstance(error, openai.APIStatusError)
-    assert openai_shared.openai_request_failure(error) == terminal("rejected")
-    bodyless = client._make_status_error(
-        "boom", body=None, response=_openai_response_with(429, {})
-    )
-    assert isinstance(bodyless, openai.APIStatusError)
-    assert openai_shared.openai_request_failure(bodyless) == transient(pauses_quota=True)
-
-
-def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
-    """Return statuses with client-specific error classes."""
-    named: set[int] = set()
-    for status_code in range(400, 600):
-        if isinstance(
-            client, (AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle)
-        ):
-            error = client._make_status_error(
-                "boom", body=None, response=_anthropic_response_with(status_code, {})
-            )
-        else:
-            error = client._make_status_error(
-                "boom", body=None, response=_openai_response_with(status_code, {})
-            )
-        if getattr(type(error), "status_code", None) is not None:
-            named.add(status_code)
-    return named
-
-
-def test_every_status_a_supported_client_names_is_in_one_of_the_status_tables() -> None:
-    clients_and_listed_statuses = (
-        (AsyncAnthropic(api_key="k"), _ANTHROPIC_LISTED_STATUSES),
-        (
-            AsyncAnthropicBedrock(aws_region="us-east-1", aws_access_key="k", aws_secret_key="s"),
-            _ANTHROPIC_LISTED_STATUSES,
-        ),
-        (AsyncAnthropicBedrockMantle(aws_region="us-east-1"), _ANTHROPIC_LISTED_STATUSES),
-        (AsyncOpenAI(api_key="k"), _OPENAI_LISTED_STATUSES),
-        (
-            AsyncAzureOpenAI(
-                api_key="k", api_version="2024-10-01", azure_endpoint="https://example.invalid"
-            ),
-            _OPENAI_LISTED_STATUSES,
-        ),
-        (
-            AsyncBedrockOpenAI(
-                aws_region="us-east-1", aws_access_key_id="k", aws_secret_access_key="s"
-            ),
-            _OPENAI_LISTED_STATUSES,
-        ),
-    )
-    for client, listed_statuses in clients_and_listed_statuses:
-        assert _statuses_with_a_dedicated_class(client) <= listed_statuses, type(client).__name__
-
-
-def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
-    assert set(_api_client._RETRY_HTTP_STATUS_CODES) <= (
-        generate_content_adapter._PAUSE_STATUSES
-        | generate_content_adapter._RETRY_THIS_ONE_STATUSES
-    )
+    assert not messages_adapter.anthropic_request_failure(bodyless, client=client).pauses_quota

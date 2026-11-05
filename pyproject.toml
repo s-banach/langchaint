@@ -45,7 +45,7 @@ dev = [
     # The in-memory tracing exporter requires the SDK only in tests.
     "opentelemetry-sdk>=1.30.0",
     "pytest>=9.0.2",
-    "pyrefly>=1.3.0",
+    "pyrefly>=1.4.1",
     "ruff>=0.16.0",
     # jsonschema ships no stubs, so its callers in tools.py go unchecked without these.
     "types-jsonschema>=4.26.0.20260518",

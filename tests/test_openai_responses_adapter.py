@@ -77,7 +77,7 @@ from langchaint.adapter import (
 from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import final_text
-from langchaint.conformance import AdapterConformance
+from langchaint.conformance import PartWireConformance
 from langchaint.openai import (
     OpenAIPricingTable,
     OpenAIResponsesAdapter,
@@ -1636,7 +1636,7 @@ def _conformance_output() -> list[object]:
     ]
 
 
-class TestOpenAIResponsesConformance(AdapterConformance):
+class TestOpenAIResponsesConformance(PartWireConformance):
     @override
     def make_adapter(self) -> Adapter:
         return _adapter()
@@ -1697,7 +1697,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
-    def response_with_raw_part(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel:
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override

@@ -1132,20 +1132,12 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         return _text_completion(text)
 
     @override
-    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel | None:
-        return None
-
-    @override
     def response_with_tool_call(self, text: str) -> BaseModel:
         return _text_completion(text, tool_call=True, finish_reason="tool_calls")
 
     @override
     def response_with_reasoning(self) -> BaseModel:
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
-
-    @override
-    def response_with_raw_part(self) -> None:
-        return None
 
     @override
     def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:

@@ -89,7 +89,7 @@ from langchaint.anthropic.messages_adapter import (
 from langchaint.anthropic.messages_adapter import (
     _billing_from_sdk_usage as _provider_billing_from_sdk_usage,
 )
-from langchaint.conformance import AdapterConformance
+from langchaint.conformance import PartWireConformance
 from langchaint.tools import ToolSchema
 from tests.fake_adapter import fast_shared_backoff
 from tests.helpers import (
@@ -2031,7 +2031,7 @@ def _finished_message(usage: at.Usage) -> at.Message:
     return _message_with_content(_assistant_message_content(), stop_reason="end_turn", usage=usage)
 
 
-class TestAnthropicMessagesConformance(AdapterConformance):
+class TestAnthropicMessagesConformance(PartWireConformance):
     """The neutral invariants, over the Anthropic Messages adapter's own SDK objects."""
 
     @override
@@ -2090,7 +2090,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         return _finished_message(_usage_with_cache_split())
 
     @override
-    def response_with_raw_part(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel:
         return _finished_message(_usage_with_cache_split())
 
     @override

@@ -1,10 +1,8 @@
-"""The conformance test class for adapter implementations.
+"""The conformance test classes for adapter implementations.
 
-Subclass `AdapterConformance` and implement its fixture methods.
+Subclass the class that `AdapterConformance` directs, and implement the fixture methods.
 The inherited tests validate each neutral adapter invariant against SDK response objects.
 Return degenerate fixtures for unsupported capabilities so each invariant still runs.
-Where a fixture method permits `None`, returning `None` skips the tests that need that fixture.
-Importing this module requires pytest.
 """
 
 import asyncio
@@ -12,7 +10,6 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
-import pytest
 from pydantic import BaseModel
 
 from langchaint.adapter import (
@@ -78,10 +75,11 @@ def _row_number(row: Mapping[str, RowValue], column: str) -> float:
 
 
 class AdapterConformance(ABC):
-    """Subclass once per adapter.
+    """Subclass once per adapter whose wire holds the assistant message in one wire message's fields.
 
+    Subclass `PartWireConformance` instead when the wire holds the assistant message as a list of parts.
     langchaint supplies every test method.
-    Use a pytest-compatible name such as `TestAnthropicMessagesConformance`.
+    Use a pytest-compatible name such as `TestOpenAIChatCompletionsConformance`.
     Put the subclass in the adapter test module and implement the fixture methods below.
     Return a fresh value so tests cannot share mutations.
     """
@@ -129,18 +127,6 @@ class AdapterConformance(ABC):
         ...
 
     @abstractmethod
-    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel | None:
-        """Construct a finished SDK response with separate complete text parts in order.
-
-        Return `None` when the provider represents response text as one string.
-        Tests that need separate text parts then skip.
-
-        Args:
-            texts: The complete text parts, including empty text.
-        """
-        ...
-
-    @abstractmethod
     def response_with_tool_call(self, text: str) -> BaseModel:
         """Construct a finished SDK response containing text and an application tool call.
 
@@ -157,18 +143,6 @@ class AdapterConformance(ABC):
         Rebuilding the payload would drop that key.
         Each AssistantPart must map to one wire part.
         Avoid adjacent parts the adapter joins.
-        """
-        ...
-
-    @abstractmethod
-    def response_with_raw_part(self) -> BaseModel | None:
-        """Return an SDK response whose assistant message holds one RawPart.
-
-        Beside it, include at least one other AssistantPart.
-        Each AssistantPart must map to one wire part.
-        Return None when one wire message holds the whole assistant message.
-        Such a wire has no RawPart position, so the RawPart test skips.
-        Returning None on a part-based wire hides a dropped RawPart.
         """
         ...
 
@@ -276,26 +250,6 @@ class AdapterConformance(ABC):
         assert len(wire_parts) == len(content)
         assert wire_parts[index] == reasoning_part.raw
 
-    def test_raw_part_round_trips_verbatim_in_position(self) -> None:
-        """RawPart.raw returns unchanged in its original position.
-
-        Require a RawPart because dropping it during interpretation shortens both compared sequences.
-        """
-        response = self.response_with_raw_part()
-        if response is None:
-            pytest.skip("One wire message holds the whole assistant message.")
-        assistant_message = self._finished_response(response).assistant_message
-        content = assistant_message.content
-        assert isinstance(content, tuple)
-        assert any(part.kind == "raw" for part in content)
-        wire_parts = self._assistant_wire_parts_of(
-            self._bound_adapter(), [UserMessage(content="hi"), assistant_message]
-        )
-        assert len(wire_parts) == len(content)
-        for index, part in enumerate(content):
-            if part.kind == "raw":
-                assert wire_parts[index] == part.raw
-
     def test_a_json_round_tripped_assistant_message_builds_the_same_wire_request(self) -> None:
         """Preserve provider-verified reasoning payloads through assistant message serialization and replay.
 
@@ -336,15 +290,6 @@ class AdapterConformance(ABC):
                 [UserMessage(content="hi"), AssistantMessage(content=(TextPart(text=text),))],
             )
             assert string_parts == tuple_parts
-
-    def test_text_parts_keep_their_boundaries_and_order(self) -> None:
-        """Every provider text part becomes its own `TextPart`, so the final one gives output."""
-        texts = ("Checking the temperature.", '{"city":"Lima","celsius":19}', "")
-        raw = self.response_with_text_parts(texts)
-        if raw is None:
-            pytest.skip("The provider represents response text as one string.")
-        assistant_message = self._finished_response(raw).assistant_message
-        assert self._text_parts(assistant_message) == list(texts)
 
     def test_tool_call_text_stays_beside_the_tool_call(self) -> None:
         """Text beside an application tool call stays in the assistant message with the call."""
@@ -423,6 +368,58 @@ class AdapterConformance(ABC):
                 ),
             ):
                 assert _costs_agree(_row_number(row, column), expected)
+
+
+class PartWireConformance(AdapterConformance, ABC):
+    """The conformance tests for an adapter whose wire holds the assistant message as a list of parts.
+
+    Subclassing `AdapterConformance` on such a wire hides a dropped RawPart or merged text parts.
+    """
+
+    @abstractmethod
+    def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
+        """Construct a finished SDK response with separate complete text parts in order.
+
+        Args:
+            texts: The complete text parts, including empty text.
+        """
+        ...
+
+    @abstractmethod
+    def response_with_raw_part(self) -> BaseModel:
+        """Return an SDK response whose assistant message holds one RawPart.
+
+        Beside it, include at least one other AssistantPart.
+        Each AssistantPart must map to one wire part.
+        """
+        ...
+
+    def test_raw_part_round_trips_verbatim_in_position(self) -> None:
+        """RawPart.raw returns unchanged in its original position.
+
+        Require a RawPart because dropping it during interpretation shortens both compared sequences.
+        """
+        assistant_message = self._finished_response(
+            self.response_with_raw_part()
+        ).assistant_message
+        content = assistant_message.content
+        assert isinstance(content, tuple)
+        assert any(part.kind == "raw" for part in content)
+        wire_parts = self._assistant_wire_parts_of(
+            self._bound_adapter(), [UserMessage(content="hi"), assistant_message]
+        )
+        assert len(wire_parts) == len(content)
+        for index, part in enumerate(content):
+            if part.kind == "raw":
+                assert wire_parts[index] == part.raw
+
+    def test_text_parts_keep_their_boundaries_and_order(self) -> None:
+        """Every provider text part becomes its own `TextPart`, so the final one gives output."""
+        texts = ("Checking the temperature.", '{"city":"Lima","celsius":19}', "")
+        assistant_message = self._finished_response(
+            self.response_with_text_parts(texts)
+        ).assistant_message
+        assert self._text_parts(assistant_message) == list(texts)
 
 
 def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedStreamRecord:

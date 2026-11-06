@@ -50,7 +50,7 @@ from langchaint.adapter import (
     RequestParams,
     ToolChoice,
 )
-from langchaint.conformance import AdapterConformance
+from langchaint.conformance import PartWireConformance
 from langchaint.gemini import (
     GeminiGenerateContentAdapter,
     GeminiPricingTable,
@@ -1546,7 +1546,7 @@ def _reasoning_response(
     )
 
 
-class TestGeminiGenerateContentConformance(AdapterConformance):
+class TestGeminiGenerateContentConformance(PartWireConformance):
     @override
     def make_adapter(self) -> Adapter:
         return _adapter()
@@ -1606,7 +1606,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
         return _reasoning_response(_usage_metadata())
 
     @override
-    def response_with_raw_part(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel:
         return _reasoning_response(_usage_metadata())
 
     @override

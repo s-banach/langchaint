@@ -163,7 +163,6 @@ def package_modules() -> Iterator[ModuleType]:
 
     Backend imports require their provider SDKs.
     Tracing imports require opentelemetry-api.
-    Conformance imports require pytest.
     The development environment installs those dependencies.
 
     Yields:

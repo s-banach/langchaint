@@ -912,8 +912,8 @@ def _sdk_retries(error: Exception) -> bool:
 def gemini_request_failure(error: Exception) -> RequestFailure:
     """Return the `RequestFailure` using the SDK retry predicate and the provider's quota pause rule.
 
-    google-genai 2.34.0 retries statuses 408, 429, 500, 502, 503, and 504.
-    Its predicate also retries transport failures from httpx, httpx2, and aiohttp.
+    google-genai 3.0.0 retries statuses 408, 429, 500, 502, 503, and 504.
+    Its predicate also retries httpx2 timeouts and connection failures.
     Statuses 429 and 503 pause the quota.
     Other failures pause nothing.
     The predicate uses default `HttpRetryOptions`, so retry options configured on the caller's client do not apply.
@@ -921,7 +921,7 @@ def gemini_request_failure(error: Exception) -> RequestFailure:
     The SDK reads neither on generateContent.
     `request_failure_from_response` names each `APIError` failure.
     An `APIError` without a code, other exceptions, and failed SDK retry decisions are `unknown_exception`.
-    google-genai 2.34.0 reads a missing code from the response body, so `code` may be None.
+    google-genai 3.0.0 reads a missing code from the response body, so `code` may be None.
     """
     retries = sdk_retry_decision(lambda: _sdk_retries(error))
     if isinstance(retries, RequestFailure):
@@ -957,6 +957,7 @@ class GeminiGenerateContentAdapter(Adapter):
     ) -> None:
         """Store the SDK client and request pricing without sending a request.
 
+        `client` must use the SDK's default httpx2 HTTP client, because langchaint supports no other.
         `provider_name` records the provider reached by `client`.
         A Vertex AI client requires `"gcp.vertex_ai"`.
         Per-request options disable retries without copying the client.

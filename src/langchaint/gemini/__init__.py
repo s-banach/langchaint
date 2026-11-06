@@ -128,6 +128,7 @@ class Gemini:
 
         `client=None` constructs `genai.Client(vertexai=False)`.
         A passed `client` must reach the Gemini Developer API.
+        A passed `client` must use the SDK's default httpx2 HTTP client, because langchaint supports no other.
         `shared_backoff` admits every request of the created `LLM` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.
         `observer` follows every input and every tool dispatch of the created `LLM` values.

@@ -11,7 +11,6 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     BoundAdapter,
-    ReasoningDelta,
     RejectedMessages,
     RequestParams,
     ResponseOutcome,
@@ -374,12 +373,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 continue
             self._items = self._adapter_stream.items()
 
-    @overload
-    async def __anext__(self: "StreamHandle[OutputT, Never]") -> str | ReasoningDelta: ...
-    @overload
-    async def __anext__(self) -> StreamItem: ...
     async def __anext__(self) -> StreamItem:
         """Return the next item.
+
+        The handle yields a response's `ToolCallDelta` and `ToolCall` items under every binding.
+        When they arrive under a binding without a `ToolManager`, `final` raises `GenerationError`.
 
         Raises:
             GenerationError: The open stream fails transiently.

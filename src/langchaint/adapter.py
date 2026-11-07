@@ -305,7 +305,7 @@ def validated_provider_executed_tool_types(
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
-    """The frozen prefix of one BoundLLM, in langchaint terms only.
+    """The frozen prefix of one LLM, in langchaint terms only.
 
     Every field determines the provider's cacheable prompt prefix or stays fixed for one binding.
     The `messages` argument of each `BoundAdapter` method contains the per-request data.
@@ -822,8 +822,8 @@ class Adapter(ABC):
         """Return a snapshot of stored adapter configuration that can form provider requests.
 
         Exclude the SDK client, credentials, pricing, and response-accounting configuration.
-        `BoundLLM.config_fingerprint` adds the adapter class, model, and provider.
-        `BoundLLM.config_fingerprint` also adds the binding and response format.
+        The configured model's `config_fingerprint` adds the adapter class, model, and provider.
+        It also adds the binding and response format.
         An adapter may include a non-secret endpoint identity when its contract treats that identity as configuration.
         """
         ...

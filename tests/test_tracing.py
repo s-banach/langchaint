@@ -21,10 +21,10 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 from langchaint import (
     LLM,
     AbandonedStreamRecord,
+    AdapterLLM,
     AssistantMessage,
     AssistantPart,
     AudioPart,
-    BoundLLM,
     ContentPart,
     DispatchOutcome,
     Generation,
@@ -45,6 +45,7 @@ from langchaint import (
     ToolMessage,
     ToolReturnExplicit,
     UserMessage,
+    llm_from_adapter,
     to_tables,
 )
 from langchaint.adapter import (
@@ -61,9 +62,9 @@ from langchaint.embedding import EmbeddingModel, EmbeddingTask, _EmbeddingBatchR
 from langchaint.embedding_requests import EmbeddingRequestRecord
 from langchaint.span_parsing import (
     OtelToolCallResponsePart,
-    bound_llm_from_otel,
     generation_input_from_otel,
     generation_record_from_otel,
+    llm_from_otel,
     output_messages_from_otel,
     parse_otel_chat,
     parse_otel_execute_tool,
@@ -123,10 +124,10 @@ def _traced(
     chat_attribute_transform: ChatAttributeTransform | None = None,
     extra_attributes: SpanAttributes | None = None,
     max_concurrent_requests: int = 8,
-) -> tuple[LLM, InMemorySpanExporter]:
+) -> tuple[AdapterLLM, InMemorySpanExporter]:
     """`max_concurrent_requests=1` makes batch spans end in input order."""
     tracer_provider, exporter = _in_memory_tracer_provider()
-    llm = LLM(
+    llm = llm_from_adapter(
         adapter,
         shared_backoff=fast_shared_backoff(max_concurrent_requests=max_concurrent_requests),
         observer=OtelObserver(
@@ -144,7 +145,7 @@ type _GenerationPath = Literal["generate", "stream"]
 
 async def _generate_through[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     path: _GenerationPath,
-    bound_llm: BoundLLM[OutputT, ToolManagerT],
+    bound_llm: LLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
 ) -> Generation[OutputT]:
     if path == "generate":
@@ -185,7 +186,7 @@ class _MidFailStream(FakeStream):
 def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter(echo=True))
-        bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
+        bound = llm.rebind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
         result = await bound.generate_one("hi")
         assert result.kind == "plain"
         assert result.output == "hi"
@@ -237,7 +238,7 @@ def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
     async def scenario() -> None:
         adapter = _CurrentSpanRecordingAdapter()
         llm, exporter = _traced(adapter)
-        await _generate_through(path, llm.bind())
+        await _generate_through(path, llm)
         (bound_adapter,) = adapter.bound_adapters
         assert isinstance(bound_adapter, _CurrentSpanRecordingBoundAdapter)
         (span_current_at_open,) = bound_adapter.spans_current_at_open
@@ -312,7 +313,7 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attri
     async def scenario() -> None:
         llm, exporter = _traced(case.adapter(), capture_message_content=True)
         with pytest.raises(GenerationError):
-            await _generate_through(path, llm.bind(system_prompt="be brief", max_requests=2))
+            await _generate_through(path, llm.rebind(system_prompt="be brief", max_requests=2))
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == case.status_description
@@ -359,7 +360,7 @@ async def _drain(handle: StreamHandle[str]) -> None:
 def test_a_traced_streams_expired_deadline_takes_error_status() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter(stream=HangsAfterFirstItemStream()))
-        handle = llm.bind().stream_one("hi", timeout_seconds=0.02)
+        handle = llm.stream_one("hi", timeout_seconds=0.02)
 
         with pytest.raises(GenerationError):
             async with handle:
@@ -378,7 +379,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status() -> None:
 def test_retry_surfaces_as_a_request_failed_span_event() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter(scripted_requests=[TransientError("boom")]))
-        generation = await llm.bind().generate_one("hi")
+        generation = await llm.generate_one("hi")
         assert len(generation.request_history.records) == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
@@ -394,8 +395,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
 ) -> None:
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        llm, exporter = _traced(adapter)
-        bound = llm.bind()
+        bound, exporter = _traced(adapter)
         resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(
             ["a", "b"],
@@ -427,16 +427,16 @@ def test_a_stream_block_left_after_its_first_item_reports_the_stream_input_with_
 
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter())
-        other_llm = LLM(
+        other_llm = llm_from_adapter(
             FakeAdapter(rejected_messages=[RejectedMessages(error_text="misconfigured")]),
             shared_backoff=fast_shared_backoff(),
         )
 
         async def leave_after_the_first_item() -> None:
-            async with llm.bind().stream_one("hi") as stream:
+            async with llm.stream_one("hi") as stream:
                 _ = await anext(stream)
                 if block_exit == "another_inputs_generation_error":
-                    await other_llm.bind().generate_one("hi")
+                    await other_llm.generate_one("hi")
 
         if block_exit == "another_inputs_generation_error":
             with pytest.raises(GenerationError):
@@ -458,7 +458,7 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
 
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter())
-        async with llm.bind().stream_one("hi"):
+        async with llm.stream_one("hi"):
             pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
@@ -471,15 +471,15 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
 def test_stream_never_entered_emits_no_span() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter())
-        _handle = llm.bind().stream_one("hi")
+        _handle = llm.stream_one("hi")
         assert exporter.get_finished_spans() == ()
 
     run_with_timeout(scenario())
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
-    async def _drain(llm: LLM) -> None:
-        async with llm.bind().stream_one("hi") as stream:
+    async def _drain(llm: AdapterLLM) -> None:
+        async with llm.stream_one("hi") as stream:
             async for _item in stream:
                 pass
 
@@ -544,7 +544,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             ]
         )
         llm, exporter = _traced(adapter, capture_message_content=True)
-        text_bound = llm.bind(
+        text_bound = llm.rebind(
             system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
             max_completion_tokens=123,
@@ -556,7 +556,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             bound = text_bound
             generation = await _generate_through(path, text_bound, generation_input)
         else:
-            bound = text_bound.bind(response_format=_Answer)
+            bound = text_bound.rebind(response_format=_Answer)
             generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_chat(_exported_attributes(span))
@@ -568,9 +568,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
         assert parsed.request_stream == (True if path == "stream" else None)
         assert parsed.output_type == ("text" if response_format is str else "json")
-        reconstructed = bound_llm_from_otel(
-            parsed, llm=llm, tools=[_echo_tool()], response_format=response_format
-        )
+        reconstructed = llm_from_otel(parsed, llm=bound)
         assert reconstructed.binding == bound.binding
         assert generation_input_from_otel(parsed) == generation_input
         assert output_messages_from_otel(parsed) == (generation.assistant_message,)
@@ -603,7 +601,7 @@ def test_transform_not_invoked_on_a_non_recording_span() -> None:
             return attributes
 
         tracer_provider = trace.NoOpTracerProvider()
-        llm = LLM(
+        llm = llm_from_adapter(
             FakeAdapter(),
             observer=OtelObserver(
                 chat_attribute_transform=_transform,
@@ -611,7 +609,7 @@ def test_transform_not_invoked_on_a_non_recording_span() -> None:
                 capture_message_content=False,
             ),
         )
-        generation = await llm.bind().generate_one("hi")
+        generation = await llm.generate_one("hi")
         assert generation.output == "ok"
         assert calls == []
 
@@ -645,7 +643,7 @@ def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation
             chat_attribute_transform=_raising_transform,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await _generate_through(path, llm.bind())
+            response = await _generate_through(path, llm)
         assert response.kind == "plain"
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
@@ -666,7 +664,7 @@ def test_a_raising_transform_keeps_error_type_beside_the_error_status() -> None:
             chat_attribute_transform=_raising_transform,
         )
         with pytest.raises(GenerationError):
-            await llm.bind().generate_one("hi")
+            await llm.generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert dict(span.attributes or {}) == {**_START_ATTRIBUTES, "error.type": "refusal_error"}
@@ -681,7 +679,7 @@ def _covariance_pin(
     return transform(generation, {})
 
 
-def test_a_transform_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
+def test_a_transform_and_extra_attributes_reach_every_chat_span_across_rebind() -> None:
     async def scenario() -> None:
         transformed_models: list[str] = []
 
@@ -702,7 +700,7 @@ def test_a_transform_and_extra_attributes_reach_every_chat_span_across_bind() ->
                 "gen_ai.operation.name": "not-the-operation",
             },
         )
-        replacement_bound = llm.bind(system_prompt="s").bind(system_prompt="s2")
+        replacement_bound = llm.rebind(system_prompt="s").rebind(system_prompt="s2")
         for path in ("generate", "stream"):
             await _generate_through(path, replacement_bound)
         await replacement_bound.generate_many(["a", "b"])
@@ -743,7 +741,7 @@ def test_a_chat_transform_receives_every_attribute_and_edits_what_the_span_recor
             chat_attribute_transform=_transform,
             extra_attributes={"custom.agent": "agent_a"},
         )
-        await llm.bind().generate_one("hi")
+        await llm.generate_one("hi")
         (attributes,) = received
         assert {
             "custom.agent",
@@ -782,7 +780,7 @@ def test_a_cancelled_input_passes_none_to_the_transform_and_records_its_result()
         )
         with pytest.raises(TimeoutError):
             await time_out_when(
-                llm.bind().generate_one("hi"),
+                llm.generate_one("hi"),
                 lambda: adapter.bound_adapters[0].open_count == 1,
             )
         assert calls == [(None, True)]
@@ -1034,16 +1032,16 @@ def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
     run_with_timeout(scenario())
 
 
-def test_bind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
+def test_rebind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(
             FakeAdapter(),
             capture_message_content=True,
             extra_attributes={"gen_ai.agent.name": "agent_a"},
         )
-        bound = llm.bind(tools=[_echo_tool()])
-        replacement_bound = bound.bind(tools=[_echo_tool()])
-        unobserved_bound = bound.bind(tools=ToolManager([_echo_tool()]))
+        bound = llm.rebind(tools=[_echo_tool()])
+        replacement_bound = bound.rebind(tools=[_echo_tool()])
+        unobserved_bound = bound.rebind(tools=ToolManager([_echo_tool()]))
         await bound.tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
         )
@@ -1230,14 +1228,14 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
     async def scenario() -> None:
         tracer_provider, exporter = _in_memory_tracer_provider()
         content_filter: ContentFilter = _drop_binary
-        llm = LLM(
+        llm = llm_from_adapter(
             FakeAdapter(),
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
                 capture_message_content=content_filter,
             ),
         )
-        await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
+        await llm.generate_one([_MULTIMODAL_USER_MESSAGE])
         captured_parts = _captured_user_parts(exporter)
         assert [part.get("type") for part in captured_parts if isinstance(part, dict)] == [
             "text",
@@ -1284,7 +1282,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             tracer_provider=tracer_provider,
             capture_message_content=_scrub_marker,
         )
-        llm = LLM(
+        llm = llm_from_adapter(
             FakeAdapter(
                 scripted_requests=[
                     ScriptedResponse(
@@ -1299,7 +1297,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             ),
             observer=observer,
         )
-        bound = llm.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
+        bound = llm.rebind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
         await bound.generate_one([
             UserMessage(content=f"question {_MARKER}"),
@@ -1346,7 +1344,7 @@ def test_system_instructions_render_one_element_per_part_and_omit_an_empty_array
     content_filter: ContentFilter,
     expected_instructions: object,
 ) -> None:
-    binding = LLM(FakeAdapter()).bind(system_prompt=system_prompt).binding
+    binding = llm_from_adapter(FakeAdapter(), system_prompt=system_prompt).binding
     attributes = _input_content_attributes(
         binding, [UserMessage(content="hi")], content_filter=content_filter
     )
@@ -1386,14 +1384,14 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
 
     async def scenario() -> None:
         tracer_provider, exporter = _in_memory_tracer_provider()
-        llm = LLM(
+        llm = llm_from_adapter(
             FakeAdapter(),
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
                 capture_message_content=content_filter,
             ),
         )
-        bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
+        bound = llm.rebind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             result = await _generate_through(path, bound)
         assert result.kind == "plain"
@@ -1572,7 +1570,7 @@ def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_outp
         )
         llm, exporter = _traced(adapter, capture_message_content=capture_message_content)
         with pytest.raises(GenerationError) as raised:
-            await llm.bind(max_requests=3).generate_one("hi")
+            await llm.rebind(max_requests=3).generate_one("hi")
 
         error = raised.value
         assert len(error.request_history.records) == 2

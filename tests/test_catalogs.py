@@ -12,7 +12,7 @@ from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from pydantic import TypeAdapter
 
-from langchaint import LLM, JsonValue, SharedBackoff, TokenRates
+from langchaint import JsonValue, SharedBackoff, TokenRates
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
@@ -45,6 +45,7 @@ from langchaint.openai import (
 )
 from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 from tests.helpers import run_with_timeout
+from tests.test_configured_providers import ProviderLLM
 
 _ARBITRARY_RATES = TokenRates(
     input_tokens_cache_none=1.0,
@@ -101,7 +102,7 @@ def _provider_name_values_fixture() -> set[str]:
 
 def test_anthropic_llm_wires_model_and_pricing() -> None:
     model = "claude-sonnet-5"
-    llm = Anthropic(client=AsyncAnthropic(api_key="offline")).llm(model)
+    llm = Anthropic(client=AsyncAnthropic(api_key="offline")).llm(model, max_completion_tokens=128)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
@@ -324,7 +325,7 @@ def test_openai_bedrock_llm_wires_model_pricing_and_region() -> None:
 
 def test_adapter_client_never_retries_beneath_langchaint() -> None:
     client = AsyncAnthropic(api_key="offline")
-    llm = Anthropic(client=client).llm("claude-sonnet-5")
+    llm = Anthropic(client=client).llm("claude-sonnet-5", max_completion_tokens=128)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.client.max_retries == 0
@@ -341,7 +342,9 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
 ) -> None:
     http_client = httpx2.AsyncClient()
     client = client_class(aws_region="us-east-1", http_client=http_client)
-    llm = AnthropicBedrock(api=api, client=client).llm("anthropic.claude-opus-4-8")
+    llm = AnthropicBedrock(api=api, client=client).llm(
+        "anthropic.claude-opus-4-8", max_completion_tokens=128
+    )
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert client.max_retries != 0
@@ -387,10 +390,7 @@ def test_anthropic_llm_uses_stated_pricing(model: str) -> None:
         Anthropic(
             client=AsyncAnthropic(api_key="offline"),
         )
-        .llm(
-            model,
-            pricing=replacement,
-        )
+        .llm(model, pricing=replacement, max_completion_tokens=128)
         .adapter
     )
     assert isinstance(adapter, AnthropicMessagesAdapter)
@@ -404,11 +404,12 @@ def test_service_tier_reaches_each_first_party_adapter() -> None:
         "claude-sonnet-5",
         service_tier="standard_only",
         inference_geo="us",
+        max_completion_tokens=128,
     ).adapter
     assert isinstance(anthropic_adapter, AnthropicMessagesAdapter)
     assert anthropic_adapter.service_tier == "standard_only"
     assert anthropic_adapter.inference_geo == "us"
-    anthropic_unstated = anthropic.llm("claude-sonnet-5").adapter
+    anthropic_unstated = anthropic.llm("claude-sonnet-5", max_completion_tokens=128).adapter
     assert isinstance(anthropic_unstated, AnthropicMessagesAdapter)
     assert anthropic_unstated.service_tier is None
     openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
@@ -486,11 +487,11 @@ def test_reasoning_summary_lands_on_the_adapter() -> None:
 
 def test_cache_ttl_lands_on_the_adapter() -> None:
     anthropic = Anthropic(client=AsyncAnthropic(api_key="offline"))
-    llm = anthropic.llm("claude-sonnet-5", cache_ttl="1h")
+    llm = anthropic.llm("claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.cache_ttl == "1h"
-    defaulted = anthropic.llm("claude-sonnet-5")
+    defaulted = anthropic.llm("claude-sonnet-5", max_completion_tokens=128)
     assert isinstance(defaulted.adapter, AnthropicMessagesAdapter)
     assert defaulted.adapter.cache_ttl == "5m"
 
@@ -499,13 +500,15 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
     ("build_llm", "expected_provider_name"),
     [
         (
-            lambda: Anthropic(client=AsyncAnthropic(api_key="offline")).llm("claude-sonnet-5"),
+            lambda: Anthropic(client=AsyncAnthropic(api_key="offline")).llm(
+                "claude-sonnet-5", max_completion_tokens=128
+            ),
             "anthropic",
         ),
         (
             lambda: AnthropicBedrock(
                 client=AsyncAnthropicBedrock(aws_region="us-east-1"),
-            ).llm("us.anthropic.claude-sonnet-4-6"),
+            ).llm("us.anthropic.claude-sonnet-4-6", max_completion_tokens=128),
             "aws.bedrock",
         ),
         (
@@ -535,7 +538,9 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
     ],
 )
 def test_each_model_states_a_convention_provider_name(
-    build_llm: Callable[[], LLM], expected_provider_name: str, provider_name_values: set[str]
+    build_llm: Callable[[], ProviderLLM],
+    expected_provider_name: str,
+    provider_name_values: set[str],
 ) -> None:
     adapter = build_llm().adapter
     assert adapter.provider_name == expected_provider_name

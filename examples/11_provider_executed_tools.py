@@ -11,9 +11,9 @@ async def search_the_web() -> PlainGeneration[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: Generation fails.
     """
-    openai = OpenAI()
     # Catalog pricing supplies the required web-search invocation rate.
-    bound = openai.llm("gpt-5.6-terra").bind(
+    bound = OpenAI().llm(
+        "gpt-5.6-terra",
         provider_executed_tools=({"type": "web_search"},),
         automatic_cache_breakpoints=True,
     )

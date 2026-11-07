@@ -5,7 +5,7 @@ Applications configure the OTel SDK.
 
 Pass one `OtelObserver` to a backend constructor, as in `OpenAI(observer=OtelObserver(...))`.
 Every `LLM`, binding, and stream that backend creates is then traced, and the application's code is otherwise unchanged.
-A `ToolManager` that `bind` builds from a tool sequence traces its dispatches.
+A `ToolManager` built from a tool sequence by a provider factory or `rebind` traces its dispatches.
 A `ToolManager` the application builds traces its dispatches when built with `observer=`.
 Every `EmbeddingModel` that backend creates traces its requests.
 
@@ -701,7 +701,7 @@ class _EmbeddingsSpan(_SpanOperation[EmbeddingRequestRecord]):
 class OtelObserver:
     """Trace generations, tool dispatches, and embedding requests with OTel spans.
 
-    Pass one instance to a backend constructor, `LLM(observer=...)`, or `ToolManager(observer=...)`.
+    Pass one instance to a backend constructor or `ToolManager(observer=...)`.
     The OTel SDK configures whether tracing records and where it sends spans.
     An application without an SDK configuration gets non-recording no-op spans.
     This class owns each span's name, kind, status, and events.

@@ -1,4 +1,4 @@
-"""Resume file reading and writing for `BoundLLM.generate_many_records`.
+"""Resume file reading and writing for `LLM.generate_many_records`.
 
 A resume file holds JSON Lines.
 The first line is a `_ResumeHeader`.

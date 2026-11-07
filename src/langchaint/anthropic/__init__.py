@@ -44,6 +44,11 @@ except ModuleNotFoundError as exc:
         "langchaint[anthropic] or langchaint[anthropic-bedrock]."
     ) from exc
 
+from collections.abc import Mapping, Sequence
+
+from pydantic import BaseModel
+
+from langchaint.adapter import ToolChoice
 from langchaint.anthropic._generated_pricing import (
     ANTHROPIC_BEDROCK_PRICING,
     ANTHROPIC_PRICING,
@@ -58,9 +63,11 @@ from langchaint.anthropic.messages_adapter import (
     CacheTTL,
 )
 from langchaint.common.bedrock import BedrockCatalogResolution, resolve_bedrock_catalog_id
+from langchaint.common.messages import TextPart
 from langchaint.concurrency.shared_backoff import SharedBackoff
-from langchaint.generation.llm import LLM
+from langchaint.generation.llm import UNCHANGED, Unchanged, _configure, _ConfiguredLLM
 from langchaint.generation.observer import Observer
+from langchaint.tools import ToolManager, ToolSequence
 
 _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items())
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""
@@ -91,6 +98,174 @@ A `BEDROCK_CROSS_REGION_MULTIPLIER` prefix on a literal value resolves the same 
 """
 
 
+class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
+    _ConfiguredLLM[OutputT, ToolManagerT]
+):
+    """Create instances through `Anthropic.llm` to validate request settings before generation."""
+
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[NewOutputT, ToolManager]": ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[NewOutputT, None]": ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self: "AnthropicLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: type[NewOutputT],
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[NewOutputT, ToolManagerT]": ...
+    @overload
+    def rebind(
+        self: "AnthropicLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[OutputT, ToolManager]": ...
+    @overload
+    def rebind(
+        self: "AnthropicLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[OutputT, None]": ...
+    @overload
+    def rebind(
+        self: "AnthropicLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicLLM[OutputT, ToolManagerT]": ...
+    def rebind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
+        tool_choice: ToolChoice | Unchanged = UNCHANGED,
+        parallel_tool_calls: bool | Unchanged = UNCHANGED,
+        max_completion_tokens: int | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_requests: int | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
+    ) -> "AnthropicLLM[BaseModel | str, ToolManager | None]":
+        """Return a new LLM, preserving every omitted setting.
+
+        `tools=None` removes `ToolManager`.
+        A `tools` sequence constructs `ToolManager` with this binding's observer.
+        An existing `ToolManager` retains its identity and its own observer.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools only through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
+            TypeError: The adapter does not support `tool_choice`.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+        """
+        return AnthropicLLM(
+            self._reconfigure(
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
+
+
 class Anthropic:
     """Create `LLM` values for Anthropic."""
 
@@ -115,6 +290,52 @@ class Anthropic:
         self.client: AsyncAnthropic = client if client is not None else AsyncAnthropic()
 
     @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: AnthropicModelId,
+        *,
+        pricing: AnthropicPricingTable | None = ...,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: AnthropicModelId,
+        *,
+        pricing: AnthropicPricingTable | None = ...,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[OutputT, None]: ...
+
+    @overload
     def llm(
         self,
         model: AnthropicModelId,
@@ -123,7 +344,88 @@ class Anthropic:
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
         inference_geo: str | None = ...,
-    ) -> LLM: ...
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: AnthropicModelId,
+        *,
+        pricing: AnthropicPricingTable | None = ...,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[str, None]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        pricing: AnthropicPricingTable,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        pricing: AnthropicPricingTable,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[OutputT, None]: ...
 
     @overload
     def llm(
@@ -134,7 +436,42 @@ class Anthropic:
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
         inference_geo: str | None = ...,
-    ) -> LLM: ...
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: str,
+        *,
+        pricing: AnthropicPricingTable,
+        cache_ttl: CacheTTL = ...,
+        service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicLLM[str, None]: ...
 
     def llm(
         self,
@@ -144,7 +481,19 @@ class Anthropic:
         cache_ttl: CacheTTL = "5m",
         service_tier: AnthropicServiceTier | None = None,
         inference_geo: str | None = None,
-    ) -> LLM:
+        system_prompt: str | Sequence[TextPart] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = (),
+        response_format: type[str] | type[BaseModel] = str,
+        max_completion_tokens: int,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
+        max_requests: int = 3,
+        automatic_cache_breakpoints: bool | None = None,
+    ) -> AnthropicLLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Messages API model.
 
         `model` is sent verbatim.
@@ -156,8 +505,7 @@ class Anthropic:
         `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
 
-        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
-        - `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
+        `llm` and `rebind` raise `ValueError` when:
         - The binding places more than four cache breakpoints.
           System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
           Provider-executed tools with `cache_control` also count.
@@ -165,10 +513,36 @@ class Anthropic:
           The adapter supports specific versions of web search, web fetch, tool search, and code execution.
         - Code execution is bound without a web search or web fetch version from 20260209 or later.
         - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
-        `bind` raises `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+        `llm` and `rebind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+
+        `reasoning_level` sets `output_config.effort`.
+        It enables adaptive `thinking` unless `extra_body` sets `thinking`.
+        `max_completion_tokens` is required because the Messages API requires `max_tokens`.
+
+        `tools` accepts application tools or an existing `ToolManager`.
+        A sequence constructs a `ToolManager` with the backend's observer.
+        An existing manager retains its identity and observer.
+        `provider_executed_tools` contains provider-shaped tool definitions executed by the provider.
+
+        `response_format` selects a pydantic model for structured output, or `str` for final text.
+        A response without a text part or tool call gives `GenerationError`.
+        An empty final text part gives `""`.
+        `reasoning_level=None` uses the provider's reasoning default.
+
+        `extra_body` adds provider wire-body fields.
+        Declare application tools through `tools` so result types match executable tools.
+        `max_requests` limits the requests for one input, including retries.
+        `automatic_cache_breakpoints=None` uses the adapter default.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
+            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
+            TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
         if pricing is None:
             pricing = _PRICING_BY_MODEL_ID.get(model)
@@ -185,7 +559,193 @@ class Anthropic:
             service_tier=service_tier,
             inference_geo=inference_geo,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
+        return AnthropicLLM(
+            _configure(
+                adapter,
+                shared_backoff=self._shared_backoff,
+                observer=self._observer,
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
+
+
+class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
+    _ConfiguredLLM[OutputT, ToolManagerT]
+):
+    """Create instances through `AnthropicBedrock.llm` to validate request settings before generation."""
+
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[NewOutputT, ToolManager]": ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[NewOutputT, None]": ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: type[NewOutputT],
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[NewOutputT, ToolManagerT]": ...
+    @overload
+    def rebind(
+        self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[OutputT, ToolManager]": ...
+    @overload
+    def rebind(
+        self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[OutputT, None]": ...
+    @overload
+    def rebind(
+        self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
+        *,
+        response_format: Unchanged = ...,
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> "AnthropicBedrockLLM[OutputT, ToolManagerT]": ...
+    def rebind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
+        tool_choice: ToolChoice | Unchanged = UNCHANGED,
+        parallel_tool_calls: bool | Unchanged = UNCHANGED,
+        max_completion_tokens: int | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_requests: int | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
+    ) -> "AnthropicBedrockLLM[BaseModel | str, ToolManager | None]":
+        """Return a new LLM, preserving every omitted setting.
+
+        `tools=None` removes `ToolManager`.
+        A `tools` sequence constructs `ToolManager` with this binding's observer.
+        An existing `ToolManager` retains its identity and its own observer.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools only through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
+            TypeError: The adapter does not support `tool_choice`.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+        """
+        return AnthropicBedrockLLM(
+            self._reconfigure(
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
 
 
 class AnthropicBedrock:
@@ -234,13 +794,109 @@ class AnthropicBedrock:
             else client_class(aws_region=aws_region, http_client=http_client)
         )
 
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: AnthropicBedrockModelId,
+        *,
+        pricing: AnthropicPricingTable | None = None,
+        cache_ttl: CacheTTL = "5m",
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicBedrockLLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: AnthropicBedrockModelId,
+        *,
+        pricing: AnthropicPricingTable | None = None,
+        cache_ttl: CacheTTL = "5m",
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicBedrockLLM[OutputT, None]: ...
+
+    @overload
     def llm(
         self,
         model: AnthropicBedrockModelId,
         *,
         pricing: AnthropicPricingTable | None = None,
         cache_ttl: CacheTTL = "5m",
-    ) -> LLM:
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicBedrockLLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: AnthropicBedrockModelId,
+        *,
+        pricing: AnthropicPricingTable | None = None,
+        cache_ttl: CacheTTL = "5m",
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> AnthropicBedrockLLM[str, None]: ...
+
+    def llm(
+        self,
+        model: AnthropicBedrockModelId,
+        *,
+        pricing: AnthropicPricingTable | None = None,
+        cache_ttl: CacheTTL = "5m",
+        system_prompt: str | Sequence[TextPart] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = (),
+        response_format: type[str] | type[BaseModel] = str,
+        max_completion_tokens: int,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
+        max_requests: int = 3,
+        automatic_cache_breakpoints: bool | None = None,
+    ) -> AnthropicBedrockLLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Bedrock model.
 
         `model` is sent verbatim.
@@ -251,15 +907,40 @@ class AnthropicBedrock:
         `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
-        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
-        - `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
+        `llm` and `rebind` raise `ValueError` when:
         - The binding places more than four cache breakpoints.
           System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
         - `provider_executed_tools` is nonempty.
-        `bind` raises `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+        `llm` and `rebind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+
+        `reasoning_level` sets `output_config.effort`.
+        It enables adaptive `thinking` unless `extra_body` sets `thinking`.
+        `max_completion_tokens` is required because the Messages API requires `max_tokens`.
+
+        `tools` accepts application tools or an existing `ToolManager`.
+        A sequence constructs a `ToolManager` with the backend's observer.
+        An existing manager retains its identity and observer.
+        `provider_executed_tools` contains provider-shaped tool definitions executed by the provider.
+
+        `response_format` selects a pydantic model for structured output, or `str` for final text.
+        A response without a text part or tool call gives `GenerationError`.
+        An empty final text part gives `""`.
+        `reasoning_level=None` uses the provider's reasoning default.
+
+        `extra_body` adds provider wire-body fields.
+        Declare application tools through `tools` so result types match executable tools.
+        `max_requests` limits the requests for one input, including retries.
+        `automatic_cache_breakpoints=None` uses the adapter default.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
+            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
+            TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
         resolution = resolve_bedrock_catalog_id(
             model,
@@ -273,7 +954,25 @@ class AnthropicBedrock:
             provider_name="aws.bedrock",
             cache_ttl=cache_ttl,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
+        return AnthropicBedrockLLM(
+            _configure(
+                adapter,
+                shared_backoff=self._shared_backoff,
+                observer=self._observer,
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
 
     def _catalog_pricing(
         self, model: str, resolution: BedrockCatalogResolution
@@ -301,7 +1000,9 @@ __all__ = [
     "BEDROCK_CROSS_REGION_MULTIPLIER",
     "Anthropic",
     "AnthropicBedrock",
+    "AnthropicBedrockLLM",
     "AnthropicBedrockModelId",
+    "AnthropicLLM",
     "AnthropicMessagesAdapter",
     "AnthropicModelId",
     "AnthropicPricingTable",

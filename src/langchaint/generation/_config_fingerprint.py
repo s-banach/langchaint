@@ -41,7 +41,7 @@ def capture_response_format_fingerprint_data(
     return canonical_value
 
 
-def bound_llm_config_fingerprint(
+def llm_config_fingerprint(
     *,
     adapter_class: type[Adapter],
     adapter_model: str,

@@ -1,10 +1,12 @@
 """Provider-neutral LLM binding, request admission, retries, and batch generation."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
+from dataclasses import dataclass, replace
 from functools import partial
-from pathlib import Path
-from typing import Final, Protocol, overload
+from typing import TYPE_CHECKING, Final, Protocol, Self, overload
 
 from pydantic import BaseModel
 
@@ -31,14 +33,13 @@ from langchaint.common.observed_operation import (
     start_observed_operation,
 )
 from langchaint.common.request_failure import RequestFailure, _request_failure_of
-from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff
 from langchaint.generation._config_fingerprint import (
     ResponseFormatFingerprintData,
-    bound_llm_config_fingerprint,
     capture_response_format_fingerprint_data,
     input_fingerprint,
+    llm_config_fingerprint,
 )
 from langchaint.generation._generate_many_records import (
     _run_resume_io,
@@ -72,9 +73,14 @@ from langchaint.generation.response import (
 from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from langchaint.common.sequence_not_str import SequenceNotStr
+
 
 class Unchanged:
-    """Sentinel type for an omitted `bind` keyword."""
+    """Sentinel type for an omitted `rebind` keyword."""
 
     def __repr__(self) -> str:
         """Render the default as `UNCHANGED` in signatures and `help()` output."""
@@ -243,260 +249,355 @@ def _resolve_tool_manager(
     return ToolManager(tools, observer=observer)
 
 
-class LLM:
-    """Hold the client state shared across bindings."""
+@dataclass(frozen=True)
+class _Configuration[OutputT: str | BaseModel, ToolManagerT: ToolManager | None]:
+    adapter: Adapter
+    bound_adapter: BoundAdapter
+    read_output: OutputReader[OutputT]
+    response_format: type[OutputT]
+    binding: Binding
+    tool_manager: ToolManagerT
+    shared_backoff: SharedBackoff
+    max_requests: int
+    observer: Observer | None
 
-    def __init__(
-        self,
-        adapter: Adapter,
-        *,
-        shared_backoff: SharedBackoff | None = None,
-        observer: Observer | None = None,
-    ) -> None:
-        """Store the adapter, request admission state, and observer.
 
-        Share `shared_backoff` across every `LLM` using one rate-limit quota.
+def _configure(
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = None,
+    tools: ToolManager | ToolSequence | None = None,
+    provider_executed_tools: Sequence[Mapping[str, object]] = (),
+    response_format: type[str] | type[BaseModel] = str,
+    max_completion_tokens: int | None = None,
+    reasoning_level: str | None = None,
+    temperature: float | None = None,
+    tool_choice: ToolChoice = "auto",
+    parallel_tool_calls: bool = True,
+    extra_body: Mapping[str, object] | None = None,
+    max_requests: int = 3,
+    automatic_cache_breakpoints: bool | None = None,
+) -> _Configuration[BaseModel | str, ToolManager | None]:
+    tool_manager = _resolve_tool_manager(tools, observer=observer)
+    binding = _build_binding(
+        system_prompt=system_prompt,
+        tool_schemas=() if tool_manager is None else tool_manager.schemas(),
+        provider_executed_tools=provider_executed_tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        max_completion_tokens=max_completion_tokens,
+        reasoning_level=reasoning_level,
+        temperature=temperature,
+        automatic_cache_breakpoints=(
+            adapter.automatic_cache_breakpoints_default
+            if automatic_cache_breakpoints is None
+            else automatic_cache_breakpoints
+        ),
+        extra_body=extra_body,
+    )
+    bound_adapter, read_output = _bound_adapter_and_reader(adapter, binding, response_format)
+    return _Configuration(
+        adapter=adapter,
+        bound_adapter=bound_adapter,
+        read_output=read_output,
+        response_format=response_format,
+        binding=binding,
+        tool_manager=tool_manager,
+        shared_backoff=shared_backoff if shared_backoff is not None else SharedBackoff(),
+        max_requests=max_requests,
+        observer=observer,
+    )
 
-        Args:
-            adapter: The provider SDK adapter.
-            shared_backoff: The request admission state, or `None` to create one with default settings.
-            observer: The observer that follows every input and tool dispatch, or `None` to follow none.
-        """
-        self.adapter: Adapter = adapter
-        self.shared_backoff: SharedBackoff = (
-            shared_backoff if shared_backoff is not None else SharedBackoff()
-        )
-        self.observer: Observer | None = observer
+
+class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](Protocol):
+    """Generate and rebind a configured model through a provider-neutral interface.
+
+    `OutputT` is `str` or the pydantic model that validates structured output.
+    Both type parameters are covariant.
+    Implementations satisfy this protocol structurally, without inheriting from it.
+    Match `generation.kind` before reading output; the protocol permits tool-call generations.
+    Batch results expose read-only sequences to preserve covariance.
+    Concrete provider classes refine results when tools are absent.
+    """
 
     @overload
-    def bind[ModelT: BaseModel](
+    def rebind[NewOutputT: str | BaseModel](
         self,
         *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
+        response_format: type[NewOutputT],
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[ModelT],
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> "BoundLLM[ModelT, ToolManager]": ...
+    ) -> LLM[NewOutputT, ToolManager]: ...
     @overload
-    def bind[ModelT: BaseModel](
+    def rebind[NewOutputT: str | BaseModel](
         self,
         *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: None = ...,
+        response_format: type[NewOutputT],
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[ModelT],
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> "BoundLLM[ModelT, None]": ...
+    ) -> LLM[NewOutputT, None]: ...
     @overload
-    def bind(
+    def rebind[NewOutputT: str | BaseModel](
         self,
         *,
+        response_format: type[NewOutputT],
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> LLM[NewOutputT, ToolManagerT]: ...
+    @overload
+    def rebind(
+        self,
+        *,
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[str] = ...,
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
-        tool_choice: ToolChoice = ...,
-        parallel_tool_calls: bool = ...,
-        extra_body: Mapping[str, object] | None = ...,
-        max_requests: int = ...,
-        automatic_cache_breakpoints: bool | None = ...,
-    ) -> "BoundLLM[str, ToolManager]": ...
-    @overload
-    def bind(
-        self,
-        *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: None = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[str] = ...,
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> "BoundLLM[str, None]": ...
-    def bind(
+    ) -> LLM[OutputT, ToolManager]: ...
+    @overload
+    def rebind(
         self,
         *,
-        system_prompt: str | Sequence[TextPart] | None = None,
-        tools: ToolManager | ToolSequence | None = None,
-        provider_executed_tools: Sequence[Mapping[str, object]] = (),
-        response_format: type[str] | type[BaseModel] = str,
-        max_completion_tokens: int | None = None,
-        reasoning_level: str | None = None,
-        temperature: float | None = None,
-        tool_choice: ToolChoice = "auto",
-        parallel_tool_calls: bool = True,
-        extra_body: Mapping[str, object] | None = None,
-        max_requests: int = 3,
-        automatic_cache_breakpoints: bool | None = None,
-    ) -> "BoundLLM[BaseModel | str, ToolManager | None]":
-        """Freeze the prompt prefix and fix the output type.
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> LLM[OutputT, None]: ...
+    @overload
+    def rebind(
+        self,
+        *,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> LLM[OutputT, ToolManagerT]: ...
+    def rebind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence | None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        max_completion_tokens: int = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> LLM[BaseModel | str, ToolManager | None]:
+        """Return a new configured model, preserving every omitted setting.
 
-        A `tools` sequence constructs `ToolManager` with this `LLM`'s observer.
-        An existing `ToolManager` retains its identity and its own observer.
-
-        Args:
-            system_prompt: The bound system prompt, or `None`.
-            tools: The application tools or an existing `ToolManager`.
-            provider_executed_tools: The provider-shaped tool definitions executed by the provider.
-            response_format: The pydantic model for structured output, or `str` for text.
-                With `str`, `output` is the kept assistant message's final text.
-                A response without a text part or tool call gives `GenerationError`.
-                An empty final text part gives `""`.
-            max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
-            reasoning_level: The provider's reasoning value, sent unchanged, or `None` to send none.
-                `None` leaves reasoning at the model default, which is on for some models and off for others.
-                The Anthropic adapter sends it as `output_config.effort`.
-                The Anthropic adapter also sends adaptive `thinking` unless `extra_body` sets `thinking`.
-                The OpenAI Responses adapter sends it as `reasoning.effort`.
-                The OpenAI Chat Completions adapter sends it as `reasoning_effort`.
-                The Gemini adapter sends it as `generationConfig.thinkingConfig.thinkingLevel`.
-                The Gemini adapter also sets `includeThoughts` to `true`.
-                With `None`, `extra_body` may set Gemini `generationConfig.thinkingConfig`.
-                Each LLM backend subpackage docstring links the provider's reasoning values.
-            temperature: The sampling temperature, or `None` for the provider default.
-            tool_choice: The provider-neutral tool choice.
-            parallel_tool_calls: Whether the provider may request parallel tool calls.
-            extra_body: Additional provider wire-body fields, or `None`.
-                Declare tools only through `tools`, because result types follow the bound tools.
-            max_requests: The maximum number of requests sent for one input; i.e., max_requests = max_retries + 1.
-            automatic_cache_breakpoints: The automatic cache setting, or `None` for the adapter default.
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `tools=None` removes `ToolManager`.
+        A tool sequence creates `ToolManager` with the model's observer.
+        An existing `ToolManager` retains its identity and observer.
+        `max_completion_tokens` accepts an integer through this common interface because Anthropic requires a limit.
+        Concrete OpenAI, DeepSeek, and Gemini models also accept `None` to clear it.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+        `automatic_cache_breakpoints=None` selects the adapter's default.
 
         Raises:
+            ValueError: A configuration value violates the provider's constraints.
             ValueError: `tools` contains duplicate names.
-            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the configured tools.
             ValueError: `system_prompt` is an empty sequence.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one.
-            ValueError: The binding breaks a rule of the adapter.
-                The docstring of the backend's `llm()` lists the rules.
             TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
             pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
-            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
-            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+            pydantic.PydanticInvalidForJsonSchema: The output or tool model has no JSON schema.
+            pydantic.PydanticUserError: The output or tool model is not fully defined.
         """
-        tool_manager = _resolve_tool_manager(tools, observer=self.observer)
-        binding = _build_binding(
-            system_prompt=system_prompt,
-            tool_schemas=() if tool_manager is None else tool_manager.schemas(),
-            provider_executed_tools=provider_executed_tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            max_completion_tokens=max_completion_tokens,
-            reasoning_level=reasoning_level,
-            temperature=temperature,
-            automatic_cache_breakpoints=(
-                self.adapter.automatic_cache_breakpoints_default
-                if automatic_cache_breakpoints is None
-                else automatic_cache_breakpoints
-            ),
-            extra_body=extra_body,
-        )
-        bound_adapter, read_output = _bound_adapter_and_reader(
-            self.adapter, binding, response_format
-        )
-        return BoundLLM(
-            adapter=self.adapter,
-            bound_adapter=bound_adapter,
-            read_output=read_output,
-            response_format=response_format,
-            binding=binding,
-            tool_manager=tool_manager,
-            shared_backoff=self.shared_backoff,
-            max_requests=max_requests,
-            observer=self.observer,
-        )
+        ...
+
+    @property
+    def tool_manager(self) -> ToolManagerT:
+        """The configured tools for application dispatch."""
+        ...
+
+    async def generate_one(
+        self,
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Generation[OutputT]:
+        """Return the generation, retrying transient failures within the configured request limit.
+
+        `timeout_seconds` includes admission, requests, and backoff waits.
+
+        Raises:
+            GenerationError: Generation fails.
+            asyncio.CancelledError: The caller cancels this coroutine.
+        """
+        ...
+
+    async def generate_many(
+        self,
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        warm_cache: bool = False,
+        max_working_seconds_per_input: float | None = None,
+    ) -> Sequence[Generation[OutputT]]:
+        """Generate an input-aligned batch, raising on failure.
+
+        `warm_cache=True` completes the first input before starting the others.
+        `max_working_seconds_per_input` excludes admission and shared-pause waits.
+        A failure cancels and awaits unfinished inputs before propagating.
+
+        Raises:
+            GenerationError: Handling an input fails.
+            asyncio.CancelledError: The caller cancels the batch.
+            BaseException: An item raises a non-`Exception` value.
+        """
+        ...
+
+    async def generate_many_records(
+        self,
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path | None = None,
+        input_ids: SequenceNotStr[str] | None = None,
+        warm_cache: bool = False,
+        max_working_seconds_per_input: float | None = None,
+    ) -> Sequence[GenerationOutcomeRecord[OutputT]]:
+        """Return an input-aligned batch of records, including generation failures.
+
+        `resume_path` persists completed records in JSON Lines for interrupted batches.
+        `input_ids` supplies stable identifiers when inputs can be reordered between runs.
+        `warm_cache=True` completes the first input requiring generation before starting the others.
+        `max_working_seconds_per_input` excludes admission and shared-pause waits.
+
+        Raises:
+            ValueError: Resume data, input identifiers, or a generated record are invalid.
+            RuntimeError: Another call in this process is using `resume_path`.
+            TypeError: Resume configuration or an input has no deterministic fingerprint encoding.
+            OSError: The resume file cannot be read, written, or replaced.
+            asyncio.CancelledError: The caller cancels the batch after started items settle.
+            BaseException: An item raises a non-`Exception` value after started items settle.
+        """
+        ...
+
+    def stream_one(
+        self,
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> StreamHandle[OutputT, ToolCallGeneration]:
+        """Build a `StreamHandle` that opens on context-manager entry.
+
+        `timeout_seconds` starts on entry and includes request opening, iteration, and caller work.
+        """
+        ...
 
 
-class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None]:
+class _ConfiguredLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None]:
     """A frozen prompt prefix with generation and streaming methods.
 
     `OutputT` is the `response_format` type: `str`, or the pydantic model that validates structured output.
     Both type parameters are covariant.
-    `BoundLLM[Answer, ToolManager]` satisfies `BoundLLM[BaseModel, ToolManager | None]`.
+    `_ConfiguredLLM[Answer, ToolManager]` satisfies `_ConfiguredLLM[BaseModel, ToolManager | None]`.
     With a `ToolManager`, application tool calls produce `ToolCallGeneration`.
     Without one, they produce `GenerationError` with kind `unexpected_response_error`.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
-    def __init__(
-        self,
-        *,
-        adapter: Adapter,
-        bound_adapter: BoundAdapter,
-        read_output: OutputReader[OutputT],
-        response_format: type[OutputT],
-        binding: Binding,
-        tool_manager: ToolManagerT,
-        shared_backoff: SharedBackoff,
-        max_requests: int,
-        observer: Observer | None,
-    ) -> None:
-        """Store the frozen pieces.
-
-        Args:
-            adapter: The provider SDK adapter.
-            bound_adapter: `adapter` bound to `binding` for `response_format` output.
-            read_output: The reader of `response_format` output.
-            response_format: The pydantic model for structured output, or `str` for text.
-            binding: The frozen provider-neutral prompt prefix.
-            tool_manager: The bound `ToolManager`, or `None`.
-            shared_backoff: The request admission state.
-            max_requests: The maximum number of requests sent for one input; i.e., max_requests = max_retries + 1.
-            observer: The originating `LLM.observer`.
+    def __init__(self, configuration: _Configuration[OutputT, ToolManagerT]) -> None:
+        """Store the validated request configuration.
 
         Raises:
-            ValueError: `max_requests` is a bool or below one.
+            ValueError: `max_requests` is boolean or below one.
         """
+        max_requests = configuration.max_requests
         if isinstance(max_requests, bool) or max_requests < 1:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
-        # Final attributes keep both type parameters covariant.
-        self.adapter: Final[Adapter] = adapter
-        self.binding: Final[Binding] = binding
-        self.response_format: Final[type[OutputT]] = response_format
-        self.tool_manager: Final[ToolManagerT] = tool_manager
-        self.shared_backoff: Final[SharedBackoff] = shared_backoff
-        self.max_requests: Final[int] = max_requests
-        self.observer: Final[Observer | None] = observer
-        self._bound_adapter: Final[BoundAdapter] = bound_adapter
-        self._read_output: Final[OutputReader[OutputT]] = read_output
-        self._adapter_class: Final[type[Adapter]] = type(adapter)
-        self._adapter_model: Final[str] = adapter.model
-        self._adapter_provider_name: Final[str] = adapter.provider_name
+        self._configuration: Final = configuration
+        self.adapter: Final[Adapter] = configuration.adapter
+        self.binding: Final[Binding] = configuration.binding
+        self.response_format: Final[type[OutputT]] = configuration.response_format
+        self.shared_backoff: Final[SharedBackoff] = configuration.shared_backoff
+        self.max_requests: Final[int] = configuration.max_requests
+        self.observer: Final[Observer | None] = configuration.observer
+        self._bound_adapter: Final[BoundAdapter] = configuration.bound_adapter
+        self._read_output: Final[OutputReader[OutputT]] = configuration.read_output
+        self._adapter_class: Final[type[Adapter]] = type(self.adapter)
+        self._adapter_model: Final[str] = self.adapter.model
+        self._adapter_provider_name: Final[str] = self.adapter.provider_name
         self._adapter_config_fingerprint_data: Final[Mapping[str, object]] = (
-            adapter.config_fingerprint_data()
+            self.adapter.config_fingerprint_data()
         )
         self._response_format_fingerprint_data: Final[ResponseFormatFingerprintData] = (
-            capture_response_format_fingerprint_data(response_format)
+            capture_response_format_fingerprint_data(self.response_format)
         )
+
+    def _with_binding(self, binding: Binding) -> Self:
+        bound_adapter, _ = _bound_adapter_and_reader(self.adapter, binding, self.response_format)
+        return type(self)(
+            replace(self._configuration, binding=binding, bound_adapter=bound_adapter)
+        )
+
+    @property
+    def tool_manager(self) -> ToolManagerT:
+        """The configured tools for application dispatch."""
+        return self._configuration.tool_manager
 
     def config_fingerprint(self) -> str:
         """Return a SHA-256 fingerprint of the current stored request configuration.
 
-        `BoundLLM` captures adapter and response-format configuration during binding.
+        `_ConfiguredLLM` captures adapter and response-format configuration during binding.
         Each call reads current `Binding` values.
         It excludes per-input messages, retry and admission configuration, pricing, and credentials.
         It also excludes SDK client state and tool functions.
@@ -509,7 +610,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         Raises:
             TypeError: A configuration value has no deterministic encoding or contains a cycle.
         """
-        return bound_llm_config_fingerprint(
+        return llm_config_fingerprint(
             adapter_class=self._adapter_class,
             adapter_model=self._adapter_model,
             adapter_provider_name=self._adapter_provider_name,
@@ -522,160 +623,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     def _splits_on_tool_calls(self) -> bool:
         return self.tool_manager is not None
 
-    @overload
-    def bind[NewModelT: BaseModel](
-        self,
-        *,
-        response_format: type[NewModelT],
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, ToolManager]": ...
-    @overload
-    def bind[NewModelT: BaseModel](
-        self,
-        *,
-        response_format: type[NewModelT],
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, None]": ...
-    @overload
-    def bind[NewModelT: BaseModel](
-        self: "BoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: type[NewModelT],
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        response_format: type[str],
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[str, ToolManager]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        response_format: type[str],
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[str, None]": ...
-    @overload
-    def bind(
-        self: "BoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: type[str],
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[str, ToolManagerT]": ...
-    @overload
-    def bind(
-        self: "BoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, ToolManager]": ...
-    @overload
-    def bind(
-        self: "BoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, None]": ...
-    @overload
-    def bind(
-        self: "BoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, ToolManagerT]": ...
-    def bind(
+    def _reconfigure(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -690,43 +638,8 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_requests: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
-    ) -> "BoundLLM[BaseModel | str, ToolManager | None]":
-        """Return a new `BoundLLM` with specified fields replaced.
-
-        `tools=None` removes `ToolManager`.
-        A `tools` sequence constructs `ToolManager` with this binding's observer.
-        An existing `ToolManager` retains its identity and its own observer.
-        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
-
-        Args:
-            response_format: The replacement output model, `str` for text, or `UNCHANGED`.
-            system_prompt: The replacement system prompt, `None`, or `UNCHANGED`.
-            tools: The replacement tools, `None`, or `UNCHANGED`.
-            provider_executed_tools: The replacement provider-shaped tools or `UNCHANGED`.
-            tool_choice: The replacement tool choice or `UNCHANGED`.
-            parallel_tool_calls: The replacement parallel-tool setting or `UNCHANGED`.
-            max_completion_tokens: The replacement token limit, `None` to omit the limit, or `UNCHANGED`.
-            reasoning_level: The replacement exact provider string, `None`, or `UNCHANGED`.
-            temperature: The replacement sampling temperature, `None`, or `UNCHANGED`.
-            extra_body: The replacement provider wire-body fields, `None`, or `UNCHANGED`.
-                Declare tools only through `tools`, because result types follow the bound tools.
-            max_requests: The replacement request limit or `UNCHANGED`.
-            automatic_cache_breakpoints: The replacement automatic cache setting or `UNCHANGED`.
-
-        Raises:
-            ValueError: `tools` contains duplicate names.
-            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
-            ValueError: `system_prompt` is an empty sequence.
-            ValueError: `extra_body` contains an adapter-populated key.
-            ValueError: `max_requests` is boolean or below one.
-            ValueError: The binding breaks a rule of the adapter.
-                The docstring of the backend's `llm()` lists the rules.
-            TypeError: The adapter does not support `tool_choice`.
-            TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
-            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
-            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
-        """
+    ) -> _Configuration[BaseModel | str, ToolManager | None]:
+        """Replace specified settings and preserve tool schemas when tools are omitted."""
         if isinstance(tools, Unchanged):
             tool_manager = self.tool_manager
             tool_schemas = self.binding.tool_schemas
@@ -763,7 +676,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         bound_adapter, read_output = _bound_adapter_and_reader(
             self.adapter, binding, resolved_response_format
         )
-        return BoundLLM(
+        return _Configuration(
             adapter=self.adapter,
             bound_adapter=bound_adapter,
             read_output=read_output,
@@ -931,29 +844,28 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         return built
 
     @overload
-    async def generate_one(
-        self: "BoundLLM[OutputT, None]",
+    async def generate_one[CallOutputT: str | BaseModel](
+        self: _ConfiguredLLM[CallOutputT, None],
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> PlainGeneration[OutputT]: ...
+    ) -> PlainGeneration[CallOutputT]: ...
     @overload
-    async def generate_one(
-        self: "BoundLLM[OutputT, ToolManagerT]",
+    async def generate_one[CallOutputT: str | BaseModel](
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> Generation[OutputT]: ...
-    async def generate_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> Generation[OutputT]:
+    ) -> Generation[CallOutputT]: ...
+    async def generate_one[CallOutputT: str | BaseModel](
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Generation[CallOutputT]:
         """Return the `Generation` for one input, retrying transient failures while `max_requests` allows.
 
         `timeout_seconds` bounds admission, requests, and backoff waits.
-
-        Args:
-            generation_input: The text or messages to send.
-            timeout_seconds: The wall-clock budget in seconds, or `None`.
 
         Raises:
             GenerationError: Generation fails.
@@ -1024,7 +936,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, None]",
+        self: _ConfiguredLLM[CallOutputT, None],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1032,7 +944,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     ) -> list[PlainGeneration[CallOutputT]]: ...
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManager]",
+        self: _ConfiguredLLM[CallOutputT, ToolManager],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1040,14 +952,14 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     ) -> list[Generation[CallOutputT]]: ...
     @overload
     async def generate_many[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
     ) -> list[PlainGeneration[CallOutputT]] | list[Generation[CallOutputT]]: ...
     async def generate_many[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
@@ -1086,12 +998,12 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
         )
 
-    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
+    # `CallOutputT` is the output type of the `_ConfiguredLLM` type the caller holds.
     # Typing the invariant `list` result with it keeps `OutputT` covariant.
     # That is sound only because the caller holds the only reference to the returned `list`.
     @overload
     async def generate_many_records[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, None]",
+        self: _ConfiguredLLM[CallOutputT, None],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path | None = None,
@@ -1101,7 +1013,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     ) -> list[PlainGenerationRecord[CallOutputT] | GenerationErrorRecord]: ...
     @overload
     async def generate_many_records[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManager]",
+        self: _ConfiguredLLM[CallOutputT, ToolManager],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path | None = None,
@@ -1111,7 +1023,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
     ) -> list[GenerationOutcomeRecord[CallOutputT]]: ...
     @overload
     async def generate_many_records[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path | None = None,
@@ -1123,7 +1035,7 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
         | list[GenerationOutcomeRecord[CallOutputT]]
     ): ...
     async def generate_many_records[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         resume_path: Path | None = None,
@@ -1270,25 +1182,22 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
                 for input_index in range(len(input_snapshots))
             ]
 
-    # `CallOutputT` is the output type of the `BoundLLM` type the caller holds.
-    # Typing the invariant `StreamHandle` result with it keeps `OutputT` covariant.
-    # That is sound only because the caller holds the only reference to the returned `StreamHandle`.
     @overload
     def stream_one[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, None]",
+        self: _ConfiguredLLM[CallOutputT, None],
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[CallOutputT]: ...
     @overload
     def stream_one[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[CallOutputT, ToolCallGeneration]: ...
     def stream_one[CallOutputT: str | BaseModel](
-        self: "BoundLLM[CallOutputT, ToolManagerT]",
+        self: _ConfiguredLLM[CallOutputT, ToolManagerT],
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = None,
@@ -1297,10 +1206,6 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
 
         `timeout_seconds` starts on entry and covers request opening, iteration, and caller work.
         It ends when the stream stores a `GenerationOutcome` or the block exits.
-
-        Args:
-            generation_input: The text or messages to send.
-            timeout_seconds: The wall-clock budget in seconds, or `None`.
         """
         messages = _as_messages(generation_input)
         return StreamHandle(
@@ -1314,3 +1219,316 @@ class BoundLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None = None
             splits_on_tool_calls=self._splits_on_tool_calls,
             generation_started=partial(self._generation_started, messages, stream=True),
         )
+
+
+class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
+    _ConfiguredLLM[OutputT, ToolManagerT]
+):
+    """Create instances through `llm_from_adapter` to validate request settings before generation."""
+
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[NewOutputT, ToolManager]: ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[NewOutputT, None]: ...
+    @overload
+    def rebind[NewOutputT: str | BaseModel](
+        self: AdapterLLM[OutputT, ToolManagerT],
+        *,
+        response_format: type[NewOutputT],
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[NewOutputT, ToolManagerT]: ...
+    @overload
+    def rebind(
+        self: AdapterLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[OutputT, ToolManager]: ...
+    @overload
+    def rebind(
+        self: AdapterLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[OutputT, None]: ...
+    @overload
+    def rebind(
+        self: AdapterLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> AdapterLLM[OutputT, ToolManagerT]: ...
+    def rebind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
+        tool_choice: ToolChoice | Unchanged = UNCHANGED,
+        parallel_tool_calls: bool | Unchanged = UNCHANGED,
+        max_completion_tokens: int | None | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_requests: int | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
+    ) -> AdapterLLM[BaseModel | str, ToolManager | None]:
+        """Return a new LLM, preserving every omitted setting.
+
+        `tools=None` removes `ToolManager`.
+        A `tools` sequence constructs `ToolManager` with this binding's observer.
+        An existing `ToolManager` retains its identity and its own observer.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `max_completion_tokens=None` omits the limit.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools only through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one.
+            ValueError: The binding breaks a rule of the adapter.
+                The adapter documents its binding constraints.
+            TypeError: The adapter does not support `tool_choice`.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+        """
+        return AdapterLLM(
+            self._reconfigure(
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
+
+
+@overload
+def llm_from_adapter[OutputT: str | BaseModel](
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = ...,
+    tools: ToolManager | ToolSequence,
+    provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+    response_format: type[OutputT],
+    max_completion_tokens: int | None = ...,
+    reasoning_level: str | None = ...,
+    temperature: float | None = ...,
+    tool_choice: ToolChoice = ...,
+    parallel_tool_calls: bool = ...,
+    extra_body: Mapping[str, object] | None = ...,
+    max_requests: int = ...,
+    automatic_cache_breakpoints: bool | None = ...,
+) -> AdapterLLM[OutputT, ToolManager]: ...
+
+
+@overload
+def llm_from_adapter[OutputT: str | BaseModel](
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = ...,
+    tools: None = ...,
+    provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+    response_format: type[OutputT],
+    max_completion_tokens: int | None = ...,
+    reasoning_level: str | None = ...,
+    temperature: float | None = ...,
+    tool_choice: ToolChoice = ...,
+    parallel_tool_calls: bool = ...,
+    extra_body: Mapping[str, object] | None = ...,
+    max_requests: int = ...,
+    automatic_cache_breakpoints: bool | None = ...,
+) -> AdapterLLM[OutputT, None]: ...
+
+
+@overload
+def llm_from_adapter(
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = ...,
+    tools: ToolManager | ToolSequence,
+    provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+    response_format: type[str] = ...,
+    max_completion_tokens: int | None = ...,
+    reasoning_level: str | None = ...,
+    temperature: float | None = ...,
+    tool_choice: ToolChoice = ...,
+    parallel_tool_calls: bool = ...,
+    extra_body: Mapping[str, object] | None = ...,
+    max_requests: int = ...,
+    automatic_cache_breakpoints: bool | None = ...,
+) -> AdapterLLM[str, ToolManager]: ...
+
+
+@overload
+def llm_from_adapter(
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = ...,
+    tools: None = ...,
+    provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+    response_format: type[str] = ...,
+    max_completion_tokens: int | None = ...,
+    reasoning_level: str | None = ...,
+    temperature: float | None = ...,
+    tool_choice: ToolChoice = ...,
+    parallel_tool_calls: bool = ...,
+    extra_body: Mapping[str, object] | None = ...,
+    max_requests: int = ...,
+    automatic_cache_breakpoints: bool | None = ...,
+) -> AdapterLLM[str, None]: ...
+
+
+def llm_from_adapter(
+    adapter: Adapter,
+    *,
+    shared_backoff: SharedBackoff | None = None,
+    observer: Observer | None = None,
+    system_prompt: str | Sequence[TextPart] | None = None,
+    tools: ToolManager | ToolSequence | None = None,
+    provider_executed_tools: Sequence[Mapping[str, object]] = (),
+    response_format: type[str] | type[BaseModel] = str,
+    max_completion_tokens: int | None = None,
+    reasoning_level: str | None = None,
+    temperature: float | None = None,
+    tool_choice: ToolChoice = "auto",
+    parallel_tool_calls: bool = True,
+    extra_body: Mapping[str, object] | None = None,
+    max_requests: int = 3,
+    automatic_cache_breakpoints: bool | None = None,
+) -> AdapterLLM[BaseModel | str, ToolManager | None]:
+    """Configure an adapter for generation through its provider-neutral contract.
+
+    Adapter authors can expose this factory without importing a provider SDK.
+    `response_format` selects text or a validated pydantic model.
+    `tools=None` disables application tool dispatch.
+    A tools sequence constructs a `ToolManager` with `observer`; an existing manager retains its identity and observer.
+    `max_requests` limits requests for one input, including retries.
+    `max_completion_tokens=None` omits the limit when the adapter permits it.
+    `automatic_cache_breakpoints=None` uses the adapter default.
+    `provider_executed_tools` and `extra_body` pass provider-shaped data to the adapter.
+
+    Raises:
+        ValueError: A binding value violates the adapter's constraints.
+        ValueError: `tools` contains duplicate names.
+        ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the configured tools.
+        ValueError: `system_prompt` is an empty sequence or `max_requests` is below one or boolean.
+        TypeError: The adapter does not support the binding or `response_format` is a proper subclass of `str`.
+        pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+        pydantic.PydanticInvalidForJsonSchema: The output or tool model has no JSON schema.
+        pydantic.PydanticUserError: The output or tool model is not fully defined.
+    """
+    return AdapterLLM(
+        _configure(
+            adapter,
+            shared_backoff=shared_backoff,
+            observer=observer,
+            system_prompt=system_prompt,
+            tools=tools,
+            provider_executed_tools=provider_executed_tools,
+            response_format=response_format,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_level=reasoning_level,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            extra_body=extra_body,
+            max_requests=max_requests,
+            automatic_cache_breakpoints=automatic_cache_breakpoints,
+        )
+    )

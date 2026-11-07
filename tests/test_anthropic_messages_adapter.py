@@ -27,7 +27,6 @@ from anthropic.types.parsed_message import ParsedTextBlock
 from pydantic import BaseModel
 
 from langchaint import (
-    LLM,
     AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
@@ -52,6 +51,7 @@ from langchaint import (
     ToolManager,
     ToolMessage,
     UserMessage,
+    llm_from_adapter,
 )
 from langchaint.adapter import (
     Adapter,
@@ -69,6 +69,8 @@ from langchaint.anthropic import (
     BEDROCK_CROSS_REGION_MULTIPLIER,
     Anthropic,
     AnthropicBedrock,
+    AnthropicBedrockLLM,
+    AnthropicLLM,
     AnthropicMessagesAdapter,
     AnthropicPricingTable,
     AnthropicRates,
@@ -467,8 +469,12 @@ def test_cache_reads_and_writes_count_toward_the_long_context_threshold() -> Non
 
 def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
     for llm in (
-        Anthropic(client=AsyncAnthropic(api_key="test")).llm("claude-sonnet-5", cache_ttl="1h"),
-        AnthropicBedrock(api="mantle").llm("anthropic.claude-sonnet-5", cache_ttl="1h"),
+        Anthropic(client=AsyncAnthropic(api_key="test")).llm(
+            "claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128
+        ),
+        AnthropicBedrock(api="mantle").llm(
+            "anthropic.claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128
+        ),
     ):
         bound = llm.adapter.bind_text(
             _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
@@ -1560,22 +1566,27 @@ def _structured_bound() -> BoundAdapter:
     [
         (
             lambda: Anthropic(client=AsyncAnthropic(api_key="test")).llm(
-                "claude-sonnet-5", cache_ttl="1h"
+                "claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128
             ),
             True,
         ),
         (
             lambda: AnthropicBedrock(api="mantle").llm(
-                "us.anthropic.claude-sonnet-4-6", cache_ttl="1h"
+                "us.anthropic.claude-sonnet-4-6", cache_ttl="1h", max_completion_tokens=128
             ),
             True,
         ),
-        (lambda: AnthropicBedrock().llm("anthropic.claude-sonnet-5", cache_ttl="1h"), False),
+        (
+            lambda: AnthropicBedrock().llm(
+                "anthropic.claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128
+            ),
+            False,
+        ),
     ],
     ids=["anthropic", "bedrock_mantle", "bedrock_legacy"],
 )
 def test_automatic_cache_breakpoints_select_final_caching_by_api(
-    build_llm: Callable[[], LLM],
+    build_llm: Callable[[], AnthropicLLM | AnthropicBedrockLLM],
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
@@ -1733,8 +1744,11 @@ def test_retry_count_header_counts_prior_requests(path: Literal["generate", "str
             max_retries=0,
             http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
         ) as client:
-            bound = LLM(_adapter(client=client), shared_backoff=fast_shared_backoff()).bind(
-                max_completion_tokens=16, max_requests=2
+            bound = llm_from_adapter(
+                _adapter(client=client),
+                shared_backoff=fast_shared_backoff(),
+                max_completion_tokens=16,
+                max_requests=2,
             )
             if path == "generate":
                 with pytest.raises(GenerationError) as caught:
@@ -1773,8 +1787,11 @@ def test_a_persistent_401_on_a_token_cache_client_ends_as_auth_error() -> None:
             max_retries=0,
             http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
         ) as client:
-            bound = LLM(_adapter(client=client), shared_backoff=fast_shared_backoff()).bind(
-                max_completion_tokens=16, max_requests=10
+            bound = llm_from_adapter(
+                _adapter(client=client),
+                shared_backoff=fast_shared_backoff(),
+                max_completion_tokens=16,
+                max_requests=10,
             )
             with pytest.raises(GenerationError) as caught:
                 await bound.generate_one("hello")
@@ -1837,7 +1854,7 @@ def _connection_error() -> anthropic.APIConnectionError:
     )
 
 
-def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
+def _anthropic_adapter_of(llm: AnthropicLLM | AnthropicBedrockLLM) -> AnthropicMessagesAdapter:
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     return adapter
@@ -1845,7 +1862,9 @@ def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
 
 def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> None:
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1").llm("us.anthropic.claude-opus-4-6-v1")
+        AnthropicBedrock(aws_region="us-east-1").llm(
+            "us.anthropic.claude-opus-4-6-v1", max_completion_tokens=128
+        )
     )
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
 
@@ -1853,7 +1872,9 @@ def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> N
 @pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
 def test_prefixed_bedrock_model_applies_its_multiplier_by_default(prefix: str) -> None:
     adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1").llm(f"{prefix}.anthropic.claude-sonnet-5")
+        AnthropicBedrock(aws_region="us-east-1").llm(
+            f"{prefix}.anthropic.claude-sonnet-5", max_completion_tokens=128
+        )
     )
     base = ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
     multiplier = BEDROCK_CROSS_REGION_MULTIPLIER[prefix]
@@ -1866,7 +1887,7 @@ def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled
 ) -> None:
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1", apply_cross_region_multiplier=False).llm(
-            f"{prefix}.anthropic.claude-sonnet-5"
+            f"{prefix}.anthropic.claude-sonnet-5", max_completion_tokens=128
         )
     )
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
@@ -1889,7 +1910,7 @@ def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(
             api="mantle", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
-        ).llm("anthropic.claude-opus-4-8")
+        ).llm("anthropic.claude-opus-4-8", max_completion_tokens=128)
     )
     assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
     assert adapter.model == "anthropic.claude-opus-4-8"
@@ -1912,7 +1933,9 @@ def test_bedrock_rejects_a_client_that_contradicts_api(
 @pytest.mark.parametrize("api", ["legacy", "mantle"])
 def test_bedrock_model_accepts_custom_pricing(api: Literal["legacy", "mantle"]) -> None:
     model = "us.anthropic.claude-next"
-    adapter = _anthropic_adapter_of(AnthropicBedrock(api=api).llm(model, pricing=_PRICING))
+    adapter = _anthropic_adapter_of(
+        AnthropicBedrock(api=api).llm(model, pricing=_PRICING, max_completion_tokens=128)
+    )
     assert adapter.model == model
     assert adapter.pricing is _PRICING
 
@@ -1920,7 +1943,7 @@ def test_bedrock_model_accepts_custom_pricing(api: Literal["legacy", "mantle"]) 
 def test_uncataloged_bedrock_model_requires_pricing() -> None:
     bedrock = AnthropicBedrock(api="mantle")
     with pytest.raises(ValueError, match="pass pricing="):
-        _ = bedrock.llm("us.anthropic.claude-next")
+        _ = bedrock.llm("us.anthropic.claude-next", max_completion_tokens=128)
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:

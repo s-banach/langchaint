@@ -65,7 +65,7 @@ def finished_response(bound_adapter: BoundAdapter, raw: BaseModel) -> FinishedRe
 def structured_outcome[ModelT: BaseModel](
     bound_adapter: BoundAdapter, raw: BaseModel, response_format: type[ModelT]
 ) -> ResponseOutcome[ModelT]:
-    """Read `raw` as `BoundLLM` does for a structured binding."""
+    """Read `raw` as generation does for a structured binding."""
     return response_outcome(
         bound_adapter.interpret(raw),
         functools.partial(structured_output, response_format=response_format),

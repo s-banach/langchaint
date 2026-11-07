@@ -1,10 +1,10 @@
 """Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from importlib.resources import files
-from typing import Annotated, Literal, overload
+from typing import Annotated, Literal
 
 import jsonschema
 from pydantic import (
@@ -40,7 +40,7 @@ from langchaint.common.messages import (
     _is_object_dict,
     final_text,
 )
-from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
+from langchaint.generation.llm import GenerationInput, _ConfiguredLLM
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
 from langchaint.generation.response import (
     GenerationRecord,
@@ -48,7 +48,7 @@ from langchaint.generation.response import (
     ToolCallGenerationRecord,
     response_outcome,
 )
-from langchaint.tools import ToolManager, ToolSchema, ToolSequence
+from langchaint.tools import ToolManager, ToolSchema
 
 OPERATION_NAME = "gen_ai.operation.name"
 PROMPT_VARIABLE_PREFIX = "gen_ai.prompt.variable."
@@ -738,82 +738,32 @@ def generation_record_from_otel(
             )
 
 
-@overload
-def bound_llm_from_otel[ModelT: BaseModel](
+def llm_from_otel[LLMT: _ConfiguredLLM[str | BaseModel, ToolManager | None]](
     otel_chat_span: OtelChatSpan,
     *,
-    llm: LLM,
-    tools: ToolManager | ToolSequence,
-    response_format: type[ModelT],
-) -> BoundLLM[ModelT, ToolManager]: ...
-
-
-@overload
-def bound_llm_from_otel[ModelT: BaseModel](
-    otel_chat_span: OtelChatSpan,
-    *,
-    llm: LLM,
-    tools: None = None,
-    response_format: type[ModelT],
-) -> BoundLLM[ModelT, None]: ...
-
-
-@overload
-def bound_llm_from_otel(
-    otel_chat_span: OtelChatSpan,
-    *,
-    llm: LLM,
-    tools: ToolManager | ToolSequence,
-    response_format: type[str] = str,
-) -> BoundLLM[str, ToolManager]: ...
-
-
-@overload
-def bound_llm_from_otel(
-    otel_chat_span: OtelChatSpan,
-    *,
-    llm: LLM,
-    tools: None = None,
-    response_format: type[str] = str,
-) -> BoundLLM[str, None]: ...
-
-
-def bound_llm_from_otel[ModelT: BaseModel](
-    otel_chat_span: OtelChatSpan,
-    *,
-    llm: LLM,
-    tools: ToolManager | ToolSequence | None = None,
-    response_format: type[ModelT] | type[str] = str,
-) -> (
-    BoundLLM[ModelT, ToolManager]
-    | BoundLLM[ModelT, None]
-    | BoundLLM[str, ToolManager]
-    | BoundLLM[str, None]
-):
-    """Bind supported captured request fields and caller-supplied Python objects.
+    llm: LLMT,
+) -> LLMT:
+    """Reconstruct captured request settings with the configured model's concrete class.
 
     OTel tool definitions contain schemas without executable Python functions.
-    `tools` supplies executable Python functions.
-    `response_format` supplies the model class that `output_type="json"` omits.
+    `llm.tool_manager` supplies executable Python functions.
+    `llm.response_format` supplies the model class that `output_type="json"` omits.
 
     Args:
         otel_chat_span: The parsed OTel chat span attributes.
-        llm: The provider SDK client state and request-admission configuration.
-        tools: Executable Python tools.
-            When `gen_ai.tool.definitions` is present, its converted schemas must equal the tool schemas.
-        response_format: The structured response model for JSON output, or `str` for text output.
+        llm: The model that supplies the concrete class, output type, tools, and admission configuration.
+            Captured tool schemas must equal its tool schemas.
+            Captured system prompt, token limit, reasoning level, and temperature replace its corresponding settings.
 
     Raises:
         ValueError: The provider name or model on `llm` differs from `otel_chat_span`.
         ValueError: A parsed binding field is invalid for the adapter.
         ValueError: The span lacks `gen_ai.request.max_tokens` and `llm` uses `AnthropicMessagesAdapter`.
-        ValueError: `tools` contains duplicate names.
         OtelToLangchaintConversionError: Captured configuration differs from caller-supplied objects.
         OtelToLangchaintConversionError: A captured value has no lossless langchaint representation.
         TypeError: The adapter does not support the reconstructed binding.
-        TypeError: `response_format` is a proper subclass of `str`.
-        pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool model has no JSON schema.
-        pydantic.PydanticUserError: `response_format` or a tool model is not fully defined.
+        pydantic.PydanticInvalidForJsonSchema: `llm.response_format` has no JSON schema.
+        pydantic.PydanticUserError: `llm.response_format` is not fully defined.
     """
     if llm.adapter.provider_name != otel_chat_span.provider_name:
         raise ValueError(
@@ -826,15 +776,16 @@ def bound_llm_from_otel[ModelT: BaseModel](
             f"{otel_chat_span.request_model!r}"
         )
     system_prompt = system_prompt_from_otel(otel_chat_span)
-    _require_matching_response_format(otel_chat_span.output_type, response_format)
+    _require_matching_response_format(otel_chat_span.output_type, llm.response_format)
     captured_tool_schemas = tool_schemas_from_otel(otel_chat_span)
-    bound_llm = llm.bind(
-        system_prompt=system_prompt,
-        tools=tools,
-        response_format=response_format,
-        max_completion_tokens=otel_chat_span.request_max_tokens,
-        reasoning_level=otel_chat_span.request_reasoning_level,
-        temperature=otel_chat_span.request_temperature,
+    bound_llm = llm._with_binding(
+        replace(
+            llm.binding,
+            system_prompt=system_prompt,
+            max_completion_tokens=otel_chat_span.request_max_tokens,
+            reasoning_level=otel_chat_span.request_reasoning_level,
+            temperature=otel_chat_span.request_temperature,
+        )
     )
     if (
         captured_tool_schemas is not None
@@ -1062,9 +1013,9 @@ __all__ = [
     "OtelToolCallResult",
     "OtelToolDefinition",
     "OtelUriPart",
-    "bound_llm_from_otel",
     "generation_input_from_otel",
     "generation_record_from_otel",
+    "llm_from_otel",
     "output_messages_from_otel",
     "parse_otel_chat",
     "parse_otel_execute_tool",

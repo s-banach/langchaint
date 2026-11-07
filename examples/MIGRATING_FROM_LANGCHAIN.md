@@ -5,7 +5,7 @@ It provides no chains, middleware stack, or agent loop.
 
 ## Basic construction
 
-Construct `OpenAI`, select a model, bind configuration, then generate.
+Construct `OpenAI`, configure a model, then generate.
 
 ```python
 from langchaint import UserMessage
@@ -13,8 +13,7 @@ from langchaint.openai import OpenAI
 
 openai = OpenAI()
 llm = openai.llm("gpt-5.6-terra")
-bound = llm.bind()
-generation = await bound.generate_one([UserMessage(content="Hello")])
+generation = await llm.generate_one([UserMessage(content="Hello")])
 print(generation.output)
 ```
 
@@ -30,17 +29,17 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
 | `model.batch(inputs)` | `await bound.generate_many(inputs)` |
 | `model.stream(messages)` | `async with bound.stream_one(messages) as stream:` |
-| `model.bind_tools(tools)` | `llm.bind(tools=tools)` |
-| `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
+| `model.bind_tools(tools)` | `llm.rebind(tools=tools)` |
+| `model.with_structured_output(Model)` | `llm.rebind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
-| `RunnableRetry` | `max_requests` on `bind` |
+| `RunnableRetry` | `max_requests` on `llm` |
 | `InMemoryRateLimiter` | `SharedBackoff(max_concurrent_requests=..., max_request_starts_per_second=...)` |
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
 | callbacks and LangSmith | `OpenAI(observer=OtelObserver(...))` |
 | `temperature=` | `temperature=` |
 | unmatched provider fields | `extra_body={...}` |
-| `SystemMessage` | `system_prompt=` on `bind` |
+| `SystemMessage` | `system_prompt=` on `llm` |
 | `HumanMessage` | `UserMessage` |
 | `AIMessage` | `AssistantMessage` |
 | `ToolMessage` | `ToolMessage` |
@@ -63,7 +62,7 @@ openai = OpenAI()
 openai_llm = openai.llm("gpt-5.6-terra")
 
 anthropic = Anthropic()
-anthropic_llm = anthropic.llm("claude-sonnet-5")
+anthropic_llm = anthropic.llm("claude-sonnet-5", max_completion_tokens=2048)
 
 gemini = Gemini()
 gemini_llm = gemini.llm("gemini-3.6-flash")
@@ -72,7 +71,9 @@ deepseek = DeepSeek()
 deepseek_llm = deepseek.llm("deepseek-v4-flash")
 
 anthropic_bedrock = AnthropicBedrock(api="mantle")
-anthropic_bedrock_llm = anthropic_bedrock.llm("anthropic.claude-sonnet-5")
+anthropic_bedrock_llm = anthropic_bedrock.llm(
+    "anthropic.claude-sonnet-5", max_completion_tokens=2048
+)
 
 openai_bedrock = OpenAIBedrock(aws_region="us-east-1")
 
@@ -87,34 +88,35 @@ cohere_embeddings = cohere_bedrock.embedding_model(
 Uncataloged models require explicit pricing.
 `OpenAI.llm` also requires `supports_prompt_cache_options` for uncataloged models.
 `OpenAIBedrock.llm` always requires both values.
-`Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `bind`, because the Messages API requires `max_tokens`.
+`Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `llm`, because the Messages API requires `max_tokens`.
 
 ## Bind again
 
-`LLM.bind` freezes request configuration.
-`BoundLLM.bind` returns another binding with selected fields replaced.
+Provider factories return configured models.
+Their `rebind` methods return new instances of the same concrete provider class with selected settings replaced.
+The provider-neutral `LLM` protocol exposes typed `rebind`, generation methods, and `tool_manager`.
 
 ```python
-concise = llm.bind(
+concise = llm.rebind(
     system_prompt="Answer in one sentence.",
     temperature=0.2,
     max_requests=3,
 )
-creative = concise.bind(
+creative = concise.rebind(
     system_prompt="Write a vivid paragraph.",
     temperature=0.8,
 )
 ```
 
-`BoundLLM.bind` preserves every omitted field.
+`rebind` preserves every omitted field.
 
 Use `AllowedToolsChoice` to change `tool_choice` without changing `tools`:
 
 ```python
 from langchaint import AllowedToolsChoice
 
-bound = llm.bind(tools=[search, final_answer])
-search_only = bound.bind(
+bound = llm.rebind(tools=[search, final_answer])
+search_only = bound.rebind(
     tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,))
 )
 ```
@@ -146,7 +148,7 @@ class Answer(BaseModel):
     text: str
 
 
-generation = await llm.bind(
+generation = await llm.rebind(
     response_format=Answer,
     tools=tools,
 ).generate_one("Answer the question")
@@ -172,7 +174,7 @@ Do not pass their calls to `ToolManager`.
 
 `provider_executed_tools` response items appear as `RawPart` values.
 `Usage.provider_executed_tool_cost_in_usd` contributes to `Usage.cost_in_usd`.
-An unusable required rate raises during `bind`.
+An unusable required rate raises during `llm`.
 
 See [`11_provider_executed_tools.py`](11_provider_executed_tools.py) for a complete request.
 
@@ -210,7 +212,7 @@ See [`09_embeddings.py`](09_embeddings.py) for both embedding tasks.
 
 ## Prompt caching
 
-`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` when the argument is `None`.
+Provider factories and `rebind` use `Adapter.automatic_cache_breakpoints_default` when the argument is `None`.
 Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
 
 `automatic_cache_breakpoints` does not change which parts with `cache_breakpoint=True` send a cache breakpoint.
@@ -218,7 +220,7 @@ Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoi
 ```python
 from langchaint import TextPart
 
-bound = llm.bind(
+bound = llm.rebind(
     system_prompt=[
         TextPart(
             text="Stable instructions and reference material.",
@@ -247,11 +249,11 @@ See [`05_prompt_caching.py`](05_prompt_caching.py) for measured cache counters.
 
 ## Unmatched provider fields
 
-`LLM.bind` accepts `max_completion_tokens`, `reasoning_level`, and `temperature` directly.
+`llm` accepts `max_completion_tokens`, `reasoning_level`, and `temperature` directly.
 Use `extra_body` for other provider wire fields.
 
 ```python
-bound = llm.bind(
+bound = llm.rebind(
     extra_body={"top_p": 0.9},
 )
 ```
@@ -267,12 +269,9 @@ Set `max_requests=1` to disable retries.
 ```python
 from langchaint import SharedBackoff
 
-openai = OpenAI(
+bound = OpenAI(
     shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
-)
-bound = openai.llm("gpt-5.6-terra").bind(
-    max_requests=5,
-)
+).llm("gpt-5.6-terra", max_requests=5)
 ```
 
 `generate_one` raises `GenerationError` for terminal generation failures.
@@ -305,7 +304,7 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | --- | --- |
 | `before_model` | before `await bound.generate_one(messages)` |
 | `after_model` | after receiving `PlainGeneration` or `ToolCallGeneration` |
-| `modify_model_request` | `bound = bound.bind(...)` |
+| `modify_model_request` | `bound = bound.rebind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |
 | concurrent tool calls | `ToolManager.dispatch_many(tool_calls)` |

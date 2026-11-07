@@ -19,7 +19,7 @@ class RequestFailure:
     `kind` decides whether the retry loop sends the request again:
     - `transient`: send it again while `max_requests` permits.
     - `auth`: the provider rejected the client's credentials or permissions.
-      `BoundLLM.config_fingerprint()` excludes credentials.
+      The configured model's `config_fingerprint()` excludes credentials.
       The same request can succeed after the caller repairs them.
     - `rejected`: the provider rejected the request.
     - `provider_failed_terminally`: the provider reported a failure that sending the request again would repeat.

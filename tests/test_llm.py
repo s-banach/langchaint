@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, assert_type, override
 
@@ -14,9 +15,9 @@ from langchaint import (
     LLM,
     ZERO_USAGE,
     AbandonedStreamRecord,
+    AdapterLLM,
     AllowedToolsChoice,
     AssistantMessage,
-    BoundLLM,
     CaptureTool,
     CutOffRequestRecord,
     DispatchHandled,
@@ -43,6 +44,7 @@ from langchaint import (
     TransientErrorRecord,
     Usage,
     UserMessage,
+    llm_from_adapter,
 )
 from langchaint.adapter import (
     AdapterStream,
@@ -124,13 +126,14 @@ def _outputs(
 type _GenerationPath = Literal["generate", "stream"]
 
 
-async def _generate_through(
-    path: _GenerationPath, bound_llm: BoundLLM[str]
-) -> PlainGeneration[str]:
+async def _generate_through(path: _GenerationPath, bound_llm: LLM[str]) -> PlainGeneration[str]:
     if path == "generate":
-        return await bound_llm.generate_one("hi")
-    async with bound_llm.stream_one("hi") as handle:
-        return await handle.final()
+        generation = await bound_llm.generate_one("hi")
+    else:
+        async with bound_llm.stream_one("hi") as handle:
+            generation = await handle.final()
+    assert generation.kind == "plain"
+    return generation
 
 
 def _resume_header(resume_path: Path) -> _ResumeHeader:
@@ -242,18 +245,20 @@ class _InterpretRaisesAdapter(FakeAdapter):
 
 
 @pytest.mark.parametrize("max_requests", [True, False, 0, -1])
-def test_initial_and_replacement_bind_reject_invalid_max_requests(max_requests: int) -> None:
-    llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff())
+def test_construction_and_rebind_reject_invalid_max_requests(max_requests: int) -> None:
+    llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
     with pytest.raises(ValueError, match="max_requests"):
-        _ = llm.bind(max_requests=max_requests)
+        _ = llm_from_adapter(FakeAdapter(), max_requests=max_requests)
     with pytest.raises(ValueError, match="max_requests"):
-        _ = llm.bind().bind(max_requests=max_requests)
+        _ = llm.rebind(max_requests=max_requests)
 
 
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(_InterpretRaisesAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            _InterpretRaisesAdapter(), shared_backoff=fast_shared_backoff()
+        )
         with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = _settled_request_records(unplaceable.value.request_history.records)
@@ -271,9 +276,9 @@ def test_a_stream_interpret_failure_raises_a_generation_error_with_the_response(
 
     async def scenario() -> None:
         stream = FakeStream()
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             _InterpretRaisesAdapter(stream=stream), shared_backoff=fast_shared_backoff()
-        ).bind()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError, match="interpretation failed") as raised:
                 await handle.final()
@@ -293,7 +298,9 @@ def test_retry_recovers_after_a_transient_failure() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(scripted_requests=[TransientError("boom")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(system_prompt="s")
+        bound_llm = llm_from_adapter(
+            adapter, shared_backoff=fast_shared_backoff(), system_prompt="s"
+        )
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         assert generation.output == "ok"
         assert generation.request_history.model == "fake-model"
@@ -332,7 +339,7 @@ def test_an_input_builds_request_params_once_and_sends_them_once_per_request(
         adapter = FakeAdapter(
             scripted_requests=[TransientError("boom"), TransientError("boom again")]
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         await _generate_through(path, bound_llm)
         bound_adapter = adapter.bound_adapters[0]
         assert (bound_adapter.build_count, bound_adapter.open_count) == (1, 3)
@@ -350,7 +357,7 @@ def test_a_failed_request_records_the_request_id_off_its_error() -> None:
             ],
             request_failure=transient(pauses_quota=False),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         named, unnamed, succeeded = generation.request_records
         assert named.request_id == "req-from-error"
@@ -367,7 +374,7 @@ def test_an_adapter_raised_transient_error_still_names_its_request(path: _Genera
         adapter = FakeAdapter(
             scripted_requests=[TransientRequestIdError("boom", "req-from-transient")]
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         generation = await _generate_through(path, bound_llm)
         assert generation.request_records[0].request_id == "req-from-transient"
 
@@ -380,7 +387,9 @@ def test_retry_exhaustion_raises_ordered_failure(path: _GenerationPath) -> None:
     async def scenario() -> None:
         last_error = TransientError("e2")
         adapter = FakeAdapter(scripted_requests=[TransientError("e1"), last_error])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=fast_shared_backoff(),
             max_requests=2,
         )
         with pytest.raises(GenerationError) as exhausted:
@@ -405,7 +414,9 @@ def test_request_record_bracket_excludes_the_backoff_sleep() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(scripted_requests=[TransientError("boom", retry_after_seconds=0.02)])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff(max_wait_seconds=1.0)).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=fast_shared_backoff(max_wait_seconds=1.0),
             max_requests=2,
         )
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -430,7 +441,7 @@ def test_build_request_rejecting_messages_fails_the_input_with_nothing_sent(
             rejected_messages=[RejectedMessages(error_text="nope")],
             request_failure=transient(pauses_quota=False),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as rejected:
             await _generate_through(path, bound_llm)
         assert adapter.bound_adapters[0].open_count == 0
@@ -456,7 +467,7 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
             ],
             request_failure=terminal("rejected"),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
         billed_record, rejected_record = _settled_request_records(
@@ -521,7 +532,7 @@ def test_a_terminal_outcome_raises_without_retry(
 
     async def scenario() -> None:
         adapter = FakeAdapter(stream=FakeStream(interpretation=outcome))
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as caught:
             await _generate_through(path, bound_llm)
         assert adapter.bound_adapters[0].open_count == 1
@@ -544,7 +555,7 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(scripted_requests=[billed(_PROVIDER_FAILED_TRANSIENTLY)])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 2
         rejected, succeeded = generation.request_records
@@ -572,7 +583,9 @@ def test_provider_failed_transiently_with_pauses_quota_pauses_admission() -> Non
                 )
             ]
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=shared_backoff,
             max_requests=1,
         )
         with pytest.raises(GenerationError) as exhausted:
@@ -610,7 +623,7 @@ def test_an_exception_placed_terminal_fails_the_item_without_retry(
             scripted_requests=[ValueError("boom")],
             request_failure=request_failure,
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await _generate_through(path, bound_llm)
         assert adapter.bound_adapters[0].open_count == 1
@@ -636,7 +649,9 @@ def test_a_mid_drain_failure_records_reported_billing_and_request_id() -> None:
         stream = _FailsAfterFirstItemStream()
         stream._usage_reported = USAGE_STREAM
         adapter = FakeAdapter(stream=stream, request_failure=transient(pauses_quota=False))
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=fast_shared_backoff(),
             max_requests=1,
         )
         with pytest.raises(GenerationError) as exhausted:
@@ -654,7 +669,9 @@ def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -
     async def scenario() -> None:
         stream = HangsAfterFirstItemStream()
         stream._usage_reported = USAGE_STREAM
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        )
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
@@ -676,7 +693,7 @@ def test_a_settled_requests_billing_is_counted_once_after_a_later_deadline_cut()
         adapter = FakeAdapter(
             stream=stream, request_failure=transient(pauses_quota=False), hang_from_open=2
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
@@ -695,7 +712,9 @@ def test_a_request_records_the_adapter_stream_request_id(path: _GenerationPath) 
     async def scenario() -> None:
         stream = FakeStream()
         stream.raw = FakeRawResponse(id="fake-final", request_id="req-from-assembled")
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        )
         response = await _generate_through(path, bound_llm)
         (record,) = response.request_records
         assert record.request_id == "req-fake-stream"
@@ -707,7 +726,9 @@ def test_a_close_that_raises_does_not_displace_a_generation() -> None:
 
     async def scenario() -> None:
         stream = _FailingCloseStream()
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        )
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         assert generation.output == "ab"
         assert stream.closed
@@ -719,7 +740,9 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_request() -> N
 
     async def scenario() -> None:
         stream = _UnnamedItemErrorStream()
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        )
         with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = _settled_request_records(unplaceable.value.request_history.records)
@@ -795,17 +818,18 @@ def test_allowed_tools_choice_requires_a_name() -> None:
 def test_allowed_tools_choice_rejects_an_unbound_name_before_adapter_binding() -> None:
     adapter = FakeAdapter()
     with pytest.raises(ValueError, match="missing"):
-        _ = LLM(adapter).bind(
+        _ = llm_from_adapter(
+            adapter,
             tools=[_capture_tool("present")],
             tool_choice=AllowedToolsChoice(mode="auto", tool_names=("missing",)),
         )
     assert adapter.bound_adapters == []
 
 
-def test_bind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
+def test_rebind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     tool = _SchemaOnceTool()
-    bound = LLM(FakeAdapter()).bind(tools=[tool])
-    replacement_bound = bound.bind(
+    bound = llm_from_adapter(FakeAdapter(), tools=[tool])
+    replacement_bound = bound.rebind(
         tool_choice=AllowedToolsChoice(mode="required", tool_names=(tool.name,))
     )
     assert tool.schema_calls == 1
@@ -813,52 +837,40 @@ def test_bind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     assert replacement_bound.binding.tool_schemas is bound.binding.tool_schemas
 
 
-def test_bind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
-    adapter = FakeAdapter()
-    text = LLM(adapter).bind(system_prompt="s")
-    _ = text.bind()
-    structured = text.bind(response_format=_Answer)
-    assert adapter.structured_bind_count == 1
-    _ = structured.bind(system_prompt="s2")
-    assert adapter.structured_bind_count == 2
-    _ = structured.bind(response_format=str)
-    assert len(adapter.bound_adapters) == 3
-
-
 def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
     tool = _capture_tool()
-    bound = LLM(FakeAdapter()).bind(tools=[tool])
+    bound = llm_from_adapter(FakeAdapter(), tools=[tool])
     assert isinstance(bound.tool_manager, ToolManager)
     assert bound.tool_manager.schemas() == (tool.schema(),)
-    empty = LLM(FakeAdapter()).bind(tools=[])
+    empty = llm_from_adapter(FakeAdapter(), tools=[])
     assert isinstance(empty.tool_manager, ToolManager)
     assert empty.tool_manager.schemas() == ()
     tool_manager = ToolManager([tool])
-    assert LLM(FakeAdapter()).bind(tools=tool_manager).tool_manager is tool_manager
+    assert llm_from_adapter(FakeAdapter(), tools=tool_manager).tool_manager is tool_manager
 
 
-def test_duplicate_tool_names_fail_before_initial_and_replacement_bind_reach_adapter() -> None:
+def test_duplicate_tool_names_fail_before_construction_and_rebind_reach_adapter() -> None:
     adapter = FakeAdapter()
     duplicate = _capture_tool()
     with pytest.raises(ValueError, match="duplicate tool name"):
-        _ = LLM(adapter).bind(tools=[duplicate, duplicate])
+        _ = llm_from_adapter(adapter, tools=[duplicate, duplicate])
     assert adapter.bound_adapters == []
-    bound = LLM(adapter).bind()
+    bound = llm_from_adapter(adapter)
     with pytest.raises(ValueError, match="duplicate tool name"):
-        _ = bound.bind(tools=[duplicate, duplicate])
+        _ = bound.rebind(tools=[duplicate, duplicate])
     assert len(adapter.bound_adapters) == 1
 
 
-def test_bind_tools_replace_the_manager_and_none_removes_it() -> None:
+def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
     original = _capture_tool("original")
     replacement = _capture_tool("replacement")
-    bound = LLM(FakeAdapter()).bind(tools=[original])
-    replacement_bound = bound.bind(tools=[replacement])
+    bound = llm_from_adapter(FakeAdapter(), tools=[original])
+    replacement_bound = bound.rebind(tools=[replacement])
     assert replacement_bound.tool_manager is not bound.tool_manager
     assert replacement_bound.tool_manager.schemas() == (replacement.schema(),)
-    assert replacement_bound.bind(tools=None).tool_manager is None
+    assert replacement_bound.rebind(tools=None).tool_manager is None
     tool_manager = ToolManager([replacement])
-    assert bound.bind(tools=tool_manager).tool_manager is tool_manager
+    assert bound.rebind(tools=tool_manager).tool_manager is tool_manager
 
 
 class _Label(str):
@@ -867,58 +879,57 @@ class _Label(str):
     __slots__ = ()
 
 
-def test_bind_rejects_a_str_subclass_response_format() -> None:
-    llm = LLM(FakeAdapter())
+def test_construction_and_rebind_reject_a_str_subclass_response_format() -> None:
+    llm = llm_from_adapter(FakeAdapter())
     with pytest.raises(TypeError, match="response_format must be str"):
-        _ = llm.bind(response_format=_Label)
+        _ = llm_from_adapter(FakeAdapter(), response_format=_Label)
     with pytest.raises(TypeError, match="response_format must be str"):
-        _ = llm.bind().bind(response_format=_Label)
+        _ = llm.rebind(response_format=_Label)
 
 
-def _pin_initial_and_replacement_bind_types(llm: LLM, tool_manager: ToolManager) -> None:
-    text = llm.bind()
-    assert_type(text, BoundLLM[str, None])
-    text_with_constructed_tools = llm.bind(tools=[_capture_tool()])
-    assert_type(text_with_constructed_tools, BoundLLM[str, ToolManager])
-    text_with_tools = llm.bind(tools=tool_manager)
-    assert_type(text_with_tools, BoundLLM[str, ToolManager])
-    structured = llm.bind(response_format=_Answer)
-    assert_type(structured, BoundLLM[_Answer, None])
-    structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
-    assert_type(structured_with_tools, BoundLLM[_Answer, ToolManager])
-    structured_with_constructed_tools = llm.bind(
+def _pin_construction_and_rebind_types(llm: AdapterLLM, tool_manager: ToolManager) -> None:
+    assert_type(llm, AdapterLLM[str, None])
+    text_with_constructed_tools = llm.rebind(tools=[_capture_tool()])
+    assert_type(text_with_constructed_tools, AdapterLLM[str, ToolManager])
+    text_with_tools = llm.rebind(tools=tool_manager)
+    assert_type(text_with_tools, AdapterLLM[str, ToolManager])
+    structured = llm.rebind(response_format=_Answer)
+    assert_type(structured, AdapterLLM[_Answer, None])
+    structured_with_tools = llm.rebind(response_format=_Answer, tools=tool_manager)
+    assert_type(structured_with_tools, AdapterLLM[_Answer, ToolManager])
+    structured_with_constructed_tools = llm.rebind(
         response_format=_Answer,
         tools=[_capture_tool()],
     )
-    assert_type(structured_with_constructed_tools, BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_constructed_tools, AdapterLLM[_Answer, ToolManager])
     provider_executed_tool = ({"type": "web_search"},)
-    text_with_provider_executed_tool = llm.bind(
+    text_with_provider_executed_tool = llm.rebind(
         provider_executed_tools=provider_executed_tool,
     )
-    assert_type(text_with_provider_executed_tool, BoundLLM[str, None])
+    assert_type(text_with_provider_executed_tool, AdapterLLM[str, None])
     assert_type(
-        structured.bind(provider_executed_tools=provider_executed_tool),
-        BoundLLM[_Answer, None],
+        structured.rebind(provider_executed_tools=provider_executed_tool),
+        AdapterLLM[_Answer, None],
     )
 
-    # BoundLLM[X] is BoundLLM[X, None]: the PEP 696 default keeps the common annotation short.
-    assert_type(structured, BoundLLM[_Answer])
+    # AdapterLLM[X] is AdapterLLM[X, None]: the PEP 696 default keeps the common annotation short.
+    assert_type(structured, AdapterLLM[_Answer])
 
     assert_type(text_with_tools.tool_manager, ToolManager)
-    assert_type(text.tool_manager, None)
+    assert_type(llm.tool_manager, None)
 
-    replacement_with_tool_manager = structured.bind(tools=tool_manager)
-    assert_type(replacement_with_tool_manager, BoundLLM[_Answer, ToolManager])
-    assert_type(structured.bind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.bind(tools=None), BoundLLM[_Answer, None])
-    assert_type(text_with_tools.bind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.bind(response_format=str), BoundLLM[str, ToolManager])
-    assert_type(structured_with_tools.bind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
+    replacement_with_tool_manager = structured.rebind(tools=tool_manager)
+    assert_type(replacement_with_tool_manager, AdapterLLM[_Answer, ToolManager])
+    assert_type(structured.rebind(tools=[_capture_tool()]), AdapterLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(tools=None), AdapterLLM[_Answer, None])
+    assert_type(text_with_tools.rebind(response_format=_Answer), AdapterLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(response_format=str), AdapterLLM[str, ToolManager])
+    assert_type(structured_with_tools.rebind(system_prompt="s"), AdapterLLM[_Answer, ToolManager])
 
 
-async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) -> None:
+async def _pin_request_method_return_types(llm: AdapterLLM, tool_manager: ToolManager) -> None:
     """Let pyrefly check return types without running requests."""
-    structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
+    structured_with_tools = llm.rebind(response_format=_Answer, tools=tool_manager)
     assert_type(
         await structured_with_tools.generate_one("hi"),
         PlainGeneration[_Answer] | ToolCallGeneration,
@@ -933,13 +944,13 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         ),
         list[GenerationOutcomeRecord[_Answer]],
     )
-    structured = llm.bind(response_format=_Answer)
+    structured = llm.rebind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), PlainGeneration[_Answer])
     assert_type(
         await structured.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
         list[PlainGenerationRecord[_Answer] | GenerationErrorRecord],
     )
-    text_with_tools = llm.bind(tools=tool_manager)
+    text_with_tools = llm.rebind(tools=tool_manager)
     assert_type(
         await text_with_tools.generate_one("hi"),
         PlainGeneration[str] | ToolCallGeneration,
@@ -957,17 +968,16 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
 async def _pin_generic_request_method_return_types[
     OutputT: str | BaseModel,
     ToolManagerT: ToolManager | None,
-](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
+](bound_llm: LLM[OutputT, ToolManagerT]) -> None:
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
-        list[PlainGenerationRecord[OutputT] | GenerationErrorRecord]
-        | list[GenerationOutcomeRecord[OutputT]],
+        Sequence[GenerationOutcomeRecord[OutputT]],
     )
 
 
 def _pin_covariance(
-    structured_with_tools: BoundLLM[_Answer, ToolManager],
-) -> BoundLLM[BaseModel, ToolManager | None]:
+    structured_with_tools: AdapterLLM[_Answer, ToolManager],
+) -> LLM[BaseModel, ToolManager | None]:
     """Let pyrefly check covariance without running requests.
 
     pyrefly infers each type parameter's variance from every attribute and method signature, private ones included.
@@ -1030,27 +1040,20 @@ _STRUCTURED_FINAL_RESPONSE = FinishedResponse(
 
 
 def _with_bound_adapter[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
-    bound_llm: BoundLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter
-) -> BoundLLM[OutputT, ToolManagerT]:
-    return BoundLLM(
-        adapter=bound_llm.adapter,
-        bound_adapter=bound_adapter,
-        read_output=bound_llm._read_output,
-        response_format=bound_llm.response_format,
-        binding=bound_llm.binding,
-        tool_manager=bound_llm.tool_manager,
-        shared_backoff=bound_llm.shared_backoff,
-        max_requests=bound_llm.max_requests,
-        observer=bound_llm.observer,
-    )
+    bound_llm: AdapterLLM[OutputT, ToolManagerT], bound_adapter: BoundAdapter
+) -> AdapterLLM[OutputT, ToolManagerT]:
+    return AdapterLLM(replace(bound_llm._configuration, bound_adapter=bound_adapter))
 
 
 def _structured_tool_bound_llm(
     finished_response: FinishedResponse,
-) -> BoundLLM[_Answer, ToolManager]:
+) -> AdapterLLM[_Answer, ToolManager]:
     """Supply structured output through a scripted adapter while preserving the binding."""
-    bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
-        response_format=_Answer, tools=ToolManager([])
+    bound_llm = llm_from_adapter(
+        FakeAdapter(),
+        shared_backoff=fast_shared_backoff(),
+        response_format=_Answer,
+        tools=ToolManager([]),
     )
     return _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(finished_response))
 
@@ -1120,7 +1123,7 @@ def test_generate_many_records_validates_a_record_line_before_appending_it(
             stop_reason="stop",
             cannot_continue=None,
         )
-        bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
+        bound_llm = llm_from_adapter(FakeAdapter(), response_format=_NonRoundTrippableAnswer)
         bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(finished_response))
         with pytest.raises(ValueError, match="Input should be a valid integer"):
             await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
@@ -1134,7 +1137,7 @@ def test_generate_many_records_validates_a_record_line_before_appending_it(
 def test_tool_calls_without_a_tool_manager_raise_an_unexpected_response_error() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
         bound_llm = _with_bound_adapter(bound_llm, _ScriptedBoundAdapter(_TOOL_CALL_RESPONSE))
         with pytest.raises(GenerationError) as escaped:
             await bound_llm.generate_one("hi")
@@ -1157,42 +1160,42 @@ def test_structured_tool_bound_stream_final_returns_a_tool_call_generation() -> 
 
 
 @pytest.mark.parametrize("default_value", [False, True])
-def test_bind_resolves_automatic_cache_breakpoints(*, default_value: bool) -> None:
-    llm = LLM(FakeAdapter(automatic_cache_breakpoints_default=default_value))
+def test_rebind_resolves_automatic_cache_breakpoints(*, default_value: bool) -> None:
+    llm = llm_from_adapter(FakeAdapter(automatic_cache_breakpoints_default=default_value))
     override_value = not default_value
-    assert llm.bind().binding.automatic_cache_breakpoints is default_value
-    bound = llm.bind(automatic_cache_breakpoints=override_value)
+    assert llm.binding.automatic_cache_breakpoints is default_value
+    bound = llm.rebind(automatic_cache_breakpoints=override_value)
     assert bound.binding.automatic_cache_breakpoints is override_value
-    assert bound.bind().binding.automatic_cache_breakpoints is override_value
+    assert bound.rebind().binding.automatic_cache_breakpoints is override_value
     assert (
-        bound.bind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
+        bound.rebind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
         is default_value
     )
 
 
-def test_initial_and_replacement_bind_carry_extra_body_by_reference() -> None:
+def test_construction_and_rebind_carry_extra_body_by_reference() -> None:
     adapter = FakeAdapter()
     extra_body = {"safety_identifier": "user-7"}
-    bound_llm = LLM(adapter).bind(extra_body=extra_body)
+    bound_llm = llm_from_adapter(adapter, extra_body=extra_body)
     assert bound_llm.binding.extra_body is extra_body
-    assert bound_llm.bind(system_prompt="s").binding.extra_body is extra_body
+    assert bound_llm.rebind(system_prompt="s").binding.extra_body is extra_body
     replacement = {"safety_identifier": "user-8"}
-    assert bound_llm.bind(extra_body=replacement).binding.extra_body is replacement
-    assert bound_llm.bind(extra_body=None).binding.extra_body is None
+    assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
+    assert bound_llm.rebind(extra_body=None).binding.extra_body is None
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
-    first = LLM(FakeAdapter()).bind(extra_body={"alpha": 1, "beta": 2})
-    second = LLM(FakeAdapter()).bind(extra_body={"beta": 2, "alpha": 1})
+    first = llm_from_adapter(FakeAdapter(), extra_body={"alpha": 1, "beta": 2})
+    second = llm_from_adapter(FakeAdapter(), extra_body={"beta": 2, "alpha": 1})
     assert first.config_fingerprint() == second.config_fingerprint()
 
 
 def test_config_fingerprint_preserves_sequence_order_and_container_types() -> None:
-    ordered = LLM(FakeAdapter()).bind(extra_body={"values": [1, 2]})
-    reversed_order = LLM(FakeAdapter()).bind(extra_body={"values": [2, 1]})
-    tuple_value = LLM(FakeAdapter()).bind(extra_body={"values": (1, 2)})
-    set_value = LLM(FakeAdapter()).bind(extra_body={"values": {1, 2}})
-    frozen_set_value = LLM(FakeAdapter()).bind(extra_body={"values": frozenset({1, 2})})
+    ordered = llm_from_adapter(FakeAdapter(), extra_body={"values": [1, 2]})
+    reversed_order = llm_from_adapter(FakeAdapter(), extra_body={"values": [2, 1]})
+    tuple_value = llm_from_adapter(FakeAdapter(), extra_body={"values": (1, 2)})
+    set_value = llm_from_adapter(FakeAdapter(), extra_body={"values": {1, 2}})
+    frozen_set_value = llm_from_adapter(FakeAdapter(), extra_body={"values": frozenset({1, 2})})
     assert ordered.config_fingerprint() != reversed_order.config_fingerprint()
     assert ordered.config_fingerprint() != tuple_value.config_fingerprint()
     assert set_value.config_fingerprint() != frozen_set_value.config_fingerprint()
@@ -1200,25 +1203,34 @@ def test_config_fingerprint_preserves_sequence_order_and_container_types() -> No
 
 def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuration() -> None:
     baseline_adapter = FakeAdapter()
-    baseline = LLM(baseline_adapter).bind()
+    baseline = llm_from_adapter(baseline_adapter)
     changed_model_adapter = FakeAdapter()
     changed_model_adapter.model = "other-model"
     changed_provider_adapter = FakeAdapter()
     changed_provider_adapter.provider_name = "other-provider"
     changed_config_adapter = FakeAdapter()
     changed_config_adapter.automatic_cache_breakpoints_default = True
-    assert baseline.config_fingerprint() != LLM(changed_model_adapter).bind().config_fingerprint()
     assert (
-        baseline.config_fingerprint() != LLM(changed_provider_adapter).bind().config_fingerprint()
+        baseline.config_fingerprint()
+        != llm_from_adapter(changed_model_adapter).config_fingerprint()
     )
-    assert baseline.config_fingerprint() != LLM(_OtherFakeAdapter()).bind().config_fingerprint()
-    assert baseline.config_fingerprint() != LLM(changed_config_adapter).bind().config_fingerprint()
+    assert (
+        baseline.config_fingerprint()
+        != llm_from_adapter(changed_provider_adapter).config_fingerprint()
+    )
+    assert (
+        baseline.config_fingerprint() != llm_from_adapter(_OtherFakeAdapter()).config_fingerprint()
+    )
+    assert (
+        baseline.config_fingerprint()
+        != llm_from_adapter(changed_config_adapter).config_fingerprint()
+    )
 
 
 def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -> None:
     extra_body: dict[str, object] = {"value": 1}
     adapter = FakeAdapter()
-    bound = LLM(adapter).bind(extra_body=extra_body)
+    bound = llm_from_adapter(adapter, extra_body=extra_body)
     initial = bound.config_fingerprint()
     extra_body["value"] = 2
     after_binding_mutation = bound.config_fingerprint()
@@ -1227,20 +1239,20 @@ def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -
     adapter.automatic_cache_breakpoints_default = True
     assert initial != after_binding_mutation
     assert after_binding_mutation == bound.config_fingerprint()
-    assert after_binding_mutation != bound.bind().config_fingerprint()
+    assert after_binding_mutation != bound.rebind().config_fingerprint()
 
 
-def test_config_fingerprint_tracks_response_format_and_bind() -> None:
-    text = LLM(FakeAdapter()).bind()
-    answer = LLM(FakeAdapter()).bind(response_format=_Answer)
-    other_answer = LLM(FakeAdapter()).bind(response_format=_OtherAnswer)
-    replacement_bound = answer.bind(system_prompt="changed")
+def test_config_fingerprint_tracks_response_format_and_rebind() -> None:
+    text = llm_from_adapter(FakeAdapter())
+    answer = llm_from_adapter(FakeAdapter(), response_format=_Answer)
+    other_answer = llm_from_adapter(FakeAdapter(), response_format=_OtherAnswer)
+    replacement_bound = answer.rebind(system_prompt="changed")
     assert text.config_fingerprint() != answer.config_fingerprint()
     assert answer.config_fingerprint() != other_answer.config_fingerprint()
     assert answer.config_fingerprint() != replacement_bound.config_fingerprint()
     assert (
         text.config_fingerprint()
-        != text.bind(automatic_cache_breakpoints=True).config_fingerprint()
+        != text.rebind(automatic_cache_breakpoints=True).config_fingerprint()
     )
 
 
@@ -1264,11 +1276,11 @@ def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> Non
         args_model=_Answer,
         function=second_function,
     )
-    first = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
-        tools=[first_tool], max_requests=1
+    first = llm_from_adapter(
+        FakeAdapter(), shared_backoff=fast_shared_backoff(), tools=[first_tool], max_requests=1
     )
-    second = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
-        tools=[second_tool], max_requests=9
+    second = llm_from_adapter(
+        FakeAdapter(), shared_backoff=fast_shared_backoff(), tools=[second_tool], max_requests=9
     )
     assert first.config_fingerprint() == second.config_fingerprint()
 
@@ -1283,7 +1295,7 @@ def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> Non
 def test_config_fingerprint_rejects_values_without_a_deterministic_encoding(
     value: object, message: str
 ) -> None:
-    bound = LLM(FakeAdapter()).bind(extra_body={"value": value})
+    bound = llm_from_adapter(FakeAdapter(), extra_body={"value": value})
     with pytest.raises(TypeError) as raised:
         _ = bound.config_fingerprint()
     assert str(raised.value) == message
@@ -1292,7 +1304,7 @@ def test_config_fingerprint_rejects_values_without_a_deterministic_encoding(
 def test_config_fingerprint_rejects_a_container_cycle() -> None:
     cyclic: dict[str, object] = {}
     cyclic["self"] = cyclic
-    bound = LLM(FakeAdapter()).bind(extra_body=cyclic)
+    bound = llm_from_adapter(FakeAdapter(), extra_body=cyclic)
     message = "binding.extra_body['self'] contains a cycle"
     with pytest.raises(TypeError) as raised:
         _ = bound.config_fingerprint()
@@ -1301,12 +1313,14 @@ def test_config_fingerprint_rejects_a_container_cycle() -> None:
 
 def test_config_fingerprint_encodes_an_unpaired_surrogate() -> None:
     """ASCII JSON escaping gives every Python string a UTF-8 fingerprint input."""
-    fingerprint = LLM(FakeAdapter()).bind(extra_body={"value": "\ud800"}).config_fingerprint()
+    fingerprint = llm_from_adapter(
+        FakeAdapter(), extra_body={"value": "\ud800"}
+    ).config_fingerprint()
     assert fingerprint.startswith("sha256:")
 
 
 def test_config_fingerprint_normalizes_a_response_schema_failure() -> None:
-    bound = LLM(FakeAdapter()).bind(response_format=_UnschematizableAnswer)
+    bound = llm_from_adapter(FakeAdapter(), response_format=_UnschematizableAnswer)
     with pytest.raises(TypeError) as raised:
         _ = bound.config_fingerprint()
     assert str(raised.value).startswith(
@@ -1315,31 +1329,32 @@ def test_config_fingerprint_normalizes_a_response_schema_failure() -> None:
 
 
 def test_config_fingerprint_captures_the_response_schema_during_binding() -> None:
-    first = LLM(FakeAdapter()).bind(response_format=_MutableSchemaAnswer)
+    first = llm_from_adapter(FakeAdapter(), response_format=_MutableSchemaAnswer)
     field = _MutableSchemaAnswer.model_fields["value"]
     field.annotation = str
     _ = _MutableSchemaAnswer.model_rebuild(force=True)
     try:
-        second = LLM(FakeAdapter()).bind(response_format=_MutableSchemaAnswer)
+        second = llm_from_adapter(FakeAdapter(), response_format=_MutableSchemaAnswer)
         assert first.config_fingerprint() != second.config_fingerprint()
     finally:
         field.annotation = int
         _ = _MutableSchemaAnswer.model_rebuild(force=True)
 
 
-def test_bind_keeps_replaces_and_removes_provider_executed_tools() -> None:
+def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
     first_tool = {"type": "web_search"}
     second_tool = {"type": "file_search", "vector_store_ids": ["vs_1"]}
-    bound = LLM(FakeAdapter()).bind(
+    bound = llm_from_adapter(
+        FakeAdapter(),
         provider_executed_tools=(first_tool,),
         max_requests=5,
     )
     assert bound.binding.provider_executed_tools == (first_tool,)
-    assert bound.bind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
-    replaced = bound.bind(provider_executed_tools=(second_tool,))
+    assert bound.rebind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
+    replaced = bound.rebind(provider_executed_tools=(second_tool,))
     assert replaced.binding.provider_executed_tools == (second_tool,)
     assert replaced.max_requests == 5
-    assert bound.bind(provider_executed_tools=()).binding.provider_executed_tools == ()
+    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -1347,7 +1362,7 @@ def test_generate_many_raises_on_failure(*, warm_cache: bool) -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(scripted_requests=[TransientError("x")], hang_from_open=2)
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(max_requests=1)
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff(), max_requests=1)
         with pytest.raises(GenerationError) as failure:
             await bound_llm.generate_many(["a", "b"], warm_cache=warm_cache)
         assert failure.value.record.kind == "retries_exhausted_error"
@@ -1361,7 +1376,7 @@ def test_generate_many_raises_on_failure(*, warm_cache: bool) -> None:
 def test_generate_many_returns_generations_in_input_order(*, warm_cache: bool) -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff())
         assert await bound_llm.generate_many([], warm_cache=warm_cache) == []
         generations = await bound_llm.generate_many(["a", "b"], warm_cache=warm_cache)
         assert [generation.output for generation in generations] == ["a", "b"]
@@ -1375,7 +1390,9 @@ def test_generate_many_records_aligns_a_failure_among_generations() -> None:
         """One permit keeps the scripted failure on the first input."""
         adapter = FakeAdapter(echo=True, scripted_requests=[TransientError("x")])
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=shared_backoff,
             max_requests=1,
             extra_body={"opaque": object()},
         )
@@ -1400,7 +1417,7 @@ def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_pa
     async def scenario() -> None:
         resume_path = tmp_path / "records.jsonl"
         first_adapter = FakeAdapter(echo=True)
-        first_bound = LLM(first_adapter, shared_backoff=fast_shared_backoff()).bind()
+        first_bound = llm_from_adapter(first_adapter, shared_backoff=fast_shared_backoff())
         first_records = await first_bound.generate_many_records(
             ["a", "b"], resume_path=resume_path
         )
@@ -1408,7 +1425,7 @@ def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_pa
         assert first_adapter.bound_adapters[0].open_count == 2
 
         resumed_adapter = FakeAdapter(echo=True)
-        resumed_bound = LLM(resumed_adapter, shared_backoff=fast_shared_backoff()).bind()
+        resumed_bound = llm_from_adapter(resumed_adapter, shared_backoff=fast_shared_backoff())
         resumed_records = await resumed_bound.generate_many_records(
             ["a", "b"], resume_path=resume_path
         )
@@ -1466,7 +1483,7 @@ def test_generate_many_records_uses_one_background_thread_for_resume_io(
     async def scenario() -> None:
         event_loop_thread_id = threading.get_ident()
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         task = asyncio.create_task(
             bound.generate_many_records(["a", "b"], resume_path=resume_path)
         )
@@ -1488,7 +1505,7 @@ def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True, scripted_requests=[TransientError("try again")])
-        bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(max_requests=1)
+        bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff(), max_requests=1)
         resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(["a"], resume_path=resume_path)
         assert first[0].kind == "retries_exhausted_error"
@@ -1508,7 +1525,7 @@ def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) ->
             echo=True,
             scripted_requests=[billed(REFUSAL)],
         )
-        bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         generated = await bound.generate_many_records(["a"], resume_path=resume_path)
         restored = await bound.generate_many_records(["a"], resume_path=resume_path)
@@ -1525,7 +1542,7 @@ def test_generate_many_records_without_input_ids_replaces_changed_input_lists(
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(["a", "b"], resume_path=resume_path)
         reordered = await bound.generate_many_records(["b", "a"], resume_path=resume_path)
@@ -1544,10 +1561,10 @@ def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_p
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        position_bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        position_bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         await position_bound.generate_many_records(["a"], resume_path=resume_path)
-        changed_bound = position_bound.bind(system_prompt="changed")
+        changed_bound = position_bound.rebind(system_prompt="changed")
         await changed_bound.generate_many_records(["a"], resume_path=resume_path)
         await changed_bound.generate_many_records(
             ["a"], resume_path=resume_path, input_ids=["input-a"]
@@ -1566,7 +1583,7 @@ def test_generate_many_records_input_ids_support_batch_edits_and_equal_inputs(
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         first = await bound.generate_many_records(
             ["same", "same"],
@@ -1614,7 +1631,7 @@ def test_generate_many_records_rejects_invalid_input_ids_before_requests(tmp_pat
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter).bind()
+        bound = llm_from_adapter(adapter)
         resume_path = tmp_path / "records.jsonl"
         with pytest.raises(ValueError, match="input_ids"):
             await bound.generate_many_records(
@@ -1665,7 +1682,7 @@ def test_generate_many_records_preserves_an_unrecognized_file(
         resume_path = tmp_path / "records.jsonl"
         _ = resume_path.write_text(resume_text)
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter).bind()
+        bound = llm_from_adapter(adapter)
         with pytest.raises(ValueError, match="resume"):
             await bound.generate_many_records(["a"], resume_path=resume_path)
         assert resume_path.read_text() == resume_text
@@ -1681,10 +1698,10 @@ def test_generate_many_records_persists_a_settled_item_before_batch_cancellation
     async def scenario() -> None:
         resume_path = tmp_path / "records.jsonl"
         first_adapter = FakeAdapter(echo=True, hang_from_open=2)
-        first_bound = LLM(
+        first_bound = llm_from_adapter(
             first_adapter,
             shared_backoff=fast_shared_backoff(max_concurrent_requests=1),
-        ).bind()
+        )
         task = asyncio.create_task(
             first_bound.generate_many_records(["a", "b"], resume_path=resume_path)
         )
@@ -1694,7 +1711,7 @@ def test_generate_many_records_persists_a_settled_item_before_batch_cancellation
             await task
 
         resumed_adapter = FakeAdapter(echo=True)
-        resumed_bound = LLM(resumed_adapter).bind()
+        resumed_bound = llm_from_adapter(resumed_adapter)
         resumed = await resumed_bound.generate_many_records(["a", "b"], resume_path=resume_path)
         assert _outputs(resumed) == ["a", "b"]
         assert resumed_adapter.bound_adapters[0].open_count == 1
@@ -1725,7 +1742,7 @@ def test_generate_many_records_rejects_a_bad_record_line_in_a_reused_file(
     async def scenario() -> None:
         resume_path = tmp_path / "records.jsonl"
         adapter = FakeAdapter(echo=True)
-        bound = LLM(adapter).bind()
+        bound = llm_from_adapter(adapter)
         await bound.generate_many_records(["a"], resume_path=resume_path)
         resume_text = corrupt(resume_path.read_text())
         _ = resume_path.write_text(resume_text)
@@ -1741,13 +1758,13 @@ def test_generate_many_records_ignores_a_cut_off_last_line(tmp_path: Path) -> No
 
     async def scenario() -> None:
         resume_path = tmp_path / "records.jsonl"
-        first_bound = LLM(FakeAdapter(echo=True)).bind()
+        first_bound = llm_from_adapter(FakeAdapter(echo=True))
         await first_bound.generate_many_records(["a", "b"], resume_path=resume_path)
         complete_file_bytes = resume_path.read_bytes()
         _ = resume_path.write_bytes(complete_file_bytes[:-10])
 
         resumed_adapter = FakeAdapter(echo=True)
-        resumed_bound = LLM(resumed_adapter).bind()
+        resumed_bound = llm_from_adapter(resumed_adapter)
         resumed = await resumed_bound.generate_many_records(["a", "b"], resume_path=resume_path)
         assert _outputs(resumed) == ["a", "b"]
         assert resumed_adapter.bound_adapters[0].open_count == 1
@@ -1760,7 +1777,7 @@ def test_generate_many_records_rejects_concurrent_use_of_one_path(tmp_path: Path
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True, hang_from_open=1)
-        bound = LLM(adapter).bind()
+        bound = llm_from_adapter(adapter)
         resume_path = tmp_path / "records.jsonl"
         first_call = asyncio.create_task(
             bound.generate_many_records(["a"], resume_path=resume_path)
@@ -1781,9 +1798,9 @@ def test_generate_many_passes_warm_cache_to_the_batch() -> None:
     async def scenario() -> None:
         opens_pair_up = asyncio.Barrier(2)
         adapter = FakeAdapter(echo=True, open_barrier=opens_pair_up)
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             adapter, shared_backoff=fast_shared_backoff(max_concurrent_requests=8)
-        ).bind()
+        )
         task = asyncio.create_task(
             bound_llm.generate_many(
                 [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
@@ -1799,7 +1816,9 @@ def test_generate_many_records_warm_cache_first_failure_still_admits_the_rest() 
 
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True, scripted_requests=[TransientError("x")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=fast_shared_backoff(),
             max_requests=1,
         )
         results = await bound_llm.generate_many_records(
@@ -1826,7 +1845,7 @@ def test_a_defect_raises_from_generate_many() -> None:
 
     async def scenario() -> None:
         adapter = _RequestFailureRaisesAdapter(scripted_requests=[ValueError("defect")], echo=True)
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_many(["a", "b"])
         failure = raised.value
@@ -1845,7 +1864,7 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
 
     async def scenario() -> None:
         adapter = _RequestFailureRaisesAdapter(scripted_requests=[ValueError("defect")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
         assert str(raised.value) == "request_failure defect"
@@ -1864,7 +1883,7 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
 def test_stream_one_raises_a_defect_as_a_generation_error(adapter: FakeAdapter) -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         with pytest.raises(GenerationError) as raised:
             async with handle:
@@ -1881,9 +1900,9 @@ def test_an_escaped_defect_keeps_the_billing_of_the_request_it_cut_off() -> None
     async def scenario() -> None:
         stream = _FailsAfterFirstItemStream()
         stream._usage_reported = USAGE
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             _RequestFailureRaisesAdapter(stream=stream), shared_backoff=fast_shared_backoff()
-        ).bind()
+        )
         with pytest.raises(GenerationError) as raised:
             async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
                 await handle.final()
@@ -1899,10 +1918,10 @@ def test_a_request_failure_defect_mid_stream_returns_the_permit_inside_the_block
 
     async def scenario() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             _RequestFailureRaisesAdapter(stream=_FailsAfterFirstItemStream()),
             shared_backoff=shared_backoff,
-        ).bind()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError):
                 async for _item in handle:
@@ -1915,9 +1934,9 @@ def test_a_request_failure_defect_mid_stream_returns_the_permit_inside_the_block
 def test_iterating_after_a_failed_final_raises_the_finished_error() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=_FinalRaisesStream()), shared_backoff=fast_shared_backoff()
-        ).bind()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError):
                 await handle.final()
@@ -1935,7 +1954,7 @@ def test_a_defect_over_a_staged_response_keeps_the_request_and_its_billing() -> 
 
     async def scenario() -> None:
         adapter = _RequestFailureRaisesOverStagedResponseAdapter()
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
         (record,) = _settled_request_records(raised.value.request_history.records)
@@ -1951,7 +1970,7 @@ def test_stream_cancelled_mid_iteration_releases_the_permit() -> None:
         stream = _HangingStream()
         adapter = FakeAdapter(stream=stream)
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             consumer = asyncio.create_task(anext(handle))
             await yield_until(lambda: stream.suspended)
@@ -1971,7 +1990,7 @@ def test_a_stream_cancelled_during_the_open_returns_the_permit_and_sets_its_aban
     async def scenario() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
         adapter = FakeAdapter(hang_from_open=1)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def enter_and_leave() -> None:
@@ -2000,7 +2019,7 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned(
         stream = _HangingStream()
         stream._usage_reported = usage_reported
         adapter = FakeAdapter(stream=stream)
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def drain() -> None:
@@ -2025,9 +2044,9 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
 
     async def scenario() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=2)
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=_FailingCloseStream()), shared_backoff=shared_backoff
-        ).bind()
+        )
         # Leaving after one item keeps admission held until __aexit__.
         # close must return that admission.
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2058,7 +2077,7 @@ def test_a_block_left_before_the_outcome_sets_abandoned_with_the_first_item_time
                 raise ValueError("application failure")
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one("hi")
         if block_exit == "application_exception":
             with pytest.raises(ValueError, match="application failure"):
@@ -2098,10 +2117,10 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned(
 ) -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=stream, request_failure=request_failure),
             shared_backoff=fast_shared_backoff(),
-        ).bind()
+        )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         hang_reached = asyncio.Event()
 
@@ -2128,7 +2147,7 @@ def test_a_mid_stream_rate_limit_pauses_the_rate_limit_quota() -> None:
     async def scenario() -> None:
         shared_backoff = SharedBackoff()
         stream = _RaisesItsOwnTransientErrorStream()
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(stream=stream), shared_backoff=shared_backoff)
         before_monotonic_seconds = time.monotonic()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
@@ -2151,7 +2170,7 @@ def test_a_failure_after_the_drained_stream_returned_its_permit_still_pauses_the
         adapter = FakeAdapter(
             stream=_FinalRaisesStream(), request_failure=transient(pauses_quota=True)
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
@@ -2175,9 +2194,9 @@ def test_a_streamed_response_reporting_a_quota_pause_pauses_the_quota() -> None:
             pauses_quota=True,
             assistant_message=REJECTED_ASSISTANT_MESSAGE,
         )
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=FakeStream(interpretation=outcome)), shared_backoff=shared_backoff
-        ).bind()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await handle.final()
@@ -2212,13 +2231,13 @@ class _CloseRaisesBaseExceptionStream(FakeStream):
 def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(
                 stream=_CloseRaisesBaseExceptionStream(),
                 request_failure=transient(pauses_quota=False),
             ),
             shared_backoff=fast_shared_backoff(),
-        ).bind()
+        )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         hang_reached = asyncio.Event()
 
@@ -2265,10 +2284,10 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
     async def scenario() -> None:
         stream = _FailsAfterFirstItemStream()
         stream._usage_reported = usage_reported
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=stream, request_failure=request_failure),
             shared_backoff=fast_shared_backoff(),
-        ).bind()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
@@ -2287,7 +2306,7 @@ def test_stream_sends_one_request_when_final_follows_the_block() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter()
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         async with handle:
             async for _item in handle:
@@ -2303,7 +2322,7 @@ def test_stream_unentered_handle_raises_instead_of_opening() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter()
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         with pytest.raises(RuntimeError, match="async with"):
             await anext(handle)
@@ -2355,8 +2374,10 @@ def test_a_stream_reports_one_outcome_and_one_end_despite_later_misuse() -> None
 
     async def scenario() -> None:
         observer = _RecordingObserver()
-        llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff(), observer=observer)
-        handle = llm.bind().stream_one("hi")
+        llm = llm_from_adapter(
+            FakeAdapter(), shared_backoff=fast_shared_backoff(), observer=observer
+        )
+        handle = llm.stream_one("hi")
         async with handle:
             _ = [item async for item in handle]
             await handle.final()
@@ -2391,10 +2412,10 @@ def test_an_input_cancelled_during_its_open_ends_its_operation(
     async def scenario() -> None:
         observer = _RecordingObserver()
         adapter = FakeAdapter(hang_from_open=1)
-        llm = LLM(adapter, shared_backoff=fast_shared_backoff(), observer=observer)
+        llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff(), observer=observer)
         with pytest.raises(TimeoutError):
             await time_out_when(
-                _generate_through(path, llm.bind()), adapter.bound_adapters[0].hang_reached.is_set
+                _generate_through(path, llm), adapter.bound_adapters[0].hang_reached.is_set
             )
         assert observer.calls == expected_calls
 
@@ -2408,14 +2429,14 @@ def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
 
     async def scenario() -> None:
         observer = RaisingObserver(raise_at_start=raise_at_start)
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(echo=True), shared_backoff=fast_shared_backoff(), observer=observer
-        ).bind()
-        failing_bound_llm = LLM(
+        )
+        failing_bound_llm = llm_from_adapter(
             FakeAdapter(rejected_messages=[RejectedMessages(error_text="misconfigured")]),
             shared_backoff=fast_shared_backoff(),
             observer=observer,
-        ).bind()
+        )
         assert (await bound_llm.generate_one("hi")).output == "hi"
         results = await bound_llm.generate_many(["a", "b"])
         assert [result.output for result in results if result.kind == "plain"] == [
@@ -2439,7 +2460,7 @@ def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
 def test_stream_passes_items_through_and_assembles_final() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             collected_items = [item async for item in handle]
             generation = await handle.final()
@@ -2459,7 +2480,7 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
 
     async def scenario() -> None:
         adapter = FakeAdapter(stream=FakeStream(interpretation=_PROVIDER_FAILED_TRANSIENTLY))
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as retry_unavailable:
                 await handle.final()
@@ -2481,7 +2502,7 @@ def test_a_stream_that_drops_mid_stream_records_the_id_its_open_response_carried
 
     async def scenario() -> None:
         adapter = FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await handle.final()
@@ -2499,7 +2520,7 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
             stream=_FailsWithARequestIdBeforeFirstItemStream(),
             request_failure=transient(pauses_quota=False),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await anext(handle)
@@ -2516,7 +2537,7 @@ def test_stream_retry_populates_request_records() -> None:
             scripted_requests=[RequestIdError("connection reset", "req-from-open-failure")],
             request_failure=transient(pauses_quota=False),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             generation = await handle.final()
         assert generation.output == "ok"
@@ -2538,7 +2559,7 @@ def test_stream_retry_populates_request_records() -> None:
 def test_a_drained_stream_records_first_item_after_seconds() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             _ = [item async for item in handle]
             generation = await handle.final()
@@ -2551,7 +2572,7 @@ def test_a_drained_stream_records_first_item_after_seconds() -> None:
 def test_a_non_stream_request_leaves_its_first_item_stamp_unset() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = generation.request_records
         assert record.first_item_after_seconds is None
@@ -2566,7 +2587,7 @@ def test_stream_open_rejected_carries_the_prior_requests_records() -> None:
             scripted_requests=[TransientError("connection reset"), ValueError("boom")],
             request_failure=terminal("rejected"),
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as rejected:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
@@ -2596,7 +2617,7 @@ def test_a_terminal_failure_that_pauses_the_quota_pauses_it_and_stops_the_retry(
             ),
         )
         shared_backoff = fast_shared_backoff()
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         with pytest.raises(GenerationError) as raised:
             await _generate_through(path, bound_llm)
         assert adapter.bound_adapters[0].open_count == 1
@@ -2620,7 +2641,7 @@ def test_a_retry_after_sets_the_minimum_private_wait(path: _GenerationPath) -> N
             ),
         )
         shared_backoff = fast_shared_backoff(max_wait_seconds=1.0)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(max_requests=2)
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff, max_requests=2)
         started_at = time.monotonic()
         _ = await _generate_through(path, bound_llm)
         assert time.monotonic() - started_at >= retry_after_seconds
@@ -2633,7 +2654,7 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await anext(handle)
@@ -2649,7 +2670,7 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
     idle_seconds = 0.02
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
@@ -2663,7 +2684,7 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
 def test_stream_final_is_idempotent() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter())
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             first: PlainGeneration[str] = await handle.final()
             second: PlainGeneration[str] = await handle.final()
@@ -2685,7 +2706,9 @@ def test_stream_final_is_idempotent() -> None:
 def test_stream_final_replays_every_error_that_concluded_the_input(stream: FakeStream) -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as first:
                 await handle.final()
@@ -2700,7 +2723,7 @@ def test_stream_closes_on_context_exit() -> None:
 
     async def scenario() -> None:
         stream = FakeStream()
-        bound_llm = LLM(FakeAdapter(stream=stream)).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(stream=stream))
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 break
@@ -2721,7 +2744,9 @@ def test_backoff_sleep_does_not_hold_the_permit() -> None:
             max_concurrent_requests=1,
             max_wait_seconds=backoff_seconds,
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+        bound_llm = llm_from_adapter(
+            adapter,
+            shared_backoff=shared_backoff,
             max_requests=2,
         )
         first_task = asyncio.create_task(bound_llm.generate_one([UserMessage(content="a")]))
@@ -2740,7 +2765,7 @@ def test_stream_protocol_error_raises_retry_unavailable_and_releases_the_permit(
         stream = _ProtocolErrorStream()
         stream._usage_reported = USAGE_STREAM
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(stream=stream), shared_backoff=shared_backoff)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await handle.final()
@@ -2757,7 +2782,7 @@ def test_stream_releases_its_permit_when_exhausted() -> None:
 
     async def scenario() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(FakeAdapter(), shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=shared_backoff)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
@@ -2776,7 +2801,7 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
             ]
         )
         shared_backoff = fast_shared_backoff()
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             generation = await handle.final()
         # Only a pausing RequestFailure moves _pause_until off the sentinel, so this is the open's failure arriving.
@@ -2787,9 +2812,9 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
     run_with_timeout(scenario())
 
 
-def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
+def test_adapter_factory_coerces_system_prompt_parts_to_a_tuple() -> None:
     parts = [TextPart(text="stable", cache_breakpoint=True), TextPart(text="context")]
-    bound_llm = LLM(FakeAdapter()).bind(system_prompt=parts)
+    bound_llm = llm_from_adapter(FakeAdapter(), system_prompt=parts)
     parts.clear()
     assert bound_llm.binding.system_prompt == (
         TextPart(text="stable", cache_breakpoint=True),
@@ -2797,9 +2822,9 @@ def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
     )
 
 
-def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
+def test_adapter_factory_rejects_an_empty_system_prompt_parts_sequence() -> None:
     with pytest.raises(ValueError, match="empty"):
-        _ = LLM(FakeAdapter()).bind(system_prompt=[])
+        _ = llm_from_adapter(FakeAdapter(), system_prompt=[])
 
 
 @pytest.mark.parametrize("settled_requests", [1, 0])
@@ -2813,7 +2838,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
             # 1-based, so the request that hangs is the one after the settled ones.
             hang_from_open=settled_requests + 1,
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
@@ -2830,9 +2855,9 @@ def test_a_deadline_expiring_before_admission_reports_no_requests() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(hang_from_open=1)
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             adapter, shared_backoff=fast_shared_backoff(max_concurrent_requests=1)
-        ).bind()
+        )
         holder = asyncio.create_task(bound_llm.generate_one([UserMessage(content="held")]))
         _ = await adapter.bound_adapters[0].hang_reached.wait()
         with pytest.raises(GenerationError) as raised:
@@ -2851,7 +2876,7 @@ def test_an_outer_cancellation_inside_the_deadline_stays_a_cancellation() -> Non
 
     async def scenario() -> None:
         adapter = FakeAdapter(hang_from_open=1)
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         call = asyncio.create_task(
             bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=30.0)
         )
@@ -2870,7 +2895,7 @@ def test_a_batch_item_spends_no_budget_waiting_for_a_permit() -> None:
         """Queue a 0.02-second request behind a 0.04-second wait to exceed the final input's budget."""
         adapter = FakeAdapter(echo=True, open_seconds=0.02)
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         results = await bound_llm.generate_many(
             [[UserMessage(content=str(index))] for index in range(3)],
             max_working_seconds_per_input=0.05,
@@ -2925,7 +2950,7 @@ def test_a_batch_item_retains_its_remaining_budget_across_a_retry() -> None:
             open_seconds=0.03,
             scripted_requests=[TransientError("try again")],
         )
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_many(
                 [[UserMessage(content="retries")]], max_working_seconds_per_input=0.05
@@ -2940,7 +2965,9 @@ def test_a_stream_deadline_raises_and_leaves_abandoned_unset() -> None:
     """Returning abandonment beside the raised error would record one input twice."""
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(hang_from_open=1), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(
+            FakeAdapter(hang_from_open=1), shared_backoff=fast_shared_backoff()
+        )
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
         with pytest.raises(GenerationError):
             async with handle:
@@ -2953,10 +2980,10 @@ def test_a_stream_deadline_raises_and_leaves_abandoned_unset() -> None:
 def test_a_stream_deadline_expiring_mid_items_raises() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=HangsAfterFirstItemStream()),
             shared_backoff=fast_shared_backoff(),
-        ).bind()
+        )
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
         seen: list[StreamItem] = []
 
@@ -2977,7 +3004,7 @@ def test_a_stream_deadline_expiring_mid_items_raises() -> None:
 def test_a_stream_deadline_stops_at_the_inputs_outcome() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
         async with handle:
             generation = await handle.final()
@@ -2991,10 +3018,10 @@ def test_a_stream_deadline_stops_at_the_inputs_outcome() -> None:
 def test_a_stream_deadline_stops_at_an_outcome_an_item_pull_raised() -> None:
 
     async def scenario() -> None:
-        bound_llm = LLM(
+        bound_llm = llm_from_adapter(
             FakeAdapter(stream=_FailsAfterFirstItemStream()),
             shared_backoff=fast_shared_backoff(),
-        ).bind()
+        )
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
         async with handle:
             with pytest.raises(GenerationError):
@@ -3010,7 +3037,7 @@ def test_a_failed_stream_entry_leaves_no_armed_deadline() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(rejected_messages=[RejectedMessages(error_text="no")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
         with pytest.raises(GenerationError):
             async with handle:
@@ -3025,7 +3052,7 @@ def test_no_deadline_lets_a_callers_own_scope_expire() -> None:
 
     async def scenario() -> None:
         adapter = FakeAdapter(hang_from_open=1)
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        bound_llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(TimeoutError):
             await time_out_when(
                 bound_llm.generate_one([UserMessage(content="hi")]),

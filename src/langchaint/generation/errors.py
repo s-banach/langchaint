@@ -113,7 +113,6 @@ type _PlainErrorRecordKind = Literal[
 type _GenerationErrorStopReason = Literal[
     "stop", "max_completion_tokens", "refusal", "context_window_exceeded"
 ]
-"""The stop reasons a `GenerationError` kind implies."""
 
 
 type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_error"]

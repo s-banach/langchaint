@@ -1469,7 +1469,7 @@ def _bound_over(http_client: httpx2.AsyncClient) -> BoundAdapter:
     client = genai.Client(
         api_key="offline",
         vertexai=False,
-        http_options=types.HttpOptions(httpx_async_client=http_client),
+        http_options=types.HttpOptions(api_version="v1", httpx_async_client=http_client),
     )
     return _adapter(client=client).bind_text(_binding())
 
@@ -1482,15 +1482,11 @@ _TWO_CHUNK_SSE_BODY = (
 """A streamGenerateContent server-sent-event body of two chunks, the second carrying finishReason STOP."""
 
 
-def test_open_stream_sends_the_request_and_pulls_the_first_chunk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     """open_stream sends the built request to its model and pulls the first chunk.
 
     A connection failure therefore raises from open_stream, and the stream still yields the pulled chunk first.
-    GOOGLE_GENAI_API_VERSION overrides the SDK's default API version, so the test clears it.
     """
-    monkeypatch.delenv("GOOGLE_GENAI_API_VERSION", raising=False)
     request = _built_request([UserMessage(content="hi")], _binding(temperature=0.5))
     sent: list[tuple[str, object]] = []
 

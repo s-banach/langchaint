@@ -31,7 +31,6 @@ from langchaint import (
     PlainGeneration,
     PlainGenerationRecord,
     PydanticTool,
-    ReasoningDelta,
     SettledRequestRecord,
     SharedBackoff,
     StopReason,
@@ -950,12 +949,9 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         list[GenerationOutcomeRecord[str]],
     )
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallGeneration])
-    async with text_with_tools.stream_one("hi") as stream_with_tools:
-        async for item in stream_with_tools:
-            assert_type(item, StreamItem)
     async with structured.stream_one("hi") as stream_without_tools:
         async for item in stream_without_tools:
-            assert_type(item, str | ReasoningDelta)
+            assert_type(item, StreamItem)
 
 
 async def _pin_generic_request_method_return_types[

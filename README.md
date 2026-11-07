@@ -103,7 +103,7 @@ text_assistant = OpenAI().llm("gpt-5.6-terra").bind()
 
 async with text_assistant.stream_one("Explain photosynthesis.") as stream:
     async for item in stream:
-        # Without tools, every item is str | ReasoningDelta
+        # Answer text chunks are str; ReasoningDelta, ToolCallDelta, and ToolCall are the other items
         if isinstance(item, str):
             print(item, end="", flush=True)
 

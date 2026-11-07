@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 
 from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import TransientError
-from langchaint.common.messages import AssistantMessage, StopReason
+from langchaint.common.messages import AssistantMessage
 from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.generation.request_history import (
     RequestHistory,
@@ -110,6 +110,11 @@ type _PlainErrorRecordKind = Literal[
 """The kinds a `PlainErrorRecord` reports, which `GenerationErrorKind` documents."""
 
 
+type _GenerationErrorStopReason = Literal[
+    "stop", "max_completion_tokens", "refusal", "context_window_exceeded"
+]
+
+
 type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_error"]
 """The outcome a `GenerationError` reports.
 
@@ -157,7 +162,7 @@ class PlainErrorRecord(_GenerationErrorRecordBase):
     kind: _PlainErrorRecordKind
 
     @property
-    def stop_reason(self) -> StopReason | None:
+    def stop_reason(self) -> _GenerationErrorStopReason | None:
         """Return the stop reason that `kind` implies, or `None` when `kind` implies none."""
         match self.kind:
             case "refusal_error":
@@ -222,6 +227,14 @@ class SchemaViolationErrorRecord(_GenerationErrorRecordBase):
     def stop_reason(self) -> Literal["stop"]:
         """Return `stop`, the stop reason of a finished structured response."""
         return "stop"
+
+    @property
+    @override
+    def assistant_message(self) -> AssistantMessage:
+        """Return the rejected assistant message, from the final request."""
+        assistant_message = super().assistant_message
+        assert assistant_message is not None
+        return assistant_message
 
     @model_validator(mode="after")
     def _validate_finished_assistant_message(self) -> Self:
@@ -309,7 +322,7 @@ class GenerationError(Exception):
         return self.record.assistant_message
 
     @property
-    def stop_reason(self) -> StopReason | None:
+    def stop_reason(self) -> _GenerationErrorStopReason | None:
         """Return the normalized stop reason when present."""
         return self.record.stop_reason
 

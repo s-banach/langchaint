@@ -9,6 +9,7 @@ from typing import assert_type
 from pydantic import BaseModel
 
 from langchaint import (
+    AssistantMessage,
     AssistantPart,
     ContentPart,
     DispatchManyItemOutcome,
@@ -164,6 +165,7 @@ def _by_generation_error_record_kind(
     match record.kind:
         case "schema_violation_error":
             assert_type(record, SchemaViolationErrorRecord)
+            assert_type(record.assistant_message, AssistantMessage)
             return record.validation_error_json
         case _:
             assert_type(record, PlainErrorRecord)

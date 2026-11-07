@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
 from typing import NamedTuple, override
 
-import httpx
 import httpx2
 import pytest
 from google import genai
@@ -305,7 +304,7 @@ def _api_error(
     body = {
         "error": {"code": code, "message": "provider text", "status": "STATUS", "details": details}
     }
-    response = httpx.Response(code, headers=dict(headers)) if headers is not None else None
+    response = httpx2.Response(code, headers=dict(headers)) if headers is not None else None
     return errors.APIError(code, body, response)
 
 
@@ -1466,11 +1465,11 @@ def test_close_closes_the_sdk_iterator() -> None:
     assert closed
 
 
-def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter:
+def _bound_over(http_client: httpx2.AsyncClient) -> BoundAdapter:
     client = genai.Client(
         api_key="offline",
         vertexai=False,
-        http_options=types.HttpOptions(httpx_async_client=http_client),
+        http_options=types.HttpOptions(api_version="v1", httpx_async_client=http_client),
     )
     return _adapter(client=client).bind_text(_binding())
 
@@ -1491,22 +1490,22 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     request = _built_request([UserMessage(content="hi")], _binding(temperature=0.5))
     sent: list[tuple[str, object]] = []
 
-    def refuse(http_request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no route", request=http_request)
+    def refuse(http_request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("no route", request=http_request)
 
-    def serve(http_request: httpx.Request) -> httpx.Response:
+    def serve(http_request: httpx2.Request) -> httpx2.Response:
         sent.append((http_request.url.path, json.loads(http_request.content)))
-        return httpx.Response(
+        return httpx2.Response(
             200, content=_TWO_CHUNK_SSE_BODY, headers={"content-type": "text/event-stream"}
         )
 
     async def open_refused() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http_client:
-            with pytest.raises(httpx.ConnectError):
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(refuse)) as http_client:
+            with pytest.raises(httpx2.ConnectError):
                 _ = await _bound_over(http_client).open_stream(request, request_count=0)
 
     async def served_items() -> list[StreamItem]:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as http_client:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(serve)) as http_client:
             stream = await _bound_over(http_client).open_stream(request, request_count=0)
             return [item async for item in stream.items()]
 
@@ -1514,7 +1513,7 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     assert run_with_timeout(served_items()) == ["he", "y"]
     assert sent == [
         (
-            "/v1beta/models/gemini-3.5-flash:streamGenerateContent",
+            "/v1/models/gemini-3.5-flash:streamGenerateContent",
             {
                 "contents": [{"parts": [{"text": "hi"}], "role": "user"}],
                 "generationConfig": {"temperature": 0.5},

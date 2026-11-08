@@ -12,7 +12,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import Literal, Protocol, Self, TypeIs, override
+from typing import Literal, Protocol, Self, TypeIs, overload, override
 
 import jsonschema.exceptions
 import jsonschema.protocols
@@ -138,7 +138,7 @@ class InvalidToolArgsError(Exception):
         return str(self.validation_error)
 
 
-class DispatchExceptionGroup(ExceptionGroup[Exception]):
+class DispatchExceptionGroup[ExceptionT: Exception = Exception](ExceptionGroup[ExceptionT]):
     """Tool function exceptions from `ToolManager.dispatch_many`.
 
     `completed_outcomes` preserves settled outcomes in `tool_calls` order.
@@ -151,7 +151,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     def __new__(
         cls,
         message: str,
-        exceptions: Sequence[Exception],
+        exceptions: Sequence[ExceptionT],
         *,
         completed_outcomes: "tuple[DispatchManyItemOutcome, ...]",
     ) -> Self:
@@ -163,7 +163,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     def __init__(
         self,
         message: str,
-        exceptions: Sequence[Exception],
+        exceptions: Sequence[ExceptionT],
         *,
         completed_outcomes: "tuple[DispatchManyItemOutcome, ...]",
     ) -> None:
@@ -171,13 +171,35 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         super().__init__(message, exceptions)
         self.completed_outcomes = completed_outcomes
 
+    @overload
+    def derive[DerivedExceptionT: Exception](
+        self, excs: Sequence[DerivedExceptionT], /
+    ) -> "DispatchExceptionGroup[DerivedExceptionT]": ...
+
+    @overload
+    def derive[DerivedExceptionT: BaseException](
+        self, excs: Sequence[DerivedExceptionT], /
+    ) -> BaseExceptionGroup[DerivedExceptionT]: ...
+
     @override
-    # pyrefly: ignore[bad-override]  # Typeshed makes `derive` generic for each call.
-    def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
-        """Return a subgroup with the same `completed_outcomes`."""
-        return DispatchExceptionGroup(
-            self.message, excs, completed_outcomes=self.completed_outcomes
-        )
+    def derive(self, excs: Sequence[BaseException], /) -> BaseExceptionGroup[BaseException]:
+        """Wrap `excs` with the same message.
+
+        If every exception is an `Exception`, preserve `completed_outcomes` by reference.
+        Otherwise, return a plain `BaseExceptionGroup` without `completed_outcomes`.
+
+        Raises:
+            ValueError: `excs` is empty.
+        """
+        if _only_exceptions(excs):
+            return DispatchExceptionGroup(
+                self.message, excs, completed_outcomes=self.completed_outcomes
+            )
+        return BaseExceptionGroup(self.message, excs)
+
+
+def _only_exceptions(excs: Sequence[BaseException]) -> TypeIs[Sequence[Exception]]:
+    return all(isinstance(exc, Exception) for exc in excs)
 
 
 @dataclass(frozen=True, kw_only=True)

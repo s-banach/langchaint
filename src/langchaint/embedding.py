@@ -164,7 +164,7 @@ class _EmbeddingAdapter(Protocol):
 
     async def prepare(self) -> None:
         """Complete preparation without work."""
-        return None  # noqa: RET501 (keeps pyrefly from treating this method as abstract)
+        return
 
     async def partition_inputs(
         self,

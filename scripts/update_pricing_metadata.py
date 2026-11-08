@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_PATH = ROOT / "scripts/pricing/litellm-pricing-snapshot.json"
 METADATA_PATH = ROOT / "scripts/pricing/provider-pricing-metadata.json"
 IGNORED_MODEL_KEYS_PATH = ROOT / "scripts/pricing/ignored-litellm-model-keys.json"
-"""Hand-maintained LiteLLM keys of reported model kinds that langchaint deliberately does not price."""
+"""Path to the maintained list of LiteLLM model keys excluded from new-model reports."""
 OPENAI_OUTPUT_PATH = ROOT / "src/langchaint/openai/_generated_pricing.py"
 ANTHROPIC_OUTPUT_PATH = ROOT / "src/langchaint/anthropic/_generated_pricing.py"
 COHERE_OUTPUT_PATH = ROOT / "src/langchaint/cohere/_generated_pricing.py"
@@ -107,7 +107,7 @@ These models accept no `dimension`.
 _PRICE_FIELD = re.compile(r"cost|multiplier")
 """A LiteLLM field that sets or scales a price."""
 _EMBEDDING_DROPPED_PRICE_FIELD = re.compile(r"(?:input|output)_cost_per_token_batches")
-"""Embedding price fields the rate tables may drop.
+"""Batch API price fields omitted from embedding rate tables.
 
 No langchaint embedding adapter sends batch requests.
 """
@@ -142,7 +142,7 @@ ANTHROPIC_KNOWN_TIERS: frozenset[str] = frozenset({"batches"})
 
 
 _Rate = Annotated[StrictInt | StrictFloat, Field(ge=0, allow_inf_nan=False)]
-"""A finite nonnegative per-token rate; `int` survives so the snapshot reproduces the upstream value."""
+"""A finite nonnegative rate that preserves integer values as integers in the snapshot."""
 _RATE_ADAPTER = TypeAdapter[int | float](_Rate)
 _Multiplier = Annotated[StrictInt | StrictFloat, Field(gt=0, allow_inf_nan=False)]
 """A finite positive price multiplier."""
@@ -239,7 +239,7 @@ class _LiteLLMEntry(BaseModel):
     search_context_cost_per_query: _SearchContextCost | None = None
 
     def require_known_tiers(self, known_tiers: frozenset[str]) -> None:
-        """Reject rates for a pricing tier that the generated table would silently drop.
+        """Reject listed pricing tiers outside `known_tiers`.
 
         Raises:
             ValueError: The entry lists a rate for a tier outside `known_tiers`.
@@ -271,7 +271,9 @@ class _LiteLLMEntry(BaseModel):
             cost.search_context_size_high,
         }
         if len(prices) != 1:
-            raise ValueError("web search prices are partially listed or differ by context size")
+            raise ValueError(
+                "Web search prices are listed for only some context sizes or differ across context sizes."
+            )
         (price,) = prices
         return price
 
@@ -293,14 +295,12 @@ class _LiteLLMEntry(BaseModel):
         """Collect the Anthropic Batch API token rates without requiring any of them.
 
         LiteLLM lists no batch rate for the 1-hour cache write.
-        Anthropic's pricing page (https://platform.claude.com/docs/en/about-claude/pricing) states
-        that the cache-write multipliers stack with the Batch API discount, so the 1-hour cache
-        write rate is scaled by the ratio of the 5-minute cache write's batch rate to its standard
-        rate.
+        Anthropic documents cache-write multipliers at https://platform.claude.com/docs/en/about-claude/pricing.
+        These multipliers stack with the Batch API discount.
+        The 1-hour cache-write rate uses the batch-to-standard rate ratio of 5-minute cache writes.
 
         Raises:
-            ValueError: The 1-hour and batch 5-minute cache-write rates are listed, but the
-                standard 5-minute cache-write rate is unlisted or zero.
+            ValueError: The standard 5-minute rate is absent or zero, but 1-hour and batch 5-minute rates are listed.
         """
         standard = self.anthropic_rate_fields()
         batch_input_tokens_cache_write_5m_usd_per_token = _decimal(
@@ -327,11 +327,11 @@ class _LiteLLMEntry(BaseModel):
     def embedding_input_tokens_usd_per_token(self) -> Decimal:
         """Return the one rate of an embedding entry, which prices input tokens.
 
-        The embedding tables hold one rate per model, so any other listed rate would be dropped.
+        Embedding rate tables store only the input-token rate.
 
         Raises:
-            ValueError: The entry lists no input rate, lists a nonzero output rate, or lists a
-                price outside `_EMBEDDING_DROPPED_PRICE_FIELD` that the table cannot hold.
+            ValueError: The entry omits the input-token rate or lists a nonzero output-token rate.
+                Other prices and multipliers must match `_EMBEDDING_DROPPED_PRICE_FIELD`.
         """
         if self.input_cost_per_token is None:
             raise ValueError("LiteLLM lists no input rate for an embedding model")
@@ -346,7 +346,7 @@ class _LiteLLMEntry(BaseModel):
         ]
         if unrendered_fields:
             raise ValueError(
-                f"LiteLLM lists prices {unrendered_fields} that an embedding rate table cannot hold"
+                f"Embedding rate tables cannot represent LiteLLM price fields {unrendered_fields}"
             )
         return _decimal(self.input_cost_per_token)
 
@@ -402,18 +402,16 @@ class _LiteLLMEntry(BaseModel):
     def long_context_fields(self, rendered_tiers: frozenset[str]) -> _LongContextFields | None:
         """Read the long-context pricing of the default tier and `rendered_tiers`.
 
-        `LongContextPricing` holds one threshold for every tier, one input multiplier for the
-        input, cache-read, and cache-write rates, and one output multiplier for the output rate.
+        `LongContextPricing` holds one threshold for all tiers.
+        Its input multiplier applies to input, cache-read, and cache-write rates.
+        Its output multiplier applies to the output rate.
         Each multiplier is the exact ratio of a long-context rate to its base rate.
 
         Returns:
-            The shared threshold and multipliers, or `None` when the entry lists no long-context
-            rate in those tiers.
+            The shared threshold and multipliers, or `None` if those tiers list no long-context rates.
 
         Raises:
-            ValueError: A long-context rate lacks its base rate, a base rate is zero, the listed
-                rates do not share one threshold, one input multiplier, and one output multiplier,
-                or they include no output rate or no input, cache-read, or cache-write rate.
+            ValueError: A base rate is missing or zero, or thresholds or multipliers are missing or inconsistent.
         """
         fields = self.model_dump(exclude_none=True)
         matches = [
@@ -437,8 +435,7 @@ class _LiteLLMEntry(BaseModel):
         }
         if len(thresholds) != 1 or len(input_multipliers) != 1 or len(output_multipliers) != 1:
             raise ValueError(
-                "LiteLLM long-context rates do not share one threshold, input multiplier, "
-                f"and output multiplier: {sorted(match.group(0) for match in matches)}"
+                f"LiteLLM long-context rates do not share one threshold, input multiplier, and output multiplier: {sorted(match.group(0) for match in matches)}"
             )
         (prompt_tokens_above,) = thresholds
         (input_multiplier,) = input_multipliers
@@ -508,8 +505,8 @@ class _LiteLLMModelKind(BaseModel):
         """Report whether new-model detection covers the entry.
 
         `unprefixed_key` is the entry's LiteLLM key without a `BEDROCK_CROSS_REGION_PREFIXES` prefix.
-        Detection covers OpenAI and Anthropic direct-API text generation models, OpenAI embedding
-        models, and Cohere embedding models on Bedrock.
+        Detection covers OpenAI and Anthropic direct-API text generation models.
+        It also covers OpenAI embedding models and Cohere embedding models on Bedrock.
         """
         if self.litellm_provider in {"openai", "anthropic"} and self.mode in {"chat", "responses"}:
             return True
@@ -832,7 +829,9 @@ def _cohere_module(entries: Mapping[str, _LiteLLMEntry]) -> str:
 
     Raises:
         KeyError: A required model entry is missing.
-        ValueError: An entry prices more than input tokens, or a cross-region multiplier is not single.
+        ValueError: An embedding entry omits its input rate or lists a nonzero output rate.
+            Other prices must be permitted Batch API fields.
+            A cross-region comparison requires a nonzero base rate and consistent input-rate multipliers.
     """
     lines = [
         '"""Generated Cohere pricing metadata. Refresh with `uv run python -m scripts.update_pricing_metadata`."""',
@@ -869,7 +868,7 @@ def _cohere_module(entries: Mapping[str, _LiteLLMEntry]) -> str:
         "}",
         '"""Input-token rate multiplier of a Cohere model for each Bedrock cross-region prefix.',
         "",
-        "It is NaN for a prefix that LiteLLM prices for no Cohere model.",
+        "The multiplier is NaN when no prefixed entry for a cataloged Cohere embedding model yields an input-token rate ratio.",
         '"""',
         "",
     ]
@@ -944,7 +943,7 @@ def _anthropic_module(entries: Mapping[str, _LiteLLMEntry], metadata: _ProviderM
         "}",
         '"""Token-rate multiplier for each Bedrock cross-region inference profile prefix.',
         "",
-        "It is NaN for a prefix that LiteLLM prices for no Anthropic Bedrock model.",
+        "The multiplier is NaN when no prefixed entry for a cataloged Anthropic Bedrock model yields a token-rate ratio.",
         '"""',
         "",
     ]
@@ -1007,8 +1006,8 @@ def _rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decim
         The exact ratio of each token rate listed in `prefixed` to the same rate in `base`.
 
     Raises:
-        ValueError: A base rate is unlisted or zero, or `prefixed` lists long-context pricing
-            that differs from `base`.
+        ValueError: A base rate is unlisted or zero, or long-context rate validation fails.
+            Different long-context pricing in `prefixed` and `base` also causes this error.
     """
     for prefixed_rate, base_rate in zip(
         prefixed.anthropic_rate_fields(), base.anthropic_rate_fields(), strict=True
@@ -1078,8 +1077,8 @@ def _untracked_model_keys(
 ) -> list[str]:
     """List the keys of reported models that are neither generated nor ignored.
 
-    An OpenAI or Anthropic direct-API LiteLLM key equals the model id, so an alias key such as
-    `gpt-5.6` counts as generated.
+    OpenAI and Anthropic direct-API LiteLLM keys equal their model ids.
+    Alias keys such as `gpt-5.6` therefore count as generated.
     A Bedrock key under a cross-region prefix counts as generated or ignored when its unprefixed key is.
     """
     generated_keys = {
@@ -1108,8 +1107,8 @@ def _snapshot_json(entries: Mapping[str, _LiteLLMEntry]) -> str:
 def main() -> None:
     """Refresh pricing files from current upstream data.
 
-    Print one line per reported model key that is neither generated nor in
-    `IGNORED_MODEL_KEYS_PATH`, so the refresh workflow can report new models.
+    Print reported model keys that are neither generated nor in `IGNORED_MODEL_KEYS_PATH`.
+    The refresh workflow uses this list to report new models.
 
     Raises:
         OSError: A download or file operation fails.

@@ -37,10 +37,10 @@ async def print_tool_loop_spans(prompt: str, max_turns: int = 10) -> str:
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 
-    openai = OpenAI(
+    bound = OpenAI(
         observer=OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
-    )
-    bound = openai.llm("gpt-5.6-terra").bind(
+    ).llm(
+        "gpt-5.6-terra",
         system_prompt="Use tools when needed.",
         tools=[get_weather],
     )

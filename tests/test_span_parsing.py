@@ -8,14 +8,14 @@ import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint import (
-    LLM,
     ZERO_USAGE,
+    AdapterLLM,
     AssistantMessage,
-    BoundLLM,
     JsonValue,
     TextPart,
     ToolMessage,
     UserMessage,
+    llm_from_adapter,
 )
 from langchaint.span_parsing import (
     OtelChatSpan,
@@ -26,9 +26,9 @@ from langchaint.span_parsing import (
     OtelReasoningPart,
     OtelTextPart,
     OtelToLangchaintConversionError,
-    bound_llm_from_otel,
     generation_input_from_otel,
     generation_record_from_otel,
+    llm_from_otel,
     output_messages_from_otel,
     parse_otel_chat,
     parse_otel_execute_tool,
@@ -436,7 +436,7 @@ def test_leading_system_message_supplies_the_binding_system_prompt(
     if empty_system_instructions:
         attributes["gen_ai.system_instructions"] = list[JsonValue]()
     parsed = parse_otel_chat(_chat_span(attributes))
-    bound_llm = bound_llm_from_otel(parsed, llm=LLM(FakeAdapter()))
+    bound_llm = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
     assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
     assert generation_input_from_otel(parsed) == (
         UserMessage(content=(TextPart(text="Question"),)),
@@ -457,7 +457,7 @@ def test_rejects_combined_system_instructions_and_system_message() -> None:
     with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
         _ = generation_input_from_otel(parsed)
     with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
-        _ = bound_llm_from_otel(parsed, llm=LLM(FakeAdapter()))
+        _ = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
 
 
 @pytest.mark.parametrize(
@@ -492,7 +492,7 @@ def test_rejects_system_message_position_and_cardinality(
     with pytest.raises(OtelToLangchaintConversionError, match=error_match):
         _ = generation_input_from_otel(parsed)
     with pytest.raises(OtelToLangchaintConversionError, match=error_match):
-        _ = bound_llm_from_otel(parsed, llm=LLM(FakeAdapter()))
+        _ = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
 
 
 @pytest.mark.parametrize(
@@ -582,7 +582,7 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _chat_span({"gen_ai.provider.name": "other", "gen_ai.request.model": "fake-model"})
     )
     with pytest.raises(ValueError, match="provider_name"):
-        _ = bound_llm_from_otel(parsed, llm=LLM(FakeAdapter()))
+        _ = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
 
 
 def test_generation_record_fills_its_synthetic_request_record() -> None:
@@ -908,7 +908,7 @@ def test_reconstruction_rejects_tool_schema_mismatch(
             ]
         })
     with pytest.raises(OtelToLangchaintConversionError, match="differs"):
-        _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
+        _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter(), tools=tools))
 
 
 @pytest.mark.parametrize(
@@ -931,20 +931,19 @@ def test_reconstruction_applies_tool_definition_presence_contract(
     if definitions is not None:
         span = _generation_chat_span({"gen_ai.tool.definitions": definitions})
     if accepted:
-        _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
+        _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter(), tools=tools))
     else:
         with pytest.raises(OtelToLangchaintConversionError, match="differs"):
-            _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()), tools=tools)
+            _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter(), tools=tools))
 
 
 def test_reconstruction_binds_structured_response_model() -> None:
     span = _generation_chat_span({"gen_ai.output.type": "json"})
-    bound_llm = bound_llm_from_otel(
+    bound_llm = llm_from_otel(
         span,
-        llm=LLM(FakeAdapter()),
-        response_format=_StructuredResponse,
+        llm=llm_from_adapter(FakeAdapter(), response_format=_StructuredResponse),
     )
-    assert_type(bound_llm, BoundLLM[_StructuredResponse, None])
+    assert_type(bound_llm, AdapterLLM[_StructuredResponse, None])
     assert bound_llm.response_format is _StructuredResponse
 
 
@@ -960,17 +959,16 @@ def test_reconstruction_rejects_response_format_mismatch(
     if output_type is not None:
         span = _generation_chat_span({"gen_ai.output.type": output_type})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = bound_llm_from_otel(
+        _ = llm_from_otel(
             span,
-            llm=LLM(FakeAdapter()),
-            response_format=response_format,
+            llm=llm_from_adapter(FakeAdapter(), response_format=response_format),
         )
 
 
 def test_reconstruction_rejects_unsupported_output_type() -> None:
     span = _generation_chat_span({"gen_ai.output.type": "image"})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = bound_llm_from_otel(span, llm=LLM(FakeAdapter()))
+        _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter()))
 
 
 def test_manifest_attribute_names_match_otel_execute_tool_span_aliases() -> None:

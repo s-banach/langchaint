@@ -154,7 +154,6 @@ class GeminiRates:
     """One token rate per category Gemini bills on a request at one served tier.
 
     Each rate is in USD per million tokens and has the name of the `Usage` counter it prices.
-    No cache-write rate: no cache write is ever billed, so none exists to state.
     Pass NaN for an unknown rate.
     A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     """
@@ -180,7 +179,7 @@ class GeminiRates:
 class GeminiPricingTable:
     """Gemini rates and modifiers for one model.
 
-    Each rates field prices the responses whose `traffic_type` is the `GeminiReportedServiceTier` of the same name.
+    Each rates field corresponds to the uppercase `traffic_type` value, such as `on_demand` for `ON_DEMAND`.
     A response that reports no `traffic_type` uses the `on_demand` rates.
     Developer API responses report no `traffic_type`, so they use the `on_demand` rates.
     A response at a tier without rates costs NaN in every nonzero token category.
@@ -464,8 +463,7 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
     args = json.loads(tool_call.args_json)
     if not isinstance(args, dict):
         raise _RejectedMessagesError(
-            f"a tool call's args_json must hold a JSON object to go on the Gemini wire, "
-            f"not {type(args).__name__}"
+            f"a tool call's args_json must hold a JSON object to go on the Gemini wire, not {type(args).__name__}"
         )
     return types.FunctionCall(
         id=None if tool_call.id == tool_call.name else tool_call.id,
@@ -487,8 +485,7 @@ def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> type
         return types.Part.model_validate_json(json.dumps(raw))
     except (TypeError, ValueError) as not_a_part:
         raise _RejectedMessagesError(
-            f"{part_description} does not restore to a Gemini Part, so it cannot be sent: "
-            f"{not_a_part}"
+            f"{part_description} does not restore to a Gemini Part, so it cannot be sent: {not_a_part}"
         ) from not_a_part
 
 
@@ -603,8 +600,7 @@ def _function_response_part(
     name = tool_call_names.get(tool_message.tool_call_id)
     if name is None:
         raise _RejectedMessagesError(
-            f"tool_call_id {tool_message.tool_call_id!r} matches no ToolCall in an earlier "
-            f"assistant message, so the FunctionResponse name the wire requires cannot be recovered"
+            f"tool_call_id {tool_message.tool_call_id!r} matches no ToolCall.id in an earlier assistant message, so FunctionResponse.name cannot be recovered"
         )
     function_response_parts: list[types.FunctionResponsePart] = []
     texts: list[str] = []
@@ -784,7 +780,6 @@ def _normalized_wire_key(key: str) -> str:
 
 
 def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:
-    """Report whether `value` is a `Mapping`, whose keys and values are then read as `object`."""
     return isinstance(value, Mapping)
 
 
@@ -794,7 +789,6 @@ def _has_only_string_keys(mapping: Mapping[object, object]) -> TypeGuard[Mapping
 
 
 def _is_list(value: object) -> TypeIs[list[object]]:
-    """Report whether `value` is a `list`, whose items are then read as `object`."""
     return isinstance(value, list)
 
 
@@ -823,8 +817,7 @@ def _reject_extra_body_keys(
         # `Adapter.bind_text` requires `ValueError` for binding defects.
         if not _is_mapping(nested):
             raise ValueError(
-                f"extra_body key {key!r} must map to an object: the SDK merge would substitute "
-                f"a non-object value for the generationConfig fields the adapter populates"
+                f"extra_body key {key!r} must map to an object: the SDK merge would substitute a non-object value for the generationConfig fields the adapter populates"
             )
         if not _has_only_string_keys(nested):
             raise ValueError(f"extra_body key {key!r} must map to an object with only string keys")
@@ -850,8 +843,7 @@ def _reject_extra_body_keys(
             for key, value in generation_config.items()
         ):
             raise ValueError(
-                "generationConfig candidateCount must be 1, None, or absent, because "
-                "GeminiGenerateContentAdapter reads one candidate per response. "
+                "generationConfig candidateCount must be 1, None, or absent, because GeminiGenerateContentAdapter reads one candidate per response. "
                 "Pass the input once per candidate."
             )
 
@@ -969,8 +961,7 @@ class GeminiGenerateContentAdapter(Adapter):
         """
         if client.vertexai and provider_name != _VERTEX_PROVIDER_NAME:
             raise ValueError(
-                f"provider_name={provider_name!r} contradicts the client: "
-                f"client.vertexai is True, which reaches {_VERTEX_PROVIDER_NAME!r}"
+                f"provider_name={provider_name!r} contradicts client.vertexai=True; use provider_name={_VERTEX_PROVIDER_NAME!r} for Vertex AI"
             )
         super().__init__(
             client=client,
@@ -1007,8 +998,7 @@ class GeminiGenerateContentAdapter(Adapter):
         _reject_extra_body_keys(binding.extra_body, reasoning_level=binding.reasoning_level)
         if not binding.parallel_tool_calls:
             raise ValueError(
-                "parallel_tool_calls False has no Gemini wire form: generateContent has no "
-                "parameter disabling parallel function calls"
+                "Gemini generateContent cannot disable parallel function calls with parallel_tool_calls=False"
             )
         if binding.provider_executed_tools and binding.tool_choice != "auto":
             raise ValueError(
@@ -1031,10 +1021,7 @@ class GeminiGenerateContentAdapter(Adapter):
                 system_instruction = binding.system_prompt
             else:
                 if not binding.system_prompt:
-                    raise ValueError(
-                        "system_prompt is an empty tuple of parts; bind rejects this, "
-                        "so it can only come from a directly constructed Binding"
-                    )
+                    raise ValueError("system_prompt must contain at least one TextPart")
                 system_instruction = types.Content(
                     parts=[types.Part(text=part.text) for part in binding.system_prompt]
                 )
@@ -1072,8 +1059,7 @@ class GeminiGenerateContentAdapter(Adapter):
             thinking_level = types.ThinkingLevel(binding.reasoning_level)
             if thinking_level.value != binding.reasoning_level:
                 raise ValueError(
-                    f"reasoning_level {binding.reasoning_level!r} is not an exact Gemini value; "
-                    f"the Gemini SDK normalizes it to {thinking_level.value!r}"
+                    f"reasoning_level {binding.reasoning_level!r} is not an exact Gemini value; the Gemini SDK normalizes it to {thinking_level.value!r}"
                 )
             thinking_config = types.ThinkingConfig(
                 thinking_level=thinking_level,
@@ -1261,7 +1247,7 @@ def _candidate_parts(response: types.GenerateContentResponse) -> list[types.Part
 def assembled_response(
     chunks: Iterable[types.GenerateContentResponse],
 ) -> types.GenerateContentResponse:
-    """Assemble streamed chunks into the one response a non-streaming request would have returned.
+    """Assemble streamed chunks into one `GenerateContentResponse`.
 
     _ResponseAccumulator.add defines the merge rule.
     Adapter conformance tests compare the assembled response with a non-streamed one.
@@ -1283,9 +1269,9 @@ class _GeminiStream(AdapterStream):
         provider_executed_tool_fields: frozenset[str] = frozenset(),
         first_chunk: types.GenerateContentResponse | None = None,
     ) -> None:
-        """Store the SDK iterator and the chunk open_stream pulled ahead of it.
+        """`first_chunk` precedes `chunks`.
 
-        first_chunk precedes chunks. None means open_stream pulled no chunk.
+        `None` means `open_stream` pulled no chunk.
         """
         self._chunks = chunks
         self._pricing = pricing
@@ -1309,12 +1295,10 @@ class _GeminiStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate chunks into answer text, reasoning deltas, and complete tool calls.
 
-        Each function call arrives whole and yields no `ToolCallDelta`.
-        `REASONING_PART_SEPARATOR` separates text from different assembled reasoning parts.
-        `_ResponseAccumulator.add` defines which wire parts merge into one assembled part.
-
         Yields:
-            Stream items for parts langchaint models.
+            Each function call arrives whole and yields no `ToolCallDelta`.
+            `REASONING_PART_SEPARATOR` separates text from different assembled reasoning parts.
+            `_ResponseAccumulator.add` defines which wire parts merge into one assembled part.
 
         Raises:
             StreamProtocolError: The stream ends without `finish_reason` or `block_reason`.
@@ -1349,8 +1333,8 @@ class _GeminiStream(AdapterStream):
     def provider_billing(self) -> ProviderBilling | None:
         """Return available billing from accumulated stream evidence.
 
-        Missing usage returns None when no charged provider-executed tool was configured.
-        A charged cutoff returns NaN for the provider-executed tool category.
+        Return `None` until usage metadata arrives unless a charged provider-executed tool is configured.
+        Return NaN for the provider-executed tool cost while billing is incomplete and a charged tool is configured.
         """
         charged_fields = (
             self._provider_executed_tool_fields & _CHARGED_PROVIDER_EXECUTED_TOOL_FIELDS
@@ -1386,9 +1370,8 @@ class _GeminiStream(AdapterStream):
 
 
 def _as_response(raw: BaseModel) -> types.GenerateContentResponse:
-    """Narrow a raw response to the SDK response this adapter produces.
+    """BoundAdapter accepts BaseModel because the neutral core imports no SDK.
 
-    BoundAdapter accepts BaseModel because the neutral core imports no SDK.
     This adapter produces GenerateContentResponse.
 
     Raises:

@@ -209,7 +209,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             self._end_operation(None)
 
     def _end_operation(
-        self, outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord | None
+        self, outcome: GenerationOutcome[object] | AbandonedStreamRecord | None
     ) -> None:
         """Give the observer the input's outcome, when there is one, and end the operation once."""
         operation, self._operation = self._operation, None
@@ -531,12 +531,12 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             outcome, ended_at_monotonic_seconds=ended_at_monotonic_seconds
         )
 
-    def _outcome_from_response(
+    def _outcome_from_response[ResponseOutputT](
         self,
-        response_outcome: ResponseOutcome[OutputT],
+        response_outcome: ResponseOutcome[ResponseOutputT],
         *,
         ended_at_monotonic_seconds: float,
-    ) -> GenerationOutcome[OutputT]:
+    ) -> GenerationOutcome[ResponseOutputT]:
         """Record the staged response before building its outcome, preserving the response and billing.
 
         Return errors so `final` stores every outcome before concluding the input.

@@ -340,5 +340,5 @@ BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {
 }
 """Token-rate multiplier for each Bedrock cross-region inference profile prefix.
 
-It is NaN for a prefix that LiteLLM prices for no Anthropic Bedrock model.
+The multiplier is NaN when no prefixed entry for a cataloged Anthropic Bedrock model yields a token-rate ratio.
 """

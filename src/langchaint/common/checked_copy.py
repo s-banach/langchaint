@@ -13,15 +13,8 @@ from pydantic import BaseModel, ConfigDict
 
 def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
     if isinstance(getattr(model_class, key, None), property):
-        return (
-            f"model_copy update key {key!r} is a derived property of {model_class.__name__}, "
-            f"computed from its fields; construct a new {model_class.__name__} "
-            "from changed fields instead of updating the view"
-        )
-    return (
-        f"model_copy update key {key!r} is not a field of {model_class.__name__}; "
-        f"fields: {sorted(model_class.model_fields)}"
-    )
+        return f"model_copy cannot update property {key!r} of {model_class.__name__}; construct a new {model_class.__name__} with changed field values"
+    return f"model_copy update key {key!r} is not a field of {model_class.__name__}; fields: {sorted(model_class.model_fields)}"
 
 
 class CheckedCopyModel(BaseModel):
@@ -41,16 +34,11 @@ class CheckedCopyModel(BaseModel):
         extra = cls.model_config.get("extra")
         if extra != "forbid":
             raise TypeError(
-                f"{cls.__name__} sets extra={extra!r}, under which a key that is not a field "
-                "is kept or dropped instead of raising; a model that accepts unknown keys "
-                "must not inherit CheckedCopyModel"
+                f'{cls.__name__} sets extra={extra!r}; CheckedCopyModel subclasses must use extra="forbid"'
             )
         if cls.__pydantic_custom_init__:
             raise TypeError(
-                f"{cls.__name__} defines __init__, which sets pydantic's custom_init: pydantic "
-                "binds the raw input to that signature, so a surplus or missing key is rejected by "
-                "argument binding as an unlocated TypeError before extra='forbid' is consulted. "
-                "Let pydantic generate the constructor; its arguments are keyword-only"
+                f"{cls.__name__} defines __init__; CheckedCopyModel subclasses must use pydantic's generated constructor"
             )
 
     @override

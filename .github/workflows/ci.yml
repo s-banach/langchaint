@@ -13,13 +13,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each job runs the full gate; the pair of axes covers the supported boundary.
         # Bump the Python entries when a new release becomes supported.
         include:
-          # Newest resolvable dependencies on the floor and the current Python.
+          # Newest resolvable dependencies on the oldest and newest supported Python versions.
           - { python-version: "3.13", resolution: highest }
           - { python-version: "3.15", resolution: highest }
-          # Floor dependencies (each direct dep at its pyproject lower bound) on the floor Python, the most conservative supported combination.
+          # Minimum direct dependency versions on the oldest supported Python version.
           - { python-version: "3.13", resolution: lowest-direct }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,7 +32,8 @@ jobs:
           # UV_RESOLUTION is not part of setup-uv's cache key, so without a suffix the two 3.13 jobs (highest and lowest-direct) share one key and race to save it; keying the suffix on the resolution gives each its own cache.
           cache-suffix: ${{ matrix.resolution }}
       # scripts/CI.sh runs pyrefly, ruff, and pytest through `uv run`, which syncs the locked dev dependency group first.
-      # UV_RESOLUTION steers that resolution per matrix entry; with uv.lock gitignored, every job resolves fresh, so the check configuration stays in the committed script.
+      # Each job resolves dependencies using `UV_RESOLUTION` because `uv.lock` is ignored.
+      # Every job runs the checks defined in `scripts/CI.sh`.
       - run: bash scripts/CI.sh
         env:
           UV_RESOLUTION: ${{ matrix.resolution }}

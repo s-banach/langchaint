@@ -26,13 +26,13 @@ async def run_batch_and_handle_what_failed() -> list[
     anthropic = Anthropic(
         shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
     )
-    openai = OpenAI()
-    summarizer = anthropic.llm("claude-sonnet-5").bind(
+    summarizer = anthropic.llm(
+        "claude-sonnet-5",
         system_prompt="Summarize in one sentence.",
         max_completion_tokens=256,
         max_requests=5,
     )
-    fallback = openai.llm("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
+    fallback = OpenAI().llm("gpt-5.6-terra", system_prompt="Summarize in one sentence.")
 
     scanned_page: list[Message] = [
         UserMessage(

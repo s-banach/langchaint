@@ -203,10 +203,11 @@ def _require_abandoned_shape(request_history: RequestHistory) -> None:
 
 
 class AbandonedStreamRecord(_InputOutcomeRecordBase):
-    """A `stream_one` input whose `async with` block exited before a `Generation` or `GenerationError` recorded it.
+    """A `stream_one` input whose `async with` block exited before the stream stored its outcome.
 
+    The outcome is a `Generation` or `GenerationError`.
     The application ended the stream, so handling the input did not fail.
-    The record keeps the billing and first-item time of the request the exit cut off.
+    The record preserves available request billing and first-item timing.
     """
 
     stop_reason: ClassVar[StopReason | None] = None

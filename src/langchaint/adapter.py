@@ -99,7 +99,7 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
 
     `email.utils.mktime_tz` raises `ValueError` for a year outside 1..9999.
     It raises `OverflowError` for a year above 2**31 - 1.
-    A numeric field with hundreds of digits gives an integer whose difference with `time.time()` raises `OverflowError`.
+    A timezone offset with hundreds of digits can produce an integer too large to subtract `time.time()`.
     """
     if not retry_after_header.endswith("GMT"):
         return None
@@ -305,7 +305,7 @@ def validated_provider_executed_tool_types(
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
-    """The frozen prefix of one BoundLLM, in langchaint terms only.
+    """The frozen prefix of one LLM, in langchaint terms only.
 
     Every field determines the provider's cacheable prompt prefix or stays fixed for one binding.
     The `messages` argument of each `BoundAdapter` method contains the per-request data.
@@ -362,8 +362,7 @@ class Binding:
         )
         if unknown_tool_names:
             raise ValueError(
-                f"AllowedToolsChoice.tool_names contains names absent from "
-                f"Binding.tool_schemas: {unknown_tool_names!r}"
+                f"AllowedToolsChoice.tool_names contains names absent from Binding.tool_schemas: {unknown_tool_names!r}"
             )
 
 
@@ -429,14 +428,17 @@ class _UnusableResponseBase:
 
 @dataclass(frozen=True, kw_only=True)
 class Refusal(_UnusableResponseBase):
-    """A completed response that a refusal ended at its final tool call, which may be cut off, or without output."""
+    """A refusal ended the response at its final tool call, which may be incomplete, or without usable output."""
 
     kind: Literal["refusal"] = "refusal"
 
 
 @dataclass(frozen=True, kw_only=True)
 class MaxCompletionTokensExceeded(_UnusableResponseBase):
-    """A completed 200 that reached its token limit at its final tool call, which may be cut off, or without output."""
+    """The response reached its completion-token limit at its final tool call or without usable output.
+
+    The final tool call may be incomplete.
+    """
 
     kind: Literal["max_completion_tokens_exceeded"] = "max_completion_tokens_exceeded"
 
@@ -515,7 +517,7 @@ class UnexpectedResponse(_UnusableResponseBase):
 
 @dataclass(frozen=True, kw_only=True)
 class RejectedMessages:
-    """A `Sequence[Message]` the adapter will not put on the wire.
+    """An adapter rejection of the input messages before a request is sent.
 
     The retry loop sends no request and raises `GenerationError` with this `error_text`.
     Nothing was sent or billed.
@@ -558,7 +560,7 @@ def narrowed_request_params[RequestParamsT: RequestParams](
     """
     if not isinstance(request_params, request_params_class):
         raise TypeError(
-            f"expected request params this adapter built, got {type(request_params).__name__}"
+            f"expected {request_params_class.__name__} request params, got {type(request_params).__name__}"
         )
     return request_params
 
@@ -570,7 +572,7 @@ def request_params_json(request_params: RequestParams, *, omitted_class: type) -
 
     Args:
         request_params: The request params to render.
-        omitted_class: The omit sentinel class whose values to remove.
+        omitted_class: The sentinel class identifying mapping values to omit.
     """
     return json.dumps(
         _without_omitted(asdict(request_params), omitted_class), default=_json_default
@@ -618,10 +620,11 @@ type ResponseOutcome[OutputT] = UsableResponse[OutputT] | UnusableResponse
 
 @dataclass(frozen=True, kw_only=True)
 class FinishedResponse:
-    """A response the provider finished, as `BoundAdapter.interpret` reads it before the binding reads output.
+    """A response normalized by `BoundAdapter.interpret` before `response_outcome` reads its output.
 
-    `cannot_continue` is the error text for a response langchaint cannot continue from, such as one with an unknown
-    provider stop reason, and `None` for any other.
+    `cannot_continue` contains error text for a response langchaint cannot continue from.
+    An unknown provider stop reason is one example.
+    It is `None` for other responses.
     """
 
     assistant_message: AssistantMessage
@@ -721,7 +724,7 @@ class BoundAdapter(ABC):
 
     @abstractmethod
     def interpret(self, raw: BaseModel) -> FinishedResponse | UnusableResponse:
-        """Return what the response says about itself, or the reason it is unusable.
+        """Normalize the response's assistant message and stop reason, or return its unusable outcome.
 
         Args:
             raw: The provider SDK response.
@@ -769,8 +772,7 @@ def _require_provider_name(
     )
     if reached is not None and reached != provider_name:
         raise ValueError(
-            f"provider_name={provider_name!r} contradicts the client: "
-            f"{type(client).__name__} reaches {reached!r}"
+            f"{type(client).__name__} requires provider_name={reached!r}, got {provider_name!r}"
         )
 
 
@@ -822,8 +824,8 @@ class Adapter(ABC):
         """Return a snapshot of stored adapter configuration that can form provider requests.
 
         Exclude the SDK client, credentials, pricing, and response-accounting configuration.
-        `BoundLLM.config_fingerprint` adds the adapter class, model, and provider.
-        `BoundLLM.config_fingerprint` also adds the binding and response format.
+        The configured model's `config_fingerprint` adds the adapter class, model, and provider.
+        It also adds the binding and response format.
         An adapter may include a non-secret endpoint identity when its contract treats that identity as configuration.
         """
         ...
@@ -838,7 +840,7 @@ class Adapter(ABC):
             binding: The provider-neutral binding.
 
         Raises:
-            ValueError: `binding` asks for something this adapter cannot send.
+            ValueError: `binding` contains unsupported values.
         """
         ...
 
@@ -864,13 +866,10 @@ class Adapter(ABC):
         The retry loops pass every `Exception` a request raises, except two they map themselves.
         A `TransientError` is transient and pauses the quota when its `pauses_quota` is true.
         A `StreamProtocolError` is transient and pauses nothing.
-        Return `kind="unknown_exception"` for an exception the adapter cannot place.
+        Return `kind="unknown_exception"` for an exception the adapter cannot classify.
         Never raise, because a raise escapes the retry loop as an adapter defect.
         Each provider's function documents where its retry decision comes from and its quota pause rules.
         An SDK retry decision may have side effects, such as clearing a token cache.
-
-        Args:
-            error: The exception the failed request raised.
         """
         ...
 

@@ -1,7 +1,7 @@
 """Define the observer that follows every input, every tool dispatch, and every embedding request.
 
 A backend constructor passes one observer to every `LLM` and `EmbeddingModel` it creates.
-Each `LLM` passes it to its bindings, their streams, and each `ToolManager` that `bind` builds from a tool sequence.
+Each configured model shares its observer with streams and each `ToolManager` built from a tool sequence.
 `langchaint.tracing.OtelObserver` implements this protocol with OpenTelemetry spans.
 """
 

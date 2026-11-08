@@ -1,24 +1,27 @@
 # Migrating from LangChain
 
 langchaint provides generation, embeddings, tools, retries, and OTel tracing.
-It provides no chains, middleware stack, or agent loop.
+The application owns the code between model calls: prompt construction, conversation history, tool loops, middleware, and fallbacks.
+Start by replacing a model call, then move the surrounding orchestration into application functions.
 
-## Basic construction
+## Construct and call a model
 
-Construct `OpenAI`, select a model, bind configuration, then generate.
+Construct a backend, configure a model, then generate.
+Pass system instructions through `system_prompt` and conversation messages through `generate_one`.
 
 ```python
 from langchaint import UserMessage
 from langchaint.openai import OpenAI
 
 openai = OpenAI()
-llm = openai.llm("gpt-5.6-terra")
-bound = llm.bind()
-generation = await bound.generate_one([UserMessage(content="Hello")])
+llm = openai.llm("gpt-5.6-terra", system_prompt="Answer briefly.")
+generation = await llm.generate_one([UserMessage(content="Hello")])
 print(generation.output)
 ```
 
-Every model from `openai` uses `openai.client` and one `SharedBackoff`.
+Reuse `openai` when creating models that share its client and rate-limit quota.
+Its generation and embedding models use one `SharedBackoff` to coordinate requests.
+All generation calls are asynchronous, including single calls, batches, and stream consumption.
 
 ## API map
 
@@ -26,117 +29,51 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | --- | --- |
 | `ChatOpenAI(...)` | `openai = OpenAI()` |
 | `init_chat_model(...)` | `llm = openai.llm("gpt-5.6-terra")` |
-| `model.invoke(messages)` | `await bound.generate_one(messages)` |
-| `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
-| `model.batch(inputs)` | `await bound.generate_many(inputs)` |
-| `model.stream(messages)` | `async with bound.stream_one(messages) as stream:` |
+| `model.invoke(messages)` | `await llm.generate_one(messages)` |
+| `model.ainvoke(messages)` | `await llm.generate_one(messages)` |
+| `model.batch(inputs)` | `await llm.generate_many(inputs)` |
+| `model.stream(messages)` | `async with llm.stream_one(messages) as stream:` |
 | `model.bind_tools(tools)` | `llm.bind(tools=tools)` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
-| `RunnableRetry` | `max_requests` on `bind` |
+| `RunnableRetry` | `max_requests` on `llm` |
 | `InMemoryRateLimiter` | `SharedBackoff(max_concurrent_requests=..., max_request_starts_per_second=...)` |
 | `.with_fallbacks(...)` | application `try` and `except` |
-| `set_llm_cache(...)` | provider prompt caching |
 | callbacks and LangSmith | `OpenAI(observer=OtelObserver(...))` |
-| `temperature=` | `temperature=` |
 | unmatched provider fields | `extra_body={...}` |
-| `SystemMessage` | `system_prompt=` on `bind` |
+| `SystemMessage` | `system_prompt=` on `llm` |
 | `HumanMessage` | `UserMessage` |
 | `AIMessage` | `AssistantMessage` |
 | `ToolMessage` | `ToolMessage` |
 
-langchaint provides only asynchronous generation methods.
+## Messages and output
 
-## Backend classes
-
-Each backend subpackage exports a class named for its provider.
-These constructions use cataloged model identifiers.
-
-```python
-from langchaint.anthropic import Anthropic, AnthropicBedrock
-from langchaint.cohere import CohereBedrock
-from langchaint.deepseek import DeepSeek
-from langchaint.gemini import Gemini
-from langchaint.openai import OpenAI, OpenAIBedrock
-
-openai = OpenAI()
-openai_llm = openai.llm("gpt-5.6-terra")
-
-anthropic = Anthropic()
-anthropic_llm = anthropic.llm("claude-sonnet-5")
-
-gemini = Gemini()
-gemini_llm = gemini.llm("gemini-3.6-flash")
-
-deepseek = DeepSeek()
-deepseek_llm = deepseek.llm("deepseek-v4-flash")
-
-anthropic_bedrock = AnthropicBedrock(api="mantle")
-anthropic_bedrock_llm = anthropic_bedrock.llm("anthropic.claude-sonnet-5")
-
-openai_bedrock = OpenAIBedrock(aws_region="us-east-1")
-
-cohere_bedrock = CohereBedrock(aws_region="us-east-1")
-cohere_embeddings = cohere_bedrock.embedding_model(
-    "cohere.embed-v4:0",
-    dimension=1024,
-)
-```
-
-`DeepSeek()` reads `DEEPSEEK_API_KEY` when `client` is absent.
-Uncataloged models require explicit pricing.
-`OpenAI.llm` also requires `supports_prompt_cache_options` for uncataloged models.
-`OpenAIBedrock.llm` always requires both values.
-`Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `bind`, because the Messages API requires `max_tokens`.
-
-## Bind again
-
-`LLM.bind` freezes request configuration.
-`BoundLLM.bind` returns another binding with selected fields replaced.
+`generate_one` accepts a string as shorthand for one `UserMessage`, or a sequence of `UserMessage`, `AssistantMessage`, and `ToolMessage` values.
+Keep the conversation history in the application.
+Append `generation.assistant_message` when continuing a conversation:
 
 ```python
-concise = llm.bind(
-    system_prompt="Answer in one sentence.",
-    temperature=0.2,
-    max_requests=3,
-)
-creative = concise.bind(
-    system_prompt="Write a vivid paragraph.",
-    temperature=0.8,
-)
+from langchaint import Message, UserMessage
+
+messages: list[Message] = [UserMessage(content="Name a city in Norway.")]
+generation = await llm.generate_one(messages)
+print(generation.output)
+messages.append(generation.assistant_message)
+messages.append(UserMessage(content="What is its population?"))
+generation = await llm.generate_one(messages)
 ```
 
-`BoundLLM.bind` preserves every omitted field.
+For text generation, `generation.output` contains the final text part of `generation.assistant_message`.
+`generation.commentary` contains preceding text.
+`generation.assistant_message` preserves the ordered content, including reasoning and tool calls, for replay.
+Reconstructing an assistant message from `output` loses that content.
 
-Use `AllowedToolsChoice` to change `tool_choice` without changing `tools`:
+See [`12_messages.py`](12_messages.py) for multimodal messages and message serialization.
 
-```python
-from langchaint import AllowedToolsChoice
+## Structured output and tools
 
-bound = llm.bind(tools=[search, final_answer])
-search_only = bound.bind(
-    tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,))
-)
-```
-
-`tool_names` must be nonempty and name entries supplied through `tools`.
-`mode="auto"` permits text or a named tool call, while `mode="required"` requires a named tool call.
-`OpenAIResponsesAdapter`, `OpenAIChatCompletionsAdapter`, and `GeminiGenerateContentAdapter` support `AllowedToolsChoice`.
-`AnthropicMessagesAdapter` raises `TypeError` during binding because it does not support `AllowedToolsChoice`.
-
-See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `tool_choice="required"`, and `SpecificToolChoice` with unchanged `tools`.
-
-## Generation types
-
-| Binding | `generate_one` return type |
-| --- | --- |
-| text, without tools | `PlainGeneration[str]` |
-| text, with `ToolManager` | `PlainGeneration[str] \| ToolCallGeneration` |
-| structured, without tools | `PlainGeneration[Model]` |
-| structured, with `ToolManager` | `PlainGeneration[Model] \| ToolCallGeneration` |
-
-`Generation[str]` and `Generation[Model]` name the unions `generate_one` returns.
-A binding with `ToolManager` returns `ToolCallGeneration` whenever the kept assistant message has tool calls.
+Use `bind` to return a new configured model while preserving omitted settings.
+Pass a pydantic model through `response_format` to validate structured output:
 
 ```python
 from pydantic import BaseModel
@@ -146,51 +83,64 @@ class Answer(BaseModel):
     text: str
 
 
-generation = await llm.bind(
-    response_format=Answer,
-    tools=tools,
-).generate_one("Answer the question")
-
-match generation.kind:
-    case "tool_call":
-        print(generation.tool_calls)
-    case "plain":
-        print(generation.output.text)
+structured = llm.bind(response_format=Answer)
+generation = await structured.generate_one("Name a city in Norway.")
+print(generation.output.text)
 ```
 
-A text `PlainGeneration.output` is the final text part of the assistant message.
-Append `assistant_message`, never `output`, when continuing a conversation.
+Without application tools, `generate_one` returns `PlainGeneration`, whose `output` is text or the validated model.
+With application tools, it can also return `ToolCallGeneration`, which has `tool_calls` and no `output`.
+Check `generation.kind` before reading the result.
 
-See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.
-See [`10_tool_forms_and_approval.py`](10_tool_forms_and_approval.py) for advanced tool forms.
+With the application's tool definitions stored in `tools`, one step of an application tool loop is:
 
-## `provider_executed_tools`
+```python
+bound = llm.bind(tools=tools)
+generation = await bound.generate_one(messages)
+match generation.kind:
+    case "tool_call":
+        messages.append(generation.assistant_message)
+        outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
+        messages.extend(outcome.tool_message for outcome in outcomes)
+    case "plain":
+        print(generation.output)
+```
 
-`provider_executed_tools` accepts provider-shaped tool definitions.
-The provider executes these tools.
-Do not pass their calls to `ToolManager`.
+After dispatch, call the model again with the updated messages.
+The application decides when to stop, request approval, or route to another model.
+Tools return data; the application uses that data to choose its next action.
 
-`provider_executed_tools` response items appear as `RawPart` values.
-`Usage.provider_executed_tool_cost_in_usd` contributes to `Usage.cost_in_usd`.
-An unusable required rate raises during `bind`.
+See [`02_tool_loop.py`](02_tool_loop.py) for a complete loop with a turn limit and structured output.
+See [`06_required_choice.py`](06_required_choice.py) for tool selection and [`10_tool_forms_and_approval.py`](10_tool_forms_and_approval.py) for tool definitions and approval.
+Provider-executed tools use `provider_executed_tools` and run at the provider; they are separate from application tool dispatch.
+See [`11_provider_executed_tools.py`](11_provider_executed_tools.py) for an example.
 
-See [`11_provider_executed_tools.py`](11_provider_executed_tools.py) for a complete request.
+## Streaming
+
+Consume a stream inside `async with`, then call `final()` to obtain the assembled generation:
+
+```python
+async with llm.stream_one(messages) as stream:
+    async for item in stream:
+        if isinstance(item, str):
+            print(item, end="", flush=True)
+    generation = await stream.final()
+```
+
+The stream yields text, reasoning deltas, tool-call deltas, and completed tool calls.
+Use the assembled generation for validated output, usage, and conversation replay.
+langchaint can retry transient failures while opening a stream.
+A request failure after the stream opens raises `GenerationError` without retrying.
+
+See [`03_streaming.py`](03_streaming.py) for handling every stream item.
 
 ## Embeddings
 
-`EmbeddingModel.embed` returns `Embeddings`.
-Its `output` holds one normalized `float32` row per input, in input order.
-Its `usage` holds the billed input tokens and their estimated cost.
-A failed request batch raises `EmbeddingError`, whose `usage` keeps the billing of requests that returned.
+Create an embedding model from the backend and await `embed` for both documents and queries.
+Select the purpose with `task`:
 
 ```python
-from langchaint.openai import OpenAI
-
-openai = OpenAI()
-embedding_model = openai.embedding_model(
-    "text-embedding-3-small",
-    dimension=512,
-)
+embedding_model = openai.embedding_model("text-embedding-3-small", dimension=512)
 documents = await embedding_model.embed(
     ["Oslo is in Norway.", "Tokyo is in Japan."],
     task="retrieval_document",
@@ -200,84 +150,28 @@ query = await embedding_model.embed(
     task="retrieval_query",
 )
 print(documents.output.shape, query.output.shape)
-print(documents.usage.cost_in_usd + query.usage.cost_in_usd)
 ```
 
-`OpenAI.llm()` returns `LLM`.
-`OpenAI.embedding_model()` returns `EmbeddingModel`.
-Both use `openai.client` and one `SharedBackoff`.
-See [`09_embeddings.py`](09_embeddings.py) for both embedding tasks.
+`output` is a normalized `float32` matrix with one row per input, in input order.
+`usage` reports billed input tokens and their estimated cost.
+See [`09_embeddings.py`](09_embeddings.py) for retrieval using these matrices.
 
-## Prompt caching
+## Retries, batches, and fallbacks
 
-`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` when the argument is `None`.
-Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
-
-`automatic_cache_breakpoints` does not change which parts with `cache_breakpoint=True` send a cache breakpoint.
-
-```python
-from langchaint import TextPart
-
-bound = llm.bind(
-    system_prompt=[
-        TextPart(
-            text="Stable instructions and reference material.",
-            cache_breakpoint=True,
-        ),
-        TextPart(text="Request-specific context."),
-    ],
-    automatic_cache_breakpoints=False,
-)
-```
-
-Provider minimum-token requirements still apply.
-Inspect `Usage.input_tokens_cache_read` and `Usage.input_tokens_cache_write`.
-
-Use `warm_cache=True` for batches sharing a reusable prefix.
-The first item completes before remaining items start.
-
-```python
-outcomes = await bound.generate_many(
-    ["First question", "Second question", "Third question"],
-    warm_cache=True,
-)
-```
-
-See [`05_prompt_caching.py`](05_prompt_caching.py) for measured cache counters.
-
-## Unmatched provider fields
-
-`LLM.bind` accepts `max_completion_tokens`, `reasoning_level`, and `temperature` directly.
-Use `extra_body` for other provider wire fields.
-
-```python
-bound = llm.bind(
-    extra_body={"top_p": 0.9},
-)
-```
-
-OpenAI SDK 2.53.0 accepts `top_p` on Responses requests.
-An adapter rejects `extra_body` keys that it already populates.
-
-## Retries, batches, and errors
-
-`max_requests` counts requests, including the first request.
-Set `max_requests=1` to disable retries.
+Set `max_requests` to limit requests per input, including the first request.
+Use `max_requests=1` to disable retries.
+Use `SharedBackoff` to coordinate concurrency and request-start rate for models sharing a rate-limit quota:
 
 ```python
 from langchaint import SharedBackoff
 
-openai = OpenAI(
+primary = OpenAI(
     shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
-)
-bound = openai.llm("gpt-5.6-terra").bind(
-    max_requests=5,
-)
+).llm("gpt-5.6-terra", max_requests=5)
 ```
 
-`generate_one` raises `GenerationError` for terminal generation failures.
-`generate_many` raises `GenerationError` after cancelling and awaiting unfinished inputs.
-`generate_many_records` returns each generation failure's record at its input index.
+`generate_one` raises `GenerationError` when generation fails.
+With `fallback` set to another configured model, choose when to call it in application code:
 
 ```python
 from langchaint import GenerationError
@@ -286,20 +180,33 @@ try:
     generation = await primary.generate_one(messages, timeout_seconds=30)
 except GenerationError:
     generation = await fallback.generate_one(messages, timeout_seconds=30)
-
-outcomes = await primary.generate_many_records(inputs)
-for index, outcome in enumerate(outcomes):
-    if outcome.kind != "plain":
-        outcomes[index] = (await fallback.generate_one(inputs[index])).record
 ```
 
-`GenerationError.usage` includes paid usage across settled requests.
-`max_working_seconds_per_input` excludes admission waits.
-Use `timeout_seconds` for a `generate_one` wall-clock deadline.
+`GenerationError.usage` includes billing across the input's settled requests.
+Use it when accounting for failed calls as well as successful generations.
+`timeout_seconds` bounds the entire `generate_one` call, including admission and retry waits.
 
-See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure handling.
+Choose the batch method according to how the application handles failure.
+`generate_many` returns generations in input order; a generation failure cancels and awaits unfinished inputs before raising `GenerationError`.
+`generate_many_records` returns an outcome record at each input index, including generation failures, so the application can handle each failure separately:
 
-## Middleware becomes application code
+```python
+inputs = ["Define entropy.", "Define enthalpy."]
+outcomes = await primary.generate_many_records(inputs)
+for index, outcome in enumerate(outcomes):
+    if outcome.kind == "plain":
+        print(outcome.output)
+    else:
+        print(f"input {index} failed: {outcome.error_text}")
+```
+
+Here `primary` has no application tools, so each record is a plain generation or a generation failure.
+For batch deadlines, `max_working_seconds_per_input` excludes admission waits.
+See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for batch fallback and deadline handling.
+
+## Middleware and application orchestration
+
+Move middleware behavior to the application function that owns each call or tool dispatch.
 
 | LangChain hook | Application location |
 | --- | --- |
@@ -311,12 +218,9 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | concurrent tool calls | `ToolManager.dispatch_many(tool_calls)` |
 | human approval | `dispatch_many(..., precomputed=...)` |
 | message trimming | edit `messages` before the next call |
-| structured output | `bind(response_format=Model, ...)` |
 | usage tracking | read `generation.usage` |
 
-The application owns routing between `generate_one` calls.
-A tool returns data instead of a control-flow instruction.
-
-See [`03_streaming.py`](03_streaming.py) for provider response streaming.
-See [`08_tracing.py`](08_tracing.py) for OTel tracing.
-See [`full_app`](full_app) for an application event stream.
+Keep prompt templates, routing, and response caching in application code.
+For provider prompt caching, see [`05_prompt_caching.py`](05_prompt_caching.py).
+For OTel tracing, attach an observer to the backend as shown in [`08_tracing.py`](08_tracing.py).
+See [`full_app`](full_app) for an application that combines a tool loop with progress events.

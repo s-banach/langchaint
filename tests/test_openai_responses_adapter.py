@@ -42,7 +42,6 @@ from openai.types.responses.response_usage import InputTokensDetails, OutputToke
 from pydantic import BaseModel
 
 from langchaint import (
-    LLM,
     AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
@@ -59,6 +58,7 @@ from langchaint import (
     ToolChoice,
     ToolMessage,
     UserMessage,
+    llm_from_adapter,
 )
 from langchaint.adapter import (
     Adapter,
@@ -189,7 +189,6 @@ def _usage_with_cache() -> ResponseUsage:
 
 
 _SERVER_ERROR = ResponseError(code="server_error", message="The server had an error.")
-"""A failed response's error whose code the disposition table calls transient."""
 
 
 def _response(
@@ -799,7 +798,7 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
 
 
 def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
-    llm = LLM(_adapter(supports_prompt_cache_options=False))
+    llm = llm_from_adapter(_adapter(supports_prompt_cache_options=False))
     with pytest.raises(ValueError, match="model 'm'"):
         _ = llm.bind(automatic_cache_breakpoints=False)
 

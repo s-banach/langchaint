@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 
 class BedrockCatalogResolution(NamedTuple):
-    """The catalog identifier a Bedrock identifier resolves through."""
+    """A Bedrock model identifier resolved for catalog lookup."""
 
     catalog_id: str
     cross_region_multiplier: float | None

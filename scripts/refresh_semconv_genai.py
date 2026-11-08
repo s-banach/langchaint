@@ -218,7 +218,7 @@ def _destination_path(staged_path: pathlib.Path) -> pathlib.Path:
 
 
 def _replace_committed_files(staged_directory: pathlib.Path) -> None:
-    """Replace committed data files, and SOURCE.md only when a data file changed.
+    """Replace the committed data files and SOURCE.md only when a data file is missing or differs.
 
     Upstream commits that touch nothing langchaint consumes still move the resolved SHA.
     Leaving SOURCE.md untouched then keeps the recorded SHA at the commit that last changed the committed data.

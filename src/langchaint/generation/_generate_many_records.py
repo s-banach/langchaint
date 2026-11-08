@@ -1,4 +1,4 @@
-"""Resume file reading and writing for `BoundLLM.generate_many_records`.
+"""Resume file reading and writing for `LLM.generate_many_records`.
 
 A resume file holds JSON Lines.
 The first line is a `_ResumeHeader`.
@@ -43,11 +43,6 @@ class _ResumeHeader(CheckedCopyModel):
     model_config = _RESUME_MODEL_CONFIG
 
     format_version: Literal[8] = 8
-    """Restoring a file of this version gives the records that rerunning its binding and inputs would give.
-
-    That equality assumes the provider answers the same way both times.
-    Any change to the records written for the same binding and inputs requires a new version.
-    """
     config_fingerprint: str
     input_ids: tuple[str, ...] | None
     input_fingerprints: tuple[str, ...]
@@ -205,9 +200,9 @@ def _reused_record_by_input_index[OutputT](
     header: _ResumeHeader,
     record_line_type: type[_RecordLine[OutputT]],
 ) -> dict[int, GenerationOutcomeRecord[OutputT]]:
-    """Return each record that the input at its current index in `header` reuses.
+    """Return reusable saved records keyed by their current input index.
 
-    Bytes after the last newline are ignored, because only an append cut off by a process failure leaves them.
+    Bytes after the last newline are ignored.
     Record lines are validated only when some current input matches a stored input.
 
     Raises:

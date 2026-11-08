@@ -30,7 +30,7 @@ from langchaint import (
 )
 from langchaint.tracing import OtelObserver
 from tests.full_app_support.scenarios import build_scripts
-from tests.full_app_support.scripted_adapter import Turn, build_llm, call
+from tests.full_app_support.scripted_adapter import ScriptedAdapter, Turn, build_llm, call
 from tests.helpers import ValidatingSpanExporter, run_with_timeout
 
 
@@ -81,7 +81,13 @@ def _build_app(
         scripts[configs["research_climate"].system_prompt][1].started = climate_started
         scripts[configs["research_energy"].system_prompt][1].started = energy_started
     observer = OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
-    return App(llm=build_llm(scripts, observer=observer), configs=configs, on_event=on_event)
+    return App(
+        llm=build_llm(
+            scripts, system_prompt=configs["research_climate"].system_prompt, observer=observer
+        ),
+        configs=configs,
+        on_event=on_event,
+    )
 
 
 async def _expire_after_second_requests_start(
@@ -241,7 +247,42 @@ def test_tool_call_budget_uses_call_positions() -> None:
         True,
     ]
     assert climate.tool_calls_made == 1
-    assert climate.bound.binding.tool_choice == "none"
+
+
+@pytest.mark.parametrize("max_tool_calls", [0, 1])
+def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_calls: int) -> None:
+    config = AgentConfig(
+        name="limited",
+        system_prompt="Search then answer.",
+        automatic_cache_breakpoints=False,
+        max_tool_calls=max_tool_calls,
+        generate_one_timeout_seconds=0.1,
+    )
+    turns = [Turn(text="late", delay_seconds=1.0), Turn(text="done")]
+    if max_tool_calls:
+        turns.insert(0, Turn(tool_calls=(call("search", '{"query":"q"}'),)))
+    llm = build_llm(
+        {config.system_prompt: turns},
+        system_prompt=config.system_prompt,
+    )
+    run = ReActAgent(
+        agent_path="root/limited",
+        config=config,
+        llm=llm,
+        tools=[search_tool],
+        prompt="Find the answer.",
+        registry={},
+        on_event=_discard,
+    )
+    tool_manager = run.llm.tool_manager
+    assert run_with_timeout(run.run()) == "done"
+    assert run.llm.tool_manager is tool_manager
+    assert run.tool_calls_made == max_tool_calls
+    assert isinstance(llm.adapter, ScriptedAdapter)
+    requests = llm.adapter.scripts[config.system_prompt].requests
+    assert [request.tool_choice for request in requests] == (
+        ["auto", "none", "none"] if max_tool_calls else ["none", "none"]
+    )
 
 
 def test_duplicate_tool_call_ids_are_rejected() -> None:
@@ -256,7 +297,10 @@ def test_duplicate_tool_call_ids_are_rejected() -> None:
     run = ReActAgent(
         agent_path="root/duplicate",
         config=config,
-        llm=build_llm({config.system_prompt: [Turn(tool_calls=tool_calls)]}),
+        llm=build_llm(
+            {config.system_prompt: [Turn(tool_calls=tool_calls)]},
+            system_prompt=config.system_prompt,
+        ),
         tools=[search_tool],
         prompt="Search twice.",
         registry={},
@@ -275,7 +319,10 @@ def test_delegate_propagates_a_tool_progress_callback_defect() -> None:
 
     registry: dict[str, AgentRun] = {}
     specialist_prompt = "Answer the question."
-    llm = build_llm({specialist_prompt: [Turn(tool_calls=(call("search", '{"query": "q"}'),))]})
+    llm = build_llm(
+        {specialist_prompt: [Turn(tool_calls=(call("search", '{"query": "q"}'),))]},
+        system_prompt=specialist_prompt,
+    )
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
@@ -305,11 +352,19 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
     run = ReActAgent(
         agent_path="root/defect",
         config=config,
-        llm=build_llm({
-            config.system_prompt: [
-                Turn(tool_calls=(call("search", '{"query":"q"}'), call("broken", '{"query":"q"}')))
-            ]
-        }),
+        llm=build_llm(
+            {
+                config.system_prompt: [
+                    Turn(
+                        tool_calls=(
+                            call("search", '{"query":"q"}'),
+                            call("broken", '{"query":"q"}'),
+                        )
+                    )
+                ]
+            },
+            system_prompt=config.system_prompt,
+        ),
         tools=[search_tool, broken],
         prompt="Search.",
         registry={},
@@ -359,7 +414,10 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
     registry: dict[str, AgentRun] = {}
     # The shared script provides one turn to each spawn.
     specialist_prompt = "Answer the question."
-    llm = build_llm({specialist_prompt: [Turn(text="first"), Turn(text="second")]})
+    llm = build_llm(
+        {specialist_prompt: [Turn(text="first"), Turn(text="second")]},
+        system_prompt=specialist_prompt,
+    )
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
@@ -388,22 +446,23 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
 
 
 def test_custom_agent_runs_prescribed_steps_with_shared_lifecycle_and_accounting() -> None:
-    llm = build_llm({
-        "Plan the work.": [Turn(text="Research climate and energy.")],
-        "Write the answer.": [Turn(text="Climate and energy findings.")],
-    })
+    llm = build_llm(
+        {
+            "Plan the work.": [Turn(text="Research climate and energy.")],
+            "Write the answer.": [Turn(text="Climate and energy findings.")],
+        },
+        system_prompt="Plan the work.",
+    )
 
     class StructuredAgent(AgentRun):
         @override
         async def _execute(self) -> str:
-            plan = await llm.bind(system_prompt="Plan the work.").generate_one([
-                UserMessage(content="Prepare a report.")
-            ])
+            plan = await llm.generate_one([UserMessage(content="Prepare a report.")])
             self.turn_log.append(GenerationEntry(turn_number=1, outcome=plan))
             current_gui_emitter().emit_tool_progress(tool_name="plan", message=plan.output)
-            answer = await llm.bind(system_prompt="Write the answer.").generate_one([
-                UserMessage(content=plan.output)
-            ])
+            answer = await llm.bind(
+                system_prompt="Write the answer.",
+            ).generate_one([UserMessage(content=plan.output)])
             self.turn_log.append(GenerationEntry(turn_number=2, outcome=answer))
             return answer.output
 

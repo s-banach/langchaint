@@ -17,20 +17,18 @@ class Sentiment(BaseModel):
 
 
 async def basics() -> None:
-    """Demonstrate text generation, structured generation, `BoundLLM.bind()`, and batch generation.
+    """Demonstrate text generation, structured generation, `OpenAILLM.bind()`, and batch generation.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: A `generate_one` call fails.
     """
     openai = OpenAI()
-    llm = openai.llm("gpt-5.6-terra")
-
-    assistant = llm.bind(system_prompt="Be terse.")
+    assistant = openai.llm("gpt-5.6-terra", system_prompt="Be terse.")
     colors = await assistant.generate_one("Name three primary colors.")
     print(colors.output)
 
-    classifier = llm.bind(response_format=Sentiment)
+    classifier = openai.llm("gpt-5.6-terra", response_format=Sentiment)
     classification = await classifier.generate_one("Best day I have had in months.")
     print(f"{classification.output.label}: {classification.output.confidence}")
 

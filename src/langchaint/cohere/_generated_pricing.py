@@ -42,5 +42,5 @@ COHERE_BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {
 }
 """Input-token rate multiplier of a Cohere model for each Bedrock cross-region prefix.
 
-It is NaN for a prefix that LiteLLM prices for no Cohere model.
+The multiplier is NaN when no prefixed entry for a cataloged Cohere embedding model yields an input-token rate ratio.
 """

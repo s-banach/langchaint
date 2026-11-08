@@ -58,7 +58,7 @@ jobs:
         run: |
           if [ -z "$(git status --porcelain --untracked-files=all -- $VENDORED_PATHS)" ]; then
             echo "moved=false" >> "$GITHUB_OUTPUT"
-            echo "The vendored data matches upstream; nothing to do."
+            echo "The vendored data matches upstream."
           else
             echo "moved=true" >> "$GITHUB_OUTPUT"
             git diff --stat -- $VENDORED_PATHS

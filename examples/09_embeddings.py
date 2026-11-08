@@ -16,7 +16,7 @@ async def retrieve_and_summarize() -> PlainGeneration[str]:
     """
     openai = OpenAI()
     embedding_model = openai.embedding_model("text-embedding-3-small", dimension=256)
-    summarizer = openai.llm("gpt-5.6-terra").bind()
+    summarizer = openai.llm("gpt-5.6-terra")
 
     documents = [
         "Whales are mammals that breathe air.",

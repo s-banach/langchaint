@@ -42,13 +42,13 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalAn
         GenerationError: Generation fails.
         RuntimeError: No turn produced a valid capture.
     """
-    openai = OpenAI()
     final_answer_tool = CaptureTool(
         name="final_answer",
         description="Submit your final structured answer once.",
         args_model=FinalAnswer,
     )
-    bound = openai.llm("gpt-5.6-terra").bind(
+    bound = OpenAI().llm(
+        "gpt-5.6-terra",
         system_prompt="Research the question, then submit final_answer.",
         tools=[search, final_answer_tool],
         tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,)),

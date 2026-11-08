@@ -109,9 +109,9 @@ class _LoadTimeImports(NamedTuple):
     """The imports of one module that the load-time check follows."""
 
     at_load: set[str]
-    """Modules that the import statements run at load name."""
+    """Modules named by import statements that run when the module loads."""
     from_at_load: set[str]
-    """Modules that the `from module import name` statements run at load name."""
+    """Modules named by `from module import name` statements that run when the module loads."""
     in_getattr: set[str]
     """Modules that the module-level `__getattr__` imports."""
 
@@ -161,7 +161,7 @@ def _load_time_violation(
     exclusions: Iterable[LoadTimeExclusion], load_time_imports: Mapping[str, _LoadTimeImports]
 ) -> str | None:
     """Return the diagnostic for the first violated exclusion, or `None` when every exclusion holds."""
-    # `from source import name` runs `source.__getattr__` for a name that `source` does not define.
+    # `from source import name` can call `source.__getattr__` when `source` does not define `name`.
     # The check cannot tell which names those are, so it counts every import in that `__getattr__`.
     load_time_targets = {
         module: imports.at_load.union(

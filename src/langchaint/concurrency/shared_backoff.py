@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("langchaint.shared_backoff")
 
 _NEVER = float("-inf")
-"""The moment before every other: the initial pause end and the initial admission time."""
+"""An initial timestamp earlier than every finite clock reading."""
 
 
 def _random_up_to(ceiling: float) -> float:
@@ -167,30 +167,24 @@ class SharedBackoff:
         self._seconds_between_request_starts = 1.0 / self.max_request_starts_per_second
         if not math.isfinite(self._seconds_between_request_starts):
             raise ValueError(
-                "1 / max_request_starts_per_second must be finite, "
-                f"got {self._seconds_between_request_starts!r} from "
-                f"{max_request_starts_per_second!r}"
+                f"1 / max_request_starts_per_second must be finite, got {self._seconds_between_request_starts!r} from {max_request_starts_per_second!r}"
             )
         if self.wait_multiplier <= 1.0:
             raise ValueError(f"wait_multiplier must be greater than 1, got {wait_multiplier!r}")
         if self.max_wait_seconds < self.min_wait_ceiling_seconds:
             raise ValueError(
-                "max_wait_seconds must be at least min_wait_ceiling_seconds, "
-                f"got {max_wait_seconds!r} < {min_wait_ceiling_seconds!r}"
+                f"max_wait_seconds must be at least min_wait_ceiling_seconds, got {max_wait_seconds!r} < {min_wait_ceiling_seconds!r}"
             )
         ceiling_ratio = self.max_wait_seconds / self.min_wait_ceiling_seconds
         if not math.isfinite(ceiling_ratio):
             raise ValueError(
-                "max_wait_seconds / min_wait_ceiling_seconds must be finite, "
-                f"got {ceiling_ratio!r} from {max_wait_seconds!r} / "
-                f"{min_wait_ceiling_seconds!r}"
+                f"max_wait_seconds / min_wait_ceiling_seconds must be finite, got {ceiling_ratio!r} from {max_wait_seconds!r} / {min_wait_ceiling_seconds!r}"
             )
         if max_concurrent_requests is not None and (
             isinstance(max_concurrent_requests, bool) or max_concurrent_requests < 1
         ):
             raise ValueError(
-                f"max_concurrent_requests must be None or a positive int, "
-                f"got {max_concurrent_requests!r}"
+                f"max_concurrent_requests must be None or a positive int, got {max_concurrent_requests!r}"
             )
         self.max_concurrent_requests: Final[int | None] = max_concurrent_requests
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
@@ -219,7 +213,7 @@ class SharedBackoff:
         self._admit_timer: asyncio.TimerHandle | None = None
         """Wakes _admit_waiting when the front of the queue becomes admissible."""
         self._clock: Callable[[], float] = time.monotonic
-        """The forward-only clock every deadline reads."""
+        """The monotonic clock used for admission and backoff timestamps."""
         self.event_counts: Counter[str] = Counter()
         """How often each noteworthy entry or exit event occurred, by tag.
 
@@ -272,7 +266,7 @@ class SharedBackoff:
                 try:
                     self._queue.remove(granted)
                 except ValueError:
-                    pass  # _admit_waiting already dropped this spent entry from the front
+                    pass  # _admit_waiting already removed this completed future from the queue
             raise
 
     def _admit_waiting(self) -> None:
@@ -282,7 +276,7 @@ class SharedBackoff:
         No timer is armed while every permit is held because _release_permit calls this method.
         Granting takes a permit and records the moment in _last_admission_at.
         A queued burst starts at max_request_starts_per_second.
-        Spent entries (cancelled waiters) at the front are dropped, never granted.
+        Completed futures at the front of the queue are removed before admission.
         """
         while self._queue:
             if self._queue[0].done():
@@ -389,8 +383,7 @@ class SharedBackoff:
             chosen_wait = self._chosen_wait(request_failure)
             self._pause_until = max(self._pause_until, now + chosen_wait)
             _logger.info(
-                "pause extended by a report with retry_after_seconds=%s; %.3f seconds remain; "
-                "%d requests waiting",
+                "report with retry_after_seconds=%s received during pause; %.3f seconds remain; %d requests waiting",
                 request_failure.retry_after_seconds,
                 self._pause_until - now,
                 len(self._queue),
@@ -403,8 +396,7 @@ class SharedBackoff:
         self._pause_started_at = now
         self._pause_until = now + chosen_wait
         _logger.info(
-            "pause of %.3f seconds started by a report with retry_after_seconds=%s; "
-            "ceiling %.3f -> %.3f; %d requests waiting",
+            "pause of %.3f seconds started by a report with retry_after_seconds=%s; ceiling %.3f -> %.3f; %d requests waiting",
             chosen_wait,
             request_failure.retry_after_seconds,
             ceiling_before,

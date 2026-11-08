@@ -1,7 +1,6 @@
 """Consume every `StreamItem` variant.
 
-Streamed text can contain commentary and final output.
-The completed generation separates them: `output` contains the final text part or validated caller model.
+A completed generation's `output` contains the final text part or validated caller model.
 `commentary` contains preceding plain text joined with one newline, or `None` when absent.
 Application tool calls give a `ToolCallGeneration`, which has no `output`, and make every text part commentary.
 Replay `assistant_message` to preserve ordered content, including reasoning.
@@ -9,12 +8,7 @@ Replay `assistant_message` to preserve ordered content, including reasoning.
 
 from pydantic import BaseModel
 
-from langchaint import (
-    Generation,
-    SpecificToolChoice,
-    StreamItem,
-    tool,
-)
+from langchaint import Generation, SpecificToolChoice, StreamItem, tool
 from langchaint.openai import OpenAI
 
 
@@ -51,8 +45,9 @@ async def stream_tool_call() -> Generation[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: Generation fails.
     """
-    openai = OpenAI()
-    bound = openai.llm("gpt-5.6-terra", reasoning_summary="auto").bind(
+    bound = OpenAI().llm(
+        "gpt-5.6-terra",
+        reasoning_summary="auto",
         tools=[get_weather],
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
     )

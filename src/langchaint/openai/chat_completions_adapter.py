@@ -99,7 +99,7 @@ _AUDIO_FORMAT_BY_MEDIA_TYPE: Mapping[str, Literal["wav", "mp3"]] = {
 
 @dataclass(frozen=True, kw_only=True)
 class _OpenAIChatCompletionsPrecomputedFields:
-    """The typed request fields one binding precomputes.
+    """Request fields precomputed from a binding.
 
     Fields set to the SDK's omit sentinel leave the provider default in place.
     Passing them as explicit keywords keeps the SDK's overload resolution intact.
@@ -199,8 +199,7 @@ def _image_part_param(
 
 def _text_only_tool_message_error(part: ContentPart) -> _RejectedMessagesError:
     return _RejectedMessagesError(
-        f"OpenAIChatCompletionsAdapter cannot send {type(part).__name__} inside "
-        "ToolMessage.content: the tool message param's content is text-only"
+        f"OpenAIChatCompletionsAdapter cannot send {type(part).__name__} inside ToolMessage.content: the tool message param's content is text-only"
     )
 
 
@@ -237,9 +236,7 @@ def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
                 audio_format = _AUDIO_FORMAT_BY_MEDIA_TYPE.get(part.media_type)
                 if audio_format is None:
                     raise _RejectedMessagesError(
-                        "OpenAIChatCompletionsAdapter cannot send AudioPart inside "
-                        f"UserMessage.content: AudioPart.media_type must be 'audio/wav' or "
-                        f"'audio/mpeg', not {part.media_type!r}"
+                        f"OpenAIChatCompletionsAdapter cannot send AudioPart inside UserMessage.content: AudioPart.media_type must be 'audio/wav' or 'audio/mpeg', not {part.media_type!r}"
                     )
                 wire_audio: ChatCompletionContentPartInputAudioParam = {
                     "type": "input_audio",
@@ -311,8 +308,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
                 })
             case "raw":
                 raise _RejectedMessagesError(
-                    "RawPart.raw has no Chat Completions wire form; "
-                    "rebuild the assistant message without it"
+                    "RawPart.raw has no Chat Completions wire form; rebuild the assistant message without it"
                 )
     if texts:
         param["content"] = "".join(texts)
@@ -383,9 +379,8 @@ def _wire_function_definition(tool_schema: ToolSchema) -> FunctionDefinition:
 
 
 def _as_chat_completion(raw: BaseModel) -> ChatCompletion:
-    """Narrow a raw response to the SDK response this adapter produces.
+    """`BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
 
-    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
     This adapter's stream produces every valid value.
 
     Raises:
@@ -452,7 +447,7 @@ def _cannot_continue(choice: Choice, stop_reason: StopReason) -> str | None:
 
 
 def input_tokens_cache_read_from_usage_openai(usage: CompletionUsage) -> int:
-    """Read the cache-read counter openai reports: prompt_tokens_details.cached_tokens, 0 absent.
+    """Return `prompt_tokens_details.cached_tokens`, or 0 when the details or counter are absent.
 
     This is the default `OpenAIChatCompletionsAdapter.input_tokens_cache_read_from_usage`.
     Providers with extra usage fields supply another reader.
@@ -595,7 +590,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         }
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIChatCompletionsPrecomputedFields:
-        """Precompute the typed request fields the binding determines.
+        """Precompute request fields from the binding.
 
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
@@ -621,8 +616,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             )
         if binding.extra_body is not None and binding.extra_body.get("n") not in (None, 1):
             raise ValueError(
-                "extra_body key 'n' must be 1, None, or absent, "
-                "because OpenAIChatCompletionsAdapter reads one choice per response. "
+                "extra_body key 'n' must be 1, None, or absent, because OpenAIChatCompletionsAdapter reads one choice per response. "
                 "Pass the input once per choice."
             )
         reject_extra_body_keys_the_adapter_populates(
@@ -732,7 +726,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
         """Whether an Azure annotation chunk reported `finish_reason="content_filter"`."""
 
     async def _chunks(self) -> AsyncIterator[ChatCompletionChunk]:
-        """Iterate the SDK stream, rewrapping its mid-stream error raise for openai_request_failure.
+        """Convert generic SDK mid-stream `APIError` exceptions to `APIStatusError` for `openai_request_failure`.
 
         Yields:
             Every chunk whose `object` is `chat.completion.chunk`.
@@ -780,8 +774,8 @@ class _OpenAIChatCompletionsStream(AdapterStream):
             Stream items. SDK events that langchaint does not model are dropped.
 
         Raises:
-            openai.APIStatusError: _chunks rewrapped the SDK's mid-stream error raise.
-            StreamProtocolError: The SDK rejects a tool-call index or the stream ends without `finish_reason`.
+            openai.APIStatusError: The SDK raised a generic `APIError` while reading the stream.
+            StreamProtocolError: The SDK rejects a stream index or the stream ends without `finish_reason`.
         """
         finish_reason_seen = False
         pending_args: dict[int, str] = {}
@@ -793,8 +787,7 @@ class _OpenAIChatCompletionsStream(AdapterStream):
                 events = self._state.handle_chunk(chunk)
             except IndexError as defect:
                 raise StreamProtocolError(
-                    "openai sent a tool-call fragment whose index does not follow its "
-                    "predecessors, which the SDK's stream state cannot place"
+                    "openai sent a stream fragment with an index the SDK stream state cannot place"
                 ) from defect
             self._chunk_received = True
             reasoning_delta = (

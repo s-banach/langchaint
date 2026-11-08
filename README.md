@@ -8,8 +8,8 @@ Alpha: the API may change without notice.
 
 ## Why langchaint
 
-- **Consistent API.** Bind request fields once with `LLM.bind()`, then call `generate_one()`, `generate_many()`, or `stream_one()` on the resulting `BoundLLM`.
-- **Useful type annotations.** For example, `llm.bind(response_format=Answer)` types `generation.output` as `Answer`.
+- **Consistent API.** Configure a model with a provider factory, then call `generate_one()`, `generate_many()`, or `stream_one()`.
+- **Type annotations.** For example, `openai.llm(model, response_format=Answer)` types `generation.output` as `Answer`.
 - **Outcome variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
 - **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
 - **Complete billing.** `Generation` and `GenerationError` values retain provider-reported usage from every recorded request, including billed retries.
@@ -55,13 +55,10 @@ class Answer(BaseModel):
 
 
 async def main() -> None:
-    assistant = (
-        OpenAI()
-        .llm("gpt-5.6-terra")
-        .bind(
-            system_prompt="Answer clearly and concisely.",
-            response_format=Answer,
-        )
+    assistant = OpenAI().llm(
+        "gpt-5.6-terra",
+        system_prompt="Answer clearly and concisely.",
+        response_format=Answer,
     )
     generation = await assistant.generate_one("Why is the sky blue?")
 
@@ -99,7 +96,7 @@ After a transient failure local to one request, langchaint waits and retries tha
 ## Stream with an explicit lifetime
 
 ```python
-text_assistant = OpenAI().llm("gpt-5.6-terra").bind()
+text_assistant = OpenAI().llm("gpt-5.6-terra")
 
 async with text_assistant.stream_one("Explain photosynthesis.") as stream:
     async for item in stream:

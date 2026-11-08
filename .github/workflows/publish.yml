@@ -1,20 +1,26 @@
 name: Release and publish
 
 # The version in pyproject.toml is the single source of truth for a release.
-# This runs after CI succeeds on a push to main, reads that version, and publishes when it is strictly above every existing release tag under PEP 440 ordering: bumping to a higher version publishes it, an unchanged version does nothing, and a typo to a lower-but-new version is rejected rather than published out of order (PyPI itself does not enforce monotonic versions). The publish job builds the distribution, publishes it to PyPI over OIDC, then cuts the Release and its v{version} tag.
+# This workflow runs after CI succeeds for a push to main.
+# It publishes only when the version in `pyproject.toml` exceeds every valid `v*` release tag under PEP 440 version ordering.
+# It skips unchanged and lower versions.
+# The publish job builds the distribution, publishes it to PyPI over OIDC, then cuts the Release and its v{version} tag.
 # The trigger is workflow_run on CI, not push, so scripts/CI.sh runs once (in ci.yml) and publishing follows only a green CI run: a red matrix leaves conclusion != success and nothing publishes. The commit acted on is github.event.workflow_run.head_sha, the exact commit CI validated, not the main tip, which may have advanced. To recover from a run that published but failed before cutting the Release, re-run the CI run from the Actions UI; it re-emits the completion event, uv publish --check-url skips the already-uploaded files, and the missing Release is cut.
-# The event == 'push' guard restricts publishing to CI runs that were pushes to main. A workflow_run job runs with full repository permissions even when the CI it followed came from a fork pull request, so without this guard a fork PR whose CI passed could reach the publish path; the guard and branches: [main] together admit only a passing push to main.
+# A workflow started by `workflow_run` can access secrets and write tokens even when the triggering workflow could not.
+# The `event == 'push'` guard and `branches: [main]` restrict publication to successful CI runs for pushes to main.
 # Cutting the Release and publishing live in one job on purpose: a Release created by the built-in GITHUB_TOKEN does not trigger a separate release-published workflow (GitHub suppresses that to avoid recursion), so a two-workflow split would tag but never publish. Keeping the filename publish.yml also keeps the PyPI Trusted Publisher registration valid, so no PyPI reconfiguration is needed.
 # Authentication to PyPI is Trusted Publishing (OIDC): no API token is stored anywhere. Before the first run, register a pending publisher on https://pypi.org/manage/account/publishing/ with owner s-banach, repo langchaint, workflow publish.yml, and no environment (the job below declares none).
-# No approval gate is deliberate: merging the version bump to main is the deliberate release act for a solo maintainer, so a GitHub environment with a required reviewer would only gate a release against its own author.
+# Merging a version increase to main authorizes publication.
+# This workflow requires no separate approval.
 on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
 
-# One release run at a time so two version bumps cannot race into a duplicate uv publish. cancel-in-progress is false so a running publish is never interrupted mid-upload.
-# Accepted limit: with cancel-in-progress false, GitHub keeps only the newest pending run and cancels an older pending one, so if two distinct version bumps land inside one publish run's window the intermediate version is skipped and only the newest publishes. For a solo maintainer whose bumps are spaced far wider than a CI-plus-publish run this cannot arise, so serializing without a per-version queue is the cost-appropriate choice.
+# Run release workflows one at a time.
+# `cancel-in-progress: false` prevents a newer run from cancelling a running upload.
+# Accepted limit: with cancel-in-progress false, GitHub keeps only the newest pending run and cancels an older pending one, so if two distinct version bumps land inside one publish run's window the intermediate version is skipped and only the newest publishes.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -87,7 +93,8 @@ jobs:
           python-version: "3.13"
       - run: uv build
       # No token: uv detects the GitHub Actions OIDC environment and uses Trusted Publishing (the default --trusted-publishing automatic).
-      # --check-url skips files PyPI already holds, so a rerun after uv publish succeeded but the Release step failed uploads nothing and falls through to cut the missing Release, instead of erroring on the duplicate and wedging.
+      # `--check-url` skips files already uploaded to PyPI.
+      # A rerun can then create the missing GitHub Release after a successful upload.
       - run: uv publish --check-url https://pypi.org/simple/
       # The Release is cut after PyPI has the artifact; gh creates the v{version} tag at the validated commit when it does not exist yet.
       - run: gh release create "$TAG" --target "$HEAD_SHA" --title "$TAG" --generate-notes

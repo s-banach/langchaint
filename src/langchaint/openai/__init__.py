@@ -36,12 +36,14 @@ except ModuleNotFoundError as exc:
     if exc.name != "openai":
         raise
     raise ModuleNotFoundError(
-        "langchaint's openai backend requires its dependencies; install "
-        "langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
+        "langchaint's openai backend requires its dependencies; install langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
     ) from exc
 
+
+from pydantic import BaseModel
+
 from langchaint.concurrency.shared_backoff import SharedBackoff
-from langchaint.generation.llm import LLM
+from langchaint.generation.llm import UNCHANGED, Unchanged, _configure, _ConfiguredLLM
 from langchaint.openai._generated_pricing import (
     OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS,
     OPENAI_PRICING,
@@ -59,8 +61,13 @@ from langchaint.openai.shared import (
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
 )
+from langchaint.tools import ToolManager, ToolSequence
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from langchaint.adapter import ToolChoice
+    from langchaint.common.messages import TextPart
     from langchaint.embedding import EmbeddingModel
     from langchaint.generation.observer import Observer
 
@@ -76,6 +83,173 @@ _REGIONAL_PROCESSING_MULTIPLIER_BY_MODEL_ID = dict[str, float](
     OPENAI_REGIONAL_PROCESSING_MULTIPLIER.items()
 )
 """`OPENAI_REGIONAL_PROCESSING_MULTIPLIER` with `str` keys for runtime model lookup."""
+
+
+class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
+    _ConfiguredLLM[OutputT, ToolManagerT]
+):
+    """Create instances through `OpenAI.llm` to validate request settings before generation."""
+
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[NewOutputT, ToolManager]: ...
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[NewOutputT, None]: ...
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self: OpenAILLM[OutputT, ToolManagerT],
+        *,
+        response_format: type[NewOutputT],
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[NewOutputT, ToolManagerT]: ...
+    @overload
+    def bind(
+        self: OpenAILLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[OutputT, ToolManager]: ...
+    @overload
+    def bind(
+        self: OpenAILLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[OutputT, None]: ...
+    @overload
+    def bind(
+        self: OpenAILLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAILLM[OutputT, ToolManagerT]: ...
+    def bind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
+        tool_choice: ToolChoice | Unchanged = UNCHANGED,
+        parallel_tool_calls: bool | Unchanged = UNCHANGED,
+        max_completion_tokens: int | None | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_requests: int | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
+    ) -> OpenAILLM[BaseModel | str, ToolManager | None]:
+        """Return a new LLM, preserving every omitted setting.
+
+        `tools=None` removes `ToolManager`.
+        A `tools` sequence constructs `ToolManager` with this binding's observer.
+        An existing `ToolManager` retains its identity and its own observer.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `max_completion_tokens=None` omits the limit.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools only through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+        """
+        return OpenAILLM(
+            self._reconfigure(
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
 
 
 class OpenAI:
@@ -106,6 +280,54 @@ class OpenAI:
         self.client: AsyncOpenAI = client if client is not None else AsyncOpenAI()
 
     @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: OpenAIModelId,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable | None = ...,
+        supports_prompt_cache_options: bool | None = ...,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: OpenAIModelId,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable | None = ...,
+        supports_prompt_cache_options: bool | None = ...,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[OutputT, None]: ...
+
+    @overload
     def llm(
         self,
         model: OpenAIModelId,
@@ -115,7 +337,91 @@ class OpenAI:
         supports_prompt_cache_options: bool | None = ...,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIResponsesServiceTier | None = ...,
-    ) -> LLM: ...
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: OpenAIModelId,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable | None = ...,
+        supports_prompt_cache_options: bool | None = ...,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[str, None]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[OutputT, None]: ...
 
     @overload
     def llm(
@@ -127,7 +433,43 @@ class OpenAI:
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIResponsesServiceTier | None = ...,
-    ) -> LLM: ...
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: str,
+        *,
+        regional_processing: bool = ...,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAILLM[str, None]: ...
 
     def llm(
         self,
@@ -138,7 +480,19 @@ class OpenAI:
         supports_prompt_cache_options: bool | None = None,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIResponsesServiceTier | None = None,
-    ) -> LLM:
+        system_prompt: str | Sequence[TextPart] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = (),
+        response_format: type[str] | type[BaseModel] = str,
+        max_completion_tokens: int | None = None,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
+        max_requests: int = 3,
+        automatic_cache_breakpoints: bool | None = None,
+    ) -> OpenAILLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Responses API model.
 
         `model` is sent verbatim.
@@ -156,16 +510,41 @@ class OpenAI:
         `service_tier` sets the requested OpenAI service tier.
         The reported service tier selects pricing.
 
-        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options` is false.
         - A provider-executed tool's `type` is missing or unsupported.
           The adapter supports specific versions of web search and file search.
         - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
         - File search is bound and `pricing.file_search_usd_per_invocation` is `None`.
 
+        `reasoning_level` sets `reasoning.effort`.
+        `max_completion_tokens=None` omits the token limit.
+
+        `tools` accepts application tools or an existing `ToolManager`.
+        A sequence constructs a `ToolManager` with the backend's observer.
+        An existing manager retains its identity and observer.
+        `provider_executed_tools` contains provider-shaped tool definitions executed by the provider.
+
+        `response_format` selects a pydantic model for structured output, or `str` for final text.
+        A response without a text part or tool call gives `GenerationError`.
+        For text output, an empty final text part gives `""`.
+        `reasoning_level=None` uses the provider's reasoning default.
+
+        `extra_body` adds provider wire-body fields.
+        Declare application tools through `tools` so result types match executable tools.
+        `max_requests` limits the requests for one input, including retries.
+        `automatic_cache_breakpoints=None` uses the adapter default.
+
         Raises:
             ValueError: An uncataloged model lacks required pricing or caching data.
                 Also raised when the SDK client contradicts the OpenAI provider.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
         catalog_table = _PRICING_BY_MODEL_ID.get(model)
         if catalog_table is None:
@@ -198,7 +577,25 @@ class OpenAI:
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
+        return OpenAILLM(
+            _configure(
+                adapter,
+                shared_backoff=self._shared_backoff,
+                observer=self._observer,
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
 
     @overload
     def embedding_model(
@@ -260,8 +657,7 @@ class OpenAI:
             dimension = max_dimension if dimension is None else dimension
             if isinstance(dimension, bool) or not (1 <= dimension <= max_dimension):
                 raise ValueError(
-                    f"dimension for {model!r} must be an int from 1 through "
-                    f"{max_dimension}, got {dimension!r}"
+                    f"dimension for {model!r} must be an int from 1 through {max_dimension}, got {dimension!r}"
                 )
         try:
             from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
@@ -275,8 +671,7 @@ class OpenAI:
             ):
                 raise
             raise ModuleNotFoundError(
-                "OpenAI embeddings require numpy and tiktoken; install "
-                "langchaint[openai-embedding]."
+                "OpenAI embeddings require numpy and tiktoken; install langchaint[openai-embedding]."
             ) from exc
         adapter = _OpenAIEmbeddingAdapter(
             client=self.client,
@@ -293,6 +688,173 @@ class OpenAI:
                 else usd_per_million_tokens
             ),
             observer=self._observer,
+        )
+
+
+class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
+    _ConfiguredLLM[OutputT, ToolManagerT]
+):
+    """Create instances through `OpenAIBedrock.llm` to validate request settings before generation."""
+
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[NewOutputT, ToolManager]: ...
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self,
+        *,
+        response_format: type[NewOutputT],
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[NewOutputT, None]: ...
+    @overload
+    def bind[NewOutputT: str | BaseModel](
+        self: OpenAIBedrockLLM[OutputT, ToolManagerT],
+        *,
+        response_format: type[NewOutputT],
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[NewOutputT, ToolManagerT]: ...
+    @overload
+    def bind(
+        self: OpenAIBedrockLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[OutputT, ToolManager]: ...
+    @overload
+    def bind(
+        self: OpenAIBedrockLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[OutputT, None]: ...
+    @overload
+    def bind(
+        self: OpenAIBedrockLLM[OutputT, ToolManagerT],
+        *,
+        response_format: Unchanged = ...,
+        tools: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_requests: int | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
+    ) -> OpenAIBedrockLLM[OutputT, ToolManagerT]: ...
+    def bind(
+        self,
+        *,
+        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
+        tool_choice: ToolChoice | Unchanged = UNCHANGED,
+        parallel_tool_calls: bool | Unchanged = UNCHANGED,
+        max_completion_tokens: int | None | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_requests: int | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
+    ) -> OpenAIBedrockLLM[BaseModel | str, ToolManager | None]:
+        """Return a new LLM, preserving every omitted setting.
+
+        `tools=None` removes `ToolManager`.
+        A `tools` sequence constructs `ToolManager` with this binding's observer.
+        An existing `ToolManager` retains its identity and its own observer.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+
+        `response_format=str` returns text; a pydantic model validates structured output.
+        `max_completion_tokens=None` omits the limit.
+        `reasoning_level` accepts exact provider strings; `None` omits the setting.
+        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Declare tools only through `tools`, because result types follow the configured tools.
+        `max_requests` counts all requests per input, including retries.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one.
+            ValueError: The binding breaks a rule of the adapter.
+                The docstring of the backend's `llm()` lists the rules.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
+        """
+        return OpenAIBedrockLLM(
+            self._reconfigure(
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
         )
 
 
@@ -327,6 +889,51 @@ class OpenAIBedrock:
             client if client is not None else AsyncBedrockOpenAI(aws_region=aws_region)
         )
 
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = None,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAIBedrockLLM[OutputT, ToolManager]: ...
+
+    @overload
+    def llm[OutputT: str | BaseModel](
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = None,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[OutputT],
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAIBedrockLLM[OutputT, None]: ...
+
+    @overload
     def llm(
         self,
         model: str,
@@ -334,7 +941,62 @@ class OpenAIBedrock:
         pricing: OpenAIPricingTable,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
-    ) -> LLM:
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: ToolManager | ToolSequence,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAIBedrockLLM[str, ToolManager]: ...
+
+    @overload
+    def llm(
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = None,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tools: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
+        response_format: type[str] = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
+        max_requests: int = ...,
+        automatic_cache_breakpoints: bool | None = ...,
+    ) -> OpenAIBedrockLLM[str, None]: ...
+
+    def llm(
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable,
+        supports_prompt_cache_options: bool,
+        reasoning_summary: ReasoningSummary | None = None,
+        system_prompt: str | Sequence[TextPart] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = (),
+        response_format: type[str] | type[BaseModel] = str,
+        max_completion_tokens: int | None = None,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
+        tool_choice: ToolChoice = "auto",
+        parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
+        max_requests: int = 3,
+        automatic_cache_breakpoints: bool | None = None,
+    ) -> OpenAIBedrockLLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one OpenAI model served by Bedrock.
 
         `model` is sent verbatim.
@@ -344,9 +1006,36 @@ class OpenAIBedrock:
         `reasoning_summary` requests readable reasoning summary text.
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
-        `bind` on the returned `LLM`, and on every `BoundLLM` derived from it, raises `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options=False`.
         - `provider_executed_tools` is nonempty.
+
+        `reasoning_level` sets `reasoning.effort`.
+        `max_completion_tokens=None` omits the token limit.
+
+        `tools` accepts application tools or an existing `ToolManager`.
+        A sequence constructs a `ToolManager` with the backend's observer.
+        An existing manager retains its identity and observer.
+        `provider_executed_tools` contains provider-shaped tool definitions executed by the provider.
+
+        `response_format` selects a pydantic model for structured output, or `str` for final text.
+        A response without a text part or tool call gives `GenerationError`.
+        For text output, an empty final text part gives `""`.
+        `reasoning_level=None` uses the provider's reasoning default.
+
+        `extra_body` adds provider wire-body fields.
+        Declare application tools through `tools` so result types match executable tools.
+        `max_requests` limits the requests for one input, including retries.
+        `automatic_cache_breakpoints=None` uses the adapter default.
+
+        Raises:
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
+            ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
+            ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
+            TypeError: `response_format` is a proper subclass of `str`.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
+            pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
         adapter = OpenAIResponsesAdapter(
             client=self.client,
@@ -356,7 +1045,25 @@ class OpenAIBedrock:
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
+        return OpenAIBedrockLLM(
+            _configure(
+                adapter,
+                shared_backoff=self._shared_backoff,
+                observer=self._observer,
+                system_prompt=system_prompt,
+                tools=tools,
+                provider_executed_tools=provider_executed_tools,
+                response_format=response_format,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
+                max_requests=max_requests,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
+            )
+        )
 
 
 __all__ = [
@@ -366,8 +1073,10 @@ __all__ = [
     "OPENAI_REGIONAL_PROCESSING_MULTIPLIER",
     "OpenAI",
     "OpenAIBedrock",
+    "OpenAIBedrockLLM",
     "OpenAIChatCompletionsAdapter",
     "OpenAIEmbeddingModelId",
+    "OpenAILLM",
     "OpenAIModelId",
     "OpenAIPricingTable",
     "OpenAIResponsesAdapter",

@@ -52,7 +52,7 @@ from scripts import refresh_semconv_genai
 
 
 class StubRaw(BaseModel):
-    """Stand-in for the SDK's own response model a generation carries on raw."""
+    """Stand-in for the SDK response model stored in `Generation.raw`."""
 
 
 def finished_response(bound_adapter: BoundAdapter, raw: BaseModel) -> FinishedResponse:
@@ -65,7 +65,7 @@ def finished_response(bound_adapter: BoundAdapter, raw: BaseModel) -> FinishedRe
 def structured_outcome[ModelT: BaseModel](
     bound_adapter: BoundAdapter, raw: BaseModel, response_format: type[ModelT]
 ) -> ResponseOutcome[ModelT]:
-    """Read `raw` as `BoundLLM` does for a structured binding."""
+    """Read `raw` as generation does for a structured binding."""
     return response_outcome(
         bound_adapter.interpret(raw),
         functools.partial(structured_output, response_format=response_format),
@@ -196,7 +196,7 @@ async def yield_until(condition: Callable[[], bool]) -> None:
 
     A test calls this to wait for another task to reach a state, such as joining a queue.
     `asyncio.sleep(0)` lets the other ready tasks run without waiting for time to pass.
-    Call it under `run_with_timeout`, whose timeout ends a wait whose condition never holds.
+    Call it under `run_with_timeout` to stop the wait if `condition` never holds.
     """
     while not condition():
         await asyncio.sleep(0)
@@ -276,9 +276,9 @@ def with_sdk_retry_decisions(
 ) -> dict[Exception, RequestFailure]:
     """Return each failure as `transient` where the SDK retries its error.
 
-    Each row states the failure the adapter returns when the SDK declines the retry.
-    The rows then name failures without encoding the SDK's retry policy.
-    A row whose SDK decision raises expects `unknown_exception`.
+    Values in `failures_when_not_retried` describe the adapter failures when the SDK declines to retry.
+    The mapping names failures without encoding the SDK's retry policy.
+    If `sdk_retries` raises, the expected failure is `unknown_exception`.
     """
 
     def expected(error: Exception, failure: RequestFailure) -> RequestFailure:
@@ -399,7 +399,7 @@ _LANGCHAINT_EXTENSION_PROPERTIES: Mapping[str, Mapping[str, JsonValue]] = {
 def _strict_definition(
     name: str, definition: _Definition, declared_types: list[str]
 ) -> _Definition:
-    """Return `definition` restricted so that a part or tool definition matches only the definition its `type` declares.
+    """Return `definition` with stricter type and property constraints.
 
     A generic fallback definition rejects every declared `type`.
     A definition that declares a `type` rejects properties that neither it nor `_LANGCHAINT_EXTENSION_PROPERTIES` lists.
@@ -451,7 +451,7 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
 
     Each payload is a JSON string.
     _UNVALIDATED_PAYLOAD_ATTRIBUTES skips non-object tool arguments.
-    Exact-equality assertions test fields that the schemas leave optional.
+    Individual tests use exact-equality assertions to check fields that the schemas leave optional.
 
     Raises:
         AssertionError: A payload does not conform, is not a JSON string, or does not parse.
@@ -538,12 +538,12 @@ def _validate_attribute_keys(span: ReadableSpan, application_keys: frozenset[str
     """Check one span's operation value and keys against the vendored convention.
 
     A span may also carry any of `application_keys`.
-    A span without gen_ai.operation.name is one a test started itself, so it is not checked.
+    Spans without `gen_ai.operation.name` are skipped.
     OTel 1.45.0 allows the operation value to be a string, bool, int, float, bytes, sequence, or mapping.
 
     Raises:
         AssertionError: the operation value is not a string that langchaint traces.
-        AssertionError: the span carries a key that its operation's span does not declare.
+        AssertionError: A span carries a key allowed by neither its operation nor `application_keys`.
     """
     attributes = span.attributes or {}
     declared_keys_by_operation = _declared_keys_by_operation()
@@ -565,7 +565,7 @@ class ValidatingSpanExporter(InMemorySpanExporter):
     """
 
     def __init__(self, *, application_keys: frozenset[str] = frozenset()) -> None:
-        """Accept `application_keys` on every span, as the keys a test's transform or `extra_attributes` sets."""
+        """Allow `application_keys` on every span, including keys added by a test's transform or `extra_attributes`."""
         super().__init__()
         self._application_keys = application_keys
 

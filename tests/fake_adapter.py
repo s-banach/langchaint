@@ -340,7 +340,6 @@ class FakeAdapter(Adapter):
         self.open_barrier_from_call: int = open_barrier_from_call
         self._request_failure = request_failure
         self.bound_adapters: list[FakeBoundAdapter] = []
-        self.structured_bind_count: int = 0
 
     @override
     def config_fingerprint_data(self) -> Mapping[str, object]:
@@ -354,7 +353,6 @@ class FakeAdapter(Adapter):
 
     @override
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
-        self.structured_bind_count += 1
         return self._bound_adapter_class(self)
 
     @override

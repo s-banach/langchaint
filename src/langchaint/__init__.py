@@ -1,6 +1,6 @@
 """Provide provider-neutral LLM and embedding clients.
 
-Generation uses `LLM.bind()` and the returned `BoundLLM`.
+Provider factories return configured models implementing `LLM`.
 Embedding generation uses `EmbeddingModel.embed()`.
 `__all__` exports only the SDK-free application surface.
 `Tool` and `ToolSchema` support application-defined tool forms.
@@ -55,7 +55,7 @@ from langchaint.generation.errors import (
     PlainErrorRecord,
     SchemaViolationErrorRecord,
 )
-from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
+from langchaint.generation.llm import LLM, AdapterLLM, GenerationInput, llm_from_adapter
 from langchaint.generation.request_history import (
     AbandonedStreamRecord,
     CutOffRequestRecord,
@@ -140,12 +140,12 @@ __all__ = [
     "LLM",
     "ZERO_USAGE",
     "AbandonedStreamRecord",
+    "AdapterLLM",
     "AllowedToolsChoice",
     "AssistantMessage",
     "AssistantPart",
     "AudioPart",
     "Billing",
-    "BoundLLM",
     "CaptureTool",
     "ContentPart",
     "CutOffRequestRecord",
@@ -221,6 +221,7 @@ __all__ = [
     "TransientErrorRecord",
     "Usage",
     "UserMessage",
+    "llm_from_adapter",
     "messages_from_json",
     "messages_to_json",
     "run_many",

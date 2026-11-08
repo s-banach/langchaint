@@ -296,12 +296,7 @@ class ToolMessage(CheckedCopyModel):
 
     @classmethod
     def error(cls, tool_call: ToolCall, content: MessageContent) -> "ToolMessage":
-        """Build a `ToolMessage` with `is_error=True` that answers `tool_call`.
-
-        Args:
-            tool_call: The tool call that the message answers.
-            content: The model-facing error content.
-        """
+        """Build a `ToolMessage` with `is_error=True` that answers `tool_call`."""
         return cls(tool_call_id=tool_call.id, content=content, is_error=True)
 
 

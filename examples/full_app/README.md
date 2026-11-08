@@ -11,7 +11,7 @@ Run the live example with:
 uv run examples/full_app/run_live_task_stream.py
 ```
 
-The entrypoint uses one `OpenAI` with `gpt-5.6-terra` and prints progress through `App(on_event=...)`.
+The entrypoint passes `OpenAI(...).llm("gpt-5.6-terra")` to the provider-neutral app and prints progress through `App(on_event=...)`.
 The local tools return fixed search results and scripted critique verdicts.
 
 | File | Responsibility |
@@ -28,7 +28,7 @@ langchaint handles generation, request retries, and tool dispatch; `App` schedul
 `AgentRun` is a base class defined by this demo app for registration, accounting, progress routing, and lifecycle events.
 The app's agent classes, including `ReActAgent`, inherit from `AgentRun`, implement their own workflow in `_execute()`, and record settled outcomes in `turn_log`.
 Callers use the inherited `run()` method, which routes tool progress and emits `AgentStarted`, `AgentFinished`, `AgentFailed`, and `AgentCancelled` lifecycle events.
-All runs share one synchronous `on_event` callback for application progress; `BoundLLM.stream_one` provides model token streaming.
+All runs share one synchronous `on_event` callback for application progress; `LLM.stream_one` provides model token streaming.
 `GuiEmitter` uses a context variable that follows async tasks to route tool progress to the current run.
 Each delegated run installs its own emitter, so concurrent tools report the correct `agent_path`.
 

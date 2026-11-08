@@ -7,15 +7,14 @@ delay_seconds suspends open_stream to exercise timeouts.
 
 import asyncio
 import itertools
-import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import override
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
-    LLM,
+    AdapterLLM,
     AssistantMessage,
     Billing,
     Message,
@@ -24,7 +23,9 @@ from langchaint import (
     TextPart,
     TokenRates,
     ToolCall,
+    ToolChoice,
     Usage,
+    llm_from_adapter,
 )
 from langchaint.adapter import (
     Adapter,
@@ -111,6 +112,7 @@ class Script:
 
     turns: list[Turn]
     opens: int = 0
+    requests: list["_ScriptedRequestParams"] = field(default_factory=list)
 
 
 class ScriptedAdapter(Adapter):
@@ -143,7 +145,7 @@ class ScriptedAdapter(Adapter):
         system_prompt = binding.system_prompt
         if not isinstance(system_prompt, str):
             raise TypeError("ScriptedAdapter requires a string system prompt")
-        return _ScriptedBoundAdapter(self, system_prompt)
+        return _ScriptedBoundAdapter(self, system_prompt, binding.tool_choice)
 
     @override
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
@@ -169,19 +171,23 @@ class _ScriptedRequestParams(RequestParams):
     """Store the messages for one scripted request."""
 
     messages: tuple[Message, ...]
+    tool_choice: ToolChoice
 
     @override
     def as_json(self) -> str:
-        """Serialize the messages as JSON."""
-        return json.dumps([message.model_dump(mode="json") for message in self.messages])
+        """Serialize the request as JSON."""
+        return TypeAdapter(_ScriptedRequestParams).dump_json(self).decode()
 
 
 class _ScriptedBoundAdapter(BoundAdapter):
     """Play one agent's scripted turns in order."""
 
-    def __init__(self, adapter: ScriptedAdapter, system_prompt: str) -> None:
+    def __init__(
+        self, adapter: ScriptedAdapter, system_prompt: str, tool_choice: ToolChoice
+    ) -> None:
         self._adapter = adapter
         self._system_prompt = system_prompt
+        self._tool_choice = tool_choice
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -225,7 +231,7 @@ class _ScriptedBoundAdapter(BoundAdapter):
     @override
     def build_request_params(self, messages: Sequence[Message]) -> RequestParams:
         """Build request params containing the messages."""
-        return _ScriptedRequestParams(messages=tuple(messages))
+        return _ScriptedRequestParams(messages=tuple(messages), tool_choice=self._tool_choice)
 
     @override
     async def open_stream(
@@ -238,6 +244,8 @@ class _ScriptedBoundAdapter(BoundAdapter):
             RuntimeError: the script for this system prompt ran out of turns.
         """
         script = self._adapter.scripts[self._system_prompt]
+        assert isinstance(request_params, _ScriptedRequestParams)
+        script.requests.append(request_params)
         if script.opens >= len(script.turns):
             raise RuntimeError(
                 f"script for {self._system_prompt!r} exhausted after {script.opens} turns"
@@ -293,16 +301,18 @@ def call(name: str, args_json: str) -> ToolCall:
     return ToolCall(id=f"call-{next(_CALL_IDS)}", name=name, args_json=args_json)
 
 
-def build_llm(scripts: dict[str, list[Turn]], *, observer: Observer | None = None) -> LLM:
-    """Build an LLM with ScriptedAdapter, fast request pacing, and `observer`."""
-    adapter = ScriptedAdapter(scripts)
-    return LLM(
-        adapter,
+def build_llm(
+    scripts: dict[str, list[Turn]], *, system_prompt: str, observer: Observer | None = None
+) -> AdapterLLM:
+    """Share the scripted adapter and admission limits across configured models."""
+    return llm_from_adapter(
+        ScriptedAdapter(scripts),
+        system_prompt=system_prompt,
+        observer=observer,
         shared_backoff=SharedBackoff(
             max_concurrent_requests=16,
             max_request_starts_per_second=10_000.0,
             min_wait_ceiling_seconds=0.001,
             max_wait_seconds=0.01,
         ),
-        observer=observer,
     )

@@ -29,7 +29,6 @@ from tools import CritiqueVerdict, DelegateArgs, build_critique_tool, search_too
 from langchaint import (
     LLM,
     ZERO_USAGE,
-    BoundLLM,
     DispatchExceptionGroup,
     DispatchManyItemOutcome,
     GenerationError,
@@ -101,8 +100,8 @@ class AgentRun(ABC):
 
     The app's agent classes inherit from AgentRun and implement their own workflow in _execute.
     Subclasses append settled outcomes to turn_log for accounting and return a final answer.
-    Call the inherited run method to route tool progress and emit lifecycle events:
-    AgentStarted, AgentFinished, AgentFailed, and AgentCancelled.
+    Call the inherited `run` method to route tool progress and emit lifecycle events.
+    The events are `AgentStarted`, `AgentFinished`, `AgentFailed`, and `AgentCancelled`.
     """
 
     def __init__(
@@ -196,13 +195,13 @@ class ReActAgent(AgentRun):
         *,
         agent_path: str,
         config: AgentConfig,
-        llm: LLM,
+        llm: LLM[str, ToolManager | None],
         tools: ToolSequence,
         prompt: str,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Bind config and tools, initialize prompt messages, and register agent_path.
+        """Configure the model and tools, initialize prompt messages, and register agent_path.
 
         config sets the system prompt, binding options, and execution limits.
         self_correction_enabled adds a fresh scripted critique tool to tools.
@@ -214,9 +213,10 @@ class ReActAgent(AgentRun):
             ValueError: A binding option in config is invalid or unsupported by the provider.
         """
         tools = [*tools, build_critique_tool()] if config.self_correction_enabled else tools
-        self.bound: BoundLLM[str, ToolManager] = llm.bind(
+        self.llm: LLM[str, ToolManager] = llm.bind(
             system_prompt=config.system_prompt,
             tools=tools,
+            tool_choice="none" if config.max_tool_calls <= 0 else "auto",
             max_requests=config.max_requests,
             automatic_cache_breakpoints=config.automatic_cache_breakpoints,
         )
@@ -231,11 +231,6 @@ class ReActAgent(AgentRun):
     async def _execute(self) -> str:
         """Generate and dispatch tools until the agent answers."""
         for _ in range(self.config.max_turns):
-            if (
-                self.tool_calls_made >= self.config.max_tool_calls
-                and self.bound.binding.tool_choice != "none"
-            ):
-                self.bound = self.bound.bind(tool_choice="none")
             usage_so_far = self.usage
             _check_cost_limit(usage_so_far, self.config.max_cost_in_usd)
             self.turn_number += 1
@@ -247,7 +242,7 @@ class ReActAgent(AgentRun):
                 )
             )
             try:
-                generation = await self.bound.generate_one(
+                generation = await self.llm.generate_one(
                     self.messages,
                     timeout_seconds=self.config.generate_one_timeout_seconds,
                 )
@@ -320,7 +315,7 @@ class ReActAgent(AgentRun):
             )
 
         try:
-            outcomes = await self.bound.tool_manager.dispatch_many(
+            outcomes = await self.llm.tool_manager.dispatch_many(
                 tool_calls, precomputed=_decline_over_budget
             )
         except DispatchExceptionGroup as group:
@@ -328,6 +323,8 @@ class ReActAgent(AgentRun):
             raise
         self._settle_outcomes(call_of_id, outcomes)
         self.messages.extend(outcome.tool_message for outcome in outcomes)
+        if remaining and self.tool_calls_made >= self.config.max_tool_calls:
+            self.llm = self.llm.bind(tool_choice="none")
 
     def _settle_outcomes(
         self, call_of_id: Mapping[str, ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
@@ -380,7 +377,7 @@ def top_level_path(name: str) -> str:
 
 def build_delegate_tool(
     *,
-    llm: LLM,
+    llm: LLM[str, ToolManager | None],
     parent_path: str,
     config: AgentConfig,
     registry: dict[str, AgentRun],
@@ -430,7 +427,7 @@ class App:
     def __init__(
         self,
         *,
-        llm: LLM,
+        llm: LLM[str, ToolManager | None],
         configs: Mapping[str, AgentConfig],
         on_event: Callable[[Event], None],
     ) -> None:
@@ -459,10 +456,9 @@ class App:
         tools: ToolSequence,
         prompt: str,
     ) -> ReActAgent:
-        config = self._configs[name]
         return ReActAgent(
             agent_path=top_level_path(name),
-            config=config,
+            config=self._configs[name],
             registry=self._runs,
             on_event=self._on_event,
             llm=self._llm,

@@ -460,7 +460,7 @@ def test_custom_agent_runs_prescribed_steps_with_shared_lifecycle_and_accounting
             plan = await llm.generate_one([UserMessage(content="Prepare a report.")])
             self.turn_log.append(GenerationEntry(turn_number=1, outcome=plan))
             current_gui_emitter().emit_tool_progress(tool_name="plan", message=plan.output)
-            answer = await llm.rebind(
+            answer = await llm.bind(
                 system_prompt="Write the answer.",
             ).generate_one([UserMessage(content=plan.output)])
             self.turn_log.append(GenerationEntry(turn_number=2, outcome=answer))

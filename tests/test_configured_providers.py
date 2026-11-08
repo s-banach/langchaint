@@ -54,11 +54,11 @@ class _Answer(BaseModel):
         ),
     ],
 )
-def test_rebind_preserves_provider_and_omitted_settings(create: Callable[[], ProviderLLM]) -> None:
+def test_bind_preserves_provider_and_omitted_settings(create: Callable[[], ProviderLLM]) -> None:
     llm = create()
     assert llm.binding.system_prompt == "rules"
     assert llm.max_requests == 2
-    same = llm.rebind()
+    same = llm.bind()
     assert same is not llm
     assert type(same) is type(llm)
     assert same.binding == llm.binding
@@ -66,7 +66,7 @@ def test_rebind_preserves_provider_and_omitted_settings(create: Callable[[], Pro
     assert same.shared_backoff is llm.shared_backoff
     assert same.adapter is llm.adapter
     tool_manager = ToolManager([])
-    changed = llm.rebind(response_format=_Answer, tools=tool_manager, temperature=0.5)
+    changed = llm.bind(response_format=_Answer, tools=tool_manager, temperature=0.5)
     assert type(changed) is type(llm)
     assert changed.response_format is _Answer
     assert changed.tool_manager is tool_manager
@@ -77,7 +77,7 @@ def test_rebind_preserves_provider_and_omitted_settings(create: Callable[[], Pro
     assert llm.response_format is str
     assert llm.tool_manager is None
     assert llm.binding.temperature is None
-    cleared = changed.rebind(response_format=str, tools=None, system_prompt=None)
+    cleared = changed.bind(response_format=str, tools=None, system_prompt=None)
     assert cleared.response_format is str
     assert cleared.tool_manager is None
     assert cleared.binding.system_prompt is None
@@ -98,4 +98,4 @@ def test_rebind_preserves_provider_and_omitted_settings(create: Callable[[], Pro
     assert reconstructed.max_requests == 2
     assert reconstructed.binding.max_completion_tokens == 256
     assert reconstructed.binding.temperature == 0.75
-    assert reconstructed.rebind(response_format=str).response_format is str
+    assert reconstructed.bind(response_format=str).response_format is str

@@ -80,7 +80,7 @@ if TYPE_CHECKING:
 
 
 class Unchanged:
-    """Sentinel type for an omitted `rebind` keyword."""
+    """Sentinel type for an omitted `bind` keyword."""
 
     def __repr__(self) -> str:
         """Render the default as `UNCHANGED` in signatures and `help()` output."""
@@ -312,7 +312,7 @@ def _configure(
 
 
 class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](Protocol):
-    """Generate and rebind a configured model through a provider-neutral interface.
+    """Generate and bind a configured model through a provider-neutral interface.
 
     `OutputT` is `str` or the pydantic model that validates structured output.
     Both type parameters are covariant.
@@ -323,7 +323,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
     """
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -340,7 +340,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[NewOutputT, ToolManager]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -357,7 +357,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[NewOutputT, None]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -373,7 +373,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[NewOutputT, ToolManagerT]: ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         tools: ToolManager | ToolSequence,
@@ -389,7 +389,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[OutputT, ToolManager]: ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         tools: None,
@@ -405,7 +405,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[OutputT, None]: ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
@@ -419,7 +419,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
     ) -> LLM[OutputT, ToolManagerT]: ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] = ...,
@@ -1223,7 +1223,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
     """Create instances through `llm_from_adapter` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -1240,7 +1240,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[NewOutputT, ToolManager]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -1257,7 +1257,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[NewOutputT, None]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: AdapterLLM[OutputT, ToolManagerT],
         *,
         response_format: type[NewOutputT],
@@ -1274,7 +1274,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[NewOutputT, ToolManagerT]: ...
     @overload
-    def rebind(
+    def bind(
         self: AdapterLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -1291,7 +1291,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[OutputT, ToolManager]: ...
     @overload
-    def rebind(
+    def bind(
         self: AdapterLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -1308,7 +1308,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[OutputT, None]: ...
     @overload
-    def rebind(
+    def bind(
         self: AdapterLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -1324,7 +1324,7 @@ class AdapterLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | Non
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> AdapterLLM[OutputT, ToolManagerT]: ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,

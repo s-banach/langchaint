@@ -542,7 +542,7 @@ class ToolManager:
     def __init__(self, tools: ToolSequence, *, observer: DispatchObserver | None = None) -> None:
         """Index the tools by name.
 
-        Provider factories and `rebind` pass the backend's observer when building a `ToolManager` from a tool sequence.
+        Provider factories and `bind` pass the backend's observer when building a `ToolManager` from a tool sequence.
         A `ToolManager` the application builds receives only the `observer` passed here.
 
         Args:

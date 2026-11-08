@@ -103,7 +103,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
     """Create instances through `Anthropic.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -120,7 +120,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[NewOutputT, ToolManager]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -137,7 +137,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[NewOutputT, None]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: "AnthropicLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewOutputT],
@@ -154,7 +154,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[NewOutputT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -171,7 +171,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -188,7 +188,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -204,7 +204,7 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -503,7 +503,7 @@ class Anthropic:
         `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - The binding places more than four cache breakpoints.
           System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
           Provider-executed tools with `cache_control` also count.
@@ -511,7 +511,7 @@ class Anthropic:
           The adapter supports specific versions of web search, web fetch, tool search, and code execution.
         - Code execution is bound without a web search or web fetch version from 20260209 or later.
         - Web search is bound and `pricing.web_search_usd_per_invocation` is `None`.
-        `llm` and `rebind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+        `llm` and `bind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
 
         `reasoning_level` sets `output_config.effort`.
         It enables adaptive `thinking` unless `extra_body` sets `thinking`.
@@ -584,7 +584,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
     """Create instances through `AnthropicBedrock.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -601,7 +601,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[NewOutputT, ToolManager]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -618,7 +618,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[NewOutputT, None]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewOutputT],
@@ -635,7 +635,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[NewOutputT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -652,7 +652,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -669,7 +669,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "AnthropicBedrockLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -685,7 +685,7 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "AnthropicBedrockLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -903,11 +903,11 @@ class AnthropicBedrock:
         `cache_ttl` applies to every automatic cache breakpoint and every part with `cache_breakpoint=True`.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - The binding places more than four cache breakpoints.
           System parts with `cache_breakpoint=True` and automatic cache breakpoints count.
         - `provider_executed_tools` is nonempty.
-        `llm` and `rebind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
+        `llm` and `bind` raise `TypeError` when `tool_choice` is `AllowedToolsChoice`.
 
         `reasoning_level` sets `output_config.effort`.
         It enables adaptive `thinking` unless `extra_body` sets `thinking`.

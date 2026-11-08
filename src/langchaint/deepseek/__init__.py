@@ -85,7 +85,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
     """Create instances through `DeepSeek.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -102,7 +102,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[NewOutputT, ToolManager]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -119,7 +119,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[NewOutputT, None]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: "DeepSeekLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewOutputT],
@@ -136,7 +136,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[NewOutputT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "DeepSeekLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -153,7 +153,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "DeepSeekLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -170,7 +170,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "DeepSeekLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -186,7 +186,7 @@ class DeepSeekLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | No
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "DeepSeekLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -463,7 +463,7 @@ class DeepSeek:
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `automatic_cache_breakpoints=False`, because the adapter sends no `prompt_cache_options`.
         - `provider_executed_tools` is nonempty.
         - `extra_body` contains `web_search_options`, which langchaint cannot price.

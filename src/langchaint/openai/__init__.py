@@ -91,7 +91,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
     """Create instances through `OpenAI.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -108,7 +108,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[NewOutputT, ToolManager]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -125,7 +125,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[NewOutputT, None]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: OpenAILLM[OutputT, ToolManagerT],
         *,
         response_format: type[NewOutputT],
@@ -142,7 +142,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[NewOutputT, ToolManagerT]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAILLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -159,7 +159,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[OutputT, ToolManager]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAILLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -176,7 +176,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[OutputT, None]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAILLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -192,7 +192,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAILLM[OutputT, ToolManagerT]: ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -510,7 +510,7 @@ class OpenAI:
         `service_tier` sets the requested OpenAI service tier.
         The reported service tier selects pricing.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options` is false.
         - A provider-executed tool's `type` is missing or unsupported.
           The adapter supports specific versions of web search and file search.
@@ -697,7 +697,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
     """Create instances through `OpenAIBedrock.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -714,7 +714,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[NewOutputT, ToolManager]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -731,7 +731,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[NewOutputT, None]: ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: OpenAIBedrockLLM[OutputT, ToolManagerT],
         *,
         response_format: type[NewOutputT],
@@ -748,7 +748,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[NewOutputT, ToolManagerT]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAIBedrockLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -765,7 +765,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[OutputT, ToolManager]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAIBedrockLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -782,7 +782,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[OutputT, None]: ...
     @overload
-    def rebind(
+    def bind(
         self: OpenAIBedrockLLM[OutputT, ToolManagerT],
         *,
         response_format: Unchanged = ...,
@@ -798,7 +798,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> OpenAIBedrockLLM[OutputT, ToolManagerT]: ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -1006,7 +1006,7 @@ class OpenAIBedrock:
         `reasoning_summary` requests readable reasoning summary text.
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `automatic_cache_breakpoints=False` and `supports_prompt_cache_options=False`.
         - `provider_executed_tools` is nonempty.
 

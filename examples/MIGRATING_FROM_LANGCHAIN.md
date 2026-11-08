@@ -33,8 +33,8 @@ All generation calls are asynchronous, including single calls, batches, and stre
 | `model.ainvoke(messages)` | `await llm.generate_one(messages)` |
 | `model.batch(inputs)` | `await llm.generate_many(inputs)` |
 | `model.stream(messages)` | `async with llm.stream_one(messages) as stream:` |
-| `model.bind_tools(tools)` | `llm.rebind(tools=tools)` |
-| `model.with_structured_output(Model)` | `llm.rebind(response_format=Model)` |
+| `model.bind_tools(tools)` | `llm.bind(tools=tools)` |
+| `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
 | `RunnableRetry` | `max_requests` on `llm` |
 | `InMemoryRateLimiter` | `SharedBackoff(max_concurrent_requests=..., max_request_starts_per_second=...)` |
@@ -72,7 +72,7 @@ See [`12_messages.py`](12_messages.py) for multimodal messages and message seria
 
 ## Structured output and tools
 
-Use `rebind` to return a new configured model while preserving omitted settings.
+Use `bind` to return a new configured model while preserving omitted settings.
 Pass a pydantic model through `response_format` to validate structured output:
 
 ```python
@@ -83,7 +83,7 @@ class Answer(BaseModel):
     text: str
 
 
-structured = llm.rebind(response_format=Answer)
+structured = llm.bind(response_format=Answer)
 generation = await structured.generate_one("Name a city in Norway.")
 print(generation.output.text)
 ```
@@ -95,7 +95,7 @@ Check `generation.kind` before reading the result.
 With the application's tool definitions stored in `tools`, one step of an application tool loop is:
 
 ```python
-bound = llm.rebind(tools=tools)
+bound = llm.bind(tools=tools)
 generation = await bound.generate_one(messages)
 match generation.kind:
     case "tool_call":
@@ -212,7 +212,7 @@ Move middleware behavior to the application function that owns each call or tool
 | --- | --- |
 | `before_model` | before `await bound.generate_one(messages)` |
 | `after_model` | after receiving `PlainGeneration` or `ToolCallGeneration` |
-| `modify_model_request` | `bound = bound.rebind(...)` |
+| `modify_model_request` | `bound = bound.bind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |
 | concurrent tool calls | `ToolManager.dispatch_many(tool_calls)` |

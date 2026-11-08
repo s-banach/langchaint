@@ -127,7 +127,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
     """Create instances through `Gemini.llm` to validate request settings before generation."""
 
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -144,7 +144,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[NewOutputT, ToolManager]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self,
         *,
         response_format: type[NewOutputT],
@@ -161,7 +161,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[NewOutputT, None]": ...
     @overload
-    def rebind[NewOutputT: str | BaseModel](
+    def bind[NewOutputT: str | BaseModel](
         self: "GeminiLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewOutputT],
@@ -178,7 +178,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[NewOutputT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "GeminiLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -195,7 +195,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "GeminiLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -212,7 +212,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "GeminiLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -228,7 +228,7 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
         max_requests: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "GeminiLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def bind(
         self,
         *,
         response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
@@ -512,7 +512,7 @@ class Gemini:
         `service_tier` sets the requested Gemini service tier.
         Responses price at `on_demand` rates because google-genai 2.34.0 drops the served tier.
 
-        `llm` and `rebind` raise `ValueError` when:
+        `llm` and `bind` raise `ValueError` when:
         - `parallel_tool_calls=False`, because `generateContent` cannot disable parallel function calls.
         - `reasoning_level` differs only in letter case from a `types.ThinkingLevel` name, such as `"high"`.
           google-genai 2.33.0 would send the uppercase name instead.
@@ -528,7 +528,7 @@ class Gemini:
         - Google Search enables image search.
         - Google Search is bound and `pricing.google_search_usd_per_query` is `None`.
         - Google Maps is bound and `pricing.google_maps_usd_per_query` is `None`.
-        `llm` and `rebind` raise `pydantic.ValidationError` when a provider-executed tool fails `types.Tool` validation.
+        `llm` and `bind` raise `pydantic.ValidationError` when a provider-executed tool fails `types.Tool` validation.
 
         `reasoning_level` sets `generationConfig.thinkingConfig.thinkingLevel` and enables `includeThoughts`.
         With `reasoning_level=None`, `extra_body` may set `generationConfig.thinkingConfig`.

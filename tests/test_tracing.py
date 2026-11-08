@@ -186,7 +186,7 @@ class _MidFailStream(FakeStream):
 def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(FakeAdapter(echo=True))
-        bound = llm.rebind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
+        bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
         result = await bound.generate_one("hi")
         assert result.kind == "plain"
         assert result.output == "hi"
@@ -313,7 +313,7 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attri
     async def scenario() -> None:
         llm, exporter = _traced(case.adapter(), capture_message_content=True)
         with pytest.raises(GenerationError):
-            await _generate_through(path, llm.rebind(system_prompt="be brief", max_requests=2))
+            await _generate_through(path, llm.bind(system_prompt="be brief", max_requests=2))
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == case.status_description
@@ -544,7 +544,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             ]
         )
         llm, exporter = _traced(adapter, capture_message_content=True)
-        text_bound = llm.rebind(
+        text_bound = llm.bind(
             system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
             max_completion_tokens=123,
@@ -556,7 +556,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             bound = text_bound
             generation = await _generate_through(path, text_bound, generation_input)
         else:
-            bound = text_bound.rebind(response_format=_Answer)
+            bound = text_bound.bind(response_format=_Answer)
             generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_chat(_exported_attributes(span))
@@ -679,7 +679,7 @@ def _covariance_pin(
     return transform(generation, {})
 
 
-def test_a_transform_and_extra_attributes_reach_every_chat_span_across_rebind() -> None:
+def test_a_transform_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
     async def scenario() -> None:
         transformed_models: list[str] = []
 
@@ -700,7 +700,7 @@ def test_a_transform_and_extra_attributes_reach_every_chat_span_across_rebind() 
                 "gen_ai.operation.name": "not-the-operation",
             },
         )
-        replacement_bound = llm.rebind(system_prompt="s").rebind(system_prompt="s2")
+        replacement_bound = llm.bind(system_prompt="s").bind(system_prompt="s2")
         for path in ("generate", "stream"):
             await _generate_through(path, replacement_bound)
         await replacement_bound.generate_many(["a", "b"])
@@ -1031,16 +1031,16 @@ def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
     run_with_timeout(scenario())
 
 
-def test_rebind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
+def test_bind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
     async def scenario() -> None:
         llm, exporter = _traced(
             FakeAdapter(),
             capture_message_content=True,
             extra_attributes={"gen_ai.agent.name": "agent_a"},
         )
-        bound = llm.rebind(tools=[_echo_tool()])
-        replacement_bound = bound.rebind(tools=[_echo_tool()])
-        unobserved_bound = bound.rebind(tools=ToolManager([_echo_tool()]))
+        bound = llm.bind(tools=[_echo_tool()])
+        replacement_bound = bound.bind(tools=[_echo_tool()])
+        unobserved_bound = bound.bind(tools=ToolManager([_echo_tool()]))
         await bound.tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
         )
@@ -1296,7 +1296,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             ),
             observer=observer,
         )
-        bound = llm.rebind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
+        bound = llm.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
         await bound.generate_one([
             UserMessage(content=f"question {_MARKER}"),
@@ -1389,7 +1389,7 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
                 capture_message_content=content_filter,
             ),
         )
-        bound = llm.rebind(system_prompt="rules", tools=ToolManager([build_tool()]))
+        bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             result = await _generate_through(path, bound)
         assert result.kind == "plain"
@@ -1568,7 +1568,7 @@ def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_outp
         )
         llm, exporter = _traced(adapter, capture_message_content=capture_message_content)
         with pytest.raises(GenerationError) as raised:
-            await llm.rebind(max_requests=3).generate_one("hi")
+            await llm.bind(max_requests=3).generate_one("hi")
 
         error = raised.value
         assert len(error.request_history.records) == 2

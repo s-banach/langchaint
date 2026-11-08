@@ -245,12 +245,12 @@ class _InterpretRaisesAdapter(FakeAdapter):
 
 
 @pytest.mark.parametrize("max_requests", [True, False, 0, -1])
-def test_construction_and_rebind_reject_invalid_max_requests(max_requests: int) -> None:
+def test_construction_and_bind_reject_invalid_max_requests(max_requests: int) -> None:
     llm = llm_from_adapter(FakeAdapter(), shared_backoff=fast_shared_backoff())
     with pytest.raises(ValueError, match="max_requests"):
         _ = llm_from_adapter(FakeAdapter(), max_requests=max_requests)
     with pytest.raises(ValueError, match="max_requests"):
-        _ = llm.rebind(max_requests=max_requests)
+        _ = llm.bind(max_requests=max_requests)
 
 
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
@@ -826,10 +826,10 @@ def test_allowed_tools_choice_rejects_an_unbound_name_before_adapter_binding() -
     assert adapter.bound_adapters == []
 
 
-def test_rebind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
+def test_bind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     tool = _SchemaOnceTool()
     bound = llm_from_adapter(FakeAdapter(), tools=[tool])
-    replacement_bound = bound.rebind(
+    replacement_bound = bound.bind(
         tool_choice=AllowedToolsChoice(mode="required", tool_names=(tool.name,))
     )
     assert tool.schema_calls == 1
@@ -849,7 +849,7 @@ def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
     assert llm_from_adapter(FakeAdapter(), tools=tool_manager).tool_manager is tool_manager
 
 
-def test_duplicate_tool_names_fail_before_construction_and_rebind_reach_adapter() -> None:
+def test_duplicate_tool_names_fail_before_construction_and_bind_reach_adapter() -> None:
     adapter = FakeAdapter()
     duplicate = _capture_tool()
     with pytest.raises(ValueError, match="duplicate tool name"):
@@ -857,20 +857,20 @@ def test_duplicate_tool_names_fail_before_construction_and_rebind_reach_adapter(
     assert adapter.bound_adapters == []
     bound = llm_from_adapter(adapter)
     with pytest.raises(ValueError, match="duplicate tool name"):
-        _ = bound.rebind(tools=[duplicate, duplicate])
+        _ = bound.bind(tools=[duplicate, duplicate])
     assert len(adapter.bound_adapters) == 1
 
 
-def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
+def test_bind_tools_replace_the_manager_and_none_removes_it() -> None:
     original = _capture_tool("original")
     replacement = _capture_tool("replacement")
     bound = llm_from_adapter(FakeAdapter(), tools=[original])
-    replacement_bound = bound.rebind(tools=[replacement])
+    replacement_bound = bound.bind(tools=[replacement])
     assert replacement_bound.tool_manager is not bound.tool_manager
     assert replacement_bound.tool_manager.schemas() == (replacement.schema(),)
-    assert replacement_bound.rebind(tools=None).tool_manager is None
+    assert replacement_bound.bind(tools=None).tool_manager is None
     tool_manager = ToolManager([replacement])
-    assert bound.rebind(tools=tool_manager).tool_manager is tool_manager
+    assert bound.bind(tools=tool_manager).tool_manager is tool_manager
 
 
 class _Label(str):
@@ -879,17 +879,17 @@ class _Label(str):
     __slots__ = ()
 
 
-def test_construction_and_rebind_reject_a_str_subclass_response_format() -> None:
+def test_construction_and_bind_reject_a_str_subclass_response_format() -> None:
     llm = llm_from_adapter(FakeAdapter())
     with pytest.raises(TypeError, match="response_format must be str"):
         _ = llm_from_adapter(FakeAdapter(), response_format=_Label)
     with pytest.raises(TypeError, match="response_format must be str"):
-        _ = llm.rebind(response_format=_Label)
+        _ = llm.bind(response_format=_Label)
 
 
 async def _pin_request_method_return_types(llm: AdapterLLM, tool_manager: ToolManager) -> None:
     """Let pyrefly check return types without running requests."""
-    structured_with_tools = llm.rebind(response_format=_Answer, tools=tool_manager)
+    structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
     assert_type(
         await structured_with_tools.generate_one("hi"),
         PlainGeneration[_Answer] | ToolCallGeneration,
@@ -904,13 +904,13 @@ async def _pin_request_method_return_types(llm: AdapterLLM, tool_manager: ToolMa
         ),
         list[GenerationOutcomeRecord[_Answer]],
     )
-    structured = llm.rebind(response_format=_Answer)
+    structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), PlainGeneration[_Answer])
     assert_type(
         await structured.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
         list[PlainGenerationRecord[_Answer] | GenerationErrorRecord],
     )
-    text_with_tools = llm.rebind(tools=tool_manager)
+    text_with_tools = llm.bind(tools=tool_manager)
     assert_type(
         await text_with_tools.generate_one("hi"),
         PlainGeneration[str] | ToolCallGeneration,
@@ -1099,28 +1099,28 @@ def test_structured_tool_bound_stream_final_returns_a_tool_call_generation() -> 
 
 
 @pytest.mark.parametrize("default_value", [False, True])
-def test_rebind_resolves_automatic_cache_breakpoints(*, default_value: bool) -> None:
+def test_bind_resolves_automatic_cache_breakpoints(*, default_value: bool) -> None:
     llm = llm_from_adapter(FakeAdapter(automatic_cache_breakpoints_default=default_value))
     override_value = not default_value
     assert llm.binding.automatic_cache_breakpoints is default_value
-    bound = llm.rebind(automatic_cache_breakpoints=override_value)
+    bound = llm.bind(automatic_cache_breakpoints=override_value)
     assert bound.binding.automatic_cache_breakpoints is override_value
-    assert bound.rebind().binding.automatic_cache_breakpoints is override_value
+    assert bound.bind().binding.automatic_cache_breakpoints is override_value
     assert (
-        bound.rebind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
+        bound.bind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
         is default_value
     )
 
 
-def test_construction_and_rebind_carry_extra_body_by_reference() -> None:
+def test_construction_and_bind_carry_extra_body_by_reference() -> None:
     adapter = FakeAdapter()
     extra_body = {"safety_identifier": "user-7"}
     bound_llm = llm_from_adapter(adapter, extra_body=extra_body)
     assert bound_llm.binding.extra_body is extra_body
-    assert bound_llm.rebind(system_prompt="s").binding.extra_body is extra_body
+    assert bound_llm.bind(system_prompt="s").binding.extra_body is extra_body
     replacement = {"safety_identifier": "user-8"}
-    assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
-    assert bound_llm.rebind(extra_body=None).binding.extra_body is None
+    assert bound_llm.bind(extra_body=replacement).binding.extra_body is replacement
+    assert bound_llm.bind(extra_body=None).binding.extra_body is None
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
@@ -1178,20 +1178,20 @@ def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -
     adapter.automatic_cache_breakpoints_default = True
     assert initial != after_binding_mutation
     assert after_binding_mutation == bound.config_fingerprint()
-    assert after_binding_mutation != bound.rebind().config_fingerprint()
+    assert after_binding_mutation != bound.bind().config_fingerprint()
 
 
-def test_config_fingerprint_tracks_response_format_and_rebind() -> None:
+def test_config_fingerprint_tracks_response_format_and_bind() -> None:
     text = llm_from_adapter(FakeAdapter())
     answer = llm_from_adapter(FakeAdapter(), response_format=_Answer)
     other_answer = llm_from_adapter(FakeAdapter(), response_format=_OtherAnswer)
-    replacement_bound = answer.rebind(system_prompt="changed")
+    replacement_bound = answer.bind(system_prompt="changed")
     assert text.config_fingerprint() != answer.config_fingerprint()
     assert answer.config_fingerprint() != other_answer.config_fingerprint()
     assert answer.config_fingerprint() != replacement_bound.config_fingerprint()
     assert (
         text.config_fingerprint()
-        != text.rebind(automatic_cache_breakpoints=True).config_fingerprint()
+        != text.bind(automatic_cache_breakpoints=True).config_fingerprint()
     )
 
 
@@ -1280,7 +1280,7 @@ def test_config_fingerprint_captures_the_response_schema_during_binding() -> Non
         _ = _MutableSchemaAnswer.model_rebuild(force=True)
 
 
-def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
+def test_bind_keeps_replaces_and_removes_provider_executed_tools() -> None:
     first_tool = {"type": "web_search"}
     second_tool = {"type": "file_search", "vector_store_ids": ["vs_1"]}
     bound = llm_from_adapter(
@@ -1289,11 +1289,11 @@ def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
         max_requests=5,
     )
     assert bound.binding.provider_executed_tools == (first_tool,)
-    assert bound.rebind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
-    replaced = bound.rebind(provider_executed_tools=(second_tool,))
+    assert bound.bind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
+    replaced = bound.bind(provider_executed_tools=(second_tool,))
     assert replaced.binding.provider_executed_tools == (second_tool,)
     assert replaced.max_requests == 5
-    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
+    assert bound.bind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -1503,7 +1503,7 @@ def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_p
         position_bound = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         await position_bound.generate_many_records(["a"], resume_path=resume_path)
-        changed_bound = position_bound.rebind(system_prompt="changed")
+        changed_bound = position_bound.bind(system_prompt="changed")
         await changed_bound.generate_many_records(["a"], resume_path=resume_path)
         await changed_bound.generate_many_records(
             ["a"], resume_path=resume_path, input_ids=["input-a"]

@@ -56,20 +56,20 @@ def provider_conformance[T: str | BaseModel, ToolsT: ToolManager | None](
     return llm
 
 
-def rebind_protocol[T: str | BaseModel, ToolsT: ToolManager | None, NewT: str | BaseModel](
+def bind_protocol[T: str | BaseModel, ToolsT: ToolManager | None, NewT: str | BaseModel](
     llm: LLM[T, ToolsT],
     output: type[NewT],
     tools: ToolSequence,
 ) -> None:
-    assert_type(llm.rebind(), LLM[T, ToolsT])
-    assert_type(llm.rebind(tool_choice="none"), LLM[T, ToolsT])
-    assert_type(llm.rebind(response_format=output), LLM[NewT, ToolsT])
-    assert_type(llm.rebind(tools=tools), LLM[T, ToolManager])
-    assert_type(llm.rebind(tools=None), LLM[T, None])
-    assert_type(llm.rebind(response_format=output, tools=tools), LLM[NewT, ToolManager])
-    assert_type(llm.rebind(response_format=output, tools=None), LLM[NewT, None])
-    assert_type(llm.rebind(response_format=str), LLM[str, ToolsT])
-    configured = llm.rebind(
+    assert_type(llm.bind(), LLM[T, ToolsT])
+    assert_type(llm.bind(tool_choice="none"), LLM[T, ToolsT])
+    assert_type(llm.bind(response_format=output), LLM[NewT, ToolsT])
+    assert_type(llm.bind(tools=tools), LLM[T, ToolManager])
+    assert_type(llm.bind(tools=None), LLM[T, None])
+    assert_type(llm.bind(response_format=output, tools=tools), LLM[NewT, ToolManager])
+    assert_type(llm.bind(response_format=output, tools=None), LLM[NewT, None])
+    assert_type(llm.bind(response_format=str), LLM[str, ToolsT])
+    configured = llm.bind(
         response_format=Answer,
         tools=tools,
         system_prompt="Answer.",
@@ -77,20 +77,20 @@ def rebind_protocol[T: str | BaseModel, ToolsT: ToolManager | None, NewT: str | 
         max_completion_tokens=128,
     )
     assert_type(configured, LLM[Answer, ToolManager])
-    assert_type(configured.rebind(tool_choice="none").tool_manager, ToolManager)
+    assert_type(configured.bind(tool_choice="none").tool_manager, ToolManager)
 
 
-def rebind_optional_tools(
+def bind_optional_tools(
     llm: LLM[Answer], tools: ToolManager | None
 ) -> LLM[Answer, ToolManager | None]:
-    return llm.rebind(tools=tools)
+    return llm.bind(tools=tools)
 
 
-def reject_rebind_context[T: str | BaseModel](llm: LLM[str]) -> None:
-    wrong_output: LLM[Answer] = llm.rebind()  # pyrefly: ignore[bad-assignment]
-    wrong_callable: Callable[[], LLM[Answer]] = llm.rebind  # pyrefly: ignore[bad-assignment]
-    wrong_generic: Callable[[], LLM[T]] = llm.rebind  # pyrefly: ignore[bad-assignment]
-    _ = llm.rebind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
+def reject_bind_context[T: str | BaseModel](llm: LLM[str]) -> None:
+    wrong_output: LLM[Answer] = llm.bind()  # pyrefly: ignore[bad-assignment]
+    wrong_callable: Callable[[], LLM[Answer]] = llm.bind  # pyrefly: ignore[bad-assignment]
+    wrong_generic: Callable[[], LLM[T]] = llm.bind  # pyrefly: ignore[bad-assignment]
+    _ = llm.bind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
     _ = wrong_output, wrong_callable, wrong_generic
 
 
@@ -138,9 +138,9 @@ def reject_anthropic_token_limits(anthropic: Anthropic, bedrock: AnthropicBedroc
     _ = bedrock.llm("anthropic.claude-sonnet-5")  # pyrefly: ignore[no-matching-overload]
     _ = bedrock.llm("anthropic.claude-sonnet-5", max_completion_tokens=None)  # pyrefly: ignore[bad-argument-type]
     direct = anthropic.llm("claude-sonnet-5", max_completion_tokens=128)
-    _ = direct.rebind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
+    _ = direct.bind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
     hosted = bedrock.llm("anthropic.claude-sonnet-5", max_completion_tokens=128)
-    _ = hosted.rebind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
+    _ = hosted.bind(max_completion_tokens=None)  # pyrefly: ignore[no-matching-overload]
 
 
 def openai_optional_token_limits(openai: OpenAI) -> None:
@@ -219,16 +219,16 @@ def openai_inference[T: str | BaseModel](
     generic = provider.llm("gpt-5.6-terra", response_format=output, tools=tools)
     assert_type(generic, OpenAILLM[T, ToolManager])
     assert_type(provider.llm("gpt-5.6-terra", response_format=output), OpenAILLM[T, None])
-    assert_type(generic.rebind(), OpenAILLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), OpenAILLM[T, None])
-    assert_type(generic.rebind(response_format=str), OpenAILLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), OpenAILLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), OpenAILLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), OpenAILLM[T, None])
-    assert_type(text.rebind(tools=tools), OpenAILLM[str, ToolManager])
+    assert_type(generic.bind(), OpenAILLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), OpenAILLM[T, None])
+    assert_type(generic.bind(response_format=str), OpenAILLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), OpenAILLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), OpenAILLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), OpenAILLM[T, None])
+    assert_type(text.bind(tools=tools), OpenAILLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, OpenAILLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), OpenAILLM[T, None])
+    assert_type(restored.bind(tools=None), OpenAILLM[T, None])
     return generic
 
 
@@ -259,16 +259,16 @@ def anthropic_inference[T: str | BaseModel](
         provider.llm("claude-sonnet-5", max_completion_tokens=128, response_format=output),
         AnthropicLLM[T, None],
     )
-    assert_type(generic.rebind(), AnthropicLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), AnthropicLLM[T, None])
-    assert_type(generic.rebind(response_format=str), AnthropicLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), AnthropicLLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), AnthropicLLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), AnthropicLLM[T, None])
-    assert_type(text.rebind(tools=tools), AnthropicLLM[str, ToolManager])
+    assert_type(generic.bind(), AnthropicLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), AnthropicLLM[T, None])
+    assert_type(generic.bind(response_format=str), AnthropicLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), AnthropicLLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), AnthropicLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), AnthropicLLM[T, None])
+    assert_type(text.bind(tools=tools), AnthropicLLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, AnthropicLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), AnthropicLLM[T, None])
+    assert_type(restored.bind(tools=None), AnthropicLLM[T, None])
     return generic
 
 
@@ -324,16 +324,16 @@ def openai_bedrock_inference[T: str | BaseModel](
         ),
         OpenAIBedrockLLM[T, None],
     )
-    assert_type(generic.rebind(), OpenAIBedrockLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), OpenAIBedrockLLM[T, None])
-    assert_type(generic.rebind(response_format=str), OpenAIBedrockLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), OpenAIBedrockLLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), OpenAIBedrockLLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), OpenAIBedrockLLM[T, None])
-    assert_type(text.rebind(tools=tools), OpenAIBedrockLLM[str, ToolManager])
+    assert_type(generic.bind(), OpenAIBedrockLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), OpenAIBedrockLLM[T, None])
+    assert_type(generic.bind(response_format=str), OpenAIBedrockLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), OpenAIBedrockLLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), OpenAIBedrockLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), OpenAIBedrockLLM[T, None])
+    assert_type(text.bind(tools=tools), OpenAIBedrockLLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, OpenAIBedrockLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), OpenAIBedrockLLM[T, None])
+    assert_type(restored.bind(tools=None), OpenAIBedrockLLM[T, None])
     return generic
 
 
@@ -371,18 +371,18 @@ def anthropic_bedrock_inference[T: str | BaseModel](
         ),
         AnthropicBedrockLLM[T, None],
     )
-    assert_type(generic.rebind(), AnthropicBedrockLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), AnthropicBedrockLLM[T, None])
-    assert_type(generic.rebind(response_format=str), AnthropicBedrockLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), AnthropicBedrockLLM[str, None])
+    assert_type(generic.bind(), AnthropicBedrockLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), AnthropicBedrockLLM[T, None])
+    assert_type(generic.bind(response_format=str), AnthropicBedrockLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), AnthropicBedrockLLM[str, None])
     assert_type(
-        text.rebind(response_format=output, tools=tools), AnthropicBedrockLLM[T, ToolManager]
+        text.bind(response_format=output, tools=tools), AnthropicBedrockLLM[T, ToolManager]
     )
-    assert_type(text.rebind(response_format=output), AnthropicBedrockLLM[T, None])
-    assert_type(text.rebind(tools=tools), AnthropicBedrockLLM[str, ToolManager])
+    assert_type(text.bind(response_format=output), AnthropicBedrockLLM[T, None])
+    assert_type(text.bind(tools=tools), AnthropicBedrockLLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, AnthropicBedrockLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), AnthropicBedrockLLM[T, None])
+    assert_type(restored.bind(tools=None), AnthropicBedrockLLM[T, None])
     return generic
 
 
@@ -400,16 +400,16 @@ def gemini_inference[T: str | BaseModel](
     generic = provider.llm("gemini-3.6-flash", response_format=output, tools=tools)
     assert_type(generic, GeminiLLM[T, ToolManager])
     assert_type(provider.llm("gemini-3.6-flash", response_format=output), GeminiLLM[T, None])
-    assert_type(generic.rebind(), GeminiLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), GeminiLLM[T, None])
-    assert_type(generic.rebind(response_format=str), GeminiLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), GeminiLLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), GeminiLLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), GeminiLLM[T, None])
-    assert_type(text.rebind(tools=tools), GeminiLLM[str, ToolManager])
+    assert_type(generic.bind(), GeminiLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), GeminiLLM[T, None])
+    assert_type(generic.bind(response_format=str), GeminiLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), GeminiLLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), GeminiLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), GeminiLLM[T, None])
+    assert_type(text.bind(tools=tools), GeminiLLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, GeminiLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), GeminiLLM[T, None])
+    assert_type(restored.bind(tools=None), GeminiLLM[T, None])
     return generic
 
 
@@ -429,16 +429,16 @@ def deepseek_inference[T: str | BaseModel](
     generic = provider.llm("deepseek-v4-flash", response_format=output, tools=tools)
     assert_type(generic, DeepSeekLLM[T, ToolManager])
     assert_type(provider.llm("deepseek-v4-flash", response_format=output), DeepSeekLLM[T, None])
-    assert_type(generic.rebind(), DeepSeekLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), DeepSeekLLM[T, None])
-    assert_type(generic.rebind(response_format=str), DeepSeekLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), DeepSeekLLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), DeepSeekLLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), DeepSeekLLM[T, None])
-    assert_type(text.rebind(tools=tools), DeepSeekLLM[str, ToolManager])
+    assert_type(generic.bind(), DeepSeekLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), DeepSeekLLM[T, None])
+    assert_type(generic.bind(response_format=str), DeepSeekLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), DeepSeekLLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), DeepSeekLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), DeepSeekLLM[T, None])
+    assert_type(text.bind(tools=tools), DeepSeekLLM[str, ToolManager])
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, DeepSeekLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), DeepSeekLLM[T, None])
+    assert_type(restored.bind(tools=None), DeepSeekLLM[T, None])
     return generic
 
 
@@ -460,29 +460,25 @@ def adapter_inference[T: str | BaseModel](
     assert_type(generic.tool_manager, ToolManager)
     assert_type(llm_from_adapter(provider, response_format=output), AdapterLLM[T, None])
     assert_type(llm_from_adapter(provider, response_format=Answer), AdapterLLM[Answer])
-    assert_type(generic.rebind(), AdapterLLM[T, ToolManager])
-    assert_type(generic.rebind(system_prompt="s"), AdapterLLM[T, ToolManager])
-    assert_type(generic.rebind(tools=None), AdapterLLM[T, None])
-    assert_type(generic.rebind(response_format=str), AdapterLLM[str, ToolManager])
-    assert_type(generic.rebind(response_format=str, tools=None), AdapterLLM[str, None])
-    assert_type(text.rebind(response_format=output, tools=tools), AdapterLLM[T, ToolManager])
-    assert_type(text.rebind(response_format=output), AdapterLLM[T, None])
-    assert_type(text.rebind(tools=tools), AdapterLLM[str, ToolManager])
-    assert_type(text.rebind(tools=[]), AdapterLLM[str, ToolManager])
-    assert_type(text.rebind(response_format=output, tools=[]), AdapterLLM[T, ToolManager])
-    assert_type(
-        text.rebind(response_format=output).rebind(tools=tools), AdapterLLM[T, ToolManager]
-    )
-    assert_type(text.rebind(response_format=output).rebind(tools=[]), AdapterLLM[T, ToolManager])
+    assert_type(generic.bind(), AdapterLLM[T, ToolManager])
+    assert_type(generic.bind(system_prompt="s"), AdapterLLM[T, ToolManager])
+    assert_type(generic.bind(tools=None), AdapterLLM[T, None])
+    assert_type(generic.bind(response_format=str), AdapterLLM[str, ToolManager])
+    assert_type(generic.bind(response_format=str, tools=None), AdapterLLM[str, None])
+    assert_type(text.bind(response_format=output, tools=tools), AdapterLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output), AdapterLLM[T, None])
+    assert_type(text.bind(tools=tools), AdapterLLM[str, ToolManager])
+    assert_type(text.bind(tools=[]), AdapterLLM[str, ToolManager])
+    assert_type(text.bind(response_format=output, tools=[]), AdapterLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output).bind(tools=tools), AdapterLLM[T, ToolManager])
+    assert_type(text.bind(response_format=output).bind(tools=[]), AdapterLLM[T, ToolManager])
     provider_executed_tools = ({"type": "web_search"},)
+    assert_type(text.bind(provider_executed_tools=provider_executed_tools), AdapterLLM[str, None])
     assert_type(
-        text.rebind(provider_executed_tools=provider_executed_tools), AdapterLLM[str, None]
-    )
-    assert_type(
-        generic.rebind(tools=None).rebind(provider_executed_tools=provider_executed_tools),
+        generic.bind(tools=None).bind(provider_executed_tools=provider_executed_tools),
         AdapterLLM[T, None],
     )
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, AdapterLLM[T, ToolManager])
-    assert_type(restored.rebind(tools=None), AdapterLLM[T, None])
+    assert_type(restored.bind(tools=None), AdapterLLM[T, None])
     return generic

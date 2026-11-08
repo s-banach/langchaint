@@ -17,7 +17,7 @@ class Sentiment(BaseModel):
 
 
 async def basics() -> None:
-    """Demonstrate text generation, structured generation, `OpenAILLM.rebind()`, and batch generation.
+    """Demonstrate text generation, structured generation, `OpenAILLM.bind()`, and batch generation.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
@@ -32,7 +32,7 @@ async def basics() -> None:
     classification = await classifier.generate_one("Best day I have had in months.")
     print(f"{classification.output.label}: {classification.output.confidence}")
 
-    detailed = assistant.rebind(
+    detailed = assistant.bind(
         system_prompt="Explain the answer in one paragraph.",
         max_completion_tokens=2048,
     )

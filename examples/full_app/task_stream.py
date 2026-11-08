@@ -213,7 +213,7 @@ class ReActAgent(AgentRun):
             ValueError: A binding option in config is invalid or unsupported by the provider.
         """
         tools = [*tools, build_critique_tool()] if config.self_correction_enabled else tools
-        self.llm: LLM[str, ToolManager] = llm.rebind(
+        self.llm: LLM[str, ToolManager] = llm.bind(
             system_prompt=config.system_prompt,
             tools=tools,
             tool_choice="none" if config.max_tool_calls <= 0 else "auto",
@@ -324,7 +324,7 @@ class ReActAgent(AgentRun):
         self._settle_outcomes(call_of_id, outcomes)
         self.messages.extend(outcome.tool_message for outcome in outcomes)
         if remaining and self.tool_calls_made >= self.config.max_tool_calls:
-            self.llm = self.llm.rebind(tool_choice="none")
+            self.llm = self.llm.bind(tool_choice="none")
 
     def _settle_outcomes(
         self, call_of_id: Mapping[str, ToolCall], outcomes: Sequence[DispatchManyItemOutcome]

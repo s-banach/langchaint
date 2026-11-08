@@ -59,10 +59,10 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalAn
     for turn in range(max_turns):
         # Force the exit tool on the final turn.
         if turn == max_turns - 1:
-            bound = bound.rebind(tool_choice=SpecificToolChoice(tool_name=final_answer_tool.name))
+            bound = bound.bind(tool_choice=SpecificToolChoice(tool_name=final_answer_tool.name))
         generation = await bound.generate_one(messages)
         if turn == 0:
-            bound = bound.rebind(tool_choice="required")
+            bound = bound.bind(tool_choice="required")
         messages.append(generation.assistant_message)
         for tool_call in generation.tool_calls:
             if tool_call.name != final_answer_tool.name:

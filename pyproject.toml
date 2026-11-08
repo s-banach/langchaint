@@ -165,7 +165,6 @@ lint.select = [
     # DOC501/DOC502 misread exceptions raised through class factories; review Raises: manually.
 ]
 lint.ignore = [
-    "any-type",
     "suppressible-exception",
     "magic-value-comparison",
     "raise-vanilla-args",
@@ -183,8 +182,8 @@ lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
-lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
-lint.per-file-ignores."tests/*" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+lint.per-file-ignores."examples/full_app/*" = ["blind-except"]
+lint.per-file-ignores."tests/*" = ["D100", "D101", "D102", "D103", "D107"]
 # Conformance test methods follow the test docstring rules.
 lint.per-file-ignores."src/langchaint/conformance.py" = ["D102"]
 

@@ -84,7 +84,7 @@ class DispatchInvalidToolArgs:
 
 @dataclass(frozen=True, kw_only=True)
 class DispatchUnknownTool:
-    """A tool call whose `tool_name` is absent from `ToolManager`.
+    """A tool call whose `name` is absent from `ToolManager`.
 
     `tool_message` lists the available tool names for the model.
     """
@@ -273,13 +273,11 @@ class _ToolDecorator:
                 args_model = eval(args_model, function.__globals__, local_namespace)
             except Exception as error:
                 raise TypeError(
-                    f"@tool function {function.__name__!r} parameter {parameter.name!r} "
-                    "annotation could not resolve"
+                    f"could not resolve the annotation for @tool function {function.__name__!r} parameter {parameter.name!r}"
                 ) from error
         if not _is_matching_args_model(args_model, function):
             raise TypeError(
-                f"@tool function {function.__name__!r} parameter {parameter.name!r} "
-                "must be annotated with a BaseModel subclass"
+                f"@tool function {function.__name__!r} parameter {parameter.name!r} must be annotated with a BaseModel subclass"
             )
         return PydanticTool(
             name=function.__name__ if self.name is None else self.name,
@@ -364,7 +362,7 @@ _ARGS_OBJECT = TypeAdapter(dict[str, object])
 
 @dataclass(frozen=True, kw_only=True)
 class JSONSchemaTool[AppDataT = None]:
-    """A function whose raw JSON schema validates its model-generated arguments.
+    """A tool that validates model-generated arguments against `args_schema` before calling `function`.
 
     `args_schema` passes to the provider unchanged.
     """
@@ -436,7 +434,7 @@ class DispatchObserver(Protocol):
 
         The returned handle receives the `DispatchOutcome`, or the exception the tool function raised.
         langchaint logs an exception this method raises and dispatches the call unobserved.
-        `dispatch` enters `current()` around the tool function, so work the function starts nests under the dispatch.
+        `ToolManager.dispatch` runs the tool function inside the returned handle's `current()` context.
         """
         ...
 
@@ -514,8 +512,7 @@ def _precompute_tool_calls(
             continue
         if tool_message.tool_call_id != tool_call.id:
             raise ValueError(
-                f"precomputed answered the call with id {tool_call.id!r} with a ToolMessage "
-                f"whose tool_call_id is {tool_message.tool_call_id!r}"
+                f"precomputed answered the call with id {tool_call.id!r} with a ToolMessage whose tool_call_id is {tool_message.tool_call_id!r}"
             )
         outcomes_or_calls.append(DispatchPrecomputed(tool_message=tool_message))
     return outcomes_or_calls

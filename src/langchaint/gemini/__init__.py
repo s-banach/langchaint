@@ -266,7 +266,6 @@ class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
             ValueError: `max_requests` is boolean or below one.
             ValueError: The binding breaks a rule of the adapter.
                 The docstring of the backend's `llm()` lists the rules.
-            TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
             pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
@@ -542,7 +541,7 @@ class Gemini:
 
         `response_format` selects a pydantic model for structured output, or `str` for final text.
         A response without a text part or tool call gives `GenerationError`.
-        An empty final text part gives `""`.
+        For text output, an empty final text part gives `""`.
         `reasoning_level=None` uses the provider's reasoning default.
 
         `extra_body` adds provider wire-body fields.
@@ -553,10 +552,11 @@ class Gemini:
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when `client` reaches Vertex AI.
-            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
-            TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
+            TypeError: `response_format` is a proper subclass of `str`.
             pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.

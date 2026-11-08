@@ -45,7 +45,6 @@ from langchaint.openai import (
 )
 from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 from tests.helpers import run_with_timeout
-from tests.test_configured_providers import ProviderLLM
 
 _ARBITRARY_RATES = TokenRates(
     input_tokens_cache_none=1.0,
@@ -180,7 +179,7 @@ def test_gemini_llm_uses_stated_pricing(model: str) -> None:
 
 
 def test_gemini_llm_raises_on_a_vertex_client() -> None:
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match=r"contradicts client\.vertexai=True"):
         _ = Gemini(client=genai.Client(api_key="offline", vertexai=True)).llm("gemini-3.5-flash")
 
 
@@ -497,52 +496,66 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
 
 
 @pytest.mark.parametrize(
-    ("build_llm", "expected_provider_name"),
+    ("build_adapter", "expected_provider_name"),
     [
         (
-            lambda: Anthropic(client=AsyncAnthropic(api_key="offline")).llm(
-                "claude-sonnet-5", max_completion_tokens=128
+            lambda: (
+                Anthropic(client=AsyncAnthropic(api_key="offline"))
+                .llm("claude-sonnet-5", max_completion_tokens=128)
+                .adapter
             ),
             "anthropic",
         ),
         (
-            lambda: AnthropicBedrock(
-                client=AsyncAnthropicBedrock(aws_region="us-east-1"),
-            ).llm("us.anthropic.claude-sonnet-4-6", max_completion_tokens=128),
+            lambda: (
+                AnthropicBedrock(
+                    client=AsyncAnthropicBedrock(aws_region="us-east-1"),
+                )
+                .llm("us.anthropic.claude-sonnet-4-6", max_completion_tokens=128)
+                .adapter
+            ),
             "aws.bedrock",
         ),
         (
-            lambda: OpenAI(client=AsyncOpenAI(api_key="offline")).llm(
-                "gpt-5.6-terra", regional_processing=False
+            lambda: (
+                OpenAI(client=AsyncOpenAI(api_key="offline"))
+                .llm("gpt-5.6-terra", regional_processing=False)
+                .adapter
             ),
             "openai",
         ),
         (
-            lambda: Gemini(client=genai.Client(api_key="offline", vertexai=False)).llm(
-                "gemini-3.5-flash"
+            lambda: (
+                Gemini(client=genai.Client(api_key="offline", vertexai=False))
+                .llm("gemini-3.5-flash")
+                .adapter
             ),
             "gcp.gemini",
         ),
         (
-            lambda: OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1")).llm(
-                "openai.gpt-oss-120b-1:0",
-                pricing=_ARBITRARY_PRICING,
-                supports_prompt_cache_options=False,
+            lambda: (
+                OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1"))
+                .llm(
+                    "openai.gpt-oss-120b-1:0",
+                    pricing=_ARBITRARY_PRICING,
+                    supports_prompt_cache_options=False,
+                )
+                .adapter
             ),
             "aws.bedrock",
         ),
         (
-            lambda: DeepSeek(client=_deepseek_client()).llm("deepseek-v4-flash"),
+            lambda: DeepSeek(client=_deepseek_client()).llm("deepseek-v4-flash").adapter,
             "deepseek",
         ),
     ],
 )
 def test_each_model_states_a_convention_provider_name(
-    build_llm: Callable[[], ProviderLLM],
+    build_adapter: Callable[[], Adapter],
     expected_provider_name: str,
     provider_name_values: set[str],
 ) -> None:
-    adapter = build_llm().adapter
+    adapter = build_adapter()
     assert adapter.provider_name == expected_provider_name
     assert adapter.provider_name in provider_name_values
 
@@ -563,16 +576,16 @@ def test_openai_rejects_a_client_reaching_another_provider(
     build_client: Callable[[], AsyncOpenAI],
 ) -> None:
     client = build_client()
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match="requires provider_name="):
         _ = OpenAI(client=client).llm("gpt-5.6-terra", regional_processing=False)
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match="requires provider_name="):
         _ = OpenAI(client=client).embedding_model("text-embedding-3-small")
     run_with_timeout(client.close())
 
 
 def test_deepseek_llm_rejects_a_bedrock_client() -> None:
     client = AsyncBedrockOpenAI(aws_region="us-east-1")
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match="requires provider_name="):
         _ = DeepSeek(client=client).llm("deepseek-v4-flash")
 
 
@@ -587,7 +600,7 @@ def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
     client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     client = client_class(aws_region="us-east-1")
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match="requires provider_name="):
         _ = AnthropicMessagesAdapter(
             client=client,
             model="claude-sonnet-5",
@@ -600,7 +613,7 @@ def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
     class SigV4BedrockOpenAI(AsyncBedrockOpenAI):
         pass
 
-    with pytest.raises(ValueError, match="contradicts the client"):
+    with pytest.raises(ValueError, match="requires provider_name="):
         _ = OpenAI(client=SigV4BedrockOpenAI(aws_region="us-east-1")).llm(
             "gpt-5.6-terra", regional_processing=False
         )

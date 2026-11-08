@@ -29,8 +29,8 @@ _PAUSE_STATUSES = frozenset({429, 503})
 """429 rate limits and documented 503 forms throttle the rate-limit quota.
 
 Every request sharing the rate-limit quota pauses.
-The SDK's `api_reference/openapi.transformed.yml` (openai 3.17.0) documents only these
-two error statuses on chat completions, responses, and embeddings.
+The SDK's `api_reference/openapi.transformed.yml` (openai 3.17.0) documents these two error statuses.
+They are the only documented error statuses for chat completions, responses, and embeddings.
 It describes both as retryable after an optional integer-seconds `Retry-After` header.
 """
 
@@ -176,16 +176,14 @@ def require_prompt_cache_options_support(
     """
     if not automatic_cache_breakpoints and not supports_prompt_cache_options:
         raise ValueError(
-            f"model {model!r} was built with supports_prompt_cache_options=False, "
-            "so prompt_cache_options is never sent. "
+            f"model {model!r} was built with supports_prompt_cache_options=False, so prompt_cache_options is never sent. "
             "prompt_cache_options carries automatic_cache_breakpoints=False to the request. "
-            "Bind automatic_cache_breakpoints=True, or set supports_prompt_cache_options=True "
-            "if the model accepts it."
+            "Bind automatic_cache_breakpoints=True, or set supports_prompt_cache_options=True if the model accepts it."
         )
 
 
 def openai_request_failure(error: Exception, *, client: openai.AsyncOpenAI) -> RequestFailure:
-    """Return the `RequestFailure` of one exception an OpenAI request raised.
+    """Classify an OpenAI request exception.
 
     `APIConnectionError` is a transient transport failure without a response, and pauses nothing.
     `APITimeoutError` is an `APIConnectionError` subclass.
@@ -193,7 +191,8 @@ def openai_request_failure(error: Exception, *, client: openai.AsyncOpenAI) -> R
     The client's `_should_retry` decides retries for every other status.
     openai 3.46.0 declines retries when `Retry-After` exceeds 120 seconds, and retries spend-limit 429s.
     Statuses 429 and 503 pause the quota independently of the retry decision.
-    A failed SDK retry decision is logged and returns `unknown_exception`.
+    If the SDK's retry rule raises, langchaint logs the exception.
+    It returns a `RequestFailure` with `kind="unknown_exception"`.
     Other exceptions are `unknown_exception`.
     """
     if isinstance(error, openai.APIConnectionError):

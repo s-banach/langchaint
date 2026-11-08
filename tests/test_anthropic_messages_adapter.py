@@ -213,7 +213,7 @@ def _adapter(
     pricing: AnthropicPricingTable = _PRICING,
     cache_ttl: CacheTTL = "5m",
 ) -> AnthropicMessagesAdapter:
-    """Build an adapter over a keyless client unless a test supplies one, valid because no request leaves."""
+    """Use a client with a placeholder API key when `client` is omitted; tests do not send requests."""
     return AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test") if client is None else client,
         model="m",
@@ -315,8 +315,6 @@ def test_billing_at_a_tier_the_table_has_no_field_for_is_nan() -> None:
 
 
 class _ToolCostCase(NamedTuple):
-    """One provider-executed tool configuration, the server-tool counters a response reports, and the cost."""
-
     provider_executed_tool_types: tuple[str, ...]
     server_tool_counters: Mapping[str, int]
     expected_cost_in_usd: float
@@ -367,7 +365,7 @@ class _ToolCostCase(NamedTuple):
 def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
     """Web search prices per invocation, and web fetch, tool search, and exempt code execution add no fee.
 
-    A nonzero counter no configured tool accounts for is an unpriced charge, so the cost is NaN.
+    A nonzero tool request counter outside the configured accounting makes `provider_executed_tool_cost_in_usd` NaN.
     A partial usage snapshot cannot prove the final web-search count, so the cost is NaN.
     """
     usage_raw = at.Usage(
@@ -615,8 +613,6 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
 
 
 class _CacheBreakpointCase(NamedTuple):
-    """One message sequence, the caching parameters it converts under, and each block's cache_control."""
-
     messages: tuple[Message, ...]
     message_cache_breakpoint_budget: int
     expected_cache_controls: list[list[object]]
@@ -896,7 +892,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
                 UserMessage(content="q"),
                 AssistantMessage(content=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
             ),
-            "type key",
+            "must contain a 'type' key",
             id="stored_payload_naming_no_type",
         ),
     ],
@@ -1547,7 +1543,7 @@ def test_thinking_streams_as_reasoning_deltas_separated_by_a_blank_line(
 
 
 class _StructuredReport(BaseModel):
-    """The response_format the structured bind path parses into."""
+    """A city's temperature in degrees Celsius."""
 
     city: str
     celsius: int
@@ -1651,7 +1647,7 @@ def test_the_structured_request_merges_the_schema_into_the_output_config() -> No
             "type": "json_schema",
             "schema": {
                 "type": "object",
-                "description": "The response_format the structured bind path parses into.",
+                "description": "A city's temperature in degrees Celsius.",
                 "title": "_StructuredReport",
                 "properties": {
                     "city": {"type": "string", "title": "City"},
@@ -2006,7 +2002,7 @@ def test_request_rejects_a_binding_whose_cache_breakpoints_exceed_the_request_li
 
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
     """An empty parts tuple can reach the adapter through a directly constructed Binding."""
-    with pytest.raises(ValueError, match="empty tuple"):
+    with pytest.raises(ValueError, match="at least one TextPart"):
         _ = _adapter()._precompute_fields(
             _binding(system_prompt=(), tool_schemas=(), automatic_cache_breakpoints=True)
         )
@@ -2055,8 +2051,6 @@ def _finished_message(usage: at.Usage) -> at.Message:
 
 
 class TestAnthropicMessagesConformance(PartWireConformance):
-    """The neutral invariants, over the Anthropic Messages adapter's own SDK objects."""
-
     @override
     def make_adapter(self) -> Adapter:
         return _adapter()
@@ -2067,7 +2061,7 @@ class TestAnthropicMessagesConformance(PartWireConformance):
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a response reporting zero everywhere, anthropic's Message requiring a usage object."""
+        """Use zero token counters because anthropic 2.6.0 requires `Message.usage`."""
         return _finished_message(at.Usage(input_tokens=0, output_tokens=0))
 
     @override

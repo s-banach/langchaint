@@ -114,7 +114,7 @@ _FLOAT_EMBEDDINGS: TypeAdapter[_CohereEmbeddings] = TypeAdapter(
 
 
 def _cohere_bedrock_request_failure(error: Exception) -> RequestFailure:
-    """Return the `RequestFailure` of one exception a Bedrock request raised.
+    """Classify a Bedrock request exception.
 
     botocore 1.43.123 maps Bedrock errors to `ClientError`.
     `ThrottlingException` is transient and pauses the quota.
@@ -169,7 +169,9 @@ def _partitioned_by_body_size(
     target_body_bytes: int,
     max_body_bytes: int,
 ) -> tuple[tuple[str, ...], ...]:
-    """Partition inputs in order into batches of at most `max_inputs` whose body stays within `target_body_bytes`.
+    """Partition inputs in order into batches of at most `max_inputs`.
+
+    Use `target_body_bytes` as the request-body size target.
 
     `empty_body_bytes` is the size of the request body with an empty `texts` array.
     A batch body adds each input's JSON string bytes and one comma between inputs.

@@ -545,8 +545,7 @@ def _split_system_prompt(
         return None, input_messages
     if otel_chat_span.system_instructions:
         raise OtelToLangchaintConversionError(
-            f"{SYSTEM_INSTRUCTIONS} and an {INPUT_MESSAGES} role='system' message both provide "
-            "the system prompt"
+            f"{SYSTEM_INSTRUCTIONS} and an {INPUT_MESSAGES} role='system' message both provide the system prompt"
         )
     if system_message_count > 1:
         raise _attribute_conversion_error(
@@ -651,9 +650,9 @@ def generation_record_from_otel(
 ) -> GenerationRecord[JsonValue]:
     """Convert one parsed OTel chat span of a generation into a generation record.
 
-    The record follows the outcome that `response_outcome` returns for the output message and the selected finish
-    reason, as for a live generation: `ToolCallResponse` gives `ToolCallGenerationRecord`, and `PlainResponse` gives
-    `PlainGenerationRecord`.
+    The record follows `response_outcome` for the output message and selected finish reason, as for a live generation.
+    `ToolCallResponse` gives `ToolCallGenerationRecord`.
+    `PlainResponse` gives `PlainGenerationRecord`.
     Under `gen_ai.output.type` `"json"`, the output is the final text part parsed as JSON.
     Otherwise, the output is the final text part.
     The record contains one synthetic request record.
@@ -672,9 +671,9 @@ def generation_record_from_otel(
 
     Raises:
         OtelToLangchaintConversionError: The span reports failure.
-        OtelToLangchaintConversionError: The output message gives an outcome other than `PlainResponse` or
-            `ToolCallResponse`, such as an empty message, a token-limit stop at a final tool call, or final text that
-            is not JSON under `gen_ai.output.type` `"json"`.
+        OtelToLangchaintConversionError: The output message gives neither `PlainResponse` nor `ToolCallResponse`.
+            Examples include an empty message or a token-limit stop at a final tool call.
+            Under `gen_ai.output.type` `"json"`, final text that is not JSON also gives an unusable outcome.
         OtelToLangchaintConversionError: A selected value cannot construct a generation record unchanged.
     """
     if otel_chat_span.error_type is not None:
@@ -767,13 +766,11 @@ def llm_from_otel[LLMT: _ConfiguredLLM[str | BaseModel, ToolManager | None]](
     """
     if llm.adapter.provider_name != otel_chat_span.provider_name:
         raise ValueError(
-            f"LLM provider_name {llm.adapter.provider_name!r} differs from parsed span "
-            f"provider_name {otel_chat_span.provider_name!r}"
+            f"LLM provider_name {llm.adapter.provider_name!r} differs from parsed span provider_name {otel_chat_span.provider_name!r}"
         )
     if llm.adapter.model != otel_chat_span.request_model:
         raise ValueError(
-            f"LLM model {llm.adapter.model!r} differs from parsed span model "
-            f"{otel_chat_span.request_model!r}"
+            f"LLM model {llm.adapter.model!r} differs from parsed span model {otel_chat_span.request_model!r}"
         )
     system_prompt = system_prompt_from_otel(otel_chat_span)
     _require_matching_response_format(otel_chat_span.output_type, llm.response_format)
@@ -792,9 +789,7 @@ def llm_from_otel[LLMT: _ConfiguredLLM[str | BaseModel, ToolManager | None]](
         and captured_tool_schemas != bound_llm.binding.tool_schemas
     ):
         raise OtelToLangchaintConversionError(
-            f"{TOOL_DEFINITIONS} {otel_chat_span.tool_definitions!r} converts to "
-            f"{captured_tool_schemas!r}, which differs from caller tool schemas "
-            f"{bound_llm.binding.tool_schemas!r}"
+            f"{TOOL_DEFINITIONS} {otel_chat_span.tool_definitions!r} converts to {captured_tool_schemas!r}, which differs from caller tool schemas {bound_llm.binding.tool_schemas!r}"
         )
     return bound_llm
 
@@ -812,15 +807,13 @@ def _stop_reason_from_otel(
         selected_finish_reason = response_finish_reasons[0]
         if message_finish_reason is not None and message_finish_reason != selected_finish_reason:
             raise OtelToLangchaintConversionError(
-                f"gen_ai.response.finish_reasons {response_finish_reasons!r} differs from "
-                f"{OUTPUT_MESSAGES} finish_reason {message_finish_reason!r}"
+                f"gen_ai.response.finish_reasons {response_finish_reasons!r} differs from {OUTPUT_MESSAGES} finish_reason {message_finish_reason!r}"
             )
     else:
         selected_finish_reason = message_finish_reason
     if selected_finish_reason is None:
         raise OtelToLangchaintConversionError(
-            f"gen_ai.response.finish_reasons {response_finish_reasons!r} and "
-            f"{OUTPUT_MESSAGES} finish_reason {message_finish_reason!r} contain no value"
+            f"gen_ai.response.finish_reasons {response_finish_reasons!r} and {OUTPUT_MESSAGES} finish_reason {message_finish_reason!r} contain no value"
         )
     match selected_finish_reason:
         case "error":
@@ -885,13 +878,11 @@ def _require_matching_response_format(
     selected_output_type = _supported_output_type(output_type)
     if selected_output_type == "json" and response_format is str:
         raise OtelToLangchaintConversionError(
-            f"gen_ai.output.type {output_type!r} requires a pydantic.BaseModel response_format, "
-            f"got {response_format!r}"
+            f"gen_ai.output.type {output_type!r} requires a pydantic.BaseModel response_format, got {response_format!r}"
         )
     if selected_output_type == "text" and response_format is not str:
         raise OtelToLangchaintConversionError(
-            f"gen_ai.output.type {output_type!r} requires response_format=str, got "
-            f"{response_format!r}"
+            f"gen_ai.output.type {output_type!r} requires response_format=str, got {response_format!r}"
         )
 
 

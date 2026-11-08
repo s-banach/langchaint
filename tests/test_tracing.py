@@ -110,7 +110,7 @@ _APPLICATION_KEYS = frozenset({
     "custom.model",
     "shared.key",
 })
-"""The keys this module's transforms and `extra_attributes` set as an application would."""
+"""Keys allowed during span validation for this module's transforms and `extra_attributes`."""
 
 
 def _in_memory_tracer_provider() -> tuple[TracerProvider, InMemorySpanExporter]:
@@ -971,7 +971,6 @@ def test_tool_manager_function_exception_marks_the_span_error_and_propagates() -
         assert span.status.status_code == StatusCode.ERROR
         assert [event.name for event in span.events] == ["exception"]
         assert span.attributes is not None
-        # A raising function is classified by its exception class, the one open-ended error.type value.
         assert span.attributes["error.type"] == "RuntimeError"
 
     run_with_timeout(scenario())
@@ -1138,7 +1137,7 @@ def test_an_execute_tool_transform_edits_the_spans_of_the_tool_it_names() -> Non
 
 def test_vendored_payload_schemas_match_the_schema_mapping() -> None:
     vendored = {path.name for path in SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
-    assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
+    assert vendored, "No vendored payload schemas found."
     assert vendored == set(refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES.values())
 
 
@@ -1380,7 +1379,6 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
     logged_error_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Input content builds as one attribute group, so a failure omits the entire group."""
 
     async def scenario() -> None:
         tracer_provider, exporter = _in_memory_tracer_provider()
@@ -1552,7 +1550,7 @@ def test_tool_call_arguments_parse_any_json_value_and_keep_other_text_unchanged(
 
 
 _CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"
-"""The generated text the content-rule test traces through every reporting channel."""
+"""Generated text used to check content capture in errors, request tables, and spans."""
 
 
 @pytest.mark.parametrize("capture_message_content", [False, True])

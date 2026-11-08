@@ -153,10 +153,7 @@ Repasting it is a format break: do so only alongside the promised release-note e
 
 
 def test_a_pinned_serialization_still_loads() -> None:
-    """messages_from_json loads _PINNED_MESSAGES_JSON, enforcing messages_to_json's stability promise.
-
-    An added field with a default passes, which the promise permits.
-    """
+    """An added field with a default remains compatible with this pinned JSON."""
     assert messages_from_json(_PINNED_MESSAGES_JSON) == list(_PINNED_MESSAGES)
 
 
@@ -225,7 +222,7 @@ def test_model_copy_rejects_a_derived_property_key() -> None:
     An app could then resend the unfiltered assistant message.
     """
     message = AssistantMessage(content=(ToolCall(id="c1", name="probe", args_json="{}"),))
-    with pytest.raises(TypeError, match="derived property of AssistantMessage"):
+    with pytest.raises(TypeError, match="cannot update property 'tool_calls' of AssistantMessage"):
         _ = message.model_copy(update={"tool_calls": ()})
 
 

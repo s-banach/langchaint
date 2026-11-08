@@ -1,4 +1,4 @@
-"""Warm a reusable prompt prefix before running its batch siblings."""
+"""Warm a reusable prompt prefix with the first batch input before starting the remaining inputs."""
 
 from langchaint import PlainGeneration, TextPart
 from langchaint.anthropic import Anthropic
@@ -24,7 +24,8 @@ async def generate_with_a_warm_cache() -> list[PlainGeneration[str]]:
         "Which details may a support request include?",
     ]
     outcomes = await bound.generate_many(prompts, warm_cache=True)
-    for outcome in outcomes:
+    for index, outcome in enumerate(outcomes):
         usage = outcome.usage
-        print("tokens write/read:", usage.input_tokens_cache_write, usage.input_tokens_cache_read)
+        print(f"item {index} wrote {usage.input_tokens_cache_write} cache tokens")
+        print(f"item {index} read {usage.input_tokens_cache_read} cache tokens")
     return outcomes

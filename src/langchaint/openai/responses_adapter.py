@@ -101,7 +101,7 @@ type _WireToolChoice = (
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
 
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
-"""How much readable text to ask the API for, the values reasoning.summary takes."""
+"""Requested detail level for readable reasoning summaries."""
 
 _SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES = frozenset({
     "file_search",
@@ -250,8 +250,7 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
                 )
             case "audio":
                 raise _RejectedMessagesError(
-                    "OpenAIResponsesAdapter cannot send AudioPart inside UserMessage.content: "
-                    "ResponseInputContentParam has no audio variant"
+                    "OpenAIResponsesAdapter cannot send AudioPart inside UserMessage.content: ResponseInputContentParam has no audio variant"
                 )
     return {"role": "user", "content": wire_parts}
 
@@ -295,20 +294,18 @@ def _function_call_output(
                 )
             case "audio":
                 raise _RejectedMessagesError(
-                    "OpenAIResponsesAdapter cannot send AudioPart inside ToolMessage.content: "
-                    "ResponseFunctionCallOutputItemListParam has no audio variant"
+                    "OpenAIResponsesAdapter cannot send AudioPart inside ToolMessage.content: ResponseFunctionCallOutputItemListParam has no audio variant"
                 )
     return output_content
 
 
 def _replayed_item(raw: Mapping[str, object]) -> ResponseInputItemParam:
-    """Copy one stored SDK dump into the input item it came from, unread and unchanged.
+    """Protect the stored payload from mutable request state.
 
     This adapter's SDK dump already matches the wire parameter.
     Another provider's dump passes through unchanged for the API to validate.
-    The copy prevents mutable request state from changing the stored payload.
     """
-    # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
+    # cast: replay passes an opaque stored SDK dump to the SDK's parameter API.
     return cast("ResponseInputItemParam", dict(raw))
 
 
@@ -452,9 +449,8 @@ def _has_refusal(response: OpenAIResponse) -> bool:
 
 
 def _as_response(raw: BaseModel) -> OpenAIResponse:
-    """Narrow a raw response to the SDK response this adapter produces.
+    """`BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
 
-    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
     This adapter's stream produces every valid value.
 
     Raises:
@@ -499,10 +495,7 @@ def _cannot_continue(response: OpenAIResponse, stop_reason: StopReason) -> str |
     if response.status == "completed" or stop_reason != "other":
         return None
     reason = None if response.incomplete_details is None else response.incomplete_details.reason
-    return (
-        f"openai returned status {response.status!r} with incomplete reason {reason!r}, "
-        "which langchaint cannot continue"
-    )
+    return f"openai returned status {response.status!r} with incomplete reason {reason!r}, which langchaint cannot continue"
 
 
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
@@ -645,7 +638,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         `supports_prompt_cache_options` does not change that.
         `OpenAI.llm` sets it to True for cataloged identifiers and requires it for uncataloged identifiers.
         `OpenAIBedrock.llm` always requires it because Bedrock ids have no catalog.
-        `pricing` supplies the rates the endpoint charges.
+        `pricing` supplies the rates used to calculate billing.
         `service_tier` requests a tier, while the reported tier selects pricing.
 
         Raises:
@@ -672,7 +665,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         }
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIResponsesPrecomputedFields:
-        """Precompute the typed request fields the binding determines.
+        """Precompute request fields from the binding.
 
         A string system prompt uses `instructions`; parts form the first developer-role input message.
         `automatic_cache_breakpoints=False` sends explicit caching mode; True preserves implicit caching.
@@ -806,23 +799,23 @@ class _OpenAIResponsesStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate the SDK stream into StreamItem values.
 
-        The terminal event's response is kept for final(), which must not call the SDK's get_final_response():
-        that raises RuntimeError unless the terminal event is response.completed.
+        The terminal event's response is kept for final().
+        final() must not call the SDK's get_final_response().
+        That method raises RuntimeError unless the terminal event is response.completed.
 
         `forming_calls` uses required `output_index` because item ids are optional.
         The SDK emits the added event before its deltas.
 
-        Reasoning arrives on two independent event types and both are forwarded:
-        summary deltas requested by reasoning_summary, and text deltas from a reasoning item's content.
-        A stream yielding no ReasoningDelta is a model returning no readable reasoning.
-
-        Done events delimit reasoning parts without text.
-        `REASONING_PART_SEPARATOR` precedes the next non-empty reasoning delta.
-        Empty deltas emit no text or separator.
-        The next reasoning delta from either channel consumes a pending separator.
-
         Yields:
-            Stream items for SDK events langchaint models.
+            Reasoning arrives on two independent event types, and both are forwarded.
+            One carries summary deltas requested by reasoning_summary.
+            The other carries text deltas from a reasoning item's content.
+            A stream yielding no ReasoningDelta is a model returning no readable reasoning.
+
+            Done events delimit reasoning parts without text.
+            `REASONING_PART_SEPARATOR` precedes the next non-empty reasoning delta.
+            Empty deltas emit no text or separator.
+            The next reasoning delta from either channel consumes a pending separator.
 
         Raises:
             openai.APIStatusError: The stream ends after an error event without a terminal response.
@@ -1039,7 +1032,7 @@ class _BoundOpenAIResponses(BoundAdapter):
     def interpret(
         self, raw: BaseModel
     ) -> FinishedResponse | ProviderFailedTerminally | ProviderFailedTransiently:
-        """Read the response, or report the run openai says failed.
+        """Interpret the response, classifying `status="failed"` as a provider failure.
 
         A failed status returns `_provider_failure`, because its items are fragments even when their text gives output.
         The assistant message includes refusal text that `response.output_text` omits.

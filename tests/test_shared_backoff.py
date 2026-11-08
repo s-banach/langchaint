@@ -16,7 +16,7 @@ from tests.helpers import run_with_timeout, yield_until
 
 
 class ProviderError(Exception):
-    """The failure type the tests raise inside admitted() blocks."""
+    pass
 
 
 def _shared_backoff(
@@ -490,7 +490,7 @@ def test_decay_wins_when_traffic_also_resumed() -> None:
 
 
 def test_a_long_quiet_spell_cannot_overflow_the_decay() -> None:
-    """Past _steps_to_floor the answer is the floor, so no exponent is ever computed there."""
+    """At `_steps_to_floor`, decay reaches `min_wait_ceiling_seconds` without exponentiation, preventing overflow."""
     a_day_quiet = _shared_backoff()
     a_day_quiet._wait_ceiling = 60.0
     a_day_quiet._set_wait_ceiling(86_400.0, 0.0)

@@ -4,7 +4,6 @@ Importing this subpackage requires `opentelemetry-api`.
 Applications configure the OTel SDK.
 
 Pass one `OtelObserver` to a backend constructor, as in `OpenAI(observer=OtelObserver(...))`.
-Every `LLM`, binding, and stream that backend creates is then traced, and the application's code is otherwise unchanged.
 A `ToolManager` built from a tool sequence by a provider factory or `rebind` traces its dispatches.
 A `ToolManager` the application builds traces its dispatches when built with `observer=`.
 Every `EmbeddingModel` that backend creates traces its requests.
@@ -23,21 +22,24 @@ An embeddings span is current while its request is awaited.
 Spans started there, such as HTTP client spans, nest under them.
 A stream span is never current, because the application's code runs between stream items.
 
-Each span starts with its start attributes: `extra_attributes`, then the request or dispatch identity attributes.
+Each span starts with `extra_attributes`, followed by request or dispatch identity attributes.
 Request and dispatch identity attributes replace matching `extra_attributes` keys.
-langchaint builds the span's other attributes as attribute groups.
-A chat span's attribute groups are, in order, input content, outcome attributes, and output content.
-An execute_tool span's attribute groups are `gen_ai.tool.call.arguments` and then `gen_ai.tool.call.result`.
-An embeddings span has one attribute group, its request record's attributes.
-`error.type` follows the attribute groups.
-A key of a later attribute group replaces a matching earlier key.
-A `ContentFilter` that raises or returns a part of another kind is logged, and its attribute group is omitted.
+langchaint collects content and outcome attributes for recording when the span ends.
+Collected attributes replace matching start attributes.
+If a `ContentFilter` raises or returns a part of another kind, langchaint logs the error.
+For each chat span, langchaint builds the input attributes together.
+The input attributes are `gen_ai.system_instructions`, `gen_ai.tool.definitions`, and `gen_ai.input.messages`.
+If filtering system instructions or input messages fails, langchaint does not add these three input attributes.
+If filtering output messages fails, langchaint does not add `gen_ai.output.messages`.
+If filtering tool arguments fails on an `execute_tool` span, langchaint does not add `gen_ai.tool.call.arguments`.
+If filtering tool results fails on an `execute_tool` span, langchaint does not add `gen_ai.tool.call.result`.
+A filtering failure leaves any matching values supplied through `extra_attributes` unchanged.
 Each span kind's attribute transform, such as `chat_attribute_transform`, edits the attributes when the span ends.
 Each transform receives the outcome and every attribute, including the start attributes.
 The span records the returned attributes, and a returned key replaces the attribute of the same name.
 A start attribute missing from the result stays because the OTel `Span` API cannot remove an attribute.
-A transform that raises is logged, and the span keeps only its start attributes.
-A span with error status also keeps `error.type`.
+If a transform raises, langchaint logs the exception.
+The span keeps its start attributes and any existing `error.type`.
 Extension keys must use the application's namespace because langchaint.* is reserved.
 Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
 
@@ -152,7 +154,8 @@ The return value is the part to record, or `None` to omit the part.
 A returned part must have the same `kind` as the part passed in.
 `gen_ai.tool.call.arguments` holds one `ToolCall`, so `None` omits that attribute.
 A user or assistant message whose every part is omitted records an empty `parts` array.
-A tool message whose every part is omitted records one tool_call_response part with an empty `response`.
+When the filter omits every content part, a tool message records one `tool_call_response` part.
+Its `response` array is empty.
 A bare `str` prompt or content is passed as one `TextPart`.
 Message-level fields such as `role`, `tool_call_id`, `is_error`, and `finish_reason` never reach the filter.
 """
@@ -194,8 +197,7 @@ def _filtered_part(
     if filtered is None or isinstance(filtered, type(part)):
         return filtered
     raise TypeError(
-        f"the content filter for {attribute_name} returned {type(filtered).__name__} "
-        f"for {type(part).__name__}"
+        f"the content filter for {attribute_name} returned {type(filtered).__name__} for {type(part).__name__}"
     )
 
 
@@ -211,7 +213,6 @@ _EMBEDDINGS_OPERATION = "embeddings"
 """The GenAI operation value for an embeddings request."""
 
 _EMBEDDINGS_ENCODING_FORMATS = ("float",)
-"""The encoding formats every `EmbeddingModel` request asks for."""
 
 _logger = logging.getLogger("langchaint.tracing")
 
@@ -384,8 +385,8 @@ def _tool_call_response_part(
 ) -> dict[str, object]:
     """Render one ToolMessage as the convention's tool_call_response part, with its content filtered.
 
-    One tool result reaches a backend under this one shape from both spans that report it:
-    inside gen_ai.input.messages on a generate span, and as gen_ai.tool.call.result on a tool span.
+    Tool results use the same `tool_call_response` structure in chat and tool spans.
+    The attributes are `gen_ai.input.messages` on chat spans and `gen_ai.tool.call.result` on tool spans.
     `tool_call_id` and `is_error` never reach the filter.
     """
     return {
@@ -400,7 +401,6 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
     """Render the bound tool schemas as the convention's tool-definition array.
 
     description and parameters record what the model received despite the schema's size warning.
-    This is a deliberate departure from that recommendation.
     """
     return [
         {
@@ -419,9 +419,9 @@ def _input_content_attributes(
     """Build the input-side content attributes for one input, each a JSON string.
 
     OTel attribute values cannot nest, so structured values use the permitted JSON string form.
-    A key whose source is empty or absent is omitted.
+    `gen_ai.input.messages` is omitted when `messages` is empty.
     `system_prompt=None` omits gen_ai.system_instructions, and so does a prompt whose every part filters away.
-    No bound tools omits gen_ai.tool.definitions.
+    `gen_ai.tool.definitions` is omitted when no tools are bound.
     These omissions are indistinguishable from disabled capture.
     gen_ai.tool.definitions does not pass through `content_filter` because a tool schema is not a part.
     """
@@ -489,7 +489,7 @@ def _record_request_failed_events(
     """Add one langchaint.request_failed event per failed request in the outcome's request records.
 
     Each event carries the request's error text and its own `elapsed_seconds`.
-    Events are stamped at recording time because the records carry only monotonic brackets.
+    Request records contain relative elapsed times, so event timestamps use the recording time.
     """
     for record in outcome.request_history.records:
         if record.kind == "settled" and record.error is not None:
@@ -581,8 +581,7 @@ class _SpanOperation[OutcomeT]:
             return self._transform(self._outcome, self._attributes)
         except Exception:
             _logger.warning(
-                "the attribute transform raised; "
-                "this span records only its start attributes and error.type",
+                "the attribute transform raised; this span keeps its start attributes and any existing error.type",
                 exc_info=True,
             )
             error_type = self._attributes.get("error.type")
@@ -728,7 +727,7 @@ class OtelObserver:
         It also records tool arguments and tool results.
         It records every part unchanged, including image and audio bytes.
         A `ContentFilter` passed as `capture_message_content` selects the same attributes.
-        Each of them records the parts the filter returns.
+        The filter controls recorded prompt and message parts, tool arguments, and tool results.
         The filter never sees `gen_ai.tool.definitions`, because a tool schema is not a message part.
         A filter that keeps everything except inline bytes:
 
@@ -742,7 +741,7 @@ class OtelObserver:
         `extra_attributes` applies at the start of every span.
         `extra_attributes=None` supplies no extra attributes.
         Request and dispatch identity attributes replace matching `extra_attributes` keys at span start.
-        A matching key of a later attribute group replaces an `extra_attributes` value when the span ends.
+        Content and outcome attributes replace matching `extra_attributes` values when the span ends.
         `tracer_provider` decides where spans go, and `tracer_provider=None` uses the global tracer provider.
         Either way, the tracer is named `langchaint.tracing` with the package version.
         That name is every span's instrumentation scope, which identifies langchaint as the span's source.

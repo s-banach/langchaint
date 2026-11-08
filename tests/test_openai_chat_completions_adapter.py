@@ -139,9 +139,8 @@ def _completion(
     choices: list[object] | None = None,
     model: str = "m",
 ) -> ChatCompletion:
-    """Build a completion whose id is fixed at "r1". Every field a test varies is a parameter.
+    """message holds the assistant message's fields minus role. None gives content "hey".
 
-    message holds the assistant message's fields minus role. None gives content "hey".
     choices overrides the single built choice, [] being the no-choices response.
     """
     if choices is None:
@@ -478,7 +477,7 @@ def _adapter(
     supports_prompt_cache_options: bool = True,
     service_tier: OpenAIServiceTier | None = None,
 ) -> OpenAIChatCompletionsAdapter:
-    """Build an adapter over a keyless client unless a test supplies one, valid because no request leaves.
+    """Use a client with a placeholder API key when `client` is omitted; tests do not send requests.
 
     supports_prompt_cache_options=True sends the binding's cache setting.
     """
@@ -1141,10 +1140,9 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
-        """Decompose one assistant param into wire-order parts.
+        """Extract reasoning, content, and tool-call parts from one assistant request message, in that order.
 
-        This wire stores the assistant message in one message param.
-        Split ReasoningPart.raw, content, and ToolCall values in AssistantPart order.
+        Chat Completions stores the assistant message in one request message.
         """
         assert isinstance(request_params, _OpenAIChatCompletionsRequestParams)
         (assistant_param,) = request_params.messages[1:]

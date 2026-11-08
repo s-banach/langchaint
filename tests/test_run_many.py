@@ -42,8 +42,6 @@ def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
     """An IntEnum is a positive non-bool int, so run_many accepts it as max_pending."""
 
     class Concurrency(IntEnum):
-        """Stand in for an application's own bound, spelled as an enum."""
-
         LOW = 2
 
     async def scenario() -> None:
@@ -85,7 +83,6 @@ def test_run_many_snapshots_run_ones_before_starting_tasks() -> None:
 
 
 def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> None:
-    """max_pending=2 refills immediately without sharing ContextVar bindings."""
 
     async def scenario() -> None:
         """Complete four inputs outside input order."""

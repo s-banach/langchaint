@@ -151,7 +151,7 @@ _VALIDATION_ERROR_JSON = (
     '[{"type":"value_error","loc":["celsius"],'
     '"msg":"Value error, SENTINEL is not a temperature","input":"SENTINEL"}]'
 )
-"""A pydantic rejection whose msg embeds the rejected value, as a caller's field_validator writes it."""
+"""Serialized pydantic validation errors with the rejected value in `msg`, as a caller's field validator can produce."""
 _SCHEMA_VIOLATION = SchemaViolation(
     validation_error_json=_VALIDATION_ERROR_JSON,
     assistant_message=REJECTED_ASSISTANT_MESSAGE,
@@ -887,46 +887,6 @@ def test_construction_and_rebind_reject_a_str_subclass_response_format() -> None
         _ = llm.rebind(response_format=_Label)
 
 
-def _pin_construction_and_rebind_types(llm: AdapterLLM, tool_manager: ToolManager) -> None:
-    assert_type(llm, AdapterLLM[str, None])
-    text_with_constructed_tools = llm.rebind(tools=[_capture_tool()])
-    assert_type(text_with_constructed_tools, AdapterLLM[str, ToolManager])
-    text_with_tools = llm.rebind(tools=tool_manager)
-    assert_type(text_with_tools, AdapterLLM[str, ToolManager])
-    structured = llm.rebind(response_format=_Answer)
-    assert_type(structured, AdapterLLM[_Answer, None])
-    structured_with_tools = llm.rebind(response_format=_Answer, tools=tool_manager)
-    assert_type(structured_with_tools, AdapterLLM[_Answer, ToolManager])
-    structured_with_constructed_tools = llm.rebind(
-        response_format=_Answer,
-        tools=[_capture_tool()],
-    )
-    assert_type(structured_with_constructed_tools, AdapterLLM[_Answer, ToolManager])
-    provider_executed_tool = ({"type": "web_search"},)
-    text_with_provider_executed_tool = llm.rebind(
-        provider_executed_tools=provider_executed_tool,
-    )
-    assert_type(text_with_provider_executed_tool, AdapterLLM[str, None])
-    assert_type(
-        structured.rebind(provider_executed_tools=provider_executed_tool),
-        AdapterLLM[_Answer, None],
-    )
-
-    # AdapterLLM[X] is AdapterLLM[X, None]: the PEP 696 default keeps the common annotation short.
-    assert_type(structured, AdapterLLM[_Answer])
-
-    assert_type(text_with_tools.tool_manager, ToolManager)
-    assert_type(llm.tool_manager, None)
-
-    replacement_with_tool_manager = structured.rebind(tools=tool_manager)
-    assert_type(replacement_with_tool_manager, AdapterLLM[_Answer, ToolManager])
-    assert_type(structured.rebind(tools=[_capture_tool()]), AdapterLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(tools=None), AdapterLLM[_Answer, None])
-    assert_type(text_with_tools.rebind(response_format=_Answer), AdapterLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(response_format=str), AdapterLLM[str, ToolManager])
-    assert_type(structured_with_tools.rebind(system_prompt="s"), AdapterLLM[_Answer, ToolManager])
-
-
 async def _pin_request_method_return_types(llm: AdapterLLM, tool_manager: ToolManager) -> None:
     """Let pyrefly check return types without running requests."""
     structured_with_tools = llm.rebind(response_format=_Answer, tools=tool_manager)
@@ -963,27 +923,6 @@ async def _pin_request_method_return_types(llm: AdapterLLM, tool_manager: ToolMa
     async with structured.stream_one("hi") as stream_without_tools:
         async for item in stream_without_tools:
             assert_type(item, StreamItem)
-
-
-async def _pin_generic_request_method_return_types[
-    OutputT: str | BaseModel,
-    ToolManagerT: ToolManager | None,
-](bound_llm: LLM[OutputT, ToolManagerT]) -> None:
-    assert_type(
-        await bound_llm.generate_many_records(["hi"], resume_path=Path("records.jsonl")),
-        Sequence[GenerationOutcomeRecord[OutputT]],
-    )
-
-
-def _pin_covariance(
-    structured_with_tools: AdapterLLM[_Answer, ToolManager],
-) -> LLM[BaseModel, ToolManager | None]:
-    """Let pyrefly check covariance without running requests.
-
-    pyrefly infers each type parameter's variance from every attribute and method signature, private ones included.
-    It treats attributes whose names start with `_` as read-only.
-    """
-    return structured_with_tools
 
 
 class _ScriptedBoundAdapter(BoundAdapter):

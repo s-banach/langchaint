@@ -44,8 +44,8 @@ from langchaint.generation.request_history import (
     _settled_request_records,
 )
 
-# Declared covariant because pyrefly infers a PEP 695 parameter invariant through the record's
-# `output` field, and `ChatAttributeTransform` takes `GenerationOutcome[object]`.
+# Declared covariant because pyrefly infers a PEP 695 parameter invariant through the record's `output` field.
+# `ChatAttributeTransform` takes `GenerationOutcome[object]`.
 _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 
@@ -69,7 +69,7 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
 
     @property
     def kept_request(self) -> SettledRequestRecord:
-        """Return the final request, whose response holds the kept assistant message."""
+        """Return the final request."""
         final = self.request_history.records[-1]
         assert final.kind == "settled"
         return final
@@ -174,7 +174,7 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
 
     @property
     def kept_request(self) -> SettledRequestRecord:
-        """Return the final request, whose response holds the kept assistant message."""
+        """Return the final request."""
         return self.record.kept_request
 
     @property
@@ -202,7 +202,7 @@ class PlainGeneration(
     _LiveGenerationBase[PlainGenerationRecord[_OutputT_co]],
     Generic[_OutputT_co],  # noqa: UP046
 ):
-    """A generation whose kept assistant message has no tool calls, with provider SDK values."""
+    """A generation with output and no application tool calls."""
 
     kind: Literal["plain"] = "plain"
 
@@ -218,7 +218,7 @@ class PlainGeneration(
 
 @dataclass(frozen=True, kw_only=True)
 class ToolCallGeneration(_LiveGenerationBase[ToolCallGenerationRecord]):
-    """A generation whose kept assistant message has tool calls, with provider SDK values.
+    """A generation with application tool calls.
 
     Only a binding with tools produces one.
     """
@@ -283,7 +283,10 @@ def structured_output[ModelT: BaseModel](
 def _stop_reason_outcome(
     assistant_message: AssistantMessage, stop_reason: StopReason
 ) -> Refusal | MaxCompletionTokensExceeded | ContextWindowExceeded | None:
-    """Return the outcome a refusal or truncation stop reason names, or `None` for any other."""
+    """Return the outcome for `refusal`, `max_completion_tokens`, or `context_window_exceeded`.
+
+    Return `None` for another stop reason.
+    """
     match stop_reason:
         case "refusal":
             return Refusal(assistant_message=assistant_message)

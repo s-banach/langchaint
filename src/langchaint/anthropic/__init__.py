@@ -40,8 +40,7 @@ except ModuleNotFoundError as exc:
     if exc.name not in ("anthropic", "httpx2"):
         raise
     raise ModuleNotFoundError(
-        "langchaint's anthropic backend requires its dependencies; install "
-        "langchaint[anthropic] or langchaint[anthropic-bedrock]."
+        "langchaint's anthropic backend requires its dependencies; install langchaint[anthropic] or langchaint[anthropic-bedrock]."
     ) from exc
 
 from collections.abc import Mapping, Sequence
@@ -244,7 +243,6 @@ class AnthropicLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | N
                 The docstring of the backend's `llm()` lists the rules.
             TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -526,7 +524,7 @@ class Anthropic:
 
         `response_format` selects a pydantic model for structured output, or `str` for final text.
         A response without a text part or tool call gives `GenerationError`.
-        An empty final text part gives `""`.
+        For text output, an empty final text part gives `""`.
         `reasoning_level=None` uses the provider's reasoning default.
 
         `extra_body` adds provider wire-body fields.
@@ -536,11 +534,11 @@ class Anthropic:
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
-            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
             TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
@@ -726,7 +724,6 @@ class AnthropicBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolMana
                 The docstring of the backend's `llm()` lists the rules.
             TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -782,8 +779,7 @@ class AnthropicBedrock:
         client_class = AsyncAnthropicBedrock if api == "legacy" else AsyncAnthropicBedrockMantle
         if client is not None and not isinstance(client, client_class):
             raise ValueError(
-                f"api={api!r} requires a {client_class.__name__} client, "
-                f"but a {type(client).__name__} was passed."
+                f"api={api!r} requires a {client_class.__name__} client, but a {type(client).__name__} was passed."
             )
         self._observer = observer
         self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
@@ -924,7 +920,7 @@ class AnthropicBedrock:
 
         `response_format` selects a pydantic model for structured output, or `str` for final text.
         A response without a text part or tool call gives `GenerationError`.
-        An empty final text part gives `""`.
+        For text output, an empty final text part gives `""`.
         `reasoning_level=None` uses the provider's reasoning default.
 
         `extra_body` adds provider wire-body fields.
@@ -934,11 +930,11 @@ class AnthropicBedrock:
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
-            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
             TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """

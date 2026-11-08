@@ -1,7 +1,7 @@
 [project]
 name = "langchaint"
 version = "0.35.1"
-description = "It ain't langchain."
+description = "A provider-neutral Python client for LLM applications."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -170,8 +170,7 @@ lint.ignore = [
     "magic-value-comparison",
     "raise-vanilla-args",
     "too-many-arguments",
-    # The `bind` signatures write `X | None | Unchanged` to keep the sentinel
-    # adjacent to its `= UNCHANGED` default; obeying the rule would bury it.
+    # Keep `Unchanged` next to its `= UNCHANGED` default in parameter declarations.
     "none-not-at-end-of-union",
 ]
 
@@ -186,5 +185,7 @@ lint.pylint.max-statements = 60
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
 lint.per-file-ignores."tests/*" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+# Conformance test methods follow the test docstring rules.
+lint.per-file-ignores."src/langchaint/conformance.py" = ["D102"]
 
 [tool.typos.default.extend-words]

@@ -13,7 +13,7 @@ class _Valued(CheckedCopyModel):
 
 
 def test_a_subclass_defining_its_own_init_is_rejected() -> None:
-    with pytest.raises(TypeError, match="custom_init"):
+    with pytest.raises(TypeError, match="pydantic's generated constructor"):
 
         class CustomInitModel(_Valued):
             def __init__(self, value: int) -> None:

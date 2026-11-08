@@ -127,7 +127,7 @@ The unequal multipliers let a test detect swapped multipliers.
 """
 
 _OFFLINE_CLIENT = genai.Client(api_key="offline", vertexai=False)
-"""The client every adapter here shares unless a test needs another, since each construction takes milliseconds."""
+"""Reuse this client by default to avoid repeated client construction."""
 
 
 def _adapter(
@@ -202,7 +202,7 @@ def _usage_metadata(
     thoughts_token_count: int | None = 10,
     traffic_type: types.TrafficType | None = None,
 ) -> types.GenerateContentResponseUsageMetadata:
-    """Build usage metadata. The defaults exercise every counter the partition reads."""
+    """Populate every token counter read by `_billing_from_usage` by default."""
     return types.GenerateContentResponseUsageMetadata(
         prompt_token_count=prompt_token_count,
         cached_content_token_count=cached_content_token_count,
@@ -221,7 +221,7 @@ def _response(
     grounding_metadata: types.GroundingMetadata | None = None,
     block_reason: types.BlockedReason | None = None,
 ) -> types.GenerateContentResponse:
-    """Build a response. parts None with finish_reason None builds one without candidates."""
+    """`parts=None` and `finish_reason=None` produce a response without candidates."""
     candidates: list[types.Candidate] | None = None
     if parts is not None or finish_reason is not None:
         candidates = [
@@ -294,7 +294,7 @@ def _api_error(
     headers: Mapping[str, str] | None = None,
     retry_delay: str | None = None,
 ) -> errors.APIError:
-    """Build an APIError as raise_for_response builds one, its body the {"error": ...} envelope."""
+    """Build an `APIError` with an `{"error": ...}` body, matching the HTTP error path in google-genai 3.0.0."""
     details: list[dict[str, object]] = []
     if retry_delay is not None:
         details.append({
@@ -481,10 +481,7 @@ def test_binding_fields_build_the_config(case: _ConfigCase) -> None:
 def test_tool_choice_mapping(
     tool_choice: ToolChoice, expected: types.FunctionCallingConfig
 ) -> None:
-    """Neutral "required" is mode ANY. A specific choice is ANY narrowed to the one name.
-
-    One Tool holds every declaration whatever the choice, its schema passed as parameters_json_schema.
-    """
+    """Neutral "required" is mode ANY. A specific choice is ANY narrowed to the one name."""
     lookup_schema = ToolSchema(
         name="lookup",
         description="Look up the city.",
@@ -543,7 +540,7 @@ _COLLIDING_EXTRA_BODIES: tuple[Mapping[str, object], ...] = (
     {"generationConfig": {"response_json_schema": {}}},
     {"generationConfig": {"MAXOUTPUTTOKENS": 5}},
 )
-"""extra_body keys the adapter populates, in the spellings and casings the wire accepts."""
+"""google-genai 3.0.0 matches these alternate `extra_body` spellings to fields populated by the adapter."""
 
 _NON_STRING_KEY_GENERATION_CONFIG: dict[object, object] = {1: "value", "temperature": 0.1}
 
@@ -557,12 +554,11 @@ class _BindDefect(NamedTuple):
 
 _BIND_DEFECTS = [
     # An empty parts tuple can only come from a directly constructed Binding.
-    _BindDefect("empty_system_prompt_parts", _binding(system_prompt=()), "empty tuple"),
+    _BindDefect("empty_system_prompt_parts", _binding(system_prompt=()), "at least one TextPart"),
     # No wire form disables parallel function calls.
     _BindDefect(
         "parallel_tool_calls_false", _binding(parallel_tool_calls=False), "parallel_tool_calls"
     ),
-    # A value the Gemini SDK would change does not reach the request.
     _BindDefect(
         "reasoning_level_the_sdk_normalizes",
         _binding(reasoning_level="high"),
@@ -642,7 +638,7 @@ _BIND_DEFECTS = [
         ),
         "collide",
     ),
-    # A non-object generationConfig, None included, would replace the adapter's own wholesale.
+    # Non-object values, including `None`, would replace every `generationConfig` field populated by the adapter.
     _BindDefect(
         "generation_config_not_an_object",
         _binding(extra_body={"generationConfig": "junk"}),
@@ -697,10 +693,7 @@ def test_structured_bind_sends_the_response_schema() -> None:
 
 
 def test_service_tier_is_sent_and_fingerprinted() -> None:
-    """The adapter's service_tier is sent on every request and is the only fingerprinted setting.
-
-    Pricing is billing configuration, so the fingerprint excludes it.
-    """
+    """Pricing is billing configuration, so the fingerprint excludes it."""
     adapter = _adapter(service_tier="flex")
     assert adapter.config_fingerprint_data() == {"service_tier": "flex"}
     assert _bound_config(_binding(), adapter) == types.GenerateContentConfig(
@@ -874,7 +867,7 @@ class _InvalidMessages(NamedTuple):
 
 
 _INVALID_MESSAGES = [
-    # The wire requires the function name, recoverable only from the call the id answers.
+    # `FunctionResponse` needs the function name from the earlier `ToolCall` matched by `ToolMessage.tool_call_id`.
     _InvalidMessages(
         "tool_message_without_its_call",
         (ToolMessage(tool_call_id="ghost", content="r"),),
@@ -1552,7 +1545,7 @@ class TestGeminiGenerateContentConformance(PartWireConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a response whose usage fills every counter Gemini bills. Writes are always zero."""
+        """Use reported token counters; Gemini billing records zero cache-write tokens."""
         return _reasoning_response(_usage_metadata())
 
     @override
@@ -1561,14 +1554,12 @@ class TestGeminiGenerateContentConformance(PartWireConformance):
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a response served at PROVISIONED_THROUGHPUT, which _PRICING states no rates for."""
         return _reasoning_response(
             _usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT)
         )
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a response whose cached counter exceeds the prompt total it is a share of."""
         return _reasoning_response(
             _usage_metadata(prompt_token_count=100, cached_content_token_count=200)
         )

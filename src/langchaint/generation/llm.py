@@ -1074,10 +1074,6 @@ class _ConfiguredLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager |
         A malformed first line or unsupported format raises before any provider request.
         So does a malformed record line in a file whose header matches a current input.
         Either failure leaves the file unchanged.
-        A file in the supported format holds the records this langchaint version would write.
-        Those are the records for the binding and inputs that produced the file.
-        That equality assumes the provider answers the same way both times.
-        A langchaint version that writes different records for the same binding and inputs uses a new format.
         Missing records generate again.
         Error records with kind `retries_exhausted_error`, `timed_out_error`, or `auth_error` generate again.
         The fingerprints exclude the causes of those errors, so the same input can succeed later.
@@ -1087,7 +1083,7 @@ class _ConfiguredLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager |
         Before any request, an atomic file replacement writes the first line and one line per reused record.
         Each generated record is then appended and flushed to disk before its item finishes.
         A process failure before the append finishes can cause a repeated request after restart.
-        Loading ignores a last line without a trailing newline, which only a cut-off append leaves.
+        Loading ignores a last line without a trailing newline.
         Separate processes must not use the same `resume_path` concurrently.
 
         Args:

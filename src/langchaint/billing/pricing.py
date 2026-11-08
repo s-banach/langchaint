@@ -79,7 +79,7 @@ class LongContextPricing:
     output_multiplier: float
 
     def applied_to(self, rates: "TokenRates", *, prompt_tokens: int) -> "TokenRates":
-        """Return the rates a request whose prompt length is `prompt_tokens` pays.
+        """Return the rates for a prompt of `prompt_tokens` tokens.
 
         A prompt longer than `prompt_tokens_above` tokens pays `rates` scaled by these multipliers.
         A shorter prompt pays `rates`.
@@ -141,7 +141,6 @@ class Billing(CheckedCopyModel):
     def cache_savings_in_usd(self) -> float:
         """What prompt caching saved this request against billing every input token uncached.
 
-        The counterfactual prices every input token at the uncached rate.
         Output cost cancels because it is identical in both totals.
         The value is negative when write premiums exceed read discounts.
         It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input tokens were billed.

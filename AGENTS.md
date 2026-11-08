@@ -34,7 +34,7 @@ Document a public parameter exactly when its name and type leave its meaning or 
 - Use neutral vocabulary when providers disagree, such as `ToolCall` instead of `ToolUse`.
 - Give a keyword and the variable passed to it one name, as in `tool_manager=tool_manager`.
 - Put units and encodings in public names and in values that cross modules, such as `cost_in_usd`, `elapsed_seconds`, and the `_json` suffix.
-- A holder whose name or docstring states the unit, such as `usd_per_million_tokens` or `TokenRates`, covers its fields.
+- A unit stated in an object's name or docstring applies to all its fields, as in `usd_per_million_tokens` and `TokenRates`.
 - Prefix related fields so sorting and completion group them, as in `input_tokens_*`, `generate_one`, and `generate_many`.
 - Do not repeat the holder in an attribute name: write `tool.name`, not `tool.tool_name`.
 - Use the full name for a cross-object reference, such as `tool_call_id` on `ToolMessage`.
@@ -83,7 +83,8 @@ Document a public parameter exactly when its name and type leave its meaning or 
 - Put recoverable content in its own field.
 - Create a separate variant only when an outcome has different fields or changes control flow.
 - Require variant-specific data as non-optional fields.
-- A variant may cover several outcomes with the same fields, and then validates the data each outcome requires.
+- A variant may cover several outcomes with the same fields.
+  It must validate the data each outcome requires.
 - Give each variant a `Literal` `kind`.
 - When a variant covers one outcome, default its `kind` and name it from the class after dropping words shared by every variant.
 - Match non-exception class variants on the string `.kind` attribute.

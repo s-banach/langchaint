@@ -127,7 +127,7 @@ type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_err
 - `context_window_exceeded_error`: a response reported that the request exceeded the context window.
 - `unexpected_response_error`: langchaint cannot continue from the response, such as one with an unknown stop reason.
   A response with application tool calls under a binding without a `ToolManager` also gives this kind.
-- `provider_failed_terminally_error`: a provider reported a failure that sending the request again would repeat.
+- `provider_failed_terminally_error`: a provider reported a failure that langchaint will not retry.
   A response body or an error response can report it.
 - `auth_error`: a provider rejected the client's credentials or permissions for one request.
   The same request can succeed after the caller repairs the credentials or permissions.
@@ -253,7 +253,6 @@ type GenerationErrorRecord = Annotated[
 
 
 _GENERATION_ERROR_RECORD_CLASSES = (PlainErrorRecord, SchemaViolationErrorRecord)
-"""The record classes a `GenerationError` holds."""
 
 
 _PROVIDER_ANSWERED_KINDS = ("auth", "rejected", "provider_failed_terminally")
@@ -368,7 +367,7 @@ def _terminal_generation_error(
 def _transient_error_for(
     error: Exception, message: str, request_failure: RequestFailure
 ) -> TransientError:
-    """Wrap one transiently failed request's exception as the `TransientError` its request record carries.
+    """Return a `TransientError` for the failed request.
 
     Return an existing `TransientError` unchanged, which keeps its message, `retry_after_seconds`, and `pauses_quota`.
     A wrap takes `retry_after_seconds` and `pauses_quota` from `request_failure`.

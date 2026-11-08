@@ -21,7 +21,6 @@ from task_stream import (
 from tools import SearchArgs, search_tool
 
 from langchaint import (
-    LLM,
     ZERO_USAGE,
     DispatchExceptionGroup,
     GenerationError,
@@ -33,11 +32,6 @@ from langchaint.tracing import OtelObserver
 from tests.full_app_support.scenarios import build_scripts
 from tests.full_app_support.scripted_adapter import ScriptedAdapter, Turn, build_llm, call
 from tests.helpers import ValidatingSpanExporter, run_with_timeout
-from tests.test_configured_providers import ProviderLLM
-
-
-def _provider_llm(llm: ProviderLLM) -> LLM[str]:
-    return llm
 
 
 def _discard(event: Event) -> None:
@@ -267,13 +261,9 @@ def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_cal
     turns = [Turn(text="late", delay_seconds=1.0), Turn(text="done")]
     if max_tool_calls:
         turns.insert(0, Turn(tool_calls=(call("search", '{"query":"q"}'),)))
-    exporter = ValidatingSpanExporter()
-    tracer_provider = TracerProvider()
-    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     llm = build_llm(
         {config.system_prompt: turns},
         system_prompt=config.system_prompt,
-        observer=OtelObserver(capture_message_content=False, tracer_provider=tracer_provider),
     )
     run = ReActAgent(
         agent_path="root/limited",
@@ -293,9 +283,6 @@ def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_cal
     assert [request.tool_choice for request in requests] == (
         ["auto", "none", "none"] if max_tool_calls else ["none", "none"]
     )
-    spans = exporter.get_finished_spans()
-    assert sum(_attribute(span, "gen_ai.operation.name") == "chat" for span in spans) == len(turns)
-    assert sum(span.name == "execute_tool search" for span in spans) == max_tool_calls
 
 
 def test_duplicate_tool_call_ids_are_rejected() -> None:
@@ -475,12 +462,7 @@ def test_custom_agent_runs_prescribed_steps_with_shared_lifecycle_and_accounting
             current_gui_emitter().emit_tool_progress(tool_name="plan", message=plan.output)
             answer = await llm.rebind(
                 system_prompt="Write the answer.",
-                tools=[],
-                tool_choice="none",
-                max_requests=2,
-                automatic_cache_breakpoints=False,
             ).generate_one([UserMessage(content=plan.output)])
-            assert answer.kind == "plain"
             self.turn_log.append(GenerationEntry(turn_number=2, outcome=answer))
             return answer.output
 

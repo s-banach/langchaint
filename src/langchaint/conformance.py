@@ -1,6 +1,6 @@
 """The conformance test classes for adapter implementations.
 
-Subclass the class that `AdapterConformance` directs, and implement the fixture methods.
+Subclass `AdapterConformance` or `PartWireConformance` as their docstrings specify, and implement the fixture methods.
 The inherited tests validate each neutral adapter invariant against SDK response objects.
 Return degenerate fixtures for unsupported capabilities so each invariant still runs.
 """
@@ -51,7 +51,7 @@ _PLAIN_BINDING = Binding(
     temperature=None,
     automatic_cache_breakpoints=True,
 )
-"""The binding every invariant here binds under: no system prompt, no tools, and a completion limit.
+"""The binding used by the conformance tests: no system prompt, no tools, and a completion limit.
 
 The limit is stated because `AnthropicMessagesAdapter` rejects a binding without one.
 """
@@ -75,9 +75,9 @@ def _row_number(row: Mapping[str, RowValue], column: str) -> float:
 
 
 class AdapterConformance(ABC):
-    """Subclass once per adapter whose wire holds the assistant message in one wire message's fields.
+    """Subclass once per adapter that represents an assistant message through individual provider fields.
 
-    Subclass `PartWireConformance` instead when the wire holds the assistant message as a list of parts.
+    Subclass `PartWireConformance` for adapters that represent assistant messages as lists of provider parts.
     langchaint supplies every test method.
     Use a pytest-compatible name such as `TestOpenAIChatCompletionsConformance`.
     Put the subclass in the adapter test module and implement the fixture methods below.
@@ -123,7 +123,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_with_text(self, text: str) -> BaseModel:
-        """Return an SDK response for a finished assistant message whose only answer text is text."""
+        """Return an SDK response for a finished assistant message whose only answer text is `text`."""
         ...
 
     @abstractmethod
@@ -165,7 +165,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def stream_without_its_terminal_event(self) -> AdapterStream:
-        """Return a stream whose events end before the one that closes the assistant message."""
+        """Return a stream that ends before its terminal event."""
         ...
 
     @abstractmethod
@@ -301,7 +301,6 @@ class AdapterConformance(ABC):
         assert self._text_parts(assistant_message) == [text]
 
     def test_every_sdk_exception_maps_and_an_unknown_one_is_unknown_exception(self) -> None:
-        """Map SDK exceptions and return `unknown_exception` for an exception the adapter cannot classify."""
         adapter = self.make_adapter()
         for error, request_failure in self.sdk_errors_and_request_failures().items():
             assert adapter.request_failure(error) == request_failure
@@ -371,9 +370,9 @@ class AdapterConformance(ABC):
 
 
 class PartWireConformance(AdapterConformance, ABC):
-    """The conformance tests for an adapter whose wire holds the assistant message as a list of parts.
+    """Conformance tests for adapters that represent assistant messages as lists of provider parts.
 
-    Subclassing `AdapterConformance` on such a wire hides a dropped RawPart or merged text parts.
+    Using `AdapterConformance` for this representation can hide a dropped `RawPart` or merged text parts.
     """
 
     @abstractmethod

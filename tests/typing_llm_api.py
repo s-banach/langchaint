@@ -6,8 +6,8 @@ Functions are type examples and are not executed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol, assert_type, overload
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Literal, Protocol, assert_type
 
 from pydantic import BaseModel
 
@@ -15,13 +15,10 @@ from langchaint import (
     LLM,
     AdapterLLM,
     Generation,
-    GenerationInput,
     GenerationOutcomeRecord,
     PlainGeneration,
     StreamHandle,
-    TextPart,
     ToolCallGeneration,
-    ToolChoice,
     ToolManager,
     ToolSequence,
     llm_from_adapter,
@@ -40,183 +37,11 @@ from langchaint.openai import (
 from langchaint.span_parsing import OtelChatSpan, llm_from_otel
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from langchaint.adapter import Adapter
 
 
 class Answer(BaseModel):
     value: int
-
-
-class _Unchanged:
-    pass
-
-
-_UNCHANGED = _Unchanged()
-
-
-class IndependentLLM[OutputT: str | BaseModel, ToolManagerT: ToolManager | None]:
-    @overload
-    def rebind[NewOutputT: str | BaseModel](
-        self,
-        *,
-        response_format: type[NewOutputT],
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[NewOutputT, ToolManager]: ...
-    @overload
-    def rebind[NewOutputT: str | BaseModel](
-        self,
-        *,
-        response_format: type[NewOutputT],
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[NewOutputT, None]: ...
-    @overload
-    def rebind[NewOutputT: str | BaseModel](
-        self,
-        *,
-        response_format: type[NewOutputT],
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[NewOutputT, ToolManagerT]: ...
-    @overload
-    def rebind(
-        self,
-        *,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[OutputT, ToolManager]: ...
-    @overload
-    def rebind(
-        self,
-        *,
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[OutputT, None]: ...
-    @overload
-    def rebind(
-        self,
-        *,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = ...,
-        tool_choice: ToolChoice | _Unchanged = ...,
-        parallel_tool_calls: bool | _Unchanged = ...,
-        max_completion_tokens: int | _Unchanged = ...,
-        reasoning_level: str | None | _Unchanged = ...,
-        temperature: float | None | _Unchanged = ...,
-        extra_body: Mapping[str, object] | None | _Unchanged = ...,
-        max_requests: int | _Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | _Unchanged = ...,
-    ) -> IndependentLLM[OutputT, ToolManagerT]: ...
-    def rebind(
-        self,
-        *,
-        response_format: type[str] | type[BaseModel] | _Unchanged = _UNCHANGED,
-        system_prompt: str | Sequence[TextPart] | None | _Unchanged = _UNCHANGED,
-        tools: ToolManager | ToolSequence | None | _Unchanged = _UNCHANGED,
-        provider_executed_tools: Sequence[Mapping[str, object]] | _Unchanged = _UNCHANGED,
-        tool_choice: ToolChoice | _Unchanged = _UNCHANGED,
-        parallel_tool_calls: bool | _Unchanged = _UNCHANGED,
-        max_completion_tokens: int | None | _Unchanged = _UNCHANGED,
-        reasoning_level: str | None | _Unchanged = _UNCHANGED,
-        temperature: float | None | _Unchanged = _UNCHANGED,
-        extra_body: Mapping[str, object] | None | _Unchanged = _UNCHANGED,
-        max_requests: int | _Unchanged = _UNCHANGED,
-        automatic_cache_breakpoints: bool | None | _Unchanged = _UNCHANGED,
-    ) -> IndependentLLM[BaseModel | str, ToolManager | None]:
-        raise NotImplementedError
-
-    @property
-    def tool_manager(self) -> ToolManagerT:
-        raise NotImplementedError
-
-    async def generate_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> Generation[OutputT]:
-        raise NotImplementedError
-
-    async def generate_many(
-        self,
-        generation_inputs: Iterable[GenerationInput],
-        *,
-        warm_cache: bool = False,
-        max_working_seconds_per_input: float | None = None,
-    ) -> list[Generation[OutputT]]:
-        raise NotImplementedError
-
-    async def generate_many_records(
-        self,
-        generation_inputs: Iterable[GenerationInput],
-        *,
-        resume_path: Path | None = None,
-        input_ids: Iterable[str] | None = None,
-        warm_cache: bool = False,
-        max_working_seconds_per_input: float | None = None,
-    ) -> list[GenerationOutcomeRecord[OutputT]]:
-        raise NotImplementedError
-
-    def stream_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> StreamHandle[OutputT, ToolCallGeneration]:
-        raise NotImplementedError
-
-
-def structural_llm[T: str | BaseModel, ToolsT: ToolManager | None](
-    llm: IndependentLLM[T, ToolsT],
-) -> LLM[T, ToolsT]:
-    return llm
-
-
-def widen_independent_llm(
-    llm: IndependentLLM[Answer, ToolManager],
-) -> LLM[BaseModel | str, ToolManager | None]:
-    return llm
 
 
 def provider_conformance[T: str | BaseModel, ToolsT: ToolManager | None](
@@ -270,6 +95,10 @@ def reject_rebind_context[T: str | BaseModel](llm: LLM[str]) -> None:
 
 
 def protocol_covariance(llm: LLM[Answer, ToolManager]) -> LLM[BaseModel, ToolManager | None]:
+    return llm
+
+
+def adapter_covariance(llm: AdapterLLM[Answer, ToolManager]) -> LLM[BaseModel, ToolManager | None]:
     return llm
 
 
@@ -618,6 +447,8 @@ def adapter_inference[T: str | BaseModel](
 ) -> LLM[T, ToolManager]:
     text = llm_from_adapter(provider)
     assert_type(text, AdapterLLM[str, None])
+    assert_type(text, AdapterLLM)
+    assert_type(text.tool_manager, None)
     assert_type(llm_from_adapter(provider, tools=[]), AdapterLLM[str, ToolManager])
     assert_type(llm_from_adapter(provider, response_format=Answer), AdapterLLM[Answer, None])
     assert_type(
@@ -626,14 +457,31 @@ def adapter_inference[T: str | BaseModel](
     )
     generic = llm_from_adapter(provider, response_format=output, tools=tools)
     assert_type(generic, AdapterLLM[T, ToolManager])
+    assert_type(generic.tool_manager, ToolManager)
     assert_type(llm_from_adapter(provider, response_format=output), AdapterLLM[T, None])
+    assert_type(llm_from_adapter(provider, response_format=Answer), AdapterLLM[Answer])
     assert_type(generic.rebind(), AdapterLLM[T, ToolManager])
+    assert_type(generic.rebind(system_prompt="s"), AdapterLLM[T, ToolManager])
     assert_type(generic.rebind(tools=None), AdapterLLM[T, None])
     assert_type(generic.rebind(response_format=str), AdapterLLM[str, ToolManager])
     assert_type(generic.rebind(response_format=str, tools=None), AdapterLLM[str, None])
     assert_type(text.rebind(response_format=output, tools=tools), AdapterLLM[T, ToolManager])
     assert_type(text.rebind(response_format=output), AdapterLLM[T, None])
     assert_type(text.rebind(tools=tools), AdapterLLM[str, ToolManager])
+    assert_type(text.rebind(tools=[]), AdapterLLM[str, ToolManager])
+    assert_type(text.rebind(response_format=output, tools=[]), AdapterLLM[T, ToolManager])
+    assert_type(
+        text.rebind(response_format=output).rebind(tools=tools), AdapterLLM[T, ToolManager]
+    )
+    assert_type(text.rebind(response_format=output).rebind(tools=[]), AdapterLLM[T, ToolManager])
+    provider_executed_tools = ({"type": "web_search"},)
+    assert_type(
+        text.rebind(provider_executed_tools=provider_executed_tools), AdapterLLM[str, None]
+    )
+    assert_type(
+        generic.rebind(tools=None).rebind(provider_executed_tools=provider_executed_tools),
+        AdapterLLM[T, None],
+    )
     restored = llm_from_otel(span, llm=generic)
     assert_type(restored, AdapterLLM[T, ToolManager])
     assert_type(restored.rebind(tools=None), AdapterLLM[T, None])

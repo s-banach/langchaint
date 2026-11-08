@@ -36,8 +36,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "openai":
         raise
     raise ModuleNotFoundError(
-        "langchaint's openai backend requires its dependencies; install "
-        "langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
+        "langchaint's openai backend requires its dependencies; install langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
     ) from exc
 
 
@@ -231,9 +230,7 @@ class OpenAILLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None
             ValueError: `max_requests` is boolean or below one.
             ValueError: The binding breaks a rule of the adapter.
                 The docstring of the backend's `llm()` lists the rules.
-            TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -530,7 +527,7 @@ class OpenAI:
 
         `response_format` selects a pydantic model for structured output, or `str` for final text.
         A response without a text part or tool call gives `GenerationError`.
-        An empty final text part gives `""`.
+        For text output, an empty final text part gives `""`.
         `reasoning_level=None` uses the provider's reasoning default.
 
         `extra_body` adds provider wire-body fields.
@@ -541,11 +538,11 @@ class OpenAI:
         Raises:
             ValueError: An uncataloged model lacks required pricing or caching data.
                 Also raised when the SDK client contradicts the OpenAI provider.
-            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
-            TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            TypeError: `response_format` is a proper subclass of `str`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """
@@ -660,8 +657,7 @@ class OpenAI:
             dimension = max_dimension if dimension is None else dimension
             if isinstance(dimension, bool) or not (1 <= dimension <= max_dimension):
                 raise ValueError(
-                    f"dimension for {model!r} must be an int from 1 through "
-                    f"{max_dimension}, got {dimension!r}"
+                    f"dimension for {model!r} must be an int from 1 through {max_dimension}, got {dimension!r}"
                 )
         try:
             from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
@@ -675,8 +671,7 @@ class OpenAI:
             ):
                 raise
             raise ModuleNotFoundError(
-                "OpenAI embeddings require numpy and tiktoken; install "
-                "langchaint[openai-embedding]."
+                "OpenAI embeddings require numpy and tiktoken; install langchaint[openai-embedding]."
             ) from exc
         adapter = _OpenAIEmbeddingAdapter(
             client=self.client,
@@ -841,9 +836,7 @@ class OpenAIBedrockLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager
             ValueError: `max_requests` is boolean or below one.
             ValueError: The binding breaks a rule of the adapter.
                 The docstring of the backend's `llm()` lists the rules.
-            TypeError: The adapter does not support `tool_choice`.
             TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
@@ -1027,7 +1020,7 @@ class OpenAIBedrock:
 
         `response_format` selects a pydantic model for structured output, or `str` for final text.
         A response without a text part or tool call gives `GenerationError`.
-        An empty final text part gives `""`.
+        For text output, an empty final text part gives `""`.
         `reasoning_level=None` uses the provider's reasoning default.
 
         `extra_body` adds provider wire-body fields.
@@ -1036,11 +1029,11 @@ class OpenAIBedrock:
         `automatic_cache_breakpoints=None` uses the adapter default.
 
         Raises:
-            ValueError: `tools` contains duplicate names or `tool_choice` names an absent tool.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence or `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one, or a provider constraint listed above is violated.
-            TypeError: `response_format` is a proper subclass of `str`, or the adapter does not support `tool_choice`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
+            TypeError: `response_format` is a proper subclass of `str`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's argument model has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's argument model is not fully defined.
         """

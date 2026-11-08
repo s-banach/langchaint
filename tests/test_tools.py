@@ -144,7 +144,7 @@ def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
     decorator = tool(description="Invalid test function.")
     with pytest.raises(TypeError, match="BaseModel subclass"):
         _ = decorator(_plain_annotation)
-    with pytest.raises(TypeError, match="annotation could not resolve"):
+    with pytest.raises(TypeError, match="could not resolve the annotation"):
         _ = decorator(_type_checking_only_annotation)
 
 
@@ -274,7 +274,7 @@ def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
 def test_function_validation_error_propagates_as_a_defect() -> None:
     tool = PydanticTool(
         name="broken",
-        description="Raises from its own pydantic use.",
+        description="Raise a ValidationError inside the tool function.",
         args_model=_EchoArgs,
         function=_validation_error_function,
     )

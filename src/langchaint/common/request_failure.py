@@ -1,4 +1,4 @@
-"""`RequestFailure` and the mapping every retry loop shares, without langchaint imports outside `common/`."""
+"""Define `RequestFailure` and shared request-exception classification."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,7 +22,7 @@ class RequestFailure:
       The configured model's `config_fingerprint()` excludes credentials.
       The same request can succeed after the caller repairs them.
     - `rejected`: the provider rejected the request.
-    - `provider_failed_terminally`: the provider reported a failure that sending the request again would repeat.
+    - `provider_failed_terminally`: the provider reported a failure that langchaint will not retry.
     - `unknown_exception`: the adapter could not place the exception.
     In generation, each kind except `transient` ends handling the input with a `GenerationError`.
     In `EmbeddingModel.embed`, it ends the call with an `EmbeddingError`.

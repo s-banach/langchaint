@@ -189,7 +189,6 @@ def _usage_with_cache() -> ResponseUsage:
 
 
 _SERVER_ERROR = ResponseError(code="server_error", message="The server had an error.")
-"""A failed response's error whose code the disposition table calls transient."""
 
 
 def _response(

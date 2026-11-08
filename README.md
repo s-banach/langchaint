@@ -8,8 +8,8 @@ Alpha: the API may change without notice.
 
 ## Why langchaint
 
-- **Consistent API.** Configure a model with a provider factory, then call `generate_one()`, `generate_many()`, or `stream_one()` through the `LLM` protocol.
-- **Useful type annotations.** For example, `openai.llm(model, response_format=Answer)` types `generation.output` as `Answer`.
+- **Consistent API.** Configure a model with a provider factory, then call `generate_one()`, `generate_many()`, or `stream_one()`.
+- **Type annotations.** For example, `openai.llm(model, response_format=Answer)` types `generation.output` as `Answer`.
 - **Outcome variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
 - **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
 - **Complete billing.** `Generation` and `GenerationError` values retain provider-reported usage from every recorded request, including billed retries.
@@ -70,22 +70,6 @@ asyncio.run(main())
 ```
 
 The Pydantic model validates the provider response.
-`assistant.rebind(system_prompt="Explain in detail.")` creates another configured model and preserves omitted settings.
-`Anthropic.llm` and `AnthropicBedrock.llm` require `max_completion_tokens`; OpenAI permits omission.
-
-Adapter authors can configure their own `Adapter` with the SDK-free `langchaint.llm_from_adapter(adapter, ...)` factory.
-It returns `AdapterLLM`, which provides generation and typed `rebind()` methods.
-The adapter validates provider-specific constraints, including required token limits.
-
-`langchaint.span_parsing.llm_from_otel(span, llm=assistant)` reconstructs captured request settings and preserves the concrete model class.
-Configure the input model with the required output type and executable tools; reconstruction checks them against captured output and tool metadata.
-
-Provider-neutral application functions accept `LLM[OutputT, ToolManagerT]` without requiring inheritance.
-The protocol exposes typed `rebind`, `tool_manager`, and generation methods with read-only batch results.
-`rebind` preserves omitted settings and infers changed output and tool types.
-Its common `max_completion_tokens` parameter accepts integers because Anthropic requires a limit; concrete OpenAI, DeepSeek, and Gemini models also accept `None` to clear it.
-Generation methods return `Generation[OutputT]`; match `generation.kind` before reading `.output` through this interface.
-Concrete provider models retain precise plain-generation results when configured without tools.
 
 `generate_many()` returns generations in input order, or raises `GenerationError` after cancelling and awaiting unfinished inputs.
 `generate_many_records()` returns one normalized record per input, including generation failures.

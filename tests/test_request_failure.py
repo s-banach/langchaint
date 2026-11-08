@@ -1,5 +1,3 @@
-"""The `RequestFailure` of one exception a request raised, over constructed exceptions."""
-
 from typing import NamedTuple
 
 import pytest

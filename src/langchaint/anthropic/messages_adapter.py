@@ -392,7 +392,7 @@ def _provider_executed_tools(
 
 @dataclass(frozen=True, kw_only=True)
 class _AnthropicPrecomputedFields:
-    """The typed request fields one binding precomputes.
+    """Request fields precomputed from a binding.
 
     Fields set to the SDK's omit sentinel leave the provider default in place.
     Passing them as explicit keywords keeps the SDK's overload resolution intact.
@@ -505,9 +505,7 @@ def _part_block(
         case "image":
             if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
                 raise _RejectedMessagesError(
-                    f"AnthropicMessagesAdapter cannot send ImagePart inside "
-                    f"{message_class.__name__}.content: the Anthropic API accepts media types "
-                    f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
+                    f"AnthropicMessagesAdapter cannot send ImagePart inside {message_class.__name__}.content: the Anthropic API accepts media types {_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
                 )
             image_source: Base64ImageSourceParam = {
                 "type": "base64",
@@ -525,8 +523,7 @@ def _part_block(
                 else "ToolResultBlockParam.content has no audio variant"
             )
             raise _RejectedMessagesError(
-                f"AnthropicMessagesAdapter cannot send AudioPart inside "
-                f"{message_class.__name__}.content: {missing_audio_type}"
+                f"AnthropicMessagesAdapter cannot send AudioPart inside {message_class.__name__}.content: {missing_audio_type}"
             )
 
 
@@ -535,7 +532,7 @@ def _user_content_blocks(
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
     """Convert one UserMessage.content value to wire blocks.
 
-    The second element holds the blocks whose part sets cache_breakpoint in content order.
+    The second element contains the blocks produced from parts with `cache_breakpoint=True`, in content order.
     The caller applies `message_cache_breakpoint_budget`, so this function writes no `cache_control`.
 
     Raises:
@@ -576,10 +573,9 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     """
     if "type" not in raw:
         raise _RejectedMessagesError(
-            "ReasoningPart.raw or RawPart.raw names no type key, "
-            "so anthropic has no content block to send it as"
+            "ReasoningPart.raw or RawPart.raw must contain a 'type' key for an Anthropic content block"
         )
-    # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
+    # cast: replay passes an opaque stored SDK dump to the SDK's parameter API.
     return cast("_ContentBlockParam", dict(raw))
 
 
@@ -588,7 +584,7 @@ def _assistant_content_blocks(
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam]]:
     """Convert one AssistantMessage to wire blocks in `content` order.
 
-    The second element holds the text blocks whose part sets cache_breakpoint in content order.
+    The second element contains text blocks produced from parts with `cache_breakpoint=True`, in content order.
     The caller applies `message_cache_breakpoint_budget`, so this function writes no `cache_control`.
     `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
     The API rejects modified thinking blocks and unknown `type` values.
@@ -626,8 +622,7 @@ def _tool_message_has_cache_breakpoint(tool_message: ToolMessage) -> bool:
     parts = tool_message.content_parts
     if any(part.cache_breakpoint for part in parts[:-1]):
         raise _RejectedMessagesError(
-            "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
-            "the cache breakpoint goes on the enclosing tool_result block, whose span ends at the last part"
+            "cache_breakpoint on a ToolMessage part is honored only on the message's last part: the cache breakpoint goes on the enclosing tool_result block, whose span ends at the last part"
         )
     return bool(parts and parts[-1].cache_breakpoint)
 
@@ -790,9 +785,8 @@ def _cannot_continue(stop_reason: str) -> str | None:
 
 
 def _as_message(raw: BaseModel) -> anthropic.types.Message:
-    """Narrow a raw response to the SDK message this adapter produces.
+    """`BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
 
-    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
     This adapter's stream produces every valid value.
 
     Raises:
@@ -923,14 +917,17 @@ def _billing_from_sdk_usage(
 
 
 def anthropic_request_failure(error: Exception, *, client: AnthropicClient) -> RequestFailure:
-    """Return the `RequestFailure` of one exception an Anthropic request raised.
+    """Classify an Anthropic request exception.
 
     anthropic 2.5.0 `_should_retry_exception` decides retries through the exception's cause chain.
     A client with credentials from `credentials`, `config`, `profile`, or `default_credentials` holds a token cache.
-    A 401 clears that cache and retries when `x-stainless-retry-count` is "0"; otherwise the SDK's status rule decides.
+    On HTTP 401, a client with a token cache invalidates the cache.
+    For that response, the retry rule returns `True` when the `x-stainless-retry-count` request header is `"0"`.
+    Otherwise, it uses the SDK's status rule.
     The judged response's status and error type decide the quota pause.
     Status 200 identifies a mid-stream error, whose type decides the retry.
-    A failed SDK retry decision is logged and returns `unknown_exception`.
+    If the SDK's retry rule raises, langchaint logs the exception.
+    It returns a `RequestFailure` with `kind="unknown_exception"`.
     """
     decision = sdk_retry_decision(lambda: client._should_retry_exception(error))
     if isinstance(decision, RequestFailure):
@@ -1082,10 +1079,7 @@ class AnthropicMessagesAdapter(Adapter):
                 system_blocks.append({"type": "text", "text": binding.system_prompt})
             else:
                 if not binding.system_prompt:
-                    raise ValueError(
-                        "system_prompt is an empty tuple of parts; bind rejects this, "
-                        "so it can only come from a directly constructed Binding"
-                    )
+                    raise ValueError("system_prompt must contain at least one TextPart")
                 for part in binding.system_prompt:
                     system_block: TextBlockParam = {"type": "text", "text": part.text}
                     if part.cache_breakpoint:
@@ -1121,9 +1115,7 @@ class AnthropicMessagesAdapter(Adapter):
         )
         if message_cache_breakpoint_budget < 0:
             raise ValueError(
-                f"the binding writes {bind_cache_breakpoint_count + automatic_cache_breakpoint_count} cache breakpoints, "
-                f"over the API's limit of {_MAX_CACHE_BREAKPOINTS_PER_REQUEST} per request; "
-                "set cache_breakpoint=False on some system parts or remove cache_control from provider_executed_tools"
+                f"the binding writes {bind_cache_breakpoint_count + automatic_cache_breakpoint_count} cache breakpoints, over the API's limit of {_MAX_CACHE_BREAKPOINTS_PER_REQUEST} per request; set cache_breakpoint=False on some system parts or remove cache_control from provider_executed_tools"
             )
         output_config: OutputConfigParam | Omit = omit
         thinking: ThinkingConfigParam | Omit = omit
@@ -1178,8 +1170,8 @@ class AnthropicMessagesAdapter(Adapter):
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         """Bind for structured output in response_format without I/O.
 
-        The output format matches `messages.parse(output_format=...)` in anthropic 2.4.0, merged into the binding's
-        `output_config` to preserve its reasoning effort.
+        The adapter adds the structured output format to the binding's `output_config`.
+        It preserves `output_config.effort`.
         anthropic 2.4.0 parses every text block independently, and langchaint validates only the final text part.
         Source: https://github.com/anthropics/anthropic-sdk-python/blob/v2.4.0/src/anthropic/lib/_parse/_response.py
 
@@ -1242,14 +1234,12 @@ class _AnthropicStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate SDK events into `StreamItem` values.
 
-        `input_json_delta` yields `ToolCallDelta` only for `tool_use` blocks.
-        The adapter reads the id and name from the SDK message snapshot.
-        `server_tool_use` yields no `ToolCallDelta` and becomes `RawPart` in `final()`.
-        `REASONING_PART_SEPARATOR` separates thinking blocks that emitted text.
-        Empty deltas and redacted thinking emit no reasoning text or separator.
-
         Yields:
-            Stream items for SDK events langchaint models.
+            `input_json_delta` yields `ToolCallDelta` only for `tool_use` blocks.
+            The adapter reads the id and name from the SDK message snapshot.
+            `server_tool_use` yields no `ToolCallDelta` and becomes `RawPart` in `final()`.
+            `REASONING_PART_SEPARATOR` separates thinking blocks that emitted text.
+            Empty deltas and redacted thinking emit no reasoning text or separator.
 
         Raises:
             StreamProtocolError: The stream ends without a stop reason.

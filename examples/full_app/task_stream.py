@@ -74,8 +74,9 @@ def _usage_of(entry: TurnLogEntry) -> Usage:
         case "generation":
             return entry.outcome.usage
         case "dispatch":
-            if entry.outcome.kind == "handled" and isinstance(entry.outcome.app_data, Usage):
-                return entry.outcome.app_data
+            outcome = entry.outcome
+            if outcome.kind == "handled" and isinstance(outcome.app_data, Usage):
+                return outcome.app_data
             return ZERO_USAGE
 
 
@@ -95,7 +96,13 @@ def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
 
 
 class AgentRun(ABC):
-    """Register descendant runs, account for turn_log usage, and emit lifecycle events around _execute."""
+    """Define this demo app's base class for agent execution.
+
+    The app's agent classes inherit from AgentRun and implement their own workflow in _execute.
+    Subclasses append settled outcomes to turn_log for accounting and return a final answer.
+    Call the inherited `run` method to route tool progress and emit lifecycle events.
+    The events are `AgentStarted`, `AgentFinished`, `AgentFailed`, and `AgentCancelled`.
+    """
 
     def __init__(
         self,
@@ -104,7 +111,9 @@ class AgentRun(ABC):
         registry: dict[str, "AgentRun"],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Register agent_path and store the synchronous progress callback.
+        """Register agent_path for descendant accounting and store on_event for synchronous progress callbacks.
+
+        registry stores runs under unique agent_path values.
 
         Raises:
             ValueError: registry already contains agent_path.
@@ -192,7 +201,12 @@ class ReActAgent(AgentRun):
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Configure this agent and register its run.
+        """Configure the model and tools, initialize prompt messages, and register agent_path.
+
+        config sets the system prompt, binding options, and execution limits.
+        self_correction_enabled adds a fresh scripted critique tool to tools.
+        registry stores runs for descendant accounting under unique agent_path values.
+        on_event receives synchronous progress callbacks from the run and its tools.
 
         Raises:
             ValueError: registry already contains agent_path.
@@ -316,14 +330,23 @@ class ReActAgent(AgentRun):
         self, call_of_id: Mapping[str, ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
     ) -> None:
         """Record the batch, then emit events with usage captured after each entry."""
-        outcome_ids = {outcome.tool_message.tool_call_id for outcome in outcomes}
-        if len(outcome_ids) != len(outcomes) or not outcome_ids <= call_of_id.keys():
-            raise RuntimeError("dispatch_many returned duplicate or unknown tool-call IDs")
+        settled_ids: set[str] = set()
         events: list[ToolDispatched] = []
         for outcome in outcomes:
+            tool_message = outcome.tool_message
+            tool_call_id = tool_message.tool_call_id
+            if tool_call_id in settled_ids:
+                raise RuntimeError(f"dispatch_many returned tool_call_id {tool_call_id!r} twice")
+            settled_ids.add(tool_call_id)
+            try:
+                tool_call = call_of_id[tool_call_id]
+            except KeyError:
+                raise RuntimeError(
+                    f"dispatch_many returned unknown tool_call_id {tool_call_id!r}"
+                ) from None
             entry = DispatchEntry(
                 turn_number=self.turn_number,
-                tool_call=call_of_id[outcome.tool_message.tool_call_id],
+                tool_call=tool_call,
                 outcome=outcome,
             )
             self.turn_log.append(entry)

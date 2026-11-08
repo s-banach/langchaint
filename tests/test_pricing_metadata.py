@@ -244,7 +244,7 @@ def test_litellm_rates_accept_zero() -> None:
 )
 def test_embedding_rate_rejects_unrendered_prices(rates: dict[str, float]) -> None:
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **rates})
-    with pytest.raises(ValueError, match="LiteLLM lists"):
+    with pytest.raises(ValueError, match=r"LiteLLM lists|cannot represent LiteLLM price fields"):
         _ = entry.embedding_input_tokens_usd_per_token()
 
 
@@ -336,7 +336,7 @@ def test_web_search_price_requires_one_price_for_every_context_size(
         "litellm_provider": "anthropic",
         "search_context_cost_per_query": prices,
     })
-    with pytest.raises(ValueError, match="web search prices"):
+    with pytest.raises(ValueError, match="Web search prices"):
         _ = entry.web_search_usd_per_invocation()
 
 

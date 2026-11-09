@@ -47,7 +47,7 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalAn
         description="Submit your final structured answer once.",
         args_model=FinalAnswer,
     )
-    bound = OpenAI().llm(
+    llm = OpenAI().llm(
         "gpt-5.6-terra",
         system_prompt="Research the question, then submit final_answer.",
         tools=[search, final_answer_tool],
@@ -59,14 +59,14 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalAn
     for turn in range(max_turns):
         # Force the exit tool on the final turn.
         if turn == max_turns - 1:
-            bound = bound.bind(tool_choice=SpecificToolChoice(tool_name=final_answer_tool.name))
-        generation = await bound.generate_one(messages)
+            llm = llm.bind(tool_choice=SpecificToolChoice(tool_name=final_answer_tool.name))
+        generation = await llm.generate_one(messages)
         if turn == 0:
-            bound = bound.bind(tool_choice="required")
+            llm = llm.bind(tool_choice="required")
         messages.append(generation.assistant_message)
         for tool_call in generation.tool_calls:
             if tool_call.name != final_answer_tool.name:
-                messages.append((await bound.tool_manager.dispatch(tool_call)).tool_message)
+                messages.append((await llm.tool_manager.dispatch(tool_call)).tool_message)
                 continue
             outcome = await final_answer_tool.capture(tool_call)
             messages.append(outcome.tool_message)

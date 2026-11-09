@@ -10,7 +10,7 @@ async def generate_with_a_warm_cache() -> list[PlainGeneration[str]]:
         "Support policy: route refunds to a human. "
         "Never request a password or payment-card number. "
     ) * 300
-    bound = Anthropic().llm(
+    llm = Anthropic().llm(
         "claude-sonnet-5",
         cache_ttl="1h",
         system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
@@ -23,7 +23,7 @@ async def generate_with_a_warm_cache() -> list[PlainGeneration[str]]:
         "How do I request a refund?",
         "Which details may a support request include?",
     ]
-    outcomes = await bound.generate_many(prompts, warm_cache=True)
+    outcomes = await llm.generate_many(prompts, warm_cache=True)
     for index, outcome in enumerate(outcomes):
         usage = outcome.usage
         print(f"item {index} wrote {usage.input_tokens_cache_write} cache tokens")

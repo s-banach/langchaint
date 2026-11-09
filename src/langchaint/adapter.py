@@ -98,8 +98,7 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
     """Return the seconds until a GMT HTTP date, or None for a past or unconvertible date.
 
     `email.utils.mktime_tz` raises `ValueError` for a year outside 1..9999.
-    It raises `OverflowError` for a year above 2**31 - 1.
-    A timezone offset with hundreds of digits can produce an integer too large to subtract `time.time()`.
+    A year, day, time, or timezone field can overflow during conversion or subtraction of `time.time()`.
     """
     if not retry_after_header.endswith("GMT"):
         return None

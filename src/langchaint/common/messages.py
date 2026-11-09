@@ -336,9 +336,13 @@ def messages_from_json(messages_json: str) -> list[Message]:
     return _MESSAGES_JSON.validate_json(messages_json)
 
 
-type StopReason = Literal[
-    "stop", "tool_call", "max_completion_tokens", "refusal", "context_window_exceeded", "other"
+type GenerationErrorStopReason = Literal[
+    "stop", "max_completion_tokens", "refusal", "context_window_exceeded"
 ]
+"""Provider stop reasons that can accompany a generation error."""
+
+
+type StopReason = GenerationErrorStopReason | Literal["tool_call", "other"]
 """Provider stop reasons normalized to one vocabulary.
 
 Adapters map unrecognized provider values to `"other"`.

@@ -27,6 +27,7 @@ from anthropic.types.parsed_message import ParsedTextBlock
 from pydantic import BaseModel
 
 from langchaint import (
+    LLM,
     AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
@@ -69,8 +70,6 @@ from langchaint.anthropic import (
     BEDROCK_CROSS_REGION_MULTIPLIER,
     Anthropic,
     AnthropicBedrock,
-    AnthropicBedrockLLM,
-    AnthropicLLM,
     AnthropicMessagesAdapter,
     AnthropicPricingTable,
     AnthropicRates,
@@ -474,10 +473,10 @@ def test_model_cache_ttl_reaches_the_system_cache_breakpoint() -> None:
             "anthropic.claude-sonnet-5", cache_ttl="1h", max_completion_tokens=128
         ),
     ):
-        bound = llm.adapter.bind_text(
+        bound_adapter = llm.adapter.bind_text(
             _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
         )
-        request = bound.build_request_params([UserMessage(content="q")])
+        request = bound_adapter.build_request_params([UserMessage(content="q")])
         assert isinstance(request, _AnthropicRequestParams)
         assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == (
             _CACHE_CONTROL_1H
@@ -1005,7 +1004,7 @@ def test_open_stream_sends_the_built_request() -> None:
         service_tier="standard_only",
         inference_geo="us",
     )
-    bound = adapter.bind_text(
+    bound_adapter = adapter.bind_text(
         _binding(
             system_prompt="sys",
             tool_schemas=(),
@@ -1013,10 +1012,10 @@ def test_open_stream_sends_the_built_request() -> None:
             temperature=0.2,
         )
     )
-    request = bound.build_request_params([UserMessage(content="q")])
+    request = bound_adapter.build_request_params([UserMessage(content="q")])
     assert not isinstance(request, RejectedMessages)
     with pytest.raises(anthropic.BadRequestError):
-        _ = run_with_timeout(bound.open_stream(request, request_count=0))
+        _ = run_with_timeout(bound_adapter.open_stream(request, request_count=0))
     assert sent_bodies == [
         {
             "model": "m",
@@ -1582,15 +1581,15 @@ def _structured_bound() -> BoundAdapter:
     ids=["anthropic", "bedrock_mantle", "bedrock_legacy"],
 )
 def test_automatic_cache_breakpoints_select_final_caching_by_api(
-    build_llm: Callable[[], AnthropicLLM | AnthropicBedrockLLM],
+    build_llm: Callable[[], LLM],
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
     adapter = _anthropic_adapter_of(build_llm())
-    bound = adapter.bind_text(
+    bound_adapter = adapter.bind_text(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    request = bound.build_request_params([
+    request = bound_adapter.build_request_params([
         UserMessage(
             content=tuple(
                 TextPart(text=str(index), cache_breakpoint=index < 4) for index in range(5)
@@ -1740,7 +1739,7 @@ def test_retry_count_header_counts_prior_requests(path: Literal["generate", "str
             max_retries=0,
             http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
         ) as client:
-            bound = llm_from_adapter(
+            llm = llm_from_adapter(
                 _adapter(client=client),
                 shared_backoff=fast_shared_backoff(),
                 max_completion_tokens=16,
@@ -1748,10 +1747,10 @@ def test_retry_count_header_counts_prior_requests(path: Literal["generate", "str
             )
             if path == "generate":
                 with pytest.raises(GenerationError) as caught:
-                    await bound.generate_one("hello")
+                    await llm.generate_one("hello")
             else:
                 with pytest.raises(GenerationError) as caught:
-                    async with bound.stream_one("hello"):
+                    async with llm.stream_one("hello"):
                         pass
             assert caught.value.kind == "retries_exhausted_error"
 
@@ -1783,14 +1782,14 @@ def test_a_persistent_401_on_a_token_cache_client_ends_as_auth_error() -> None:
             max_retries=0,
             http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
         ) as client:
-            bound = llm_from_adapter(
+            llm = llm_from_adapter(
                 _adapter(client=client),
                 shared_backoff=fast_shared_backoff(),
                 max_completion_tokens=16,
                 max_requests=10,
             )
             with pytest.raises(GenerationError) as caught:
-                await bound.generate_one("hello")
+                await llm.generate_one("hello")
             assert caught.value.kind == "auth_error"
 
     run_with_timeout(scenario())
@@ -1850,7 +1849,7 @@ def _connection_error() -> anthropic.APIConnectionError:
     )
 
 
-def _anthropic_adapter_of(llm: AnthropicLLM | AnthropicBedrockLLM) -> AnthropicMessagesAdapter:
+def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     return adapter

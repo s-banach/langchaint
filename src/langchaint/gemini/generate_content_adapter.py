@@ -63,7 +63,7 @@ Source: https://ai.google.dev/gemini-api/docs/troubleshooting, read 2026-08-03.
 """
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
-"""What a request may ask for: the SDK ServiceTier wire values except "unspecified" (google-genai 2.34.0).
+"""What a request may ask for: the SDK ServiceTier wire values except "unspecified" (google-genai 3.0.0).
 
 "unspecified" is the SDK's "Default service tier, which is standard."
 """
@@ -74,7 +74,7 @@ type GeminiReportedServiceTier = Literal[
 """The `usage_metadata.traffic_type` values with pricing fields in `GeminiPricingTable`.
 
 `GeminiPricingTable` has one rates field per value.
-The SDK's open enum also constructs unknown values (google-genai 2.34.0).
+The SDK's open enum also constructs unknown values (google-genai 3.0.0).
 The request and response tier vocabularies share no value.
 """
 
@@ -246,7 +246,7 @@ def _priced_tier(traffic_type: types.TrafficType | None) -> str:
     """Return the tier that selects the rates: what the response reports, "ON_DEMAND" where it reports none.
 
     TRAFFIC_TYPE_UNSPECIFIED counts as reporting none: it is the proto zero value, not a tier.
-    The Developer API reports the served tier in `usageMetadata.serviceTier` instead, which google-genai 2.34.0 drops.
+    The Developer API reports the served tier in `usageMetadata.serviceTier` instead, which google-genai 3.0.0 drops.
     Price Developer API responses by that field once the SDK models it.
     """
     if traffic_type is None or traffic_type == types.TrafficType.TRAFFIC_TYPE_UNSPECIFIED:
@@ -262,12 +262,12 @@ def _billing_from_usage(
 ) -> ProviderBilling:
     """Price the reported counters at the rates the served tier selects.
 
-    prompt_token_count includes cached_content_token_count (google-genai 2.34.0 field description).
+    prompt_token_count includes cached_content_token_count (google-genai 3.0.0 field description).
     This includes implicit cache reads (https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03).
     Their difference is input_tokens_cache_none.
     thoughts_token_count is outside candidates_token_count.
     output_tokens is their sum, and output_tokens_reasoning is thoughts_token_count.
-    Source: google-genai 2.34.0 total_token_count field description.
+    Source: google-genai 3.0.0 total_token_count field description.
     tool_use_prompt_token_count is outside prompt_token_count and uses the uncached input rate.
     Long-context pricing compares prompt_token_count with its threshold, so tool-use input does not count toward it.
     None usage_metadata bills zero counters at the "ON_DEMAND" rates.
@@ -774,7 +774,7 @@ Unlisted terminal keys such as topK, seed, and stopSequences pass through.
 def _normalized_wire_key(key: str) -> str:
     """Normalize a wire-body key the way the SDK matches extra_body keys to wire keys.
 
-    google-genai 2.34.0 _normalize_key_for_matching ignores case and underscores.
+    google-genai 3.0.0 _normalize_key_for_matching ignores case and underscores.
     """
     return key.replace("_", "").lower()
 
@@ -851,7 +851,7 @@ def _reject_extra_body_keys(
 def _retry_after_seconds_from_retry_info(details: object) -> float | None:
     """Read the RetryInfo-stated wait from an APIError's details, None on any shape mismatch.
 
-    google-genai 2.34.0 errors.py supplies the error envelope or its inner error dict.
+    google-genai 3.0.0 errors.py supplies the error envelope or its inner error dict.
     RetryInfo uses the google/rpc/error_details.proto shape.
     retryDelay is a protobuf Duration encoded as decimal seconds plus "s".
     """
@@ -983,7 +983,8 @@ class GeminiGenerateContentAdapter(Adapter):
     ) -> tuple[types.GenerateContentConfig, frozenset[str]]:
         """Convert one binding to its shared `GenerateContentConfig`.
 
-        Every config disables SDK retries.
+        Every config disables SDK retries and automatic continuation so each admitted request sends one HTTP request.
+        google-genai 3.0.0 enables automatic continuation by default.
         Structured configs send `response_json_schema` with `response_mime_type="application/json"`.
         Caches selected through `extra_body["cachedContent"]` must not declare tools.
         Bound tools determine output types.
@@ -1068,6 +1069,7 @@ class GeminiGenerateContentAdapter(Adapter):
         # `HttpOptions.extra_body` requires a `dict`, and the copied values retain their identities.
         return (
             types.GenerateContentConfig(
+                automatic_continuation=False,
                 system_instruction=system_instruction,
                 tools=tools,
                 tool_config=tool_config,
@@ -1112,8 +1114,8 @@ class GeminiGenerateContentAdapter(Adapter):
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         """Bind for structured output in response_format without I/O.
 
-        google-genai 2.34.0 parses concatenated non-thought text, and langchaint validates only the final text part.
-        Source: https://github.com/googleapis/python-genai/blob/v2.34.0/google/genai/types.py
+        google-genai 3.0.0 parses concatenated non-thought text, and langchaint validates only the final text part.
+        Source: https://github.com/googleapis/python-genai/blob/v3.0.0/google/genai/types.py
 
         Raises:
             pydantic.ValidationError: A provider-executed tool is invalid.
@@ -1351,7 +1353,7 @@ class _GeminiStream(AdapterStream):
 
     @override
     def request_id(self) -> str | None:
-        """Return None: google-genai 2.34.0 names no request-id header.
+        """Return None: google-genai 3.0.0 names no request-id header.
 
         Each streamed chunk carries the response headers as `sdk_http_response.headers`, a `dict[str, str]`.
         """
@@ -1467,7 +1469,7 @@ class _BoundGemini(BoundAdapter):
     ) -> AdapterStream:
         """Open one generate_content_stream and return the live stream.
 
-        In google-genai 2.34.0, awaiting generate_content_stream returns an unstarted async generator.
+        In google-genai 3.0.0, awaiting generate_content_stream returns an unstarted async generator.
         Pulling first_chunk performs connection I/O before any event is yielded.
         _GeminiStream yields first_chunk first.
 

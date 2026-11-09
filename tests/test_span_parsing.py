@@ -8,8 +8,8 @@ import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint import (
+    LLM,
     ZERO_USAGE,
-    AdapterLLM,
     AssistantMessage,
     JsonValue,
     TextPart,
@@ -436,8 +436,8 @@ def test_leading_system_message_supplies_the_binding_system_prompt(
     if empty_system_instructions:
         attributes["gen_ai.system_instructions"] = list[JsonValue]()
     parsed = parse_otel_chat(_chat_span(attributes))
-    bound_llm = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
-    assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
+    llm = llm_from_otel(parsed, llm=llm_from_adapter(FakeAdapter()))
+    assert llm.binding.system_prompt == (TextPart(text="Be brief."),)
     assert generation_input_from_otel(parsed) == (
         UserMessage(content=(TextPart(text="Question"),)),
     )
@@ -939,12 +939,12 @@ def test_reconstruction_applies_tool_definition_presence_contract(
 
 def test_reconstruction_binds_structured_response_model() -> None:
     span = _generation_chat_span({"gen_ai.output.type": "json"})
-    bound_llm = llm_from_otel(
+    llm = llm_from_otel(
         span,
         llm=llm_from_adapter(FakeAdapter(), response_format=_StructuredResponse),
     )
-    assert_type(bound_llm, AdapterLLM[_StructuredResponse, None])
-    assert bound_llm.response_format is _StructuredResponse
+    assert_type(llm, LLM[_StructuredResponse, None])
+    assert llm.response_format is _StructuredResponse
 
 
 @pytest.mark.parametrize(

@@ -1,7 +1,7 @@
 """Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from importlib.resources import files
 from typing import Annotated, Literal
@@ -40,7 +40,7 @@ from langchaint.common.messages import (
     _is_object_dict,
     final_text,
 )
-from langchaint.generation.llm import GenerationInput, _ConfiguredLLM
+from langchaint.generation.llm import LLM, GenerationInput
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
 from langchaint.generation.response import (
     GenerationRecord,
@@ -737,20 +737,22 @@ def generation_record_from_otel(
             )
 
 
-def llm_from_otel[LLMT: _ConfiguredLLM[str | BaseModel, ToolManager | None]](
+def llm_from_otel[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     otel_chat_span: OtelChatSpan,
     *,
-    llm: LLMT,
-) -> LLMT:
-    """Reconstruct captured request settings with the configured model's concrete class.
+    llm: LLM[OutputT, ToolManagerT],
+) -> LLM[OutputT, ToolManagerT]:
+    """Reconstruct captured request settings with the configured model.
 
     OTel tool definitions contain schemas without executable Python functions.
     `llm.tool_manager` supplies executable Python functions.
     `llm.response_format` supplies the model class that `output_type="json"` omits.
+    `tool_choice`, `parallel_tool_calls`, and `provider_executed_tools` carry over unchanged.
+    `extra_body` and `automatic_cache_breakpoints` also carry over unchanged.
 
     Args:
         otel_chat_span: The parsed OTel chat span attributes.
-        llm: The model that supplies the concrete class, output type, tools, and admission configuration.
+        llm: The model that supplies the output type, tools, and admission configuration.
             Captured tool schemas must equal its tool schemas.
             Captured system prompt, token limit, reasoning level, and temperature replace its corresponding settings.
 
@@ -775,23 +777,17 @@ def llm_from_otel[LLMT: _ConfiguredLLM[str | BaseModel, ToolManager | None]](
     system_prompt = system_prompt_from_otel(otel_chat_span)
     _require_matching_response_format(otel_chat_span.output_type, llm.response_format)
     captured_tool_schemas = tool_schemas_from_otel(otel_chat_span)
-    bound_llm = llm._with_binding(
-        replace(
-            llm.binding,
-            system_prompt=system_prompt,
-            max_completion_tokens=otel_chat_span.request_max_tokens,
-            reasoning_level=otel_chat_span.request_reasoning_level,
-            temperature=otel_chat_span.request_temperature,
-        )
+    llm = llm.bind(
+        system_prompt=system_prompt,
+        max_completion_tokens=otel_chat_span.request_max_tokens,
+        reasoning_level=otel_chat_span.request_reasoning_level,
+        temperature=otel_chat_span.request_temperature,
     )
-    if (
-        captured_tool_schemas is not None
-        and captured_tool_schemas != bound_llm.binding.tool_schemas
-    ):
+    if captured_tool_schemas is not None and captured_tool_schemas != llm.binding.tool_schemas:
         raise OtelToLangchaintConversionError(
-            f"{TOOL_DEFINITIONS} {otel_chat_span.tool_definitions!r} converts to {captured_tool_schemas!r}, which differs from caller tool schemas {bound_llm.binding.tool_schemas!r}"
+            f"{TOOL_DEFINITIONS} {otel_chat_span.tool_definitions!r} converts to {captured_tool_schemas!r}, which differs from caller tool schemas {llm.binding.tool_schemas!r}"
         )
-    return bound_llm
+    return llm
 
 
 def _stop_reason_from_otel(

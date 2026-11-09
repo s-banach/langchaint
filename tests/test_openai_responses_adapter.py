@@ -974,7 +974,7 @@ def _request_body_sent(
         bodies.append(request.content)
         return httpx2.Response(200, headers={"content-type": "text/event-stream"})
 
-    bound = bind(
+    bound_adapter = bind(
         _adapter(
             client=AsyncOpenAI(
                 api_key="offline",
@@ -982,9 +982,9 @@ def _request_body_sent(
             )
         )
     )
-    request = bound.build_request_params([UserMessage(content="q")])
+    request = bound_adapter.build_request_params([UserMessage(content="q")])
     assert isinstance(request, RequestParams)
-    _ = run_with_timeout(bound.open_stream(request, request_count=0))
+    _ = run_with_timeout(bound_adapter.open_stream(request, request_count=0))
     (body,) = bodies
     decoded_body: object = json.loads(body)
     return decoded_body
@@ -994,11 +994,11 @@ def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_refere
     extra_body = {"safety_identifier": "user-7"}
 
     def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter:
-        bound = adapter.bind_text(
+        bound_adapter = adapter.bind_text(
             _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
         )
         extra_body["safety_identifier"] = "user-8"
-        return bound
+        return bound_adapter
 
     assert _request_body_sent(bind_then_edit_extra_body) == {
         "model": "m",
@@ -1454,11 +1454,11 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
     """Earlier commentary and a schema-valid provisional answer precede the final answer."""
     path = Path(__file__).parent / "fixtures" / "responses_structured" / f"{name}.json"
     response = OpenAIResponse.model_validate_json(path.read_text())
-    bound = _adapter().bind_structured(
+    bound_adapter = _adapter().bind_structured(
         _binding(automatic_cache_breakpoints=False), _CapturedAnswer
     )
-    billing = bound.billing_from_raw(response)
-    outcome = _assert_plain(structured_outcome(bound, response, _CapturedAnswer))
+    billing = bound_adapter.billing_from_raw(response)
+    outcome = _assert_plain(structured_outcome(bound_adapter, response, _CapturedAnswer))
     assert outcome.output == _CapturedAnswer(value=17)
     assert outcome.assistant_message == _assistant_message_from(response)
     assert billing.usage_raw is response.usage
@@ -1477,7 +1477,9 @@ def test_structured_binding_selects_the_final_answer_in_live_luna_captures(name:
         _ = [item async for item in stream.items()]
         return await stream.final()
 
-    assert structured_outcome(bound, run_with_timeout(streamed()), _CapturedAnswer) == outcome
+    assert (
+        structured_outcome(bound_adapter, run_with_timeout(streamed()), _CapturedAnswer) == outcome
+    )
 
 
 def _text_response(text: str, *, tool_call: bool = False) -> OpenAIResponse:

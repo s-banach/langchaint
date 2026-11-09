@@ -8,7 +8,7 @@ import json
 import logging
 import pathlib
 from collections.abc import AsyncIterator, Callable, Mapping
-from typing import ClassVar, Literal, NamedTuple, get_args, override
+from typing import ClassVar, Literal, NamedTuple, override
 
 import numpy as np
 import pytest
@@ -21,7 +21,6 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 from langchaint import (
     LLM,
     AbandonedStreamRecord,
-    AdapterLLM,
     AssistantMessage,
     AssistantPart,
     AudioPart,
@@ -124,7 +123,7 @@ def _traced(
     chat_attribute_transform: ChatAttributeTransform | None = None,
     extra_attributes: SpanAttributes | None = None,
     max_concurrent_requests: int = 8,
-) -> tuple[AdapterLLM, InMemorySpanExporter]:
+) -> tuple[LLM, InMemorySpanExporter]:
     """`max_concurrent_requests=1` makes batch spans end in input order."""
     tracer_provider, exporter = _in_memory_tracer_provider()
     llm = llm_from_adapter(
@@ -145,12 +144,12 @@ type _GenerationPath = Literal["generate", "stream"]
 
 async def _generate_through[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     path: _GenerationPath,
-    bound_llm: LLM[OutputT, ToolManagerT],
+    llm: LLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
 ) -> Generation[OutputT]:
     if path == "generate":
-        return await bound_llm.generate_one(generation_input)
-    async with bound_llm.stream_one(generation_input) as handle:
+        return await llm.generate_one(generation_input)
+    async with llm.stream_one(generation_input) as handle:
         _ = [item async for item in handle]
         return await handle.final()
 
@@ -185,9 +184,9 @@ class _MidFailStream(FakeStream):
 
 def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
     async def scenario() -> None:
-        llm, exporter = _traced(FakeAdapter(echo=True))
-        bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
-        result = await bound.generate_one("hi")
+        initial_llm, exporter = _traced(FakeAdapter(echo=True))
+        llm = initial_llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
+        result = await llm.generate_one("hi")
         assert result.kind == "plain"
         assert result.output == "hi"
         (span,) = exporter.get_finished_spans()
@@ -395,9 +394,9 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
 ) -> None:
     async def scenario() -> None:
         adapter = FakeAdapter(echo=True)
-        bound, exporter = _traced(adapter)
+        llm, exporter = _traced(adapter)
         resume_path = tmp_path / "records.jsonl"
-        first = await bound.generate_many_records(
+        first = await llm.generate_many_records(
             ["a", "b"],
             resume_path=resume_path,
             input_ids=["input-a", "input-b"],
@@ -405,7 +404,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         assert all(record.kind == "plain" for record in first)
         assert len(exporter.get_finished_spans()) == 2
 
-        resumed = await bound.generate_many_records(
+        resumed = await llm.generate_many_records(
             ["b", "c", "a"],
             resume_path=resume_path,
             input_ids=["input-b", "input-c", "input-a"],
@@ -478,7 +477,7 @@ def test_stream_never_entered_emits_no_span() -> None:
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
-    async def _drain(llm: AdapterLLM) -> None:
+    async def _drain(llm: LLM) -> None:
         async with llm.stream_one("hi") as stream:
             async for _item in stream:
                 pass
@@ -503,7 +502,10 @@ class _Answer(BaseModel):
 
 
 @pytest.mark.parametrize("response_format", [str, _Answer])
-@pytest.mark.parametrize("stop_reason", get_args(StopReason.__value__))
+@pytest.mark.parametrize(
+    "stop_reason",
+    ["stop", "max_completion_tokens", "refusal", "context_window_exceeded", "tool_call", "other"],
+)
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
     path: _GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
@@ -543,8 +545,8 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
                 )
             ]
         )
-        llm, exporter = _traced(adapter, capture_message_content=True)
-        text_bound = llm.bind(
+        initial_llm, exporter = _traced(adapter, capture_message_content=True)
+        text_llm = initial_llm.bind(
             system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
             max_completion_tokens=123,
@@ -553,11 +555,11 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         )
         generation: Generation[str] | Generation[_Answer]
         if response_format is str:
-            bound = text_bound
-            generation = await _generate_through(path, text_bound, generation_input)
+            llm = text_llm
+            generation = await _generate_through(path, text_llm, generation_input)
         else:
-            bound = text_bound.bind(response_format=_Answer)
-            generation = await _generate_through(path, bound, generation_input)
+            llm = text_llm.bind(response_format=_Answer)
+            generation = await _generate_through(path, llm, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_chat(_exported_attributes(span))
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
@@ -568,8 +570,8 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
         assert parsed.request_stream == (True if path == "stream" else None)
         assert parsed.output_type == ("text" if response_format is str else "json")
-        reconstructed = llm_from_otel(parsed, llm=bound)
-        assert reconstructed.binding == bound.binding
+        reconstructed = llm_from_otel(parsed, llm=llm)
+        assert reconstructed.binding == llm.binding
         assert generation_input_from_otel(parsed) == generation_input
         assert output_messages_from_otel(parsed) == (generation.assistant_message,)
         record = generation_record_from_otel(parsed)
@@ -700,10 +702,10 @@ def test_a_transform_and_extra_attributes_reach_every_chat_span_across_bind() ->
                 "gen_ai.operation.name": "not-the-operation",
             },
         )
-        replacement_bound = llm.bind(system_prompt="s").bind(system_prompt="s2")
+        replacement_llm = llm.bind(system_prompt="s").bind(system_prompt="s2")
         for path in ("generate", "stream"):
-            await _generate_through(path, replacement_bound)
-        await replacement_bound.generate_many(["a", "b"])
+            await _generate_through(path, replacement_llm)
+        await replacement_llm.generate_many(["a", "b"])
         spans = exporter.get_finished_spans()
         assert len(spans) == 4
         assert transformed_models == ["fake-model"] * 4
@@ -1033,21 +1035,21 @@ def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
 
 def test_bind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
     async def scenario() -> None:
-        llm, exporter = _traced(
+        initial_llm, exporter = _traced(
             FakeAdapter(),
             capture_message_content=True,
             extra_attributes={"gen_ai.agent.name": "agent_a"},
         )
-        bound = llm.bind(tools=[_echo_tool()])
-        replacement_bound = bound.bind(tools=[_echo_tool()])
-        unobserved_bound = bound.bind(tools=ToolManager([_echo_tool()]))
-        await bound.tool_manager.dispatch(
+        llm = initial_llm.bind(tools=[_echo_tool()])
+        replacement_llm = llm.bind(tools=[_echo_tool()])
+        unobserved_llm = llm.bind(tools=ToolManager([_echo_tool()]))
+        await llm.tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
         )
-        await replacement_bound.tool_manager.dispatch(
+        await replacement_llm.tool_manager.dispatch(
             ToolCall(id="call2", name="echo", args_json='{"text": "b"}')
         )
-        await unobserved_bound.tool_manager.dispatch(
+        await unobserved_llm.tool_manager.dispatch(
             ToolCall(id="call3", name="echo", args_json='{"text": "c"}')
         )
         spans = exporter.get_finished_spans()
@@ -1281,7 +1283,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             tracer_provider=tracer_provider,
             capture_message_content=_scrub_marker,
         )
-        llm = llm_from_adapter(
+        initial_llm = llm_from_adapter(
             FakeAdapter(
                 scripted_requests=[
                     ScriptedResponse(
@@ -1296,9 +1298,9 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             ),
             observer=observer,
         )
-        bound = llm.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
+        llm = initial_llm.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
-        await bound.generate_one([
+        await llm.generate_one([
             UserMessage(content=f"question {_MARKER}"),
             AssistantMessage(content=(tool_call,)),
             ToolMessage(tool_call_id="call1", content=f"echoed {_MARKER}"),
@@ -1382,16 +1384,16 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
 
     async def scenario() -> None:
         tracer_provider, exporter = _in_memory_tracer_provider()
-        llm = llm_from_adapter(
+        initial_llm = llm_from_adapter(
             FakeAdapter(),
             observer=OtelObserver(
                 tracer_provider=tracer_provider,
                 capture_message_content=content_filter,
             ),
         )
-        bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
+        llm = initial_llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            result = await _generate_through(path, bound)
+            result = await _generate_through(path, llm)
         assert result.kind == "plain"
         assert result.output == "ok"
         (span,) = exporter.get_finished_spans()

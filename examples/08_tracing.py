@@ -37,7 +37,7 @@ async def print_tool_loop_spans(prompt: str, max_turns: int = 10) -> str:
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 
-    bound = OpenAI(
+    llm = OpenAI(
         observer=OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
     ).llm(
         "gpt-5.6-terra",
@@ -47,11 +47,11 @@ async def print_tool_loop_spans(prompt: str, max_turns: int = 10) -> str:
 
     messages: list[Message] = [UserMessage(content=prompt)]
     for _ in range(max_turns):
-        generation = await bound.generate_one(messages)
+        generation = await llm.generate_one(messages)
         match generation.kind:
             case "tool_call":
                 messages.append(generation.assistant_message)
-                outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
+                outcomes = await llm.tool_manager.dispatch_many(generation.tool_calls)
                 messages.extend(outcome.tool_message for outcome in outcomes)
             case "plain":
                 return generation.output

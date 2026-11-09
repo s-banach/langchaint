@@ -4,6 +4,8 @@ Importing this subpackage requires `opentelemetry-api`.
 Applications configure the OTel SDK.
 
 Pass one `OtelObserver` to a backend constructor, as in `OpenAI(observer=OtelObserver(...))`.
+Configured models trace their inputs and streams.
+For an adapter configured directly, pass the observer through `llm_from_adapter(observer=...)`.
 A `ToolManager` built from a tool sequence by a provider factory or `bind` traces its dispatches.
 A `ToolManager` the application builds traces its dispatches when built with `observer=`.
 Every `EmbeddingModel` that backend creates traces its requests.

@@ -45,14 +45,14 @@ async def stream_tool_call() -> Generation[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: Generation fails.
     """
-    bound = OpenAI().llm(
+    llm = OpenAI().llm(
         "gpt-5.6-terra",
         reasoning_summary="auto",
         tools=[get_weather],
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
     )
 
-    async with bound.stream_one("What is the weather in Oslo?") as handle:
+    async with llm.stream_one("What is the weather in Oslo?") as handle:
         async for item in handle:
             print_stream_item(item)
         generation = await handle.final()

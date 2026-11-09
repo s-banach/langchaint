@@ -178,8 +178,8 @@ def _binding(
 def _bound_config(
     binding: Binding, adapter: GeminiGenerateContentAdapter | None = None
 ) -> types.GenerateContentConfig:
-    bound = (adapter or _adapter()).bind_text(binding)
-    request = bound.build_request_params([UserMessage(content="hi")])
+    bound_adapter = (adapter or _adapter()).bind_text(binding)
+    request = bound_adapter.build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
     return request.config
 
@@ -354,23 +354,28 @@ _CONFIG_CASES = [
     _ConfigCase(
         "unset_fields_send_nothing",
         _binding(),
-        types.GenerateContentConfig(http_options=_NO_SDK_RETRIES),
+        types.GenerateContentConfig(automatic_continuation=False, http_options=_NO_SDK_RETRIES),
     ),
     # Implicit caching has no wire form, so the parameter changes nothing.
     _ConfigCase(
         "automatic_cache_breakpoints_has_no_wire_form",
         _binding(automatic_cache_breakpoints=True),
-        types.GenerateContentConfig(http_options=_NO_SDK_RETRIES),
+        types.GenerateContentConfig(automatic_continuation=False, http_options=_NO_SDK_RETRIES),
     ),
     _ConfigCase(
         "system_prompt_text",
         _binding(system_prompt="be terse"),
-        types.GenerateContentConfig(system_instruction="be terse", http_options=_NO_SDK_RETRIES),
+        types.GenerateContentConfig(
+            automatic_continuation=False,
+            system_instruction="be terse",
+            http_options=_NO_SDK_RETRIES,
+        ),
     ),
     _ConfigCase(
         "system_prompt_parts",
         _binding(system_prompt=(TextPart(text="a"), TextPart(text="b"))),
         types.GenerateContentConfig(
+            automatic_continuation=False,
             system_instruction=types.Content(parts=[types.Part(text="a"), types.Part(text="b")]),
             http_options=_NO_SDK_RETRIES,
         ),
@@ -379,13 +384,17 @@ _CONFIG_CASES = [
         "max_completion_tokens_and_temperature",
         _binding(max_completion_tokens=64, temperature=0.5),
         types.GenerateContentConfig(
-            temperature=0.5, max_output_tokens=64, http_options=_NO_SDK_RETRIES
+            automatic_continuation=False,
+            temperature=0.5,
+            max_output_tokens=64,
+            http_options=_NO_SDK_RETRIES,
         ),
     ),
     _ConfigCase(
         "reasoning_level",
         _binding(reasoning_level="HIGH"),
         types.GenerateContentConfig(
+            automatic_continuation=False,
             thinking_config=types.ThinkingConfig(
                 thinking_level=types.ThinkingLevel.HIGH, include_thoughts=True
             ),
@@ -403,13 +412,14 @@ _CONFIG_CASES = [
             }
         ),
         types.GenerateContentConfig(
+            automatic_continuation=False,
             http_options=types.HttpOptions(
                 retry_options=types.HttpRetryOptions(attempts=1),
                 extra_body={
                     "cachedContent": "caches/abc",
                     "generationConfig": {"topK": 5, "thinkingConfig": {"thinkingBudget": 0}},
                 },
-            )
+            ),
         ),
     ),
     # Function declarations precede provider-executed tools, and mode VALIDATED keeps both usable.
@@ -417,6 +427,7 @@ _CONFIG_CASES = [
         "function_declarations_precede_provider_executed_tools",
         _binding(tool_schemas=(_echo_schema(),), provider_executed_tools=({"google_search": {}},)),
         types.GenerateContentConfig(
+            automatic_continuation=False,
             tools=[
                 types.Tool(function_declarations=[_ECHO_DECLARATION]),
                 types.Tool(google_search=types.GoogleSearch()),
@@ -435,6 +446,7 @@ _CONFIG_CASES = [
             f"provider_executed_tool_{'_'.join(provider_executed_tool)}",
             _binding(provider_executed_tools=(provider_executed_tool,)),
             types.GenerateContentConfig(
+                automatic_continuation=False,
                 tools=[types.Tool.model_validate(provider_executed_tool)],
                 tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
                 http_options=_NO_SDK_RETRIES,
@@ -686,6 +698,7 @@ def test_structured_bind_sends_the_response_schema() -> None:
     )
     assert isinstance(request, _GeminiRequestParams)
     assert request.config == types.GenerateContentConfig(
+        automatic_continuation=False,
         response_mime_type="application/json",
         response_json_schema=TypeAdapter(_Answer).json_schema(),
         http_options=_NO_SDK_RETRIES,
@@ -697,7 +710,9 @@ def test_service_tier_is_sent_and_fingerprinted() -> None:
     adapter = _adapter(service_tier="flex")
     assert adapter.config_fingerprint_data() == {"service_tier": "flex"}
     assert _bound_config(_binding(), adapter) == types.GenerateContentConfig(
-        service_tier=types.ServiceTier.FLEX, http_options=_NO_SDK_RETRIES
+        automatic_continuation=False,
+        service_tier=types.ServiceTier.FLEX,
+        http_options=_NO_SDK_RETRIES,
     )
 
 
@@ -828,9 +843,11 @@ def _cache_breakpoint_part_messages(
 def test_cache_breakpoints_preserve_requests(
     part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
 ) -> None:
-    bound = _adapter().bind_text(_binding())
-    unmarked = bound.build_request_params(_cache_breakpoint_part_messages(part, message_class))
-    marked = bound.build_request_params(
+    bound_adapter = _adapter().bind_text(_binding())
+    unmarked = bound_adapter.build_request_params(
+        _cache_breakpoint_part_messages(part, message_class)
+    )
+    marked = bound_adapter.build_request_params(
         _cache_breakpoint_part_messages(
             part.model_copy(update={"cache_breakpoint": True}), message_class
         )
@@ -1039,14 +1056,16 @@ def test_an_unfinished_finish_reason_cannot_continue_and_names_the_finish_reason
 
 
 def test_identity_reads_the_response_fields() -> None:
-    bound = _adapter().bind_text(_binding())
-    identity = bound.identity_from_raw(_response([types.Part(text="hi")]), request_id="req-gemini")
+    bound_adapter = _adapter().bind_text(_binding())
+    identity = bound_adapter.identity_from_raw(
+        _response([types.Part(text="hi")]), request_id="req-gemini"
+    )
     assert (identity.model_served, identity.response_id, identity.request_id) == (
         "gemini-3.5-flash",
         "resp-1",
         "req-gemini",
     )
-    bare = bound.identity_from_raw(types.GenerateContentResponse(), request_id=None)
+    bare = bound_adapter.identity_from_raw(types.GenerateContentResponse(), request_id=None)
     assert (bare.model_served, bare.response_id) == ("", "")
 
 
@@ -1572,7 +1591,7 @@ class TestGeminiGenerateContentConformance(PartWireConformance):
     def response_with_text_parts(self, texts: Sequence[str]) -> BaseModel:
         """Construct complete ordered parts, separately from streamed partial JSON.
 
-        Google-genai 2.33.0 yields chunks without complete text-part boundary events.
+        google-genai 3.0.0 yields chunks without complete text-part boundary events.
         The sources do not establish every constructed multi-part arrangement as provider output.
         Source: https://ai.google.dev/api/generate-content#Content
         Source: https://ai.google.dev/gemini-api/docs/structured-output#streaming

@@ -14,7 +14,7 @@ from typing import override
 from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
-    AdapterLLM,
+    LLM,
     AssistantMessage,
     Billing,
     Message,
@@ -303,7 +303,7 @@ def call(name: str, args_json: str) -> ToolCall:
 
 def build_llm(
     scripts: dict[str, list[Turn]], *, system_prompt: str, observer: Observer | None = None
-) -> AdapterLLM:
+) -> LLM:
     """Share the scripted adapter and admission limits across configured models."""
     return llm_from_adapter(
         ScriptedAdapter(scripts),

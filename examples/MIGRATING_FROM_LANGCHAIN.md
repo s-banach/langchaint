@@ -95,12 +95,12 @@ Check `generation.kind` before reading the result.
 With the application's tool definitions stored in `tools`, one step of an application tool loop is:
 
 ```python
-bound = llm.bind(tools=tools)
-generation = await bound.generate_one(messages)
+llm = llm.bind(tools=tools)
+generation = await llm.generate_one(messages)
 match generation.kind:
     case "tool_call":
         messages.append(generation.assistant_message)
-        outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
+        outcomes = await llm.tool_manager.dispatch_many(generation.tool_calls)
         messages.extend(outcome.tool_message for outcome in outcomes)
     case "plain":
         print(generation.output)
@@ -210,9 +210,9 @@ Move middleware behavior to the application function that owns each call or tool
 
 | LangChain hook | Application location |
 | --- | --- |
-| `before_model` | before `await bound.generate_one(messages)` |
+| `before_model` | before `await llm.generate_one(messages)` |
 | `after_model` | after receiving `PlainGeneration` or `ToolCallGeneration` |
-| `modify_model_request` | `bound = bound.bind(...)` |
+| `modify_model_request` | `llm = llm.bind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |
 | concurrent tool calls | `ToolManager.dispatch_many(tool_calls)` |

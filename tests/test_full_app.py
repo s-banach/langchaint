@@ -24,7 +24,9 @@ from langchaint import (
     ZERO_USAGE,
     DispatchExceptionGroup,
     GenerationError,
+    SpecificToolChoice,
     ToolCall,
+    ToolChoice,
     UserMessage,
     tool,
 )
@@ -250,7 +252,12 @@ def test_tool_call_budget_uses_call_positions() -> None:
 
 
 @pytest.mark.parametrize("max_tool_calls", [0, 1])
-def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_calls: int) -> None:
+@pytest.mark.parametrize(
+    "tool_choice", ["auto", "required", SpecificToolChoice(tool_name="search")]
+)
+def test_tool_budget_disables_requests_through_a_subsequent_timeout(
+    max_tool_calls: int, tool_choice: ToolChoice
+) -> None:
     config = AgentConfig(
         name="limited",
         system_prompt="Search then answer.",
@@ -264,7 +271,7 @@ def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_cal
     llm = build_llm(
         {config.system_prompt: turns},
         system_prompt=config.system_prompt,
-    )
+    ).bind(tool_choice=tool_choice)
     run = ReActAgent(
         agent_path="root/limited",
         config=config,
@@ -281,7 +288,7 @@ def test_tool_budget_disables_requests_through_a_subsequent_timeout(max_tool_cal
     assert isinstance(llm.adapter, ScriptedAdapter)
     requests = llm.adapter.scripts[config.system_prompt].requests
     assert [request.tool_choice for request in requests] == (
-        ["auto", "none", "none"] if max_tool_calls else ["none", "none"]
+        [tool_choice, "none", "none"] if max_tool_calls else ["none", "none"]
     )
 
 

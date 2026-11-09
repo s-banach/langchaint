@@ -48,11 +48,7 @@ from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import final_text
 from langchaint.conformance import AdapterConformance
 from langchaint.deepseek import input_tokens_cache_read_from_usage_deepseek
-from langchaint.openai import (
-    OpenAIChatCompletionsAdapter,
-    OpenAIPricingTable,
-    OpenAIServiceTier,
-)
+from langchaint.openai import OpenAIChatCompletionsAdapter, OpenAIPricingTable, OpenAIServiceTier
 from langchaint.openai.chat_completions_adapter import (
     _assistant_message_from,
     _assistant_message_param,
@@ -1037,10 +1033,10 @@ def _request_body_sent(
         api_key="offline",
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
-    bound = bind(_adapter(client=client))
-    request = bound.build_request_params([UserMessage(content="q")])
+    bound_adapter = bind(_adapter(client=client))
+    request = bound_adapter.build_request_params([UserMessage(content="q")])
     assert not isinstance(request, RejectedMessages)
-    _ = run_with_timeout(bound.open_stream(request, request_count=0))
+    _ = run_with_timeout(bound_adapter.open_stream(request, request_count=0))
     (body,) = bodies
     decoded_body: object = json.loads(body)
     return decoded_body
@@ -1052,9 +1048,9 @@ def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> N
     def bind_then_edit_extra_body(
         adapter: OpenAIChatCompletionsAdapter,
     ) -> BoundAdapter:
-        bound = adapter.bind_text(_binding(extra_body=extra_body))
+        bound_adapter = adapter.bind_text(_binding(extra_body=extra_body))
         extra_body["safety_identifier"] = "user-8"
-        return bound
+        return bound_adapter
 
     assert _request_body_sent(bind_then_edit_extra_body) == {
         "model": "m",

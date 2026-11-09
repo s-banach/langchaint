@@ -216,7 +216,7 @@ class ReActAgent(AgentRun):
         self.llm: LLM[str, ToolManager] = llm.bind(
             system_prompt=config.system_prompt,
             tools=tools,
-            tool_choice="none" if config.max_tool_calls <= 0 else "auto",
+            tool_choice="none" if config.max_tool_calls <= 0 else llm.binding.tool_choice,
             max_requests=config.max_requests,
             automatic_cache_breakpoints=config.automatic_cache_breakpoints,
         )

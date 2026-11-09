@@ -69,21 +69,24 @@ asyncio.run(main())
 `generate_many()` returns generations in input order, or raises `GenerationError` after cancelling and awaiting unfinished inputs.
 `generate_many_records()` returns one normalized record per input, including failures; pass `resume_path` to persist records and resume interrupted batches.
 
+To configure an adapter directly, use `llm_from_adapter(adapter, ...)` from `langchaint`.
+
 ## Build agent loops
 
 Configuring tools adds a tool-call variant to the generation's discriminated union.
 Match `.kind` to narrow its type, and set turn limits in your loop:
 
 ```python
+llm = OpenAI().llm("gpt-5.6-terra", tools=tools)
 messages: list[Message] = [UserMessage(content=prompt)]
 
 for _ in range(max_turns):
-    generation = await bound.generate_one(messages)
+    generation = await llm.generate_one(messages)
 
     match generation.kind:
         case "tool_call":
             messages.append(generation.assistant_message)
-            outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
+            outcomes = await llm.tool_manager.dispatch_many(generation.tool_calls)
             messages.extend(outcome.tool_message for outcome in outcomes)
         case "plain":
             return generation.output

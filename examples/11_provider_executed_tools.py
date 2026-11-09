@@ -12,12 +12,12 @@ async def search_the_web() -> PlainGeneration[str]:
         GenerationError: Generation fails.
     """
     # Catalog pricing supplies the required web-search invocation rate.
-    bound = OpenAI().llm(
+    llm = OpenAI().llm(
         "gpt-5.6-terra",
         provider_executed_tools=({"type": "web_search"},),
         automatic_cache_breakpoints=True,
     )
-    generation = await bound.generate_one("Find today's OpenAI developer news.")
+    generation = await llm.generate_one("Find today's OpenAI developer news.")
 
     raw_parts: list[object] = [
         part.raw for part in generation.assistant_message.content_parts if part.kind == "raw"

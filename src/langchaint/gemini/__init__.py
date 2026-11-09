@@ -51,7 +51,7 @@ from langchaint.gemini.generate_content_adapter import (
     GeminiServiceTier,
     assembled_response,
 )
-from langchaint.generation.llm import UNCHANGED, Unchanged, _configure, _ConfiguredLLM
+from langchaint.generation.llm import LLM, llm_from_adapter
 from langchaint.generation.observer import Observer
 from langchaint.tools import ToolManager, ToolSequence
 
@@ -121,174 +121,6 @@ _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 """`GEMINI_PRICING` with `str` keys for runtime model lookup."""
 
 
-class GeminiLLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = None](
-    _ConfiguredLLM[OutputT, ToolManagerT]
-):
-    """Create instances through `Gemini.llm` to validate request settings before generation."""
-
-    @overload
-    def bind[NewOutputT: str | BaseModel](
-        self,
-        *,
-        response_format: type[NewOutputT],
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[NewOutputT, ToolManager]": ...
-    @overload
-    def bind[NewOutputT: str | BaseModel](
-        self,
-        *,
-        response_format: type[NewOutputT],
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[NewOutputT, None]": ...
-    @overload
-    def bind[NewOutputT: str | BaseModel](
-        self: "GeminiLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: type[NewOutputT],
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[NewOutputT, ToolManagerT]": ...
-    @overload
-    def bind(
-        self: "GeminiLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[OutputT, ToolManager]": ...
-    @overload
-    def bind(
-        self: "GeminiLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[OutputT, None]": ...
-    @overload
-    def bind(
-        self: "GeminiLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_requests: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "GeminiLLM[OutputT, ToolManagerT]": ...
-    def bind(
-        self,
-        *,
-        response_format: type[str] | type[BaseModel] | Unchanged = UNCHANGED,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
-        tool_choice: ToolChoice | Unchanged = UNCHANGED,
-        parallel_tool_calls: bool | Unchanged = UNCHANGED,
-        max_completion_tokens: int | None | Unchanged = UNCHANGED,
-        reasoning_level: str | None | Unchanged = UNCHANGED,
-        temperature: float | None | Unchanged = UNCHANGED,
-        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
-        max_requests: int | Unchanged = UNCHANGED,
-        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
-    ) -> "GeminiLLM[BaseModel | str, ToolManager | None]":
-        """Return a new LLM, preserving every omitted setting.
-
-        `tools=None` removes `ToolManager`.
-        A `tools` sequence constructs `ToolManager` with this binding's observer.
-        An existing `ToolManager` retains its identity and its own observer.
-        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
-
-        `response_format=str` returns text; a pydantic model validates structured output.
-        `max_completion_tokens=None` omits the limit.
-        `reasoning_level` accepts exact provider strings; `None` omits the setting.
-        `extra_body` supplies provider wire-body fields; `None` clears them.
-        Declare tools only through `tools`, because result types follow the configured tools.
-        `max_requests` counts all requests per input, including retries.
-
-        Raises:
-            ValueError: `tools` contains duplicate names.
-            ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the bound tool schemas.
-            ValueError: `system_prompt` is an empty sequence.
-            ValueError: `extra_body` contains an adapter-populated key.
-            ValueError: `max_requests` is boolean or below one.
-            ValueError: The binding breaks a rule of the adapter.
-                The docstring of the backend's `llm()` lists the rules.
-            TypeError: `response_format` is a proper subclass of `str`.
-            pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
-            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
-            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
-        """
-        return GeminiLLM(
-            self._reconfigure(
-                system_prompt=system_prompt,
-                tools=tools,
-                provider_executed_tools=provider_executed_tools,
-                response_format=response_format,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_level=reasoning_level,
-                temperature=temperature,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                extra_body=extra_body,
-                max_requests=max_requests,
-                automatic_cache_breakpoints=automatic_cache_breakpoints,
-            )
-        )
-
-
 class Gemini:
     """Create `LLM` values for Gemini."""
 
@@ -335,7 +167,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[OutputT, ToolManager]: ...
+    ) -> LLM[OutputT, ToolManager]: ...
 
     @overload
     def llm[OutputT: str | BaseModel](
@@ -356,7 +188,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[OutputT, None]: ...
+    ) -> LLM[OutputT, None]: ...
 
     @overload
     def llm(
@@ -377,7 +209,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[str, ToolManager]: ...
+    ) -> LLM[str, ToolManager]: ...
 
     @overload
     def llm(
@@ -398,7 +230,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[str, None]: ...
+    ) -> LLM[str, None]: ...
 
     @overload
     def llm[OutputT: str | BaseModel](
@@ -419,7 +251,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[OutputT, ToolManager]: ...
+    ) -> LLM[OutputT, ToolManager]: ...
 
     @overload
     def llm[OutputT: str | BaseModel](
@@ -440,7 +272,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[OutputT, None]: ...
+    ) -> LLM[OutputT, None]: ...
 
     @overload
     def llm(
@@ -461,7 +293,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[str, ToolManager]: ...
+    ) -> LLM[str, ToolManager]: ...
 
     @overload
     def llm(
@@ -482,7 +314,7 @@ class Gemini:
         extra_body: Mapping[str, object] | None = ...,
         max_requests: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
-    ) -> GeminiLLM[str, None]: ...
+    ) -> LLM[str, None]: ...
 
     def llm(
         self,
@@ -502,20 +334,22 @@ class Gemini:
         extra_body: Mapping[str, object] | None = None,
         max_requests: int = 3,
         automatic_cache_breakpoints: bool | None = None,
-    ) -> GeminiLLM[str | BaseModel, ToolManager | None]:
+    ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Gemini Developer API model.
+
+        See `LLM.bind` for common settings and validation.
 
         `model` is sent verbatim.
         Cataloged models receive `GEMINI_PRICING`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
         `service_tier` sets the requested Gemini service tier.
-        Responses price at `on_demand` rates because google-genai 2.34.0 drops the served tier.
+        Responses price at `on_demand` rates because google-genai 3.0.0 drops the served tier.
 
         `llm` and `bind` raise `ValueError` when:
         - `parallel_tool_calls=False`, because `generateContent` cannot disable parallel function calls.
         - `reasoning_level` differs only in letter case from a `types.ThinkingLevel` name, such as `"high"`.
-          google-genai 2.33.0 would send the uppercase name instead.
+          google-genai 3.0.0 sends the uppercase name.
         - `extra_body` has a `generationConfig` key whose value is not a mapping with only string keys.
           Every letter case and underscore spelling of `generationConfig` counts.
         - `extra_body` sets `generationConfig.candidateCount` to a value other than 1 or `None`.
@@ -532,22 +366,6 @@ class Gemini:
 
         `reasoning_level` sets `generationConfig.thinkingConfig.thinkingLevel` and enables `includeThoughts`.
         With `reasoning_level=None`, `extra_body` may set `generationConfig.thinkingConfig`.
-        `max_completion_tokens=None` omits the token limit.
-
-        `tools` accepts application tools or an existing `ToolManager`.
-        A sequence constructs a `ToolManager` with the backend's observer.
-        An existing manager retains its identity and observer.
-        `provider_executed_tools` contains provider-shaped tool definitions executed by the provider.
-
-        `response_format` selects a pydantic model for structured output, or `str` for final text.
-        A response without a text part or tool call gives `GenerationError`.
-        For text output, an empty final text part gives `""`.
-        `reasoning_level=None` uses the provider's reasoning default.
-
-        `extra_body` adds provider wire-body fields.
-        Declare application tools through `tools` so result types match executable tools.
-        `max_requests` limits the requests for one input, including retries.
-        `automatic_cache_breakpoints=None` uses the adapter default.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
@@ -574,24 +392,22 @@ class Gemini:
             provider_name="gcp.gemini",
             service_tier=service_tier,
         )
-        return GeminiLLM(
-            _configure(
-                adapter,
-                shared_backoff=self._shared_backoff,
-                observer=self._observer,
-                system_prompt=system_prompt,
-                tools=tools,
-                provider_executed_tools=provider_executed_tools,
-                response_format=response_format,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_level=reasoning_level,
-                temperature=temperature,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                extra_body=extra_body,
-                max_requests=max_requests,
-                automatic_cache_breakpoints=automatic_cache_breakpoints,
-            )
+        return llm_from_adapter(
+            adapter,
+            shared_backoff=self._shared_backoff,
+            observer=self._observer,
+            system_prompt=system_prompt,
+            tools=tools,
+            provider_executed_tools=provider_executed_tools,
+            response_format=response_format,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_level=reasoning_level,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            extra_body=extra_body,
+            max_requests=max_requests,
+            automatic_cache_breakpoints=automatic_cache_breakpoints,
         )
 
 
@@ -599,7 +415,6 @@ __all__ = [
     "GEMINI_PRICING",
     "Gemini",
     "GeminiGenerateContentAdapter",
-    "GeminiLLM",
     "GeminiModelId",
     "GeminiPricingTable",
     "GeminiRates",

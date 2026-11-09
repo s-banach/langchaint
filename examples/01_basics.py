@@ -17,7 +17,7 @@ class Sentiment(BaseModel):
 
 
 async def basics() -> None:
-    """Demonstrate text generation, structured generation, `OpenAILLM.bind()`, and batch generation.
+    """Demonstrate text generation, structured generation, `LLM.bind()`, and batch generation.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

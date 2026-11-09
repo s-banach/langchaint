@@ -1481,7 +1481,7 @@ def test_close_closes_the_sdk_iterator() -> None:
     assert closed
 
 
-def _text_adapter(http_client: httpx2.AsyncClient) -> BoundAdapter:
+def _text_bound_adapter(http_client: httpx2.AsyncClient) -> BoundAdapter:
     client = genai.Client(
         api_key="offline",
         vertexai=False,
@@ -1518,11 +1518,11 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     async def open_refused() -> None:
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(refuse)) as http_client:
             with pytest.raises(httpx2.ConnectError):
-                _ = await _text_adapter(http_client).open_stream(request, request_count=0)
+                _ = await _text_bound_adapter(http_client).open_stream(request, request_count=0)
 
     async def served_items() -> list[StreamItem]:
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(serve)) as http_client:
-            stream = await _text_adapter(http_client).open_stream(request, request_count=0)
+            stream = await _text_bound_adapter(http_client).open_stream(request, request_count=0)
             return [item async for item in stream.items()]
 
     run_with_timeout(open_refused())

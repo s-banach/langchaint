@@ -283,7 +283,7 @@ def test_the_reported_tier_selects_the_rates() -> None:
 def test_a_stop_finish_reason_defers_to_tool_calls_and_the_refusal_field(
     completion: ChatCompletion, expected: StopReason, expected_output: str | None
 ) -> None:
-    finished = finished_response(_text_adapter(), completion)
+    finished = finished_response(_text_bound_adapter(), completion)
     assert finished.stop_reason == expected
     assert final_text(finished.assistant_message) == expected_output
 
@@ -675,7 +675,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
     assert _adapter().client.max_retries == 0
 
 
-def _text_adapter() -> BoundAdapter:
+def _text_bound_adapter() -> BoundAdapter:
     return _adapter().bind_text(_binding())
 
 
@@ -702,14 +702,14 @@ def test_a_finish_reason_without_a_refusal_field_gives_its_stop_reason(
 ) -> None:
     """Each completion carries a tool call, because a token limit or filter can cut off the final tool call."""
     finished = finished_response(
-        _text_adapter(), _text_completion("hey", finish_reason=finish_reason, tool_call=True)
+        _text_bound_adapter(), _text_completion("hey", finish_reason=finish_reason, tool_call=True)
     )
     assert finished.stop_reason == expected
     assert finished.cannot_continue is None
 
 
 def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
-    identity = _text_adapter().identity_from_raw(
+    identity = _text_bound_adapter().identity_from_raw(
         _completion(usage=None, model="m-2026-01-01"), request_id="req-chat"
     )
     assert identity.response_id == "r1"
@@ -880,7 +880,7 @@ def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -
         ReasoningDelta(text=" part b"),
         "hey",
     ]
-    finished = finished_response(_text_adapter(), final)
+    finished = finished_response(_text_bound_adapter(), final)
     assert finished.assistant_message.content[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )

@@ -900,7 +900,7 @@ def test_build_request_reports_an_unsendable_sequence_as_rejected_messages(
     messages: tuple[Message, ...], reason_fragment: str
 ) -> None:
     """A non-final tool part's cache breakpoint would move to the enclosing block's end."""
-    request = _structured_adapter().build_request_params(messages)
+    request = _structured_bound_adapter().build_request_params(messages)
     assert isinstance(request, RejectedMessages)
     assert reason_fragment in request.error_text
 
@@ -1548,7 +1548,7 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_adapter() -> BoundAdapter:
+def _structured_bound_adapter() -> BoundAdapter:
     return _adapter().bind_structured(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False),
         _StructuredReport,
@@ -1609,7 +1609,7 @@ def test_automatic_cache_breakpoints_select_final_caching_by_api(
 
 
 def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_id() -> None:
-    identity = _structured_adapter().identity_from_raw(
+    identity = _structured_bound_adapter().identity_from_raw(
         _message_with_content([]), request_id="req_anthropic"
     )
     assert identity == ResponseIdentity(
@@ -1637,7 +1637,7 @@ def _structured_message(
 
 
 def test_the_structured_request_merges_the_schema_into_the_output_config() -> None:
-    request = _structured_adapter().build_request_params([UserMessage(content="q")])
+    request = _structured_bound_adapter().build_request_params([UserMessage(content="q")])
     assert isinstance(request, _AnthropicRequestParams)
     assert request.precomputed.output_config == {
         "effort": "high",
@@ -1687,14 +1687,17 @@ def test_a_stop_reason_gives_its_neutral_stop_reason(
 ) -> None:
     """Each message ends in a tool_use block, because a token limit or refusal can cut off the final tool call."""
     finished = finished_response(
-        _structured_adapter(), _structured_message(None, anthropic_stop_reason, tool_use=True)
+        _structured_bound_adapter(),
+        _structured_message(None, anthropic_stop_reason, tool_use=True),
     )
     assert finished.stop_reason == expected
     assert finished.cannot_continue is None
 
 
 def test_pause_turn_cannot_continue_and_names_the_stop_reason() -> None:
-    finished = finished_response(_structured_adapter(), _structured_message(None, "pause_turn"))
+    finished = finished_response(
+        _structured_bound_adapter(), _structured_message(None, "pause_turn")
+    )
     assert finished.cannot_continue is not None
     assert "pause_turn" in finished.cannot_continue
 
@@ -1941,7 +1944,7 @@ def test_uncataloged_bedrock_model_requires_pricing() -> None:
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
-    request = _structured_adapter().build_request_params([UserMessage(content="hi")])
+    request = _structured_bound_adapter().build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _AnthropicRequestParams)
     rendered = json.loads(request.as_json())
     assert rendered["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]

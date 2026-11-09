@@ -5,7 +5,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
-from typing import Literal, assert_type, get_args, override
+from typing import Literal, assert_type, override
 
 import pytest
 from pydantic import BaseModel, field_serializer
@@ -87,7 +87,9 @@ from tests.fake_adapter import (
     finished_text_response,
 )
 from tests.helpers import (
+    GENERATION_PATHS,
     TEST_TIMEOUT_SECONDS,
+    GenerationPath,
     RaisingObserver,
     run_with_timeout,
     terminal,
@@ -115,10 +117,7 @@ def _outputs(
     return outputs
 
 
-type _GenerationPath = Literal["generate", "stream"]
-
-
-async def _generate_through(path: _GenerationPath, llm: LLM[str]) -> PlainGeneration[str]:
+async def _generate_through(path: GenerationPath, llm: LLM[str]) -> PlainGeneration[str]:
     if path == "generate":
         generation = await llm.generate_one("hi")
     else:
@@ -319,9 +318,9 @@ def test_retry_recovers_after_a_transient_failure() -> None:
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_an_input_builds_request_params_once_and_sends_them_once_per_request(
-    path: _GenerationPath,
+    path: GenerationPath,
 ) -> None:
     async def scenario() -> None:
         adapter = FakeAdapter(
@@ -356,8 +355,8 @@ def test_a_failed_request_records_the_request_id_off_its_error() -> None:
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
-def test_an_adapter_raised_transient_error_still_names_its_request(path: _GenerationPath) -> None:
+@pytest.mark.parametrize("path", GENERATION_PATHS)
+def test_an_adapter_raised_transient_error_still_names_its_request(path: GenerationPath) -> None:
     async def scenario() -> None:
         adapter = FakeAdapter(
             scripted_requests=[TransientRequestIdError("boom", "req-from-transient")]
@@ -369,8 +368,8 @@ def test_an_adapter_raised_transient_error_still_names_its_request(path: _Genera
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
-def test_retry_exhaustion_raises_ordered_failure(path: _GenerationPath) -> None:
+@pytest.mark.parametrize("path", GENERATION_PATHS)
+def test_retry_exhaustion_raises_ordered_failure(path: GenerationPath) -> None:
 
     async def scenario() -> None:
         last_error = TransientError("e2")
@@ -419,9 +418,9 @@ def test_request_record_bracket_excludes_the_backoff_sleep() -> None:
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_build_request_rejecting_messages_fails_the_input_with_nothing_sent(
-    path: _GenerationPath,
+    path: GenerationPath,
 ) -> None:
 
     async def scenario() -> None:
@@ -509,9 +508,9 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         "provider_failed_terminally",
     ],
 )
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_a_terminal_outcome_raises_without_retry(
-    path: _GenerationPath,
+    path: GenerationPath,
     outcome: UnusableResponse,
     kind: GenerationErrorKind,
     stop_reason: StopReason | None,
@@ -597,9 +596,9 @@ def test_provider_failed_transiently_with_pauses_quota_pauses_admission() -> Non
     ],
     ids=["rejected", "provider_failed_terminally", "auth", "unknown_exception"],
 )
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_an_exception_placed_terminal_fails_the_item_without_retry(
-    path: _GenerationPath,
+    path: GenerationPath,
     request_failure: RequestFailure,
     kind: GenerationErrorKind,
     *,
@@ -692,8 +691,8 @@ def test_a_settled_requests_billing_is_counted_once_after_a_later_deadline_cut()
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
-def test_a_request_records_the_adapter_stream_request_id(path: _GenerationPath) -> None:
+@pytest.mark.parametrize("path", GENERATION_PATHS)
+def test_a_request_records_the_adapter_stream_request_id(path: GenerationPath) -> None:
 
     async def scenario() -> None:
         stream = FakeStream()
@@ -2307,7 +2306,7 @@ def test_a_stream_reports_one_outcome_and_one_end_despite_later_misuse() -> None
     ],
 )
 def test_an_input_cancelled_during_its_open_ends_its_operation(
-    path: _GenerationPath, expected_calls: list[str]
+    path: GenerationPath, expected_calls: list[str]
 ) -> None:
 
     async def scenario() -> None:
@@ -2505,9 +2504,9 @@ def test_stream_open_rejected_carries_the_prior_requests_records() -> None:
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_a_terminal_failure_that_pauses_the_quota_pauses_it_and_stops_the_retry(
-    path: _GenerationPath,
+    path: GenerationPath,
 ) -> None:
 
     async def scenario() -> None:
@@ -2529,8 +2528,8 @@ def test_a_terminal_failure_that_pauses_the_quota_pauses_it_and_stops_the_retry(
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
-def test_a_retry_after_sets_the_minimum_private_wait(path: _GenerationPath) -> None:
+@pytest.mark.parametrize("path", GENERATION_PATHS)
+def test_a_retry_after_sets_the_minimum_private_wait(path: GenerationPath) -> None:
     """Set retry_after_seconds above the 0.001-second private ceiling to distinguish the two waits."""
 
     async def scenario() -> None:

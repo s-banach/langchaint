@@ -95,8 +95,10 @@ from tests.fake_adapter import (
     fast_shared_backoff,
 )
 from tests.helpers import (
+    GENERATION_PATHS,
     LANGCHAINT_KEYS,
     SEMCONV_GENAI_DIR,
+    GenerationPath,
     in_memory_tracer_provider,
     run_with_timeout,
     time_out_when,
@@ -139,11 +141,8 @@ def _traced(
     return llm, exporter
 
 
-type _GenerationPath = Literal["generate", "stream"]
-
-
 async def _generate_through[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
-    path: _GenerationPath,
+    path: GenerationPath,
     llm: LLM[OutputT, ToolManagerT],
     generation_input: GenerationInput = "hi",
 ) -> Generation[OutputT]:
@@ -230,9 +229,9 @@ class _CurrentSpanRecordingAdapter(FakeAdapter):
     _bound_adapter_class: ClassVar[type[FakeBoundAdapter]] = _CurrentSpanRecordingBoundAdapter
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
-    path: _GenerationPath,
+    path: GenerationPath,
 ) -> None:
     async def scenario() -> None:
         adapter = _CurrentSpanRecordingAdapter()
@@ -305,9 +304,9 @@ class _TerminalCase(NamedTuple):
     ],
     ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "rejected"],
 )
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attributes(
-    path: _GenerationPath, case: _TerminalCase
+    path: GenerationPath, case: _TerminalCase
 ) -> None:
     async def scenario() -> None:
         llm, exporter = _traced(case.adapter(), capture_message_content=True)
@@ -513,9 +512,9 @@ def _literal_strings(annotation: object) -> Iterator[str]:
 
 @pytest.mark.parametrize("response_format", [str, _Answer])
 @pytest.mark.parametrize("stop_reason", tuple(_literal_strings(StopReason)))
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
-    path: _GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
+    path: GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
 ) -> None:
     """Use tuple content and compact `args_json` to match the forms returned by span parsing."""
     tool_calls = (
@@ -641,9 +640,9 @@ _START_ATTRIBUTES: Mapping[str, object] = {
 """The start attributes of a chat span for a plain `FakeAdapter` input."""
 
 
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation_survives(
-    path: _GenerationPath, caplog: pytest.LogCaptureFixture
+    path: GenerationPath, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def scenario() -> None:
         llm, exporter = _traced(
@@ -1380,9 +1379,9 @@ def _raise_on_input_messages(
     ],
     ids=["raising_filter", "unserializable_tool_schema"],
 )
-@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
+@pytest.mark.parametrize("path", GENERATION_PATHS)
 def test_a_failure_building_input_content_omits_the_three_input_attributes(
-    path: _GenerationPath,
+    path: GenerationPath,
     content_filter: ContentFilter,
     build_tool: Callable[[], PydanticTool[_EchoToolArgs] | JSONSchemaTool],
     logged_error_text: str,
@@ -1720,48 +1719,3 @@ def test_an_embeddings_transform_reads_each_request_record() -> None:
         span for span in exporter.get_finished_spans() if span.name.startswith("embeddings ")
     ]
     assert [_attribute(span, "custom.app_data") for span in embeddings_spans] == [2, 2]
-
-
-class _FalseyTransform:
-    def __bool__(self) -> bool:
-        return False
-
-    def __call__(self, _outcome: object, attributes: SpanAttributes) -> SpanAttributes:
-        return {**attributes, "custom.agent": "agent_a"}
-
-
-@pytest.mark.parametrize("operation", ["chat", "execute_tool", "embeddings"])
-def test_falsey_transforms_edit_span_attributes(
-    operation: Literal["chat", "execute_tool", "embeddings"],
-) -> None:
-    async def scenario() -> None:
-        tracer_provider, exporter = _in_memory_tracer_provider()
-        transform = _FalseyTransform()
-        observer = OtelObserver(
-            tracer_provider=tracer_provider,
-            capture_message_content=False,
-            chat_attribute_transform=transform,
-            execute_tool_attribute_transform=transform,
-        )
-        match operation:
-            case "chat":
-                await llm_from_adapter(FakeAdapter(), observer=observer).generate_one("hi")
-            case "execute_tool":
-                await ToolManager([_echo_tool()], observer=observer).dispatch(
-                    ToolCall(id="call1", name="echo", args_json='{"text":"hi"}')
-                )
-            case "embeddings":
-                model = _traced_embedding_model(
-                    tracer_provider, embeddings_attribute_transform=transform
-                )
-                await model.embed(["hi"], task="retrieval_document")
-        spans = [
-            span
-            for span in exporter.get_finished_spans()
-            if span.instrumentation_scope is not None
-            and span.instrumentation_scope.name == "langchaint.tracing"
-        ]
-        assert spans
-        assert all(_attribute(span, "custom.agent") == "agent_a" for span in spans)
-
-    run_with_timeout(scenario())

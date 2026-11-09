@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from types import ModuleType
-from typing import Literal, override
+from typing import Literal, get_args, override
 
 import httpx2
 import jsonschema
@@ -49,6 +49,9 @@ from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingReque
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.response import response_outcome, structured_output
 from scripts import refresh_semconv_genai
+
+type GenerationPath = Literal["generate", "stream"]
+GENERATION_PATHS: tuple[GenerationPath, ...] = get_args(GenerationPath.__value__)
 
 
 class StubRaw(BaseModel):

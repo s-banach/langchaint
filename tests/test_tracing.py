@@ -230,7 +230,7 @@ class _CurrentSpanRecordingAdapter(FakeAdapter):
     _bound_adapter_class: ClassVar[type[FakeBoundAdapter]] = _CurrentSpanRecordingBoundAdapter
 
 
-@pytest.mark.parametrize("path", ["generate", "stream"])
+@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
 def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
     path: _GenerationPath,
 ) -> None:
@@ -305,7 +305,7 @@ class _TerminalCase(NamedTuple):
     ],
     ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "rejected"],
 )
-@pytest.mark.parametrize("path", ["generate", "stream"])
+@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
 def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attributes(
     path: _GenerationPath, case: _TerminalCase
 ) -> None:
@@ -513,7 +513,7 @@ def _literal_strings(annotation: object) -> Iterator[str]:
 
 @pytest.mark.parametrize("response_format", [str, _Answer])
 @pytest.mark.parametrize("stop_reason", tuple(_literal_strings(StopReason)))
-@pytest.mark.parametrize("path", ["generate", "stream"])
+@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
     path: _GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
 ) -> None:
@@ -641,7 +641,7 @@ _START_ATTRIBUTES: Mapping[str, object] = {
 """The start attributes of a chat span for a plain `FakeAdapter` input."""
 
 
-@pytest.mark.parametrize("path", ["generate", "stream"])
+@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
 def test_a_raising_transform_leaves_only_the_start_attributes_and_the_generation_survives(
     path: _GenerationPath, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1380,7 +1380,7 @@ def _raise_on_input_messages(
     ],
     ids=["raising_filter", "unserializable_tool_schema"],
 )
-@pytest.mark.parametrize("path", ["generate", "stream"])
+@pytest.mark.parametrize("path", get_args(_GenerationPath.__value__))
 def test_a_failure_building_input_content_omits_the_three_input_attributes(
     path: _GenerationPath,
     content_filter: ContentFilter,

@@ -7,8 +7,8 @@ import contextlib
 import json
 import logging
 import pathlib
-from collections.abc import AsyncIterator, Callable, Mapping
-from typing import ClassVar, Literal, NamedTuple, override
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from typing import ClassVar, Literal, NamedTuple, TypeAliasType, get_args, override
 
 import numpy as np
 import pytest
@@ -501,11 +501,18 @@ class _Answer(BaseModel):
     value: int
 
 
+def _literal_strings(annotation: object) -> Iterator[str]:
+    if isinstance(annotation, str):
+        yield annotation
+    elif isinstance(annotation, TypeAliasType):
+        yield from _literal_strings(annotation.__value__)
+    else:
+        for argument in get_args(annotation):
+            yield from _literal_strings(argument)
+
+
 @pytest.mark.parametrize("response_format", [str, _Answer])
-@pytest.mark.parametrize(
-    "stop_reason",
-    ["stop", "max_completion_tokens", "refusal", "context_window_exceeded", "tool_call", "other"],
-)
+@pytest.mark.parametrize("stop_reason", tuple(_literal_strings(StopReason)))
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
     path: _GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
@@ -1713,3 +1720,48 @@ def test_an_embeddings_transform_reads_each_request_record() -> None:
         span for span in exporter.get_finished_spans() if span.name.startswith("embeddings ")
     ]
     assert [_attribute(span, "custom.app_data") for span in embeddings_spans] == [2, 2]
+
+
+class _FalseyTransform:
+    def __bool__(self) -> bool:
+        return False
+
+    def __call__(self, _outcome: object, attributes: SpanAttributes) -> SpanAttributes:
+        return {**attributes, "custom.agent": "agent_a"}
+
+
+@pytest.mark.parametrize("operation", ["chat", "execute_tool", "embeddings"])
+def test_falsey_transforms_edit_span_attributes(
+    operation: Literal["chat", "execute_tool", "embeddings"],
+) -> None:
+    async def scenario() -> None:
+        tracer_provider, exporter = _in_memory_tracer_provider()
+        transform = _FalseyTransform()
+        observer = OtelObserver(
+            tracer_provider=tracer_provider,
+            capture_message_content=False,
+            chat_attribute_transform=transform,
+            execute_tool_attribute_transform=transform,
+        )
+        match operation:
+            case "chat":
+                await llm_from_adapter(FakeAdapter(), observer=observer).generate_one("hi")
+            case "execute_tool":
+                await ToolManager([_echo_tool()], observer=observer).dispatch(
+                    ToolCall(id="call1", name="echo", args_json='{"text":"hi"}')
+                )
+            case "embeddings":
+                model = _traced_embedding_model(
+                    tracer_provider, embeddings_attribute_transform=transform
+                )
+                await model.embed(["hi"], task="retrieval_document")
+        spans = [
+            span
+            for span in exporter.get_finished_spans()
+            if span.instrumentation_scope is not None
+            and span.instrumentation_scope.name == "langchaint.tracing"
+        ]
+        assert spans
+        assert all(_attribute(span, "custom.agent") == "agent_a" for span in spans)
+
+    run_with_timeout(scenario())

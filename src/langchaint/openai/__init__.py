@@ -328,7 +328,7 @@ class OpenAI:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Responses API model.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         Cataloged models receive `OPENAI_PRICING`.
@@ -650,7 +650,7 @@ class OpenAIBedrock:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one OpenAI model served by Bedrock.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         Bedrock model identifiers have no carried pricing catalog.

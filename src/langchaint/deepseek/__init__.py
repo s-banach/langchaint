@@ -291,7 +291,7 @@ class DeepSeek:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one DeepSeek Chat Completions model.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         Cataloged models receive `DEEPSEEK_PRICING`.

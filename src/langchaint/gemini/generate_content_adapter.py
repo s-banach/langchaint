@@ -275,7 +275,11 @@ def _billing_from_usage(
     Raises:
         pydantic.ValidationError: the counters leave a category negative.
     """
-    counters = usage_metadata or types.GenerateContentResponseUsageMetadata()
+    counters = (
+        usage_metadata
+        if usage_metadata is not None
+        else types.GenerateContentResponseUsageMetadata()
+    )
     service_tier = _priced_tier(counters.traffic_type)
     prompt_token_count = counters.prompt_token_count or 0
     input_tokens_cache_read = counters.cached_content_token_count or 0

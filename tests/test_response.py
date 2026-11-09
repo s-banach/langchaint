@@ -811,10 +811,11 @@ def test_response_outcome_applies_the_first_matching_rule(
     ("content", "stop_reason", "expected_kind"),
     [
         ((_PROSE,), "max_completion_tokens", "plain_response"),
+        ((TextPart(text=""),), "stop", "plain_response"),
         ((), "max_completion_tokens", "max_completion_tokens_exceeded"),
         ((), "stop", "empty_assistant_message"),
     ],
-    ids=["truncated_text_is_output", "truncation_without_text", "no_text"],
+    ids=["truncated_text_is_output", "empty_text_is_output", "truncation_without_text", "no_text"],
 )
 def test_a_text_binding_without_a_text_part_has_no_output(
     content: tuple[TextPart, ...], stop_reason: StopReason, expected_kind: str
@@ -824,7 +825,10 @@ def test_a_text_binding_without_a_text_part_has_no_output(
         stop_reason=stop_reason,
         cannot_continue=None,
     )
-    assert response_outcome(finished_response, final_text).kind == expected_kind
+    outcome = response_outcome(finished_response, final_text)
+    assert outcome.kind == expected_kind
+    if outcome.kind == "plain_response":
+        assert outcome.output == content[-1].text
 
 
 def test_a_schema_violation_carries_pydantic_errors_without_urls() -> None:

@@ -751,14 +751,22 @@ class OtelObserver:
         self._tracer = trace.get_tracer(
             "langchaint.tracing", _PACKAGE_VERSION, tracer_provider=tracer_provider
         )
-        self._chat_attribute_transform = chat_attribute_transform or _keep_every_attribute
+        self._chat_attribute_transform = (
+            chat_attribute_transform
+            if chat_attribute_transform is not None
+            else _keep_every_attribute
+        )
         self._execute_tool_attribute_transform = (
-            execute_tool_attribute_transform or _keep_every_attribute
+            execute_tool_attribute_transform
+            if execute_tool_attribute_transform is not None
+            else _keep_every_attribute
         )
         self._embeddings_attribute_transform = (
-            embeddings_attribute_transform or _keep_every_attribute
+            embeddings_attribute_transform
+            if embeddings_attribute_transform is not None
+            else _keep_every_attribute
         )
-        self._extra_attributes = extra_attributes or {}
+        self._extra_attributes = extra_attributes if extra_attributes is not None else {}
         self._content_filter: ContentFilter | None = (
             None
             if capture_message_content is False

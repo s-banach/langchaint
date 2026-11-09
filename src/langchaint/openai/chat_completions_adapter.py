@@ -480,7 +480,11 @@ def _billing_from_chat_completion(
     """
     service_tier = _priced_tier(completion.service_tier)
     usage_raw = completion.usage
-    counters = usage_raw or CompletionUsage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
+    counters = (
+        usage_raw
+        if usage_raw is not None
+        else CompletionUsage(completion_tokens=0, prompt_tokens=0, total_tokens=0)
+    )
     input_tokens_total = counters.prompt_tokens
     rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)
     provider_executed_tool_cost_in_usd = (

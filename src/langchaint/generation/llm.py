@@ -493,6 +493,8 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
 
         `response_format=str` returns text; a pydantic model validates structured output.
+        For text output, an empty final text part gives `""`.
+        A response with neither a text part nor an application tool call gives `GenerationError`.
         `max_completion_tokens=None` omits the limit when the provider permits it.
         `reasoning_level` accepts exact provider strings; `None` omits the setting.
         `extra_body` supplies provider wire-body fields; `None` clears them.

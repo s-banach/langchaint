@@ -337,7 +337,7 @@ class Gemini:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Gemini Developer API model.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         Cataloged models receive `GEMINI_PRICING`.

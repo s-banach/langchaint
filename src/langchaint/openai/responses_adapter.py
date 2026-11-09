@@ -558,12 +558,16 @@ def _billing_from_response(
     """
     service_tier = _priced_tier(response.service_tier)
     usage_raw = response.usage
-    counters = usage_raw or ResponseUsage(
-        input_tokens=0,
-        input_tokens_details=InputTokensDetails(cache_write_tokens=0, cached_tokens=0),
-        output_tokens=0,
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
-        total_tokens=0,
+    counters = (
+        usage_raw
+        if usage_raw is not None
+        else ResponseUsage(
+            input_tokens=0,
+            input_tokens_details=InputTokensDetails(cache_write_tokens=0, cached_tokens=0),
+            output_tokens=0,
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+            total_tokens=0,
+        )
     )
     input_tokens_total = counters.input_tokens
     rates = pricing.rates_for(service_tier=service_tier, input_tokens_total=input_tokens_total)

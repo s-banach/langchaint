@@ -413,7 +413,7 @@ _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
 def test_a_completed_response_derives_its_stop_reason_from_its_items(
     response: OpenAIResponse, expected: StopReason, expected_output: str | None
 ) -> None:
-    finished = finished_response(_text_bound(), response)
+    finished = finished_response(_text_adapter(), response)
     assert finished.stop_reason == expected
     assert final_text(finished.assistant_message) == expected_output
 
@@ -511,7 +511,7 @@ def test_text_parts_replay_as_separate_messages() -> None:
 
 
 def test_text_binding_replays_one_text_part_as_a_final_answer() -> None:
-    request = _text_bound().build_request_params([
+    request = _text_adapter().build_request_params([
         AssistantMessage(content=(TextPart(text="answer"),))
     ])
     assert isinstance(request, _OpenAIResponsesRequestParams)
@@ -1407,7 +1407,7 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         async for _item in adapter_stream.items():
             pass
         assert await adapter_stream.final() is leniently_built
-        finished = finished_response(_text_bound(), leniently_built)
+        finished = finished_response(_text_adapter(), leniently_built)
         assert final_text(finished.assistant_message) == "hey"
         assert finished.stop_reason == "max_completion_tokens"
 
@@ -1508,17 +1508,17 @@ def test_an_incomplete_response_gives_the_stop_reason_of_its_reason(
         status="incomplete",
         incomplete_details=IncompleteDetails(reason=reason),
     )
-    finished = finished_response(_text_bound(), response)
+    finished = finished_response(_text_adapter(), response)
     assert finished.stop_reason == expected
     assert finished.cannot_continue is None
 
 
-def _text_bound() -> BoundAdapter:
+def _text_adapter() -> BoundAdapter:
     return _adapter().bind_text(_binding(automatic_cache_breakpoints=False))
 
 
 def test_identity_reads_the_responses_own_id_and_served_model() -> None:
-    identity = _text_bound().identity_from_raw(
+    identity = _text_adapter().identity_from_raw(
         _response(usage=None, model="m-2026-01-01"), request_id="req_openai"
     )
     assert identity == ResponseIdentity(
@@ -1558,7 +1558,7 @@ def test_identity_reads_the_responses_own_id_and_served_model() -> None:
 def test_a_failed_run_takes_its_variant_from_the_error_code(
     error: ResponseError | None, expected_kind: str, expected_reason: str
 ) -> None:
-    outcome = _text_bound().interpret(_response(usage=None, status="failed", error=error))
+    outcome = _text_adapter().interpret(_response(usage=None, status="failed", error=error))
     assert outcome.kind == expected_kind
     assert isinstance(outcome, ProviderFailedTransiently | ProviderFailedTerminally)
     assert outcome.error_text == expected_reason
@@ -1575,7 +1575,7 @@ def test_a_failed_run_takes_its_variant_from_the_error_code(
 def test_only_a_rate_limit_error_code_pauses_the_quota(
     error: ResponseError, *, expected_pauses_quota: bool
 ) -> None:
-    outcome = _text_bound().interpret(_response(usage=None, status="failed", error=error))
+    outcome = _text_adapter().interpret(_response(usage=None, status="failed", error=error))
     assert outcome.kind == "provider_failed_transiently"
     assert outcome.pauses_quota is expected_pauses_quota
 

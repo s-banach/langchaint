@@ -175,10 +175,10 @@ def _binding(
     )
 
 
-def _bound_config(
+def _request_config(
     binding: Binding, adapter: GeminiGenerateContentAdapter | None = None
 ) -> types.GenerateContentConfig:
-    bound_adapter = (adapter or _adapter()).bind_text(binding)
+    bound_adapter = (adapter if adapter is not None else _adapter()).bind_text(binding)
     request = bound_adapter.build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
     return request.config
@@ -188,7 +188,11 @@ def _built_request(
     messages: Sequence[Message], binding: Binding | None = None
 ) -> _GeminiRequestParams:
     """Build a request that must be valid."""
-    request = _adapter().bind_text(binding or _binding()).build_request_params(messages)
+    request = (
+        _adapter()
+        .bind_text(binding if binding is not None else _binding())
+        .build_request_params(messages)
+    )
     assert isinstance(request, _GeminiRequestParams)
     return request
 
@@ -459,7 +463,7 @@ _CONFIG_CASES = [
 
 @pytest.mark.parametrize("case", _CONFIG_CASES, ids=[case.case_id for case in _CONFIG_CASES])
 def test_binding_fields_build_the_config(case: _ConfigCase) -> None:
-    assert _bound_config(case.binding) == case.config
+    assert _request_config(case.binding) == case.config
 
 
 @pytest.mark.parametrize(
@@ -499,7 +503,7 @@ def test_tool_choice_mapping(
         description="Look up the city.",
         args_schema={"type": "object", "properties": {}},
     )
-    config = _bound_config(
+    config = _request_config(
         _binding(tool_schemas=(_echo_schema(), lookup_schema), tool_choice=tool_choice)
     )
     assert config.tools == [
@@ -683,7 +687,7 @@ def test_an_unsendable_binding_raises_at_bind(defect: _BindDefect) -> None:
 
 def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
     with pytest.warns(UserWarning, match="XHIGH"):
-        config = _bound_config(_binding(reasoning_level="XHIGH"))
+        config = _request_config(_binding(reasoning_level="XHIGH"))
     assert config.thinking_config is not None
     assert config.thinking_config.thinking_level is not None
     assert config.thinking_config.thinking_level.value == "XHIGH"
@@ -709,7 +713,7 @@ def test_service_tier_is_sent_and_fingerprinted() -> None:
     """Pricing is billing configuration, so the fingerprint excludes it."""
     adapter = _adapter(service_tier="flex")
     assert adapter.config_fingerprint_data() == {"service_tier": "flex"}
-    assert _bound_config(_binding(), adapter) == types.GenerateContentConfig(
+    assert _request_config(_binding(), adapter) == types.GenerateContentConfig(
         automatic_continuation=False,
         service_tier=types.ServiceTier.FLEX,
         http_options=_NO_SDK_RETRIES,
@@ -1477,7 +1481,7 @@ def test_close_closes_the_sdk_iterator() -> None:
     assert closed
 
 
-def _bound_over(http_client: httpx2.AsyncClient) -> BoundAdapter:
+def _text_adapter(http_client: httpx2.AsyncClient) -> BoundAdapter:
     client = genai.Client(
         api_key="offline",
         vertexai=False,
@@ -1514,11 +1518,11 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
     async def open_refused() -> None:
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(refuse)) as http_client:
             with pytest.raises(httpx2.ConnectError):
-                _ = await _bound_over(http_client).open_stream(request, request_count=0)
+                _ = await _text_adapter(http_client).open_stream(request, request_count=0)
 
     async def served_items() -> list[StreamItem]:
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(serve)) as http_client:
-            stream = await _bound_over(http_client).open_stream(request, request_count=0)
+            stream = await _text_adapter(http_client).open_stream(request, request_count=0)
             return [item async for item in stream.items()]
 
     run_with_timeout(open_refused())

@@ -327,7 +327,7 @@ class Anthropic:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Messages API model.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         Cataloged models receive `ANTHROPIC_PRICING`.
@@ -546,7 +546,7 @@ class AnthropicBedrock:
     ) -> LLM[str | BaseModel, ToolManager | None]:
         """Build an `LLM` for one Bedrock model.
 
-        See `LLM.bind` for common settings and validation.
+        See `LLM.bind` for generation settings and validation.
 
         `model` is sent verbatim.
         An exact catalog identifier selects pricing.

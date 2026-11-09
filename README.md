@@ -1,26 +1,20 @@
 # langchaint
 
-langchaint is a provider-neutral Python client for LLM applications.
-It provides fully typed, asynchronous APIs for generation, streaming, embeddings, tools, retries, and billing.
-The application owns the agent loop.
+langchaint is a provider-neutral Python client for LLM applications, with typed, asynchronous APIs for generation, streaming, embeddings, and tool dispatch.
 
 Alpha: the API may change without notice.
 
 ## Why langchaint
 
-- **Consistent API.** Configure a model with a provider factory, then call `generate_one()`, `generate_many()`, or `stream_one()`.
-- **Type annotations.** For example, `openai.llm(model, response_format=Answer)` types `generation.output` as `Answer`.
-- **Outcome variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
-- **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
-- **Complete billing.** `Generation` and `GenerationError` values retain provider-reported usage from every recorded request, including billed retries.
-- **Streaming.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed generation with its usage.
-- **Agent loops in Python.** Provider-neutral messages, typed tools with argument validation, concurrent dispatch, and explicit outcome variants support async control flow.
+- **Types follow configuration:** typed output and tool-call variants, narrowed by `.kind`.
+- **Agent loops in ordinary Python:** your code controls state, approvals, model changes, recovery, stopping, and persistence.
+- **Shared rate limiting:** concurrency limits, request pacing, and rate-limit pauses across your application.
+- **Usage accounting:** available provider-reported usage across every recorded request, including retries and failures.
 
 ## Install
 
-langchaint requires Python 3.13 or newer.
-
-Install the extra for each backend you use:
+Requires Python 3.13+.
+Install each backend's extra:
 
 ```bash
 pip install "langchaint[openai]"
@@ -69,49 +63,16 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The Pydantic model validates the provider response.
+`response_format=Answer` validates the response with Pydantic and types `generation.output` as `Answer`.
+`bind(response_format=...)` returns a new model with the corresponding output type.
 
 `generate_many()` returns generations in input order, or raises `GenerationError` after cancelling and awaiting unfinished inputs.
-`generate_many_records()` returns one normalized record per input, including generation failures.
-Pass `resume_path` to persist records and resume interrupted batches.
-
-## Coordinate retries across a rate-limit quota
-
-Create one `SharedBackoff` for each rate-limit quota, and pass it to every backend that sends requests against that quota. Models from one `OpenAI` share its `SharedBackoff`:
-
-```python
-from langchaint import SharedBackoff
-
-openai = OpenAI(
-    shared_backoff=SharedBackoff(max_concurrent_requests=8, max_request_starts_per_second=50.0),
-)
-
-fast_model = openai.llm("gpt-5.6-luna")
-strong_model = openai.llm("gpt-5.6-sol")
-```
-
-A rate-limit response pauses request starts across the shared quota.
-After a transient failure local to one request, langchaint waits and retries that request.
-
-## Stream with an explicit lifetime
-
-```python
-text_assistant = OpenAI().llm("gpt-5.6-terra")
-
-async with text_assistant.stream_one("Explain photosynthesis.") as stream:
-    async for item in stream:
-        # Answer text chunks are str; ReasoningDelta, ToolCallDelta, and ToolCall are the other items
-        if isinstance(item, str):
-            print(item, end="", flush=True)
-
-    generation = await stream.final()
-```
-
-`final()` consumes the remaining stream and returns the assembled generation.
+`generate_many_records()` returns one normalized record per input, including failures; pass `resume_path` to persist records and resume interrupted batches.
 
 ## Build agent loops
 
-The application controls turn limits, state, approvals, model changes, and persistence.
+Configuring tools adds a tool-call variant to the generation's discriminated union.
+Match `.kind` to narrow its type, and set turn limits in your loop:
 
 ```python
 messages: list[Message] = [UserMessage(content=prompt)]
@@ -130,18 +91,54 @@ for _ in range(max_turns):
 raise RuntimeError("model did not finish within max_turns")
 ```
 
-`ToolManager.dispatch_many()` runs tool calls concurrently and preserves their order.
+`ToolManager.dispatch_many()` validates arguments and runs calls concurrently, preserving their order.
+Invalid arguments produce an error `ToolMessage` you can return to the model.
 
-See [`examples/02_tool_loop.py`](examples/02_tool_loop.py) for a complete typed tool loop.
+Complete typed loop: [`examples/02_tool_loop.py`](examples/02_tool_loop.py).
 
-## Account for every request
+## Coordinate rate limiting
 
-`generation.usage.cost_in_usd` includes every billed retry recorded for the input.
-`GenerationError.usage` preserves the recorded cost of a failed input.
+`SharedBackoff` coordinates request concurrency, pacing, and rate-limit pauses across batches and separate tasks:
+
+```python
+from langchaint import SharedBackoff
+from langchaint.openai import OpenAI
+
+shared_backoff = SharedBackoff(max_concurrent_requests=8, max_request_starts_per_second=50.0)
+openai = OpenAI(shared_backoff=shared_backoff)
+assistant = openai.llm("gpt-5.6-terra")
+
+generations = await assistant.generate_many(
+    ["Explain photosynthesis.", "Explain cellular respiration."],
+)
+```
+
+Rate limits pause further request starts against the quota.
+For transient failures local to one request, langchaint waits and retries that request.
+
+## Track costs
+
+`generation.usage.cost_in_usd` includes every recorded billed retry; `GenerationError.usage` retains a failed input's recorded cost.
+
+## Stream with an explicit lifetime
+
+```python
+text_assistant = OpenAI().llm("gpt-5.6-terra")
+
+async with text_assistant.stream_one("Explain photosynthesis.") as stream:
+    async for item in stream:
+        # Answer text chunks are str; ReasoningDelta, ToolCallDelta, and ToolCall are the other items
+        if isinstance(item, str):
+            print(item, end="", flush=True)
+
+    generation = await stream.final()
+```
+
+`final()` consumes the remaining stream and returns the assembled generation.
 
 ## More examples
 
-See [`examples/README.md`](examples/README.md) for complete examples.
+Complete examples: [`examples/README.md`](examples/README.md).
 
 ## License
 

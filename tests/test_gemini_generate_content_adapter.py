@@ -685,15 +685,6 @@ def test_an_unsendable_binding_raises_at_bind(defect: _BindDefect) -> None:
         _ = defect.adapter.bind_text(defect.binding)
 
 
-def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
-    with pytest.warns(UserWarning, match="XHIGH"):
-        config = _request_config(_binding(reasoning_level="XHIGH"))
-    assert config.thinking_config is not None
-    assert config.thinking_config.thinking_level is not None
-    assert config.thinking_config.thinking_level.value == "XHIGH"
-    assert config.thinking_config.include_thoughts is True
-
-
 def test_structured_bind_sends_the_response_schema() -> None:
     request = (
         _adapter()

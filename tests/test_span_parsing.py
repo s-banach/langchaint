@@ -302,11 +302,19 @@ def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.provider.name": "openai",
+            "gen_ai.input.messages_ref": "s3://example/input.json",
+            "gen_ai.output.messages_ref": "s3://example/output.json",
+            "gen_ai.system_instructions_ref": "s3://example/system.json",
+            "gen_ai.tool.definitions_ref": "s3://example/tools.json",
             "gen_ai.prompt.variable.user_name": "Alice",
             "langchain.x.y.z": 42,
         })
     )
     assert parsed.provider_name == "openai"
+    assert parsed.input_messages_ref == "s3://example/input.json"
+    assert parsed.output_messages_ref == "s3://example/output.json"
+    assert parsed.system_instructions_ref == "s3://example/system.json"
+    assert parsed.tool_definitions_ref == "s3://example/tools.json"
     assert parsed.prompt_variables == {"user_name": "Alice"}
     assert parsed.unused_attributes == {"langchain.x.y.z": 42}
 

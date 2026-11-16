@@ -68,7 +68,7 @@ templates:
         | if length == 1 then .[0].attributes
           else error("the resolved registry has \(length) spans of type \($type), expected 1")
           end;
-      [span_attributes("gen_ai.execute_tool.internal")[].key]
+      [span_attributes("gen_ai.execute_tool")[].key]
       | sort
     application_mode: single
     file_name: execute-tool-span-attribute-names.json

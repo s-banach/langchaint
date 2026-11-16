@@ -300,7 +300,11 @@ _MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
 
 
 class OtelChatSpan(CheckedCopyModel):
-    """Chat attributes from the committed OTel convention snapshot."""
+    """Chat attributes from the committed OTel convention snapshot.
+
+    Fields ending in `_ref` hold URIs identifying content in external storage.
+    Parsing preserves these strings without fetching the content.
+    """
 
     operation_name: Literal["chat"] = Field(alias=OPERATION_NAME)
     error_type: str | None = Field(default=None, alias="error.type")
@@ -311,9 +315,11 @@ class OtelChatSpan(CheckedCopyModel):
     input_messages: tuple[OtelInputMessage, ...] | None = Field(
         default=None, alias=INPUT_MESSAGES, strict=False
     )
+    input_messages_ref: str | None = Field(default=None, alias="gen_ai.input.messages_ref")
     output_messages: tuple[OtelOutputMessage, ...] | None = Field(
         default=None, alias=OUTPUT_MESSAGES, strict=False
     )
+    output_messages_ref: str | None = Field(default=None, alias="gen_ai.output.messages_ref")
     output_type: str | None = Field(default=None, alias="gen_ai.output.type")
     prompt_name: str | None = Field(default=None, alias="gen_ai.prompt.name")
     prompt_variables: dict[str, str] = Field(default_factory=dict)
@@ -355,9 +361,13 @@ class OtelChatSpan(CheckedCopyModel):
     system_instructions: tuple[OtelSystemInstructionPart, ...] | None = Field(
         default=None, alias=SYSTEM_INSTRUCTIONS, strict=False
     )
+    system_instructions_ref: str | None = Field(
+        default=None, alias="gen_ai.system_instructions_ref"
+    )
     tool_definitions: tuple[OtelToolDefinition, ...] | None = Field(
         default=None, alias=TOOL_DEFINITIONS, strict=False
     )
+    tool_definitions_ref: str | None = Field(default=None, alias="gen_ai.tool.definitions_ref")
     usage_audio_cache_read_input_tokens: int | None = Field(
         default=None, alias="gen_ai.usage.audio.cache_read.input_tokens"
     )

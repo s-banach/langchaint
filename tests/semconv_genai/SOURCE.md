@@ -2,15 +2,15 @@
 
 Source repository: <https://github.com/open-telemetry/semantic-conventions-genai>.
 Tracked reference: `main`.
-Resolved commit SHA: `547934afa90a34298441caf80c43b27255c3a292`.
-Resolved Weaver version: `v0.26.1`.
+Resolved commit SHA: `e6658f14c9d9ea0760825f029cb82e7673f48fab`.
+Resolved Weaver version: `v0.28.0`.
 License: Apache-2.0.
 
 The resolved commit SHA is the upstream commit resolved by the last refresh that changed the committed data.
 A refresh that produces identical data leaves this file unchanged.
 
 `chat-span-attributes.json` is generated from the resolved `gen_ai.client.inference` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
-`execute-tool-span-attribute-names.json` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
+`execute-tool-span-attribute-names.json` lists the attribute names of the resolved `gen_ai.execute_tool` span.
 `embeddings-span-attribute-names.json` lists the attribute names of the resolved `gen_ai.client.embeddings` span.
 `src/langchaint/_semconv_genai_structured_attributes.json` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.

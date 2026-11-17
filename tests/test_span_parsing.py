@@ -22,7 +22,6 @@ from langchaint.span_parsing import (
     OtelExecuteToolSpan,
     OtelFunctionTool,
     OtelGenericObject,
-    OtelGenericTool,
     OtelReasoningPart,
     OtelTextPart,
     OtelToLangchaintConversionError,
@@ -184,45 +183,6 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
             field_names_by_alias[field.alias] = field_name
     assert set(entries_by_name) == set(field_names_by_alias)
     _assert_scalar_attributes_parse(entries_by_name, field_names_by_alias)
-
-
-def test_known_system_type_can_use_the_generic_schema_variant() -> None:
-    parsed = parse_otel_chat(
-        _chat_span({"gen_ai.system_instructions": [{"type": "text", "provider_value": 1}]})
-    )
-    assert parsed.system_instructions is not None
-    part = parsed.system_instructions[0]
-    assert isinstance(part, OtelGenericObject)
-    assert part.type == "text"
-    assert part.additional_properties == {"provider_value": 1}
-
-
-def test_known_message_type_can_use_the_generic_schema_variant() -> None:
-    parsed = parse_otel_chat(
-        _chat_span({
-            "gen_ai.input.messages": [
-                {"role": "user", "parts": [{"type": "text", "provider_value": 1}]}
-            ]
-        })
-    )
-    assert parsed.input_messages is not None
-    part = parsed.input_messages[0].parts[0]
-    assert isinstance(part, OtelGenericObject)
-    assert part.type == "text"
-    assert part.additional_properties == {"provider_value": 1}
-
-
-def test_known_tool_type_can_use_the_generic_schema_variant() -> None:
-    parsed = parse_otel_chat(
-        _chat_span({
-            "gen_ai.tool.definitions": [{"type": "function", "name": "lookup", "description": 42}]
-        })
-    )
-    assert parsed.tool_definitions is not None
-    definition = parsed.tool_definitions[0]
-    assert isinstance(definition, OtelGenericTool)
-    assert definition.type == "function"
-    assert definition.additional_properties == {"description": 42}
 
 
 def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
@@ -405,7 +365,7 @@ def test_converts_a_string_tool_response_to_string_content() -> None:
     )
 
 
-def test_non_boolean_is_error_parses_generically_and_fails_conversion() -> None:
+def test_non_boolean_is_error_fails_tool_message_conversion() -> None:
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.input.messages": [
@@ -423,9 +383,7 @@ def test_non_boolean_is_error_parses_generically_and_fails_conversion() -> None:
             ]
         })
     )
-    assert parsed.input_messages is not None
-    assert isinstance(parsed.input_messages[0].parts[0], OtelGenericObject)
-    with pytest.raises(OtelToLangchaintConversionError, match="tool message parts"):
+    with pytest.raises(OtelToLangchaintConversionError, match="non-boolean is_error"):
         _ = generation_input_from_otel(parsed)
 
 
@@ -991,12 +949,21 @@ def test_manifest_attribute_names_match_otel_execute_tool_span_aliases() -> None
     assert aliases == names
 
 
-def test_execute_tool_result_of_another_shape_parses_as_a_json_value() -> None:
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"temperature": 20},
+        {"type": "tool_call_response", "response": "done", "is_error": "yes"},
+    ],
+)
+def test_execute_tool_result_of_another_shape_parses_as_a_json_value(
+    result: dict[str, JsonValue],
+) -> None:
     parsed = parse_otel_execute_tool({
         "gen_ai.operation.name": "execute_tool",
-        "gen_ai.tool.call.result": '{"temperature": 20}',
+        "gen_ai.tool.call.result": json.dumps(result),
     })
-    assert parsed.tool_call_result == {"temperature": 20}
+    assert parsed.tool_call_result == result
 
 
 @pytest.mark.parametrize(

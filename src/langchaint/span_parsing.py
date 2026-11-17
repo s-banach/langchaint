@@ -95,7 +95,14 @@ def _decode_span_attributes(
         if name in fixed_aliases and value is None:
             raise ValueError(f"a present OTel attribute cannot be null: {name}")
         target = parsed_attributes if name in fixed_aliases else other_attributes
-        target[name] = _decode_semconv_attribute(name, value)
+        decoded = _decode_semconv_attribute(name, value)
+        if (
+            decoded is None
+            and name in (SYSTEM_INSTRUCTIONS, TOOL_DEFINITIONS, INPUT_MESSAGES, OUTPUT_MESSAGES)
+            and name in fixed_aliases
+        ):
+            raise ValueError(f"{name} must contain an array")
+        target[name] = decoded
     return parsed_attributes, other_attributes
 
 
@@ -149,7 +156,7 @@ class OtelBlobPart(OtelStructuredModel):
 
     type: Literal["blob"]
     modality: str
-    content: str
+    content: str | None = None
     mime_type: str | None = None
 
 
@@ -178,6 +185,13 @@ class OtelReasoningPart(OtelStructuredModel):
     content: str
 
 
+class OtelTranscriptionPart(OtelStructuredModel):
+    """An OTel transcript of spoken audio."""
+
+    type: Literal["transcription"]
+    content: str
+
+
 class OtelCompactionPart(OtelStructuredModel):
     """An OTel compaction part."""
 
@@ -199,13 +213,13 @@ class OtelToolCallResponsePart(OtelStructuredModel):
     """An OTel tool response part.
 
     `is_error` is langchaint's extension that records `ToolMessage.is_error`.
-    A part whose `is_error` is not a boolean validates as `OtelGenericObject` instead.
+    Converting to `ToolMessage` requires a boolean `is_error`.
     """
 
     type: Literal["tool_call_response"]
     response: JsonValue
     id: str | None = None
-    is_error: bool = False
+    is_error: JsonValue = False
 
 
 class OtelGenericObject(OtelStructuredModel):
@@ -234,6 +248,15 @@ class OtelServerToolCallResponsePart(OtelStructuredModel):
     id: str | None = None
 
 
+def _exclude_types(*reserved: str) -> AfterValidator:
+    def validate[T: OtelGenericObject | OtelGenericTool](value: T) -> T:
+        if value.type in reserved:
+            raise ValueError(f"{value.type!r} must satisfy its OTel definition")
+        return value
+
+    return AfterValidator(validate)
+
+
 type OtelMessagePart = Annotated[
     OtelTextPart
     | OtelToolCallPart
@@ -244,12 +267,28 @@ type OtelMessagePart = Annotated[
     | OtelFilePart
     | OtelUriPart
     | OtelReasoningPart
+    | OtelTranscriptionPart
     | OtelCompactionPart
-    | OtelGenericObject,
+    | Annotated[
+        OtelGenericObject,
+        _exclude_types(
+            "text",
+            "tool_call",
+            "tool_call_response",
+            "server_tool_call",
+            "server_tool_call_response",
+            "blob",
+            "file",
+            "uri",
+            "reasoning",
+            "transcription",
+            "compaction",
+        ),
+    ],
     Field(union_mode="left_to_right"),
 ]
 type OtelSystemInstructionPart = Annotated[
-    OtelTextPart | OtelGenericObject,
+    OtelTextPart | Annotated[OtelGenericObject, _exclude_types("text")],
     Field(union_mode="left_to_right"),
 ]
 
@@ -290,7 +329,7 @@ class OtelGenericTool(OtelStructuredModel):
 # The OTel schema requires `type`, but OpenLLMetry omits it on tool definitions.
 # `OtelFunctionTool.type` defaults to `"function"` so those definitions convert.
 type OtelToolDefinition = Annotated[
-    OtelFunctionTool | OtelGenericTool,
+    OtelFunctionTool | Annotated[OtelGenericTool, _exclude_types("function")],
     Field(union_mode="left_to_right"),
 ]
 
@@ -444,8 +483,15 @@ class OtelChatSpan(CheckedCopyModel):
         return parsed_attributes
 
 
+def _require_boolean_is_error(part: OtelToolCallResponsePart) -> OtelToolCallResponsePart:
+    if not isinstance(part.is_error, bool):
+        raise PydanticCustomError("otel_tool_result", "is_error must be a boolean")
+    return part
+
+
 type OtelToolCallResult = Annotated[
-    OtelToolCallResponsePart | JsonValue, Field(union_mode="left_to_right")
+    Annotated[OtelToolCallResponsePart, AfterValidator(_require_boolean_is_error)] | JsonValue,
+    Field(union_mode="left_to_right"),
 ]
 
 
@@ -911,6 +957,8 @@ def _tool_message_from_otel(message: OtelInputMessage) -> ToolMessage:
     part = message.parts[0]
     if part.id is None:
         raise _unsupported(part, "tool response without id")
+    if not isinstance(part.is_error, bool):
+        raise _unsupported(part, "non-boolean is_error")
     _require_no_additional_properties(part)
     if isinstance(part.response, str):
         content: MessageContent = part.response
@@ -948,6 +996,8 @@ def _content_part_from_otel(part: OtelMessagePart) -> ContentPart:
     if isinstance(part, OtelTextPart):
         return TextPart(text=part.content)
     if isinstance(part, OtelBlobPart):
+        if part.content is None:
+            raise _unsupported(part, "blob without content")
         if part.mime_type is None:
             raise _unsupported(part, "blob without mime_type")
         try:
@@ -1009,6 +1059,7 @@ __all__ = [
     "OtelToolCallResponsePart",
     "OtelToolCallResult",
     "OtelToolDefinition",
+    "OtelTranscriptionPart",
     "OtelUriPart",
     "generation_input_from_otel",
     "generation_record_from_otel",

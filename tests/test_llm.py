@@ -439,6 +439,7 @@ def test_build_request_rejecting_messages_fails_the_input_with_nothing_sent(
         assert rejected.value.request_history.model == adapter.model
         assert rejected.value.request_history.provider_name == adapter.provider_name
         assert rejected.value.request_history.records == ()
+        assert rejected.value.raw is None
         assert rejected.value.usage == ZERO_USAGE
 
     run_with_timeout(scenario())
@@ -463,7 +464,7 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         assert billed_record.usage.cost_in_usd == 0.25
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
-        assert rejected.value.request_provider_data[-1].raw is None
+        assert rejected.value.raw is None
         assert isinstance(rejected.value.__cause__, ValueError)
         assert rejected.value.request_params == FakeRequestParams(
             messages=(UserMessage(content="hi"),)
@@ -518,7 +519,8 @@ def test_a_terminal_outcome_raises_without_retry(
 ) -> None:
 
     async def scenario() -> None:
-        adapter = FakeAdapter(stream=FakeStream(interpretation=outcome))
+        stream = FakeStream(interpretation=outcome)
+        adapter = FakeAdapter(stream=stream)
         llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         with pytest.raises(GenerationError) as caught:
             await _generate_through(path, llm)
@@ -531,7 +533,7 @@ def test_a_terminal_outcome_raises_without_retry(
         (record,) = _settled_request_records(failure.request_history.records)
         assert record.error is None
         assert record.assistant_message == REJECTED_ASSISTANT_MESSAGE
-        assert failure.request_provider_data[0].raw is not None
+        assert failure.raw is stream.raw
         if failure.record.kind == "schema_violation_error":
             assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
 

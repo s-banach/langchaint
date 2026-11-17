@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal, Self, override
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from langchaint.adapter import RequestParams
 from langchaint.billing.usage import Usage
@@ -297,6 +297,11 @@ class GenerationError(Exception):
         self.record = record
         self.request_params = request_params
         self.request_provider_data = request_provider_data
+
+    @property
+    def raw(self) -> BaseModel | None:
+        """Return the last recorded request's SDK response, or `None` if the request or response is absent."""
+        return self.request_provider_data[-1].raw if self.request_provider_data else None
 
     @property
     def request_history(self) -> RequestHistory:

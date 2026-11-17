@@ -543,6 +543,78 @@ def test_absent_optional_values_return_none() -> None:
     assert tool_schemas_from_otel(parsed) is None
 
 
+def test_external_input_messages_prevent_input_and_system_prompt_conversion() -> None:
+    span = _generation_chat_span({"gen_ai.input.messages_ref": "s3://example/input"})
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.input\.messages_ref"):
+        _ = generation_input_from_otel(span)
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.input\.messages_ref"):
+        _ = system_prompt_from_otel(span)
+    assert generation_record_from_otel(span).kind == "plain"
+
+
+def test_external_system_instructions_block_only_conversions_that_need_them() -> None:
+    external = "s3://example/system"
+    span = _generation_chat_span({
+        "gen_ai.system_instructions_ref": external,
+        "gen_ai.input.messages": [{"role": "user", "parts": [{"type": "text", "content": "Hi"}]}],
+    })
+    assert generation_input_from_otel(span) == (UserMessage(content=(TextPart(text="Hi"),)),)
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.system_instructions_ref"):
+        _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter()))
+    leading_system_message = _generation_chat_span({
+        "gen_ai.system_instructions_ref": external,
+        "gen_ai.input.messages": [
+            {"role": "system", "parts": [{"type": "text", "content": "Hi"}]}
+        ],
+    })
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.system_instructions_ref"):
+        _ = generation_input_from_otel(leading_system_message)
+
+
+def test_input_conversion_accepts_separate_unrepresentable_system_instructions() -> None:
+    span = _generation_chat_span({
+        "gen_ai.system_instructions": [{"type": "text", "content": "Rules", "vendor": 1}],
+        "gen_ai.input.messages": [{"role": "user", "parts": [{"type": "text", "content": "Hi"}]}],
+    })
+    assert generation_input_from_otel(span) == (UserMessage(content=(TextPart(text="Hi"),)),)
+    with pytest.raises(OtelToLangchaintConversionError, match="additional properties"):
+        _ = system_prompt_from_otel(span)
+
+
+def test_external_outputs_and_tool_definitions_require_inline_content_for_conversion() -> None:
+    span = parse_otel_chat(
+        _chat_span({
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
+            "gen_ai.output.messages_ref": "s3://example/output",
+            "gen_ai.tool.definitions_ref": "s3://example/tools",
+        })
+    )
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.messages_ref"):
+        _ = output_messages_from_otel(span)
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.messages_ref"):
+        _ = generation_record_from_otel(span)
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.tool\.definitions_ref"):
+        _ = llm_from_otel(span, llm=llm_from_adapter(FakeAdapter()))
+
+
+def test_inline_empty_content_takes_precedence_over_references() -> None:
+    span = _generation_chat_span({
+        "gen_ai.input.messages": [],
+        "gen_ai.input.messages_ref": "s3://example/input",
+        "gen_ai.output.messages": [],
+        "gen_ai.output.messages_ref": "s3://example/output",
+        "gen_ai.system_instructions": [],
+        "gen_ai.system_instructions_ref": "s3://example/system",
+        "gen_ai.tool.definitions": [],
+        "gen_ai.tool.definitions_ref": "s3://example/tools",
+    })
+    assert generation_input_from_otel(span) == ()
+    assert output_messages_from_otel(span) == ()
+    assert system_prompt_from_otel(span) is None
+    assert tool_schemas_from_otel(span) == ()
+
+
 def test_reconstruction_rejects_a_different_llm_identity() -> None:
     parsed = parse_otel_chat(
         _chat_span({"gen_ai.provider.name": "other", "gen_ai.request.model": "fake-model"})

@@ -343,6 +343,7 @@ class OtelChatSpan(CheckedCopyModel):
 
     Fields ending in `_ref` hold URIs identifying content in external storage.
     Parsing preserves these strings without fetching the content.
+    Conversions require an inline value for any referenced content they use.
     """
 
     operation_name: Literal["chat"] = Field(alias=OPERATION_NAME)
@@ -571,6 +572,13 @@ def _system_prompt_from_parts(
     return tuple(converted)
 
 
+def _require_inline_content(attribute_name: str, content: object, reference: str | None) -> None:
+    if content is None and reference is not None:
+        raise _attribute_conversion_error(
+            f"{attribute_name}_ref", f"requires inline {attribute_name} for conversion"
+        )
+
+
 def system_prompt_from_otel(
     otel_chat_span: OtelChatSpan,
 ) -> tuple[TextPart, ...] | None:
@@ -584,19 +592,31 @@ def system_prompt_from_otel(
 
     Raises:
         OtelToLangchaintConversionError: The system prompt has no lossless langchaint representation.
+        OtelToLangchaintConversionError: Input messages or system instructions are available only by reference.
     """
-    system_prompt, _ = _split_system_prompt(otel_chat_span)
+    system_prompt, _ = _split_system_prompt(otel_chat_span, require_system_prompt=True)
     return system_prompt
 
 
 def _split_system_prompt(
     otel_chat_span: OtelChatSpan,
+    *,
+    require_system_prompt: bool,
 ) -> tuple[tuple[TextPart, ...] | None, tuple[OtelInputMessage, ...]]:
     """Convert the system prompt and return it with the input messages that remain."""
+    _require_inline_content(
+        INPUT_MESSAGES, otel_chat_span.input_messages, otel_chat_span.input_messages_ref
+    )
     input_messages = otel_chat_span.input_messages or ()
     system_message_count = sum(message.role == "system" for message in input_messages)
+    if require_system_prompt or system_message_count:
+        _require_inline_content(
+            SYSTEM_INSTRUCTIONS,
+            otel_chat_span.system_instructions,
+            otel_chat_span.system_instructions_ref,
+        )
     if system_message_count == 0:
-        if otel_chat_span.system_instructions:
+        if require_system_prompt and otel_chat_span.system_instructions:
             return _system_prompt_from_parts(otel_chat_span.system_instructions), input_messages
         return None, input_messages
     if otel_chat_span.system_instructions:
@@ -631,8 +651,12 @@ def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ..
 
     Raises:
         OtelToLangchaintConversionError: A tool definition has no lossless langchaint representation.
+        OtelToLangchaintConversionError: Tool definitions are available only by reference.
     """
     tool_definitions = otel_chat_span.tool_definitions
+    _require_inline_content(
+        TOOL_DEFINITIONS, tool_definitions, otel_chat_span.tool_definitions_ref
+    )
     if tool_definitions is None:
         return None
     converted: list[ToolSchema] = []
@@ -665,8 +689,10 @@ def generation_input_from_otel(
 
     Raises:
         OtelToLangchaintConversionError: An input value has no lossless langchaint representation.
+        OtelToLangchaintConversionError: Input messages are available only by reference.
+            A system message also requires inline instructions when `system_instructions_ref` is present.
     """
-    _, input_messages = _split_system_prompt(otel_chat_span)
+    _, input_messages = _split_system_prompt(otel_chat_span, require_system_prompt=False)
     return tuple(_message_from_otel(message) for message in input_messages)
 
 
@@ -694,8 +720,10 @@ def output_messages_from_otel(
 
     Raises:
         OtelToLangchaintConversionError: An output message has no lossless langchaint representation.
+        OtelToLangchaintConversionError: Output messages are available only by reference.
     """
     output_messages = otel_chat_span.output_messages
+    _require_inline_content(OUTPUT_MESSAGES, output_messages, otel_chat_span.output_messages_ref)
     if output_messages is None:
         return None
     return tuple(_assistant_message_from_output(message) for message in output_messages)
@@ -731,10 +759,12 @@ def generation_record_from_otel(
             Examples include an empty message or a token-limit stop at a final tool call.
             Under `gen_ai.output.type` `"json"`, final text that is not JSON also gives an unusable outcome.
         OtelToLangchaintConversionError: A selected value cannot construct a generation record unchanged.
+        OtelToLangchaintConversionError: Output messages are available only by reference.
     """
     if otel_chat_span.error_type is not None:
         raise _attribute_conversion_error("error.type", "reports a failed span")
     output_messages = otel_chat_span.output_messages
+    _require_inline_content(OUTPUT_MESSAGES, output_messages, otel_chat_span.output_messages_ref)
     if output_messages is None or len(output_messages) != 1:
         raise _attribute_conversion_error(
             OUTPUT_MESSAGES,
@@ -818,6 +848,7 @@ def llm_from_otel[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
         ValueError: The span lacks `gen_ai.request.max_tokens` and `llm` uses `AnthropicMessagesAdapter`.
         OtelToLangchaintConversionError: Captured configuration differs from caller-supplied objects.
         OtelToLangchaintConversionError: A captured value has no lossless langchaint representation.
+        OtelToLangchaintConversionError: Input messages, system instructions, or tool definitions require external data.
         TypeError: The adapter does not support the reconstructed binding.
         pydantic.PydanticInvalidForJsonSchema: `llm.response_format` has no JSON schema.
         pydantic.PydanticUserError: `llm.response_format` is not fully defined.

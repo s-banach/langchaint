@@ -9,6 +9,7 @@ from langchaint.anthropic.messages_adapter import (
 from langchaint.billing.pricing import LongContextPricing
 
 type AnthropicModelId = Literal[
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-5-5",
@@ -19,6 +20,25 @@ type AnthropicModelId = Literal[
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5",
 ]
+
+_CLAUDE_FABLE_5_2 = AnthropicPricingTable(
+    standard=AnthropicRates(
+        input_tokens_cache_none=8,
+        output_tokens=40,
+        input_tokens_cache_read=0.2,
+        input_tokens_cache_write_5m=10,
+        input_tokens_cache_write_1h=16,
+    ),
+    batch=AnthropicRates(
+        input_tokens_cache_none=4,
+        output_tokens=20,
+        input_tokens_cache_read=0.1,
+        input_tokens_cache_write_5m=5,
+        input_tokens_cache_write_1h=8,
+    ),
+    inference_geo_us_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+)
 
 _CLAUDE_FABLE_5_1 = AnthropicPricingTable(
     standard=AnthropicRates(
@@ -178,6 +198,7 @@ _CLAUDE_HAIKU_4_5_20251001 = AnthropicPricingTable(
 )
 
 ANTHROPIC_PRICING: dict[AnthropicModelId, AnthropicPricingTable] = {
+    "claude-fable-5-2": _CLAUDE_FABLE_5_2,
     "claude-fable-5-1": _CLAUDE_FABLE_5_1,
     "claude-fable-5": _CLAUDE_FABLE_5,
     "claude-opus-5-5": _CLAUDE_OPUS_5_5,
@@ -190,6 +211,17 @@ ANTHROPIC_PRICING: dict[AnthropicModelId, AnthropicPricingTable] = {
 }
 
 ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
+    "anthropic.claude-fable-5-2": AnthropicPricingTable(
+        standard=AnthropicRates(
+            input_tokens_cache_none=8,
+            output_tokens=40,
+            input_tokens_cache_read=0.2,
+            input_tokens_cache_write_5m=10,
+            input_tokens_cache_write_1h=16,
+        ),
+        inference_geo_us_multiplier=None,
+        web_search_usd_per_invocation=0.01,
+    ),
     "anthropic.claude-fable-5-1": AnthropicPricingTable(
         standard=AnthropicRates(
             input_tokens_cache_none=10,

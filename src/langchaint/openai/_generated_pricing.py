@@ -10,6 +10,8 @@ type OpenAIModelId = Literal[
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
     "gpt-6-sol",
@@ -91,6 +93,62 @@ _GPT_5_6_LUNA = OpenAIPricingTable(
         output_tokens=2.4,
         input_tokens_cache_read=0.04,
         input_tokens_cache_write=0.5,
+    ),
+    long_context=LongContextPricing(
+        prompt_tokens_above=272000,
+        input_multiplier=2.0,
+        output_multiplier=1.5,
+    ),
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
+)
+
+_GPT_6_2_ASTRA = OpenAIPricingTable(
+    default=TokenRates(
+        input_tokens_cache_none=8,
+        output_tokens=40,
+        input_tokens_cache_read=0.4,
+        input_tokens_cache_write=10,
+    ),
+    fast=TokenRates(
+        input_tokens_cache_none=16,
+        output_tokens=80,
+        input_tokens_cache_read=0.8,
+        input_tokens_cache_write=20,
+    ),
+    ultrafast=TokenRates(
+        input_tokens_cache_none=24,
+        output_tokens=120,
+        input_tokens_cache_read=1.2,
+        input_tokens_cache_write=30,
+    ),
+    long_context=LongContextPricing(
+        prompt_tokens_above=272000,
+        input_multiplier=2.0,
+        output_multiplier=1.5,
+    ),
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
+)
+
+_GPT_6_2_SOL = OpenAIPricingTable(
+    default=TokenRates(
+        input_tokens_cache_none=2,
+        output_tokens=10,
+        input_tokens_cache_read=0.1,
+        input_tokens_cache_write=2.5,
+    ),
+    fast=TokenRates(
+        input_tokens_cache_none=4,
+        output_tokens=20,
+        input_tokens_cache_read=0.2,
+        input_tokens_cache_write=5,
+    ),
+    ultrafast=TokenRates(
+        input_tokens_cache_none=6,
+        output_tokens=30,
+        input_tokens_cache_read=0.3,
+        input_tokens_cache_write=7.5,
     ),
     long_context=LongContextPricing(
         prompt_tokens_above=272000,
@@ -258,6 +316,8 @@ OPENAI_PRICING: dict[OpenAIModelId, OpenAIPricingTable] = {
     "gpt-5.6-sol": _GPT_5_6_SOL,
     "gpt-5.6-terra": _GPT_5_6_TERRA,
     "gpt-5.6-luna": _GPT_5_6_LUNA,
+    "gpt-6.2-astra": _GPT_6_2_ASTRA,
+    "gpt-6.2-sol": _GPT_6_2_SOL,
     "gpt-6.1-sol": _GPT_6_1_SOL,
     "gpt-6.1-terra": _GPT_6_1_TERRA,
     "gpt-6-sol": _GPT_6_SOL,
@@ -270,6 +330,8 @@ OPENAI_REGIONAL_PROCESSING_MULTIPLIER: dict[OpenAIModelId, float] = {
     "gpt-5.6-sol": 1.1,
     "gpt-5.6-terra": 1.1,
     "gpt-5.6-luna": 1.1,
+    "gpt-6.2-astra": 1.1,
+    "gpt-6.2-sol": 1.1,
     "gpt-6.1-sol": 1.1,
     "gpt-6.1-terra": 1.1,
     "gpt-6-sol": 1.1,

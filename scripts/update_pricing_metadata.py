@@ -44,6 +44,8 @@ OPENAI_LITELLM_KEYS = {
     "gpt-5.6-sol": "gpt-5.6-sol",
     "gpt-5.6-terra": "gpt-5.6-terra",
     "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-6.2-astra": "gpt-6.2-astra",
+    "gpt-6.2-sol": "gpt-6.2-sol",
     "gpt-6.1-sol": "gpt-6.1-sol",
     "gpt-6.1-terra": "gpt-6.1-terra",
     "gpt-6-sol": "gpt-6-sol",
@@ -52,6 +54,7 @@ OPENAI_LITELLM_KEYS = {
 }
 OPENAI_ALIASES = {"gpt-5.6": "gpt-5.6-sol"}
 ANTHROPIC_LITELLM_KEYS = {
+    "claude-fable-5-2": "claude-fable-5-2",
     "claude-fable-5-1": "claude-fable-5-1",
     "claude-fable-5": "claude-fable-5",
     "claude-opus-5-5": "claude-opus-5-5",
@@ -63,6 +66,7 @@ ANTHROPIC_LITELLM_KEYS = {
 }
 ANTHROPIC_ALIASES = {"claude-haiku-4-5": "claude-haiku-4-5-20251001"}
 ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
+    "claude-fable-5-2",
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-5-5",
@@ -72,6 +76,7 @@ ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
     "claude-haiku-5-5",
 })
 ANTHROPIC_BEDROCK_LITELLM_KEYS = {
+    "anthropic.claude-fable-5-2": "anthropic.claude-fable-5-2",
     "anthropic.claude-fable-5-1": "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5": "anthropic.claude-fable-5",
     "anthropic.claude-opus-5-5": "anthropic.claude-opus-5-5",

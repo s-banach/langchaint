@@ -33,7 +33,7 @@ LiteLLM lists no other nonzero rate that a langchaint embedding request incurs.
 
 COHERE_BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {
     "us": 1.0,
-    "eu": float("nan"),
+    "eu": 1.0,
     "au": float("nan"),
     "jp": float("nan"),
     "apac": float("nan"),

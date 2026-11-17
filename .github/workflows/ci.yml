@@ -15,8 +15,9 @@ jobs:
       matrix:
         # Bump the Python entries when a new release becomes supported.
         include:
-          # Newest resolvable dependencies on the oldest and newest supported Python versions.
+          # Newest resolvable dependencies on every supported Python minor version.
           - { python-version: "3.13", resolution: highest }
+          - { python-version: "3.14", resolution: highest }
           - { python-version: "3.15", resolution: highest }
           # Minimum direct dependency versions on the oldest supported Python version.
           - { python-version: "3.13", resolution: lowest-direct }

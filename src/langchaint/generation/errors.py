@@ -1,9 +1,10 @@
 """Normalized generation error records and live generation failures."""
 
-from typing import TYPE_CHECKING, Annotated, Literal, Self, override
+from typing import Annotated, Literal, Self, override
 
 from pydantic import Field, model_validator
 
+from langchaint.adapter import RequestParams
 from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import AssistantMessage, GenerationErrorStopReason
@@ -18,9 +19,6 @@ from langchaint.generation.request_history import (
     _require_finished_assistant_message,
     _settled_request_records,
 )
-
-if TYPE_CHECKING:
-    from langchaint.adapter import RequestParams
 
 
 class _GenerationErrorRecordBase(_InputOutcomeRecordBase):
@@ -280,14 +278,14 @@ class GenerationError(Exception):
     """A live terminal generation failure with one normalized record."""
 
     record: GenerationErrorRecord
-    request_params: "RequestParams | None"
+    request_params: RequestParams | None
     request_provider_data: tuple[RequestProviderData, ...]
 
     def __init__(
         self,
         *,
         record: GenerationErrorRecord,
-        request_params: "RequestParams | None",
+        request_params: RequestParams | None,
         request_provider_data: tuple[RequestProviderData, ...],
     ) -> None:
         """Store normalized and live-only failure data."""
@@ -341,7 +339,7 @@ def _terminal_generation_error(
     *,
     error_text: str,
     ledger: _RequestLedger,
-    request_params: "RequestParams | None",
+    request_params: RequestParams | None,
     stream_opened: bool,
 ) -> GenerationError:
     """Settle the failed request when the provider answered or the stream opened, then build the input's error.

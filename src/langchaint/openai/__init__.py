@@ -26,9 +26,8 @@ Source: https://developers.openai.com/api/docs/models/all.
 `OpenAIBedrock.llm(pricing=...)` uses caller rates.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Literal, overload
+from collections.abc import Mapping, Sequence
+from typing import Literal, overload
 
 try:
     from openai import AsyncBedrockOpenAI, AsyncOpenAI
@@ -42,8 +41,12 @@ except ModuleNotFoundError as exc:
 
 from pydantic import BaseModel
 
+import langchaint
+from langchaint.adapter import ToolChoice
+from langchaint.common.messages import TextPart
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM, llm_from_adapter
+from langchaint.generation.observer import Observer
 from langchaint.openai._generated_pricing import (
     OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS,
     OPENAI_PRICING,
@@ -61,15 +64,7 @@ from langchaint.openai.shared import (
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-
-    from langchaint.adapter import ToolChoice
-    from langchaint.common.messages import TextPart
-    from langchaint.embedding import EmbeddingModel
-    from langchaint.generation.observer import Observer
-    from langchaint.tools import ToolManager, ToolSequence
+from langchaint.tools import ToolManager, ToolSequence
 
 OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelId] = frozenset(
     OPENAI_EMBEDDING_USD_PER_MILLION_TOKENS
@@ -423,7 +418,7 @@ class OpenAI:
         dimension: int = 1536,
         max_requests: int = 3,
         usd_per_million_tokens: float | None = None,
-    ) -> EmbeddingModel: ...
+    ) -> "langchaint.EmbeddingModel": ...
 
     @overload
     def embedding_model(
@@ -433,7 +428,7 @@ class OpenAI:
         dimension: int = 3072,
         max_requests: int = 3,
         usd_per_million_tokens: float | None = None,
-    ) -> EmbeddingModel: ...
+    ) -> "langchaint.EmbeddingModel": ...
 
     @overload
     def embedding_model(
@@ -442,7 +437,7 @@ class OpenAI:
         *,
         max_requests: int = 3,
         usd_per_million_tokens: float | None = None,
-    ) -> EmbeddingModel: ...
+    ) -> "langchaint.EmbeddingModel": ...
 
     def embedding_model(
         self,
@@ -451,7 +446,7 @@ class OpenAI:
         dimension: int | None = None,
         max_requests: int = 3,
         usd_per_million_tokens: float | None = None,
-    ) -> EmbeddingModel:
+    ) -> "langchaint.EmbeddingModel":
         """Build an `EmbeddingModel` for one cataloged OpenAI model.
 
         Third-generation models accept their documented dimension range.
@@ -478,7 +473,7 @@ class OpenAI:
                     f"dimension for {model!r} must be an int from 1 through {max_dimension}, got {dimension!r}"
                 )
         try:
-            from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
+            embedding_model = langchaint.EmbeddingModel
             from langchaint.openai.embedding_adapter import (  # noqa: PLC0415 (keep tiktoken outside ordinary imports)
                 _OpenAIEmbeddingAdapter,
             )
@@ -496,7 +491,7 @@ class OpenAI:
             model=model,
             dimension=dimension,
         )
-        return EmbeddingModel(
+        return embedding_model(
             adapter=adapter,
             shared_backoff=self._shared_backoff,
             max_requests=max_requests,

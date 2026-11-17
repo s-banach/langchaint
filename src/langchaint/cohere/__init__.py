@@ -19,8 +19,6 @@ Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model
 Recheck https://aws.amazon.com/bedrock/pricing/ before relying on these prices.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 from functools import partial
@@ -57,6 +55,7 @@ from langchaint.cohere._generated_pricing import (
 )
 from langchaint.common.bedrock import BedrockCatalogResolution, resolve_bedrock_catalog_id
 from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.cancellation import (
     await_task_cancellation_safe,
     to_thread_cancellation_safe,
@@ -69,12 +68,12 @@ from langchaint.embedding import (
     _EmbeddingBatchResponse,
     _validated_embeddings,
 )
+from langchaint.embedding_requests import EmbeddingObserver
 
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
-
-    from langchaint.common.sequence_not_str import SequenceNotStr
-    from langchaint.embedding_requests import EmbeddingObserver
+else:
+    from botocore.client import BaseClient as BedrockRuntimeClient
 
 
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]
@@ -427,7 +426,7 @@ class CohereBedrock:
         """Build `CohereBedrock` without creating a client.
 
         `aws_region` selects the region for a client created by `CohereBedrock`.
-        A passed `client` must disable SDK retries.
+        Pass a boto3 client for `bedrock-runtime` with SDK retries disabled.
         `apply_cross_region_multiplier=False` leaves a prefixed identifier's catalog rate unmultiplied.
         `shared_backoff` admits every request of the created `EmbeddingModel` values.
         `shared_backoff=None` creates a `SharedBackoff` with its defaults.

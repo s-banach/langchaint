@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from functools import partial
+from pathlib import Path  # noqa: TC003 (public annotations)
 from typing import TYPE_CHECKING, Final, Protocol, overload
 
 from pydantic import BaseModel
@@ -32,6 +33,7 @@ from langchaint.common.observed_operation import (
     start_observed_operation,
 )
 from langchaint.common.request_failure import RequestFailure, _request_failure_of
+from langchaint.common.sequence_not_str import SequenceNotStr  # noqa: TC001 (public annotations)
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff
 from langchaint.generation._config_fingerprint import (
@@ -71,11 +73,6 @@ from langchaint.generation.response import (
 )
 from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    from langchaint.common.sequence_not_str import SequenceNotStr
 
 
 class Unchanged:
@@ -1070,6 +1067,11 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
             splits_on_tool_calls=self._splits_on_tool_calls,
             generation_started=partial(self._generation_started, messages, stream=True),
         )
+
+
+if not TYPE_CHECKING:
+    # get_type_hints resolves postponed method annotations in the module namespace.
+    OutputT, ToolManagerT = LLM.__type_params__
 
 
 @overload

@@ -5,7 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from types import TracebackType
-from typing import Literal, Never, overload
+from typing import Literal, Never, Self, overload
 
 from langchaint.adapter import (
     Adapter,
@@ -135,7 +135,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         self._state: _State = "unopened"
         self._request_params: RequestParams | None = None
 
-    async def __aenter__(self) -> "StreamHandle[OutputT, ToolCallGenerationT]":
+    async def __aenter__(self) -> Self:
         """Open the request and return self.
 
         Raises:
@@ -327,7 +327,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 self._private_backoff.next_wait_seconds(request_failure.retry_after_seconds)
             )
 
-    def __aiter__(self) -> "StreamHandle[OutputT, ToolCallGenerationT]":
+    def __aiter__(self) -> Self:
         """Return `self` because the handle is its own iterator."""
         return self
 
@@ -466,11 +466,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         return error
 
     @overload
-    async def final(
-        self: "StreamHandle[OutputT, Never]",
-    ) -> PlainGeneration[OutputT]: ...
+    async def final[CallOutputT](
+        self: "StreamHandle[CallOutputT, Never]",
+    ) -> PlainGeneration[CallOutputT]: ...
     @overload
-    async def final(self) -> "PlainGeneration[OutputT] | ToolCallGenerationT": ...
+    async def final(self) -> PlainGeneration[OutputT] | ToolCallGenerationT: ...
     async def final(self) -> PlainGeneration[OutputT] | ToolCallGeneration:
         """Drain remaining items and return the stored generation.
 

@@ -307,7 +307,7 @@ def test_waiters_are_released_in_the_order_they_joined() -> None:
             max_concurrent_requests=None,
             max_request_starts_per_second=100.0,
         )
-        shared_backoff._record(_pausing(0.01))
+        _ = shared_backoff.record(_pausing(0.01))
         admitted_order: list[int] = []
 
         async def request(index: int) -> None:
@@ -349,7 +349,7 @@ def test_a_budget_expiring_in_the_queue_leaves_nothing_held() -> None:
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff()
-        shared_backoff._record(_pausing(0.5))
+        _ = shared_backoff.record(_pausing(0.5))
         with pytest.raises(GaveUpWaitingError):
             await _enter_empty_block(shared_backoff.admitted(budget_seconds=0.005))
         assert len(shared_backoff._queue) == 0
@@ -400,7 +400,7 @@ def test_cancellation_while_queued_leaves_an_empty_queue_and_a_full_permit_count
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff()
-        shared_backoff._record(_pausing(0.5))
+        _ = shared_backoff.record(_pausing(0.5))
         waiting = asyncio.create_task(_enter_empty_block(shared_backoff.admitted()))
         await yield_until(lambda: len(shared_backoff._queue) == 1)
         _ = waiting.cancel()
@@ -421,10 +421,10 @@ def test_reports_during_a_pause_extend_it_and_never_shrink_it() -> None:
     shared_backoff._clock = lambda: moment
     for report_at, expected_end in ((0.0, 60.0), (59.0, 119.0), (118.0, 178.0), (177.0, 237.0)):
         moment = report_at
-        shared_backoff._record(_pausing(60.0))
+        _ = shared_backoff.record(_pausing(60.0))
         assert shared_backoff._pause_until == expected_end
     moment = 178.0
-    shared_backoff._record(_pausing(1.0))
+    _ = shared_backoff.record(_pausing(1.0))
     assert shared_backoff._pause_until == 237.0
 
 
@@ -432,11 +432,11 @@ def test_pause_ends_within_max_wait_seconds_after_the_most_recent_report() -> No
     shared_backoff = _shared_backoff()
     moment = 0.0
     shared_backoff._clock = lambda: moment
-    shared_backoff._record(_pausing(60.0))
+    _ = shared_backoff.record(_pausing(60.0))
     for step in range(200):
         moment += 1.0
         retry_after_seconds = 60.0 if step % 2 == 0 else None
-        shared_backoff._record(_pausing(retry_after_seconds))
+        _ = shared_backoff.record(_pausing(retry_after_seconds))
         assert shared_backoff._pause_until - moment <= 60.0
 
 

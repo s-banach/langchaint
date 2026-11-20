@@ -204,7 +204,7 @@ def openai_request_failure(error: Exception, *, client: openai.AsyncOpenAI) -> R
     if error.status_code == 200:
         retries, pauses_quota = _openai_error_code_answers(error)
     else:
-        retries = sdk_retry_decision(lambda: client._should_retry(error.response))
+        retries = sdk_retry_decision(lambda: client._should_retry(error.response))  # pyrefly: ignore[protected-access]
         if isinstance(retries, RequestFailure):
             return retries
         pauses_quota = error.status_code in _PAUSE_STATUSES

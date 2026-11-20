@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, cast, override
 
+import httpx2
 import openai
 from openai import AsyncOpenAI, Omit, omit
 from openai.lib._parsing._responses import type_to_text_format_param
@@ -882,7 +883,7 @@ class _OpenAIResponsesStream(AdapterStream):
             if error_event is not None:
                 raise openai.APIStatusError(
                     error_event.message,
-                    response=self._sdk_stream._response,
+                    response=self._http_response,
                     body={
                         "code": error_event.code,
                         "message": error_event.message,
@@ -930,16 +931,13 @@ class _OpenAIResponsesStream(AdapterStream):
             usage_raw=None,
         )
 
+    @property
+    def _http_response(self) -> httpx2.Response:
+        return self._sdk_stream._response  # pyrefly: ignore[protected-access]
+
     @override
     def request_id(self) -> str | None:
-        """Read the request-id header off the response the SDK stream is reading.
-
-        openai 3.0.0 exposes `AsyncResponseStream._response` as `httpx2.Response`.
-        No public attribute exposes the same headers.
-        """
-        http_response = self._sdk_stream._response
-        request_id: str | None = http_response.headers.get("x-request-id")
-        return request_id
+        return self._http_response.headers.get("x-request-id")
 
     @override
     async def close(self) -> None:

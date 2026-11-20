@@ -178,7 +178,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             # Failed entry skips `__aexit__`, so release admission and cancel the timer here.
             # Cancellation during entry must also record abandonment here.
             self._state = "finished"
-            self._exit_admission()
+            await self._exit_admission()
             self._note_provider_billing_in_flight()
             if await self._close_timeout_scope(exc):
                 raise _timed_out_error(self._ledger) from None
@@ -263,14 +263,14 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         self.abandoned = AbandonedStreamRecord(request_history=request_history)
         self._end_operation(self.abandoned)
 
-    def _exit_admission(self) -> None:
+    async def _exit_admission(self) -> None:
         """Return the held permit. Repeated calls do nothing."""
         if self._admission is None:
             return
         admission, self._admission = self._admission, None
-        admission._release()
+        _ = await admission.__aexit__(None, None, None)
 
-    def _request_failure_exiting_admission(self, exc: Exception) -> RequestFailure:
+    async def _request_failure_exiting_admission(self, exc: Exception) -> RequestFailure:
         """Record the failure before releasing admission, so its quota pause starts first.
 
         Assembly failures can arrive after iteration returned admission.
@@ -284,11 +284,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             request_id = self._adapter_stream.request_id()
         self._ledger.note_request_id(request_id)
         try:
-            return self._shared_backoff._recorded(
+            return self._shared_backoff.record(
                 _request_failure_of(exc, self._adapter.request_failure)
             )
         finally:
-            self._exit_admission()
+            await self._exit_admission()
 
     async def _close_adapter_stream(self) -> None:
         """Close the provider connection and release admission even when closing raises."""
@@ -304,7 +304,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                     ),
                 )
         finally:
-            self._exit_admission()
+            await self._exit_admission()
 
     async def _backoff_or_exhaust(self, exc: Exception, request_failure: RequestFailure) -> None:
         """Wait before retrying an open failure unless the request limit is reached.
@@ -356,7 +356,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                     request_params, request_count=self._ledger.request_count
                 )
             except Exception as exc:
-                request_failure = self._request_failure_exiting_admission(exc)
+                request_failure = await self._request_failure_exiting_admission(exc)
                 if request_failure.kind != "transient":
                     raise _terminal_generation_error(
                         request_failure.kind,
@@ -419,12 +419,12 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         except StopAsyncIteration:
             if self._ended_at_monotonic_seconds is None:
                 self._ended_at_monotonic_seconds = time.monotonic()
-            self._exit_admission()
+            await self._exit_admission()
             raise
         except Exception as exc:  # noqa: BLE001 (every failure of an open stream settles its request)
             raise await self._error_after_stream_failure(exc, stage="iteration")  # noqa: B904 (the returned error already holds its cause)
         except BaseException:
-            self._exit_admission()
+            await self._exit_admission()
             raise
         self._ledger.stamp_first_item()
         return item
@@ -439,7 +439,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         """
         self._state = "finished"
         self._note_provider_billing_in_flight()
-        request_failure = self._request_failure_exiting_admission(exc)
+        request_failure = await self._request_failure_exiting_admission(exc)
         if request_failure.kind != "transient":
             error = _terminal_generation_error(
                 request_failure.kind,
@@ -545,12 +545,8 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             error = TransientError(
                 response_outcome.error_text, pauses_quota=response_outcome.pauses_quota
             )
-            self._shared_backoff._record(
-                RequestFailure(
-                    kind="transient",
-                    pauses_quota=response_outcome.pauses_quota,
-                    retry_after_seconds=None,
-                )
+            _ = self._shared_backoff.record(
+                _request_failure_of(error, self._adapter.request_failure)
             )
             self._ledger.record_ending_at(
                 ended_at_monotonic_seconds,

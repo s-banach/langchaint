@@ -1405,14 +1405,43 @@ def test_generate_many_records_uses_one_background_thread_for_resume_io(
     run_with_timeout(scenario())
 
 
-def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("adapter", "max_working_seconds_per_input", "kind"),
+    [
+        (
+            FakeAdapter(echo=True, scripted_requests=[TransientError("try again")]),
+            None,
+            "retries_exhausted_error",
+        ),
+        (
+            FakeAdapter(
+                echo=True,
+                scripted_requests=[ValueError("expired credentials")],
+                request_failure=terminal("auth"),
+            ),
+            None,
+            "auth_error",
+        ),
+        (FakeAdapter(echo=True, open_seconds=0.001), 0.0, "timed_out_error"),
+    ],
+    ids=["retries_exhausted", "auth", "timed_out"],
+)
+def test_generate_many_records_retries_a_saved_failure(
+    tmp_path: Path,
+    adapter: FakeAdapter,
+    max_working_seconds_per_input: float | None,
+    kind: GenerationErrorKind,
+) -> None:
 
     async def scenario() -> None:
-        adapter = FakeAdapter(echo=True, scripted_requests=[TransientError("try again")])
         llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff(), max_requests=1)
         resume_path = tmp_path / "records.jsonl"
-        first = await llm.generate_many_records(["a"], resume_path=resume_path)
-        assert first[0].kind == "retries_exhausted_error"
+        first = await llm.generate_many_records(
+            ["a"],
+            resume_path=resume_path,
+            max_working_seconds_per_input=max_working_seconds_per_input,
+        )
+        assert first[0].kind == kind
         second = await llm.generate_many_records(["a"], resume_path=resume_path)
         assert _outputs(second) == ["a"]
         third = await llm.generate_many_records(["a"], resume_path=resume_path)
@@ -1422,19 +1451,30 @@ def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path
     run_with_timeout(scenario())
 
 
-def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("adapter", "kind"),
+    [
+        (FakeAdapter(scripted_requests=[billed(REFUSAL)]), "refusal_error"),
+        (
+            FakeAdapter(
+                scripted_requests=[ValueError("rejected")], request_failure=terminal("rejected")
+            ),
+            "rejected_error",
+        ),
+    ],
+    ids=["refusal", "rejected"],
+)
+def test_generate_many_records_reuses_a_terminal_error_record(
+    tmp_path: Path, adapter: FakeAdapter, kind: GenerationErrorKind
+) -> None:
 
     async def scenario() -> None:
-        adapter = FakeAdapter(
-            echo=True,
-            scripted_requests=[billed(REFUSAL)],
-        )
         llm = llm_from_adapter(adapter, shared_backoff=fast_shared_backoff())
         resume_path = tmp_path / "records.jsonl"
         generated = await llm.generate_many_records(["a"], resume_path=resume_path)
         restored = await llm.generate_many_records(["a"], resume_path=resume_path)
-        assert generated[0].kind == "refusal_error"
-        assert restored[0].kind == "refusal_error"
+        assert generated[0].kind == kind
+        assert restored[0].kind == kind
         assert adapter.bound_adapters[0].open_count == 1
 
     run_with_timeout(scenario())

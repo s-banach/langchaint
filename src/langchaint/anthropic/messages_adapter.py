@@ -929,7 +929,7 @@ def anthropic_request_failure(error: Exception, *, client: AnthropicClient) -> R
     If the SDK's retry rule raises, langchaint logs the exception.
     It returns a `RequestFailure` with `kind="unknown_exception"`.
     """
-    decision = sdk_retry_decision(lambda: client._should_retry_exception(error))
+    decision = sdk_retry_decision(lambda: client._should_retry_exception(error))  # pyrefly: ignore[protected-access]
     if isinstance(decision, RequestFailure):
         return decision
     retries, response = decision

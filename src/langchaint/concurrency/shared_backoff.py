@@ -74,7 +74,7 @@ class Admission:
         """
         try:
             async with asyncio.timeout(self._budget_seconds):
-                await self._shared_backoff._wait_turn()
+                await self._shared_backoff._wait_turn()  # pyrefly: ignore[protected-access]
         except TimeoutError:
             self._shared_backoff.event_counts["gave_up_waiting"] += 1
             _logger.info(
@@ -90,14 +90,7 @@ class Admission:
 
         Call it inside the block, so a pause starts before the permit passes to a waiter.
         """
-        return self._shared_backoff._recorded(request_failure)
-
-    def _release(self) -> None:
-        """Return the permit.
-
-        `StreamHandle` calls this directly because its admission spans several of its methods.
-        """
-        self._shared_backoff._release_permit()
+        return self._shared_backoff.record(request_failure)
 
     async def __aexit__(
         self,
@@ -106,7 +99,7 @@ class Admission:
         traceback: TracebackType | None,
     ) -> Literal[False]:
         """Return the permit."""
-        self._release()
+        self._shared_backoff._release_permit()  # pyrefly: ignore[protected-access]
         return False
 
 
@@ -326,11 +319,11 @@ class SharedBackoff:
             len(self._queue),
         )
 
-    def _recorded(self, request_failure: RequestFailure) -> RequestFailure:
-        """Normalize one failed request's failure, apply it to shared state, and return the normalized failure.
+    def record(self, request_failure: RequestFailure) -> RequestFailure:
+        """Apply the failure to the quota and return it with a normalized `retry_after_seconds`.
 
-        `Admission.record` calls this inside its block.
-        `StreamHandle` also calls it for a failure that may arrive after its drained stream returned the permit.
+        Record the failure before releasing a held permit so waiting requests observe the pause.
+        A stream can also report a failure discovered after returning its permit.
         """
         if request_failure.retry_after_seconds is not None:
             request_failure = replace(
@@ -339,7 +332,8 @@ class SharedBackoff:
                     request_failure.retry_after_seconds
                 ),
             )
-        self._record(request_failure)
+        if request_failure.pauses_quota:
+            self._pause(request_failure)
         return request_failure
 
     def _normalized_retry_after_seconds(self, stated: float) -> float | None:
@@ -365,10 +359,9 @@ class SharedBackoff:
         self.event_counts[tag] += 1
         _logger.warning("corrected a request failure: %s", tag)
 
-    def _record(self, request_failure: RequestFailure) -> None:
-        """Record one failed request.
+    def _pause(self, request_failure: RequestFailure) -> None:
+        """Apply a pausing failure to the quota.
 
-        Only a failure with `pauses_quota` changes shared state.
         A report during a pause proposes another capped pause.
         The pauses merge by keeping the later end.
         Reports during one pause do not increase _wait_ceiling.
@@ -376,8 +369,6 @@ class SharedBackoff:
         Waiting for admission satisfies every pausing failure's retry_after_seconds.
         The pause ends within max_wait_seconds after the most recent report.
         """
-        if not request_failure.pauses_quota:
-            return
         now = self._clock()
         if now < self._pause_until:
             chosen_wait = self._chosen_wait(request_failure)

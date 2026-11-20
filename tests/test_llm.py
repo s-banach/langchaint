@@ -1856,19 +1856,45 @@ def test_an_escaped_defect_keeps_the_billing_of_the_request_it_cut_off() -> None
     run_with_timeout(scenario())
 
 
-def test_a_request_failure_defect_mid_stream_returns_the_permit_inside_the_block() -> None:
+class _RequestIdRaisesAdapter(FakeAdapter):
+    @override
+    def request_id_from_error(self, error: Exception) -> str | None:
+        raise StopAsyncIteration("request ID defect")
+
+
+class _BillingRaisesStream(_FailsAfterFirstItemStream):
+    @override
+    def provider_billing(self) -> None:
+        raise RuntimeError("billing defect")
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "stream_type", "quota_paused"),
+    [
+        (_RequestFailureRaisesAdapter, _FailsAfterFirstItemStream, False),
+        (_RequestIdRaisesAdapter, _FailsAfterFirstItemStream, True),
+        (FakeAdapter, _BillingRaisesStream, True),
+    ],
+    ids=["request_failure", "request_id", "provider_billing"],
+)
+def test_a_failure_handling_defect_closes_the_stream_and_returns_the_permit(
+    adapter_type: type[FakeAdapter], stream_type: type[FakeStream], *, quota_paused: bool
+) -> None:
 
     async def scenario() -> None:
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
-        llm = llm_from_adapter(
-            _RequestFailureRaisesAdapter(stream=_FailsAfterFirstItemStream()),
-            shared_backoff=shared_backoff,
-        )
+        stream = stream_type()
+        adapter = adapter_type(stream=stream, request_failure=transient(pauses_quota=True))
+        llm = llm_from_adapter(adapter, shared_backoff=shared_backoff)
         async with llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(GenerationError):
+            with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
                     pass
-            assert shared_backoff._permits_held == 0
+            assert raised.value.record.kind == "unknown_exception_error"
+            assert stream.closed
+            assert (shared_backoff._pause_until != _NEVER) == quota_paused
+            async with shared_backoff.admitted(budget_seconds=1.0):
+                pass
 
     run_with_timeout(scenario())
 
@@ -1982,22 +2008,20 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned(
     run_with_timeout(scenario())
 
 
-def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
+@pytest.mark.parametrize("stream_type", [_FailingCloseStream, _BillingRaisesStream])
+def test_stream_cleanup_preserves_the_callers_exception_and_returns_the_permit(
+    stream_type: type[FakeStream],
+) -> None:
 
     async def scenario() -> None:
-        shared_backoff = fast_shared_backoff(max_concurrent_requests=2)
-        llm = llm_from_adapter(
-            FakeAdapter(stream=_FailingCloseStream()), shared_backoff=shared_backoff
-        )
-        # Leaving after one item keeps admission held until __aexit__.
-        # close must return that admission.
-        async with llm.stream_one([UserMessage(content="hi")]) as handle:
-            async for _item in handle:
-                break
-        async with (
-            shared_backoff.admitted(budget_seconds=1.0),
-            shared_backoff.admitted(budget_seconds=1.0),
-        ):
+        shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
+        stream = stream_type()
+        llm = llm_from_adapter(FakeAdapter(stream=stream), shared_backoff=shared_backoff)
+        with pytest.raises(KeyError, match="application error"):
+            async with llm.stream_one("hi"):
+                raise KeyError("application error")
+        assert stream.closed
+        async with shared_backoff.admitted(budget_seconds=1.0):
             pass
 
     run_with_timeout(scenario())

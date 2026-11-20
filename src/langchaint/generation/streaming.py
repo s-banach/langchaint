@@ -160,6 +160,9 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             failure = _escaped_error(self._ledger, escaped)
             self._end_operation(failure)
             raise failure from escaped
+        except asyncio.CancelledError:
+            self._abandon()
+            raise
         except BaseException:
             self._end_operation(None)
             raise
@@ -176,14 +179,11 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             await self._open_stream_with_retries()
         except BaseException as exc:
             # Failed entry skips `__aexit__`, so release admission and cancel the timer here.
-            # Cancellation during entry must also record abandonment here.
             self._state = "finished"
-            await self._exit_admission()
-            self._note_provider_billing_in_flight()
-            if await self._close_timeout_scope(exc):
+            timed_out = await self._close_timeout_scope(exc)
+            await self._close_stream_with_billing()
+            if timed_out:
                 raise _timed_out_error(self._ledger) from None
-            if isinstance(exc, asyncio.CancelledError):
-                self._abandon()
             raise
 
     async def __aexit__(
@@ -221,11 +221,9 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
 
     async def _close(self, exc: BaseException | None) -> None:
         self._state = "finished"
-        # Note before the close, which drops the stream that reports it.
-        self._note_provider_billing_in_flight()
         timed_out = await self._close_timeout_scope(exc)
         try:
-            await self._close_adapter_stream()
+            await self._close_stream_with_billing()
         finally:
             if not timed_out:
                 self._abandon()
@@ -277,18 +275,33 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         Release admission even when `request_failure` raises.
 
         Raises:
-            Exception: The adapter's `request_failure` raises, which is an adapter defect.
+            Exception: The adapter raises while reporting billing, reading the request ID, or classifying the failure.
         """
-        request_id = self._adapter.request_id_from_error(exc)
-        if request_id is None and self._adapter_stream is not None:
-            request_id = self._adapter_stream.request_id()
-        self._ledger.note_request_id(request_id)
         try:
-            return self._shared_backoff.record(
-                _request_failure_of(exc, self._adapter.request_failure)
+            self._note_provider_billing_in_flight()
+            request_id = self._adapter.request_id_from_error(exc)
+            if request_id is None and self._adapter_stream is not None:
+                request_id = self._adapter_stream.request_id()
+            self._ledger.note_request_id(request_id)
+        finally:
+            try:
+                request_failure = self._shared_backoff.record(
+                    _request_failure_of(exc, self._adapter.request_failure)
+                )
+            finally:
+                await self._exit_admission()
+        return request_failure
+
+    async def _close_stream_with_billing(self) -> None:
+        try:
+            if self._outcome is None:
+                self._note_provider_billing_in_flight()
+        except Exception:
+            _logger.warning(
+                "reading billing while closing the provider stream failed", exc_info=True
             )
         finally:
-            await self._exit_admission()
+            await self._close_adapter_stream()
 
     async def _close_adapter_stream(self) -> None:
         """Close the provider connection and release admission even when closing raises."""
@@ -395,9 +408,9 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
             )
         try:
             return await self._next_item()
-        except StopAsyncIteration:
-            raise
         except BaseException as exc:
+            if isinstance(exc, StopAsyncIteration) and self._state == "open":
+                raise
             self._state = "finished"
             if self._outcome is not None or not isinstance(exc, Exception):
                 # Context exit records abandonment for cancellation without a stored outcome.
@@ -438,18 +451,18 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         `stage` names the stream step that failed in the transient error text.
         """
         self._state = "finished"
-        self._note_provider_billing_in_flight()
-        request_failure = await self._request_failure_exiting_admission(exc)
-        if request_failure.kind != "transient":
-            error = _terminal_generation_error(
-                request_failure.kind,
-                error_text=str(exc),
-                ledger=self._ledger,
-                request_params=self._request_params,
-                stream_opened=True,
-            )
-            error.__cause__ = exc
-        else:
+        try:
+            request_failure = await self._request_failure_exiting_admission(exc)
+            if request_failure.kind != "transient":
+                error = _terminal_generation_error(
+                    request_failure.kind,
+                    error_text=str(exc),
+                    ledger=self._ledger,
+                    request_params=self._request_params,
+                    stream_opened=True,
+                )
+                error.__cause__ = exc
+                return error
             wrapped = _transient_error_for(
                 exc, f"open stream failed during {stage}: {exc}", request_failure
             )
@@ -462,8 +475,9 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
                 request_provider_data=self._ledger.request_provider_data,
             )
             error.__cause__ = wrapped
-        await self._close_adapter_stream()
-        return error
+            return error
+        finally:
+            await self._close_adapter_stream()
 
     @overload
     async def final[CallOutputT](

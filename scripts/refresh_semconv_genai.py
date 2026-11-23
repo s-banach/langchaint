@@ -33,6 +33,7 @@ ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.tool.definitions": "gen-ai-tool-definitions.json",
     "gen_ai.input.messages": "gen-ai-input-messages.json",
     "gen_ai.output.messages": "gen-ai-output-messages.json",
+    "gen_ai.prompt.variables": "gen-ai-prompt-variables.json",
     "gen_ai.tool.call.arguments": "gen-ai-tool-call-arguments.json",
     "gen_ai.tool.call.result": "gen-ai-tool-call-result.json",
 }

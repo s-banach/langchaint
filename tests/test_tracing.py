@@ -1319,10 +1319,17 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         for span in exporter.get_finished_spans():
             assert span.attributes is not None
             for key, value in span.attributes.items():
+                assert _MARKER not in str(value), f"{span.name}: {key} leaks {_MARKER}"
                 if key in refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES:
                     recorded_content_keys.add(key)
-                    assert _MARKER not in str(value), f"{span.name}: {key} leaks {_MARKER}"
-        assert recorded_content_keys == set(refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES)
+        assert recorded_content_keys == {
+            "gen_ai.input.messages",
+            "gen_ai.output.messages",
+            "gen_ai.system_instructions",
+            "gen_ai.tool.call.arguments",
+            "gen_ai.tool.call.result",
+            "gen_ai.tool.definitions",
+        }
 
     run_with_timeout(scenario())
 

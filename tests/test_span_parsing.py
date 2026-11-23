@@ -157,13 +157,6 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
             assert entries_by_name[name] == selected
         else:
             entries_by_name[name] = selected
-    prompt_variable = entries_by_name.pop("gen_ai.prompt.variable")
-    assert prompt_variable == {
-        "value_type": "string",
-        "allowed_values": None,
-        "structured_schema": None,
-        "template_prefix": "gen_ai.prompt.variable.",
-    }
     expected_schemas = {
         name: f"model/gen-ai/{file_name}"
         for name, file_name in refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES.items()
@@ -178,7 +171,7 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
     assert all(entry["template_prefix"] is None for entry in entries_by_name.values())
     field_names_by_alias: dict[str, str] = {}
     for field_name, field in OtelChatSpan.model_fields.items():
-        if field_name not in {"prompt_variables", "unused_attributes"}:
+        if field_name != "unused_attributes":
             assert field.alias is not None
             field_names_by_alias[field.alias] = field_name
     assert set(entries_by_name) == set(field_names_by_alias)
@@ -258,7 +251,7 @@ def test_preserves_a_raw_additional_properties_property() -> None:
     assert part.additional_properties == {"additional_properties": {"vendor": 1}}
 
 
-def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
+def test_parses_content_references_and_preserves_unused_attributes() -> None:
     parsed = parse_otel_chat(
         _chat_span({
             "gen_ai.provider.name": "openai",
@@ -267,7 +260,6 @@ def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
             "gen_ai.system_instructions_ref": "s3://example/system.json",
             "gen_ai.tool.definitions_ref": "s3://example/tools.json",
             "gen_ai.prompt.variable.user_name": "Alice",
-            "langchain.x.y.z": 42,
         })
     )
     assert parsed.provider_name == "openai"
@@ -275,8 +267,8 @@ def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
     assert parsed.output_messages_ref == "s3://example/output.json"
     assert parsed.system_instructions_ref == "s3://example/system.json"
     assert parsed.tool_definitions_ref == "s3://example/tools.json"
-    assert parsed.prompt_variables == {"user_name": "Alice"}
-    assert parsed.unused_attributes == {"langchain.x.y.z": 42}
+    assert parsed.prompt_variables == {}
+    assert parsed.unused_attributes == {"gen_ai.prompt.variable.user_name": "Alice"}
 
 
 def test_rejects_malformed_structured_attribute_json() -> None:

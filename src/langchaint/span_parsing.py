@@ -51,7 +51,6 @@ from langchaint.generation.response import (
 from langchaint.tools import ToolManager, ToolSchema
 
 OPERATION_NAME = "gen_ai.operation.name"
-PROMPT_VARIABLE_PREFIX = "gen_ai.prompt.variable."
 SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
 TOOL_DEFINITIONS = "gen_ai.tool.definitions"
 INPUT_MESSAGES = "gen_ai.input.messages"
@@ -81,29 +80,32 @@ def _decode_semconv_attribute(name: str, value: JsonValue) -> object:
     return _JSON_VALUE_ADAPTER.validate_json(value)
 
 
-def _decode_span_attributes(
-    model: type[BaseModel], input_value: object
-) -> tuple[dict[str, object], dict[str, object]]:
-    """Decode every span attribute, and split the attributes named by an alias of a `model` field from the others."""
-    fixed_aliases = {
-        field.alias for field in model.model_fields.values() if field.alias is not None
-    }
-    span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
-    parsed_attributes: dict[str, object] = {}
-    other_attributes: dict[str, object] = {}
-    for name, value in span_attributes.items():
-        if name in fixed_aliases and value is None:
-            raise ValueError(f"a present OTel attribute cannot be null: {name}")
-        target = parsed_attributes if name in fixed_aliases else other_attributes
-        decoded = _decode_semconv_attribute(name, value)
-        if (
-            decoded is None
-            and name in (SYSTEM_INSTRUCTIONS, TOOL_DEFINITIONS, INPUT_MESSAGES, OUTPUT_MESSAGES)
-            and name in fixed_aliases
-        ):
-            raise ValueError(f"{name} must contain an array")
-        target[name] = decoded
-    return parsed_attributes, other_attributes
+class _OtelSpan(CheckedCopyModel):
+    unused_attributes: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _partition_span_attributes(cls, input_value: object) -> object:
+        aliases = {field.alias for field in cls.model_fields.values() if field.alias is not None}
+        span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
+        unused_attributes: dict[str, object] = {}
+        parsed_attributes: dict[str, object] = {"unused_attributes": unused_attributes}
+        for name, value in span_attributes.items():
+            decoded = _decode_semconv_attribute(name, value)
+            if name not in aliases:
+                unused_attributes[name] = decoded
+                continue
+            if value is None:
+                raise ValueError(f"a present OTel attribute cannot be null: {name}")
+            if decoded is None and name in (
+                SYSTEM_INSTRUCTIONS,
+                TOOL_DEFINITIONS,
+                INPUT_MESSAGES,
+                OUTPUT_MESSAGES,
+            ):
+                raise ValueError(f"{name} must contain an array")
+            parsed_attributes[name] = decoded
+        return parsed_attributes
 
 
 def _validate_draft_07_schema(value: JsonValue) -> JsonValue:
@@ -338,7 +340,7 @@ _MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
 )
 
 
-class OtelChatSpan(CheckedCopyModel):
+class OtelChatSpan(_OtelSpan):
     """Chat attributes from the committed OTel convention snapshot.
 
     Fields ending in `_ref` hold URIs identifying content in external storage.
@@ -362,7 +364,9 @@ class OtelChatSpan(CheckedCopyModel):
     output_messages_ref: str | None = Field(default=None, alias="gen_ai.output.messages_ref")
     output_type: str | None = Field(default=None, alias="gen_ai.output.type")
     prompt_name: str | None = Field(default=None, alias="gen_ai.prompt.name")
-    prompt_variables: dict[str, str] = Field(default_factory=dict)
+    prompt_variables: dict[str, JsonValue] = Field(
+        default_factory=dict, alias="gen_ai.prompt.variables"
+    )
     prompt_version: str | None = Field(default=None, alias="gen_ai.prompt.version")
     provider_name: str | None = Field(default=None, alias="gen_ai.provider.name")
     request_choice_count: int | None = Field(default=None, alias="gen_ai.request.choice.count")
@@ -465,23 +469,6 @@ class OtelChatSpan(CheckedCopyModel):
     openai_response_system_fingerprint: str | None = Field(
         default=None, alias="openai.response.system_fingerprint"
     )
-    unused_attributes: dict[str, JsonValue] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _partition_span_attributes(cls, input_value: object) -> object:
-        parsed_attributes, other_attributes = _decode_span_attributes(cls, input_value)
-        parsed_attributes["prompt_variables"] = {
-            name.removeprefix(PROMPT_VARIABLE_PREFIX): value
-            for name, value in other_attributes.items()
-            if name.startswith(PROMPT_VARIABLE_PREFIX)
-        }
-        parsed_attributes["unused_attributes"] = {
-            name: value
-            for name, value in other_attributes.items()
-            if not name.startswith(PROMPT_VARIABLE_PREFIX)
-        }
-        return parsed_attributes
 
 
 def _require_boolean_is_error(part: OtelToolCallResponsePart) -> OtelToolCallResponsePart:
@@ -496,7 +483,7 @@ type OtelToolCallResult = Annotated[
 ]
 
 
-class OtelExecuteToolSpan(CheckedCopyModel):
+class OtelExecuteToolSpan(_OtelSpan):
     """Execute-tool attributes from the committed OTel convention snapshot.
 
     `tool_call_arguments` and `tool_call_result` accept any JSON value, not only the object the snapshot declares.
@@ -515,14 +502,6 @@ class OtelExecuteToolSpan(CheckedCopyModel):
     tool_description: str | None = Field(default=None, alias="gen_ai.tool.description")
     tool_name: str | None = Field(default=None, alias="gen_ai.tool.name")
     tool_type: str | None = Field(default=None, alias="gen_ai.tool.type")
-    unused_attributes: dict[str, JsonValue] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _partition_span_attributes(cls, input_value: object) -> object:
-        parsed_attributes, other_attributes = _decode_span_attributes(cls, input_value)
-        parsed_attributes["unused_attributes"] = other_attributes
-        return parsed_attributes
 
 
 class OtelToLangchaintConversionError(ValueError):

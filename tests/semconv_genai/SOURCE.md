@@ -2,7 +2,7 @@
 
 Source repository: <https://github.com/open-telemetry/semantic-conventions-genai>.
 Tracked reference: `main`.
-Resolved commit SHA: `e6658f14c9d9ea0760825f029cb82e7673f48fab`.
+Resolved commit SHA: `ae8214a8f3a98786071736855093b74621174dc4`.
 Resolved Weaver version: `v0.28.0`.
 License: Apache-2.0.
 
@@ -19,6 +19,7 @@ Structured schemas are copied from these source paths:
 
 - `model/gen-ai/gen-ai-input-messages.json` for `gen_ai.input.messages`.
 - `model/gen-ai/gen-ai-output-messages.json` for `gen_ai.output.messages`.
+- `model/gen-ai/gen-ai-prompt-variables.json` for `gen_ai.prompt.variables`.
 - `model/gen-ai/gen-ai-system-instructions.json` for `gen_ai.system_instructions`.
 - `model/gen-ai/gen-ai-tool-call-arguments.json` for `gen_ai.tool.call.arguments`.
 - `model/gen-ai/gen-ai-tool-call-result.json` for `gen_ai.tool.call.result`.

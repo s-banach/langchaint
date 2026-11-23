@@ -8,14 +8,14 @@ Every later line is a `_RecordLine`, and the last line for an input index holds 
 import asyncio
 import os
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Literal, overload
 
-from pydantic import ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
@@ -97,6 +97,44 @@ def _reuses[OutputT](outcome_record: GenerationOutcomeRecord[OutputT]) -> bool:
     Retry exhaustion, a timeout, and an auth failure can end differently when sent again.
     """
     return outcome_record.kind not in ("retries_exhausted_error", "timed_out_error", "auth_error")
+
+
+@overload
+def read_generation_outcome_records(resume_path: Path) -> list[GenerationOutcomeRecord[str]]: ...
+
+
+@overload
+def read_generation_outcome_records[OutputT: str | BaseModel](
+    resume_path: Path, *, response_format: type[OutputT]
+) -> list[GenerationOutcomeRecord[OutputT]]: ...
+
+
+def read_generation_outcome_records(
+    resume_path: Path, *, response_format: type[str] | type[BaseModel] = str
+) -> Sequence[GenerationOutcomeRecord[str | BaseModel]]:
+    """Read the saved records from an `LLM.generate_many_records` resume file in input order.
+
+    Each input contributes its last newline-terminated record, including errors that generation would retry.
+    Inputs without a saved record are omitted.
+    For structured output, pass the Pydantic model used as the binding's `response_format`.
+
+    Raises:
+        TypeError: `response_format` is a proper subclass of `str`.
+        pydantic.PydanticUserError: `response_format` is not fully defined when a complete record line is validated.
+        FileNotFoundError: The resume file does not exist.
+        OSError: The resume file cannot be read.
+        ValueError: The header is invalid or specifies an unsupported format.
+        ValueError: A complete record line is invalid for the header or `response_format`.
+    """
+    if response_format is not str and not issubclass(response_format, BaseModel):
+        raise TypeError(
+            f"response_format must be str or a pydantic.BaseModel subclass, got {response_format!r}"
+        )
+    header, record_lines_bytes = _read_resume_header(resume_path)
+    records = _records_by_input_index(
+        resume_path, header, record_lines_bytes, _RecordLine[response_format]
+    )
+    return [records[input_index] for input_index in sorted(records)]
 
 
 def prepare_resume_file[OutputT](
@@ -194,6 +232,33 @@ def _stored_input_index_by_input_index(
     }
 
 
+def _read_resume_header(resume_path: Path) -> tuple[_ResumeHeader, bytes]:
+    header_json, _, record_lines_bytes = resume_path.read_bytes().partition(b"\n")
+    try:
+        return _ResumeHeader.model_validate_json(header_json), record_lines_bytes
+    except ValidationError as error:
+        raise ValueError(f"{resume_path} is not a valid resume file") from error
+
+
+def _records_by_input_index[OutputT](
+    resume_path: Path,
+    header: _ResumeHeader,
+    record_lines_bytes: bytes,
+    record_line_type: type[_RecordLine[OutputT]],
+) -> dict[int, GenerationOutcomeRecord[OutputT]]:
+    *record_line_jsons, _ = record_lines_bytes.split(b"\n")
+    records: dict[int, GenerationOutcomeRecord[OutputT]] = {}
+    for record_line_json in record_line_jsons:
+        try:
+            record_line = record_line_type.model_validate_json(record_line_json)
+        except ValidationError as error:
+            raise ValueError(f"{resume_path} has an invalid resume record line") from error
+        if record_line.input_index >= len(header.input_fingerprints):
+            raise ValueError(f"{resume_path} has a resume record for an input outside its header")
+        records[record_line.input_index] = record_line.outcome_record
+    return records
+
+
 def _reused_record_by_input_index[OutputT](
     *,
     resume_path: Path,
@@ -209,35 +274,17 @@ def _reused_record_by_input_index[OutputT](
         ValueError: The first line is not a valid `_ResumeHeader`, or a record line of a matched file is invalid.
     """
     try:
-        file_bytes = resume_path.read_bytes()
+        stored_header, record_lines_bytes = _read_resume_header(resume_path)
     except FileNotFoundError:
         return {}
-    header_json, _, record_lines_bytes = file_bytes.partition(b"\n")
-    *record_line_jsons, _ = record_lines_bytes.split(b"\n")
-    try:
-        stored_header = _ResumeHeader.model_validate_json(header_json)
-    except ValidationError as error:
-        raise ValueError(f"{resume_path} is not a valid resume file") from error
     stored_input_index_by_input_index = _stored_input_index_by_input_index(
         stored=stored_header, current=header
     )
     if not stored_input_index_by_input_index:
         return {}
-    try:
-        record_lines = tuple(
-            record_line_type.model_validate_json(record_line_json)
-            for record_line_json in record_line_jsons
-        )
-    except ValidationError as error:
-        raise ValueError(f"{resume_path} has an invalid resume record line") from error
-    if any(
-        record_line.input_index >= len(stored_header.input_fingerprints)
-        for record_line in record_lines
-    ):
-        raise ValueError(f"{resume_path} has a resume record for an input outside its header")
-    outcome_record_by_stored_input_index = {
-        record_line.input_index: record_line.outcome_record for record_line in record_lines
-    }
+    outcome_record_by_stored_input_index = _records_by_input_index(
+        resume_path, stored_header, record_lines_bytes, record_line_type
+    )
     return {
         input_index: outcome_record
         for input_index, stored_input_index in stored_input_index_by_input_index.items()

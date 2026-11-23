@@ -42,6 +42,7 @@ from langchaint import (
     Usage,
     UserMessage,
     llm_from_adapter,
+    read_generation_outcome_records,
 )
 from langchaint.adapter import (
     ContextWindowExceeded,
@@ -60,7 +61,7 @@ from langchaint.adapter import (
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
 from langchaint.embedding_requests import EmbeddingRequestRecord, EmbeddingRequestStart
-from langchaint.generation._generate_many_records import _ResumeHeader
+from langchaint.generation._generate_many_records import _RecordLine, _ResumeHeader
 from langchaint.generation.llm import WorkingTimeDeadline
 from langchaint.generation.observer import GenerationStart
 from langchaint.generation.streaming import StreamHandle
@@ -1339,6 +1340,37 @@ def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_pa
         assert resumed_adapter.bound_adapters[0].open_count == 0
 
     run_with_timeout(scenario())
+
+
+def test_read_generation_outcome_records_returns_saved_records_in_input_order(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeAdapter(
+        scripted_requests=[billed(_STRUCTURED_FINAL_RESPONSE), TransientError("x")]
+    )
+    llm = llm_from_adapter(adapter, response_format=_Answer, max_requests=1)
+    first, third = run_with_timeout(llm.generate_many_records(["a", "c"], warm_cache=True))
+    resume_path = tmp_path / "records.jsonl"
+    header = _ResumeHeader(
+        config_fingerprint="config", input_ids=None, input_fingerprints=("a", "b", "c")
+    )
+    lines = (
+        header.model_dump_json(),
+        _RecordLine[_Answer](input_index=2, outcome_record=third).model_dump_json(),
+        _RecordLine[_Answer](input_index=0, outcome_record=third).model_dump_json(),
+        _RecordLine[_Answer](input_index=0, outcome_record=first).model_dump_json(),
+    )
+    resume_text = "\n".join(lines) + "\n{"
+    _ = resume_path.write_text(resume_text)
+
+    saved_first, saved_third = read_generation_outcome_records(
+        resume_path, response_format=_Answer
+    )
+    assert saved_first.kind == "plain"
+    assert saved_first.output == _Answer(value=7)
+    assert saved_third.kind == "retries_exhausted_error"
+    assert saved_third == third
+    assert resume_path.read_text() == resume_text
 
 
 def test_generate_many_records_uses_one_background_thread_for_resume_io(

@@ -25,12 +25,14 @@ from langchaint import (
     ToolManager,
     ToolSequence,
     llm_from_adapter,
+    read_generation_outcome_records,
 )
 from langchaint.openai import OPENAI_PRICING, OpenAI, OpenAIBedrock, OpenAIPricingTable
 from langchaint.span_parsing import OtelChatSpan, llm_from_otel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from langchaint.adapter import Adapter
     from langchaint.anthropic import Anthropic, AnthropicBedrock
@@ -40,6 +42,14 @@ if TYPE_CHECKING:
 
 class Answer(BaseModel):
     value: int
+
+
+def read_records(resume_path: Path) -> None:
+    assert_type(read_generation_outcome_records(resume_path), list[GenerationOutcomeRecord[str]])
+    assert_type(
+        read_generation_outcome_records(resume_path, response_format=Answer),
+        list[GenerationOutcomeRecord[Answer]],
+    )
 
 
 def error_stop_reason(error: GenerationError, record: PlainErrorRecord) -> None:

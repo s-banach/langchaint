@@ -49,6 +49,7 @@ from langchaint.embedding_requests import (
     EmbeddingRequestRecord,
     EmbeddingUsage,
 )
+from langchaint.generation._generate_many_records import read_generation_outcome_records
 from langchaint.generation.errors import (
     GenerationError,
     GenerationErrorKind,
@@ -225,6 +226,7 @@ __all__ = [
     "llm_from_adapter",
     "messages_from_json",
     "messages_to_json",
+    "read_generation_outcome_records",
     "run_many",
     "to_tables",
     "tool",

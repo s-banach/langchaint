@@ -22,7 +22,7 @@ anthropic = ["anthropic>=2.0.0"]
 anthropic-bedrock = ["anthropic[bedrock]>=2.0.0"]
 cohere-bedrock = ["boto3>=1.42", "numpy>=2.5.0"]
 deepseek = ["openai>=3.0.0"]
-gemini = ["google-genai>=3.0.0"]
+gemini = ["google-genai>=3.4.0"]
 openai = ["openai>=3.0.0"]
 openai-embedding = ["numpy>=2.5.0", "openai>=3.0.0", "tiktoken>=0.13.0"]
 openai-bedrock = ["openai[bedrock]>=3.0.0"]
@@ -50,7 +50,7 @@ dev = [
     # jsonschema ships no stubs, so its callers in tools.py go unchecked without these.
     "types-jsonschema>=4.26.0.20260518",
     "typos>=1.48.0",
-    "google-genai>=3.0.0",
+    "google-genai>=3.4.0",
     "boto3>=1.42",
     "boto3-stubs[bedrock-runtime]>=1.42",
     "tiktoken>=0.13.0",
@@ -76,13 +76,7 @@ protected-access = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["examples/full_app"]
-filterwarnings = [
-    "error",
-    # google-genai emits this warning during import on Python 3.14 and newer.
-    "ignore:'_UnionGenericAlias' is deprecated and slated for removal in Python 3\\.17$:DeprecationWarning:google\\.genai\\.types",
-    # google-genai 3.0.0 has an invalid escape sequence in types.py: https://github.com/googleapis/python-genai/issues/3308
-    'ignore:(invalid escape sequence .\\/.|"\\/" is an invalid escape sequence):SyntaxWarning',
-]
+filterwarnings = ["error"]
 
 [tool.coverage.run]
 branch = true

@@ -35,6 +35,7 @@ from langchaint import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    without_schema_titles,
 )
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
@@ -695,7 +696,7 @@ def test_structured_bind_sends_the_response_schema() -> None:
     assert request.config == types.GenerateContentConfig(
         automatic_continuation=False,
         response_mime_type="application/json",
-        response_json_schema=TypeAdapter(_Answer).json_schema(),
+        response_json_schema=without_schema_titles(TypeAdapter(_Answer).json_schema()),
         http_options=_NO_SDK_RETRIES,
     )
 

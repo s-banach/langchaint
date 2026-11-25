@@ -39,7 +39,7 @@ from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from langchaint import (
     AllowedToolsChoice,
@@ -1011,9 +1011,14 @@ def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_refere
     }
 
 
-class _StructuredReport(BaseModel):
+class _WeatherReading(BaseModel):
     city: str
     celsius: int
+
+
+class _StructuredReport(BaseModel):
+    current: _WeatherReading = Field(title="Current conditions")
+    previous: _WeatherReading
 
 
 def test_the_structured_request_sends_a_strict_response_schema() -> None:
@@ -1033,7 +1038,26 @@ def test_the_structured_request_sends_a_strict_response_schema() -> None:
                 "type": "json_schema",
                 "strict": True,
                 "name": "_StructuredReport",
-                "schema": _StructuredReport.model_json_schema() | {"additionalProperties": False},
+                "schema": {
+                    "$defs": {
+                        "_WeatherReading": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "celsius": {"type": "integer"},
+                            },
+                            "required": ["city", "celsius"],
+                            "additionalProperties": False,
+                        }
+                    },
+                    "type": "object",
+                    "properties": {
+                        "current": {"$ref": "#/$defs/_WeatherReading"},
+                        "previous": {"$ref": "#/$defs/_WeatherReading"},
+                    },
+                    "required": ["current", "previous"],
+                    "additionalProperties": False,
+                },
             }
         },
     }

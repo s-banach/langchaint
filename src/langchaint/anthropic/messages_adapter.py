@@ -89,6 +89,7 @@ from langchaint.billing.pricing import (
     require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.json_schema import without_schema_titles
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -1183,7 +1184,9 @@ class AnthropicMessagesAdapter(Adapter):
         """
         precomputed_fields = self._precompute_fields(binding)
         output_format: JSONOutputFormatParam = {
-            "schema": transform_schema(TypeAdapter(response_format).json_schema()),
+            "schema": transform_schema(
+                without_schema_titles(TypeAdapter(response_format).json_schema())
+            ),
             "type": "json_schema",
         }
         bound_output_config = precomputed_fields.output_config

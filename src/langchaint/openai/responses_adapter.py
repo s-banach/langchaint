@@ -7,7 +7,7 @@ from typing import Literal, cast, override
 import httpx2
 import openai
 from openai import AsyncOpenAI, Omit, omit
-from openai.lib._parsing._responses import type_to_text_format_param
+from openai.lib._pydantic import _ensure_strict_json_schema
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
@@ -70,6 +70,7 @@ from langchaint.billing.pricing import (
     require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.json_schema import without_schema_titles
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -769,18 +770,24 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         """Bind for structured output in response_format without I/O.
 
-        `type_to_text_format_param` matches `responses.parse(text_format=...)`.
-
         Raises:
             ValueError: `binding` contains unsupported values.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
+        schema = without_schema_titles(response_format.model_json_schema())
         return _BoundOpenAIResponses(
             adapter=self,
             precomputed_fields=replace(
                 self._precompute_fields(binding),
-                text={"format": type_to_text_format_param(response_format)},
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": response_format.__name__,
+                        "strict": True,
+                        "schema": _ensure_strict_json_schema(schema, path=(), root=schema),
+                    }
+                },
             ),
         )
 

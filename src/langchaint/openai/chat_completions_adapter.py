@@ -61,6 +61,7 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import ProviderBilling, billing_at_rates
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.json_schema import without_schema_titles
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -522,7 +523,7 @@ def _wire_response_format(response_format: type[BaseModel]) -> ResponseFormatJSO
     """
     json_schema: JSONSchema = {
         "name": response_format.__name__,
-        "schema": response_format.model_json_schema(),
+        "schema": without_schema_titles(response_format.model_json_schema()),
         "strict": False,
     }
     return {"type": "json_schema", "json_schema": json_schema}

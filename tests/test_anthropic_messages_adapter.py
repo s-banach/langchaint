@@ -1646,10 +1646,9 @@ def test_the_structured_request_merges_the_schema_into_the_output_config() -> No
             "schema": {
                 "type": "object",
                 "description": "A city's temperature in degrees Celsius.",
-                "title": "_StructuredReport",
                 "properties": {
-                    "city": {"type": "string", "title": "City"},
-                    "celsius": {"type": "integer", "title": "Celsius"},
+                    "city": {"type": "string"},
+                    "celsius": {"type": "integer"},
                 },
                 "additionalProperties": False,
                 "required": ["city", "celsius"],

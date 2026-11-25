@@ -43,6 +43,7 @@ from langchaint.billing.pricing import (
     require_stated_rate,
 )
 from langchaint.common.exceptions import StreamProtocolError
+from langchaint.common.json_schema import without_schema_titles
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -1128,7 +1129,8 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         config, provider_executed_tool_fields = self._bound_config(
-            binding, response_json_schema=TypeAdapter(response_format).json_schema()
+            binding,
+            response_json_schema=without_schema_titles(TypeAdapter(response_format).json_schema()),
         )
         return _BoundGemini(
             adapter=self,

@@ -33,6 +33,7 @@ from langchaint import (
     ToolChoice,
     ToolMessage,
     UserMessage,
+    without_schema_titles,
 )
 from langchaint.adapter import (
     Adapter,
@@ -1076,7 +1077,7 @@ def test_structured_request_sends_the_non_strict_json_schema_response_format() -
             "type": "json_schema",
             "json_schema": {
                 "name": "_StructuredReport",
-                "schema": _StructuredReport.model_json_schema(),
+                "schema": without_schema_titles(_StructuredReport.model_json_schema()),
                 "strict": False,
             },
         },

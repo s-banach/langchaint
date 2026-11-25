@@ -847,6 +847,8 @@ class Adapter(ABC):
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         """Bind for structured output in `response_format`.
 
+        The built-in adapters omit JSON Schema `title` annotations before provider-specific schema conversion.
+
         Args:
             binding: The provider-neutral binding.
             response_format: The pydantic model whose JSON schema the request asks for.

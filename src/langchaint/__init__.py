@@ -20,6 +20,7 @@ from langchaint.adapter import (
 )
 from langchaint.billing.pricing import Billing, LongContextPricing, TokenRates
 from langchaint.billing.usage import ZERO_USAGE, Usage
+from langchaint.common.json_schema import without_schema_titles
 from langchaint.common.messages import (
     AssistantMessage,
     AssistantPart,
@@ -230,4 +231,5 @@ __all__ = [
     "run_many",
     "to_tables",
     "tool",
+    "without_schema_titles",
 ]

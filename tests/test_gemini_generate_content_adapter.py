@@ -22,6 +22,7 @@ from langchaint import (
     AudioPart,
     Billing,
     ContentPart,
+    GenerationError,
     ImagePart,
     ImageUrlPart,
     LongContextPricing,
@@ -35,6 +36,7 @@ from langchaint import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    llm_from_adapter,
     without_schema_titles,
 )
 from langchaint.adapter import (
@@ -713,6 +715,17 @@ def test_service_tier_is_sent_and_fingerprinted() -> None:
 
 
 # --- build_request_params ---
+
+
+def test_built_request_keeps_the_generation_config_it_validated() -> None:
+    generation_config = {"topK": 5}
+    bound = _adapter().bind_text(_binding(extra_body={"generation_config": generation_config}))
+    messages = [UserMessage(content="hi")]
+    request = bound.build_request_params(messages)
+    assert isinstance(request, _GeminiRequestParams)
+    generation_config["candidateCount"] = 2
+    assert json.loads(request.as_json())["extra_body"] == {"generation_config": {"topK": 5}}
+    assert isinstance(bound.build_request_params(messages), RejectedMessages)
 
 
 def test_user_message_forms() -> None:
@@ -1488,6 +1501,39 @@ _TWO_CHUNK_SSE_BODY = (
     b' "finishReason": "STOP"}]}\r\n\r\n'
 )
 """A streamGenerateContent server-sent-event body of two chunks, the second carrying finishReason STOP."""
+
+
+def test_gemini_sends_the_extra_body_its_fingerprint_identifies() -> None:
+    sent: list[str] = []
+
+    def serve(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content)["cachedContent"])
+        return httpx2.Response(
+            200, content=_TWO_CHUNK_SSE_BODY, headers={"content-type": "text/event-stream"}
+        )
+
+    async def scenario() -> None:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(serve)) as http_client:
+            client = genai.Client(
+                api_key="offline",
+                vertexai=False,
+                http_options=types.HttpOptions(httpx_async_client=http_client),
+            )
+            extra_body = {"cachedContent": "cachedContents/A"}
+            llm = llm_from_adapter(_adapter(client=client), extra_body=extra_body)
+            initial = llm.config_fingerprint()
+            extra_body["cachedContent"] = "cachedContents/B"
+            assert llm.config_fingerprint() != initial
+            assert (await llm.generate_one("hi")).output == "hey"
+            assert sent == ["cachedContents/B"]
+
+            extra_body["systemInstruction"] = "override"
+            with pytest.raises(GenerationError, match="systemInstruction") as caught:
+                _ = await llm.generate_one("hi")
+            assert caught.value.kind == "rejected_error"
+            assert len(sent) == 1
+
+    run_with_timeout(scenario())
 
 
 def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:

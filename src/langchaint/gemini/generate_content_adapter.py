@@ -797,10 +797,10 @@ def _is_list(value: object) -> TypeIs[list[object]]:
     return isinstance(value, list)
 
 
-def _reject_extra_body_keys(
+def _validated_extra_body(
     extra_body: Mapping[str, object] | None, *, reasoning_level: str | None
-) -> None:
-    """Refuse the extra_body values that would override the binding or that the adapter cannot read.
+) -> dict[str, object] | None:
+    """Copy the top-level and generationConfig fields that Gemini validates for each input.
 
     The SDK recursively merges extra_body into the wire body.
     extra_body wins matched terminal keys.
@@ -814,21 +814,10 @@ def _reject_extra_body_keys(
         ValueError: generationConfig sets candidateCount to a value other than 1 or None.
     """
     if extra_body is None:
-        return
-    generation_configs: list[Mapping[str, object]] = []
-    for key, nested in extra_body.items():
-        if _normalized_wire_key(key) != "generationconfig":
-            continue
-        # `Adapter.bind_text` requires `ValueError` for binding defects.
-        if not _is_mapping(nested):
-            raise ValueError(
-                f"extra_body key {key!r} must map to an object: the SDK merge would substitute a non-object value for the generationConfig fields the adapter populates"
-            )
-        if not _has_only_string_keys(nested):
-            raise ValueError(f"extra_body key {key!r} must map to an object with only string keys")
-        generation_configs.append(nested)
+        return None
+    body = dict(extra_body)
     reject_extra_body_keys_the_adapter_populates(
-        extra_body,
+        body,
         populated_keys=_ADAPTER_POPULATED_TOP_LEVEL_WIRE_KEYS,
         normalized_key=_normalized_wire_key,
     )
@@ -837,7 +826,16 @@ def _reject_extra_body_keys(
         if reasoning_level is None
         else _ADAPTER_POPULATED_GENERATION_CONFIG_KEYS | {"thinkingconfig"}
     )
-    for generation_config in generation_configs:
+    for key, nested in body.items():
+        if _normalized_wire_key(key) != "generationconfig":
+            continue
+        if not _is_mapping(nested):
+            raise ValueError(
+                f"extra_body key {key!r} must map to an object: the SDK merge would substitute a non-object value for the generationConfig fields the adapter populates"
+            )
+        generation_config = dict(nested)
+        if not _has_only_string_keys(generation_config):
+            raise ValueError(f"extra_body key {key!r} must map to an object with only string keys")
         reject_extra_body_keys_the_adapter_populates(
             generation_config,
             populated_keys=populated_generation_config_keys,
@@ -851,6 +849,8 @@ def _reject_extra_body_keys(
                 "generationConfig candidateCount must be 1, None, or absent, because GeminiGenerateContentAdapter reads one candidate per response. "
                 "Pass the input once per candidate."
             )
+        body[key] = generation_config
+    return body
 
 
 def _retry_after_seconds_from_retry_info(details: object) -> float | None:
@@ -983,12 +983,12 @@ class GeminiGenerateContentAdapter(Adapter):
         """Return stored request configuration outside `Binding`."""
         return {"service_tier": self.service_tier}
 
-    def _bound_config(
+    def _bind(
         self, binding: Binding, *, response_json_schema: dict[str, object] | None
-    ) -> tuple[types.GenerateContentConfig, frozenset[str]]:
-        """Convert one binding to its shared `GenerateContentConfig`.
+    ) -> BoundAdapter:
+        """Prepare the Gemini configuration shared by every input.
 
-        Every config disables SDK retries and automatic continuation so each admitted request sends one HTTP request.
+        Disabling automatic continuation keeps the SDK from sending follow-up requests.
         google-genai 3.0.0 enables automatic continuation by default.
         Structured configs send `response_json_schema` with `response_mime_type="application/json"`.
         Caches selected through `extra_body["cachedContent"]` must not declare tools.
@@ -1001,7 +1001,7 @@ class GeminiGenerateContentAdapter(Adapter):
             ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A bound charged tool has no stated price.
         """
-        _reject_extra_body_keys(binding.extra_body, reasoning_level=binding.reasoning_level)
+        _ = _validated_extra_body(binding.extra_body, reasoning_level=binding.reasoning_level)
         if not binding.parallel_tool_calls:
             raise ValueError(
                 "Gemini generateContent cannot disable parallel function calls with parallel_tool_calls=False"
@@ -1071,9 +1071,10 @@ class GeminiGenerateContentAdapter(Adapter):
                 thinking_level=thinking_level,
                 include_thoughts=True,
             )
-        # `HttpOptions.extra_body` requires a `dict`, and the copied values retain their identities.
-        return (
-            types.GenerateContentConfig(
+        return _BoundGemini(
+            adapter=self,
+            binding=binding,
+            config=types.GenerateContentConfig(
                 automatic_continuation=False,
                 system_instruction=system_instruction,
                 tools=tools,
@@ -1088,14 +1089,8 @@ class GeminiGenerateContentAdapter(Adapter):
                 if response_json_schema is not None
                 else None,
                 response_json_schema=response_json_schema,
-                http_options=types.HttpOptions(
-                    retry_options=types.HttpRetryOptions(attempts=1),
-                    extra_body=dict(binding.extra_body)
-                    if binding.extra_body is not None
-                    else None,
-                ),
             ),
-            provider_executed_tool_fields,
+            provider_executed_tool_fields=provider_executed_tool_fields,
         )
 
     @override
@@ -1106,14 +1101,7 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.ValidationError: A provider-executed tool is invalid.
             ValueError: `binding` contains unsupported values.
         """
-        config, provider_executed_tool_fields = self._bound_config(
-            binding, response_json_schema=None
-        )
-        return _BoundGemini(
-            adapter=self,
-            config=config,
-            provider_executed_tool_fields=provider_executed_tool_fields,
-        )
+        return self._bind(binding, response_json_schema=None)
 
     @override
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
@@ -1128,14 +1116,9 @@ class GeminiGenerateContentAdapter(Adapter):
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        config, provider_executed_tool_fields = self._bound_config(
+        return self._bind(
             binding,
             response_json_schema=without_schema_titles(TypeAdapter(response_format).json_schema()),
-        )
-        return _BoundGemini(
-            adapter=self,
-            config=config,
-            provider_executed_tool_fields=provider_executed_tool_fields,
         )
 
     @override
@@ -1419,10 +1402,12 @@ class _BoundGemini(BoundAdapter):
         self,
         *,
         adapter: GeminiGenerateContentAdapter,
+        binding: Binding,
         config: types.GenerateContentConfig,
         provider_executed_tool_fields: frozenset[str],
     ) -> None:
         self._adapter = adapter
+        self._binding = binding
         self._config = config
         self._provider_executed_tool_fields = provider_executed_tool_fields
 
@@ -1461,13 +1446,21 @@ class _BoundGemini(BoundAdapter):
     def build_request_params(
         self, messages: Sequence[Message]
     ) -> RequestParams | RejectedMessages:
-        """Convert messages under the binding's config."""
+        """Build the input's request using the current `extra_body`."""
         contents = _request_contents(messages)
         if isinstance(contents, RejectedMessages):
             return contents
-        return _GeminiRequestParams(
-            model=self._adapter.model, config=self._config, contents=contents
+        try:
+            extra_body = _validated_extra_body(
+                self._binding.extra_body, reasoning_level=self._binding.reasoning_level
+            )
+        except ValueError as exc:
+            return RejectedMessages(error_text=str(exc))
+        config = self._config.model_copy()
+        config.http_options = types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1), extra_body=extra_body
         )
+        return _GeminiRequestParams(model=self._adapter.model, config=config, contents=contents)
 
     @override
     async def open_stream(

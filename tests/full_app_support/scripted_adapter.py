@@ -131,11 +131,6 @@ class ScriptedAdapter(Adapter):
         }
 
     @override
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return the scripted adapter's stored request configuration."""
-        return {}
-
-    @override
     def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind to the script named by the system prompt.
 
@@ -188,6 +183,15 @@ class _ScriptedBoundAdapter(BoundAdapter):
         self._adapter = adapter
         self._system_prompt = system_prompt
         self._tool_choice = tool_choice
+        self._model = adapter.model
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        return {
+            "model": self._model,
+            "system_prompt": self._system_prompt,
+            "tool_choice": TypeAdapter(ToolChoice).dump_python(self._tool_choice),
+        }
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:

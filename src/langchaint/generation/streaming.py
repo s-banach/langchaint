@@ -81,6 +81,8 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         *,
         adapter: Adapter,
         bound_adapter: BoundAdapter,
+        provider_name: str | None = None,
+        model: str | None = None,
         read_output: OutputReader[OutputT],
         messages: Sequence[Message],
         shared_backoff: SharedBackoff,
@@ -94,8 +96,10 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         """Prepare the input without opening a request.
 
         Args:
-            adapter: The provider adapter for request metadata and failure handling.
+            adapter: The provider adapter for failure handling.
             bound_adapter: The bound adapter for request construction and response handling.
+            provider_name: The provider name captured at bind time. Defaults to the adapter's provider name.
+            model: The model captured at bind time. Defaults to the adapter's model.
             read_output: The reader of the binding's output.
             messages: The messages to send.
             shared_backoff: Shared admission and backoff for the rate-limit quota.
@@ -110,6 +114,8 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
         ) = None
         self._adapter = adapter
         self._bound_adapter = bound_adapter
+        self._provider_name = adapter.provider_name if provider_name is None else provider_name
+        self._model = adapter.model if model is None else model
         self._read_output = read_output
         self._messages = messages
         self._shared_backoff = shared_backoff
@@ -170,9 +176,7 @@ class StreamHandle[OutputT, ToolCallGenerationT: ToolCallGeneration = Never]:
 
     async def _open(self) -> None:
         self._state = "open"
-        self._ledger = _RequestLedger(
-            model=self._adapter.model, provider_name=self._adapter.provider_name
-        )
+        self._ledger = _RequestLedger(model=self._model, provider_name=self._provider_name)
         self._timeout_scope = asyncio.timeout(self._timeout_seconds)
         await self._timeout_scope.__aenter__()
         try:

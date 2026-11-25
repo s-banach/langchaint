@@ -491,11 +491,19 @@ def _adapter(
     )
 
 
-def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
+def test_config_fingerprint_data_uses_the_bound_chat_completions_fields() -> None:
     adapter = _adapter(supports_prompt_cache_options=False, service_tier="priority")
-    assert adapter.config_fingerprint_data() == {
+    bound_adapter = adapter.bind_text(
+        _binding(system_prompt="sys", reasoning_level="high", extra_body={})
+    )
+    adapter.model = "other"
+    adapter.service_tier = "flex"
+    assert bound_adapter.config_fingerprint_data() == {
+        "model": "m",
+        "messages_prefix": [{"role": "system", "content": "sys"}],
+        "reasoning_effort": "high",
         "service_tier": "priority",
-        "supports_prompt_cache_options": False,
+        "extra_body": None,
     }
 
 
@@ -1046,22 +1054,26 @@ def _request_body_sent(
     return decoded_body
 
 
-def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> None:
-    extra_body = {"safety_identifier": "user-7"}
-
-    def bind_then_edit_extra_body(
-        adapter: OpenAIChatCompletionsAdapter,
-    ) -> BoundAdapter:
-        bound_adapter = adapter.bind_text(_binding(extra_body=extra_body))
-        extra_body["safety_identifier"] = "user-8"
+def test_the_text_request_sends_the_bound_system_prompt_and_extra_body() -> None:
+    def bind(adapter: OpenAIChatCompletionsAdapter) -> BoundAdapter:
+        metadata = {"user": "user-7"}
+        bound_adapter = adapter.bind_text(
+            _binding(system_prompt="sys", extra_body={"metadata": metadata})
+        )
+        metadata["user"] = "user-8"
+        request = bound_adapter.build_request_params([])
+        assert isinstance(request, _OpenAIChatCompletionsRequestParams)
+        system_message = request.messages[0]
+        assert system_message["role"] == "system"
+        system_message["content"] = "edited"
         return bound_adapter
 
-    assert _request_body_sent(bind_then_edit_extra_body) == {
+    assert _request_body_sent(bind) == {
         "model": "m",
-        "messages": [{"role": "user", "content": "q"}],
+        "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
         "stream": True,
         "stream_options": {"include_usage": True},
-        "safety_identifier": "user-8",
+        "metadata": {"user": "user-7"},
     }
 
 

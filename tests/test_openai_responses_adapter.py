@@ -1,6 +1,7 @@
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, override
 
@@ -45,6 +46,7 @@ from langchaint import (
     AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
+    GenerationError,
     ImagePart,
     ImageUrlPart,
     Message,
@@ -703,20 +705,36 @@ def _adapter(
     )
 
 
-def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
-    adapter = OpenAIResponsesAdapter(
-        client=AsyncOpenAI(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="openai",
-        supports_prompt_cache_options=False,
-        reasoning_summary="detailed",
-        service_tier="ultrafast",
+def test_config_fingerprint_data_uses_the_bound_responses_fields() -> None:
+    adapter = _adapter(
+        supports_prompt_cache_options=False, reasoning_summary="detailed", service_tier="ultrafast"
     )
-    assert adapter.config_fingerprint_data() == {
-        "reasoning_summary": "detailed",
+    bound_adapter = adapter.bind_text(
+        _binding(
+            automatic_cache_breakpoints=True,
+            system_prompt="sys",
+            extra_body={"metadata": openai.omit, "safety_identifier": openai.not_given},
+            provider_executed_tools=(
+                {
+                    "type": "web_search",
+                    "search_context_size": openai.omit,
+                    "user_location": {"type": "approximate", "country": openai.not_given},
+                },
+            ),
+        )
+    )
+    adapter.reasoning_summary = "concise"
+    assert bound_adapter.config_fingerprint_data() == {
+        "model": "m",
+        "instructions": "sys",
+        "input_prefix": [],
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {"summary": "detailed"},
         "service_tier": "ultrafast",
-        "supports_prompt_cache_options": False,
+        "tools": [{"type": "web_search", "user_location": {"type": "approximate"}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "extra_body": None,
     }
 
 
@@ -817,7 +835,6 @@ def test_a_request_under_a_default_binding_omits_every_unstated_field() -> None:
             "input_prefix": [],
             "include": ["reasoning.encrypted_content"],
             "extra_body": None,
-            "charged_provider_executed_tools": False,
         },
         "input": [{"role": "user", "content": "hi"}],
     }
@@ -990,25 +1007,71 @@ def _request_body_sent(
     return decoded_body
 
 
-def test_the_request_body_carries_the_reasoning_include_and_extra_body_by_reference() -> None:
-    extra_body = {"safety_identifier": "user-7"}
-
-    def bind_then_edit_extra_body(adapter: OpenAIResponsesAdapter) -> BoundAdapter:
+def test_the_request_sends_the_bound_tools_include_and_extra_body() -> None:
+    def bind(adapter: OpenAIResponsesAdapter) -> BoundAdapter:
+        vector_store_ids = ["store-1"]
+        extra_body = {"safety_identifier": "user-7"}
         bound_adapter = adapter.bind_text(
-            _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
+            _binding(
+                automatic_cache_breakpoints=True,
+                provider_executed_tools=(
+                    {"type": "file_search", "vector_store_ids": vector_store_ids},
+                ),
+                extra_body=extra_body,
+            )
         )
+        vector_store_ids.clear()
         extra_body["safety_identifier"] = "user-8"
+        request = bound_adapter.build_request_params([])
+        assert isinstance(request, _OpenAIResponsesRequestParams)
+        request.precomputed.include.clear()
         return bound_adapter
 
-    assert _request_body_sent(bind_then_edit_extra_body) == {
+    assert _request_body_sent(bind) == {
         "model": "m",
         "instructions": None,
         "input": [{"role": "user", "content": "q"}],
         "include": ["reasoning.encrypted_content"],
+        "tools": [{"type": "file_search", "vector_store_ids": ["store-1"]}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
         "store": False,
         "stream": True,
-        "safety_identifier": "user-8",
+        "safety_identifier": "user-7",
     }
+
+
+def test_extra_body_fingerprint_matches_the_json_sent_by_the_sdk() -> None:
+    class Metadata(BaseModel):
+        user: str = Field(default="Alice", serialization_alias="Owner")
+
+    sent: list[object] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content))
+        return httpx2.Response(400)
+
+    async def scenario() -> None:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(record)) as http_client:
+            adapter = _adapter(client=AsyncOpenAI(api_key="offline", http_client=http_client))
+
+            async def capture(metadata: object) -> tuple[str, object]:
+                llm = llm_from_adapter(adapter, extra_body={"metadata": metadata})
+                with pytest.raises(GenerationError):
+                    _ = await llm.generate_one("q")
+                return llm.config_fingerprint(), sent.pop()
+
+            unset = await capture(Metadata())
+            explicit = await capture(Metadata(user="Alice"))
+            assert unset == await capture({})
+            assert explicit == await capture({"Owner": "Alice"})
+            assert unset[0] != explicit[0]
+            assert unset[1] != explicit[1]
+            assert await capture((datetime(2026, 1, 1, tzinfo=UTC),)) == await capture([
+                "2026-01-01T00:00:00+00:00"
+            ])
+
+    run_with_timeout(scenario())
 
 
 class _WeatherReading(BaseModel):

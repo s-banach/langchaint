@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from functools import partial
+from functools import cached_property, partial
 from pathlib import Path  # noqa: TC003 (public annotations)
 from typing import TYPE_CHECKING, Final, Protocol, overload
 
@@ -305,6 +305,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
 
         Raises:
             ValueError: `max_requests` is boolean or below one, or the adapter rejects the binding.
+            TypeError: A provider value does not support copying.
             TypeError: The adapter does not support the binding or `response_format` is a proper subclass of `str`.
             pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: The output model has no JSON schema.
@@ -313,7 +314,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         if isinstance(max_requests, bool) or max_requests < 1:
             raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
         self.adapter: Final[Adapter] = adapter
-        self.binding: Final[Binding] = binding
+        self._binding: Final[Binding] = binding.snapshot()
         self.response_format: Final[type[OutputT]] = response_format
         self.tool_manager: Final[ToolManagerT] = tool_manager
         self.shared_backoff: Final[SharedBackoff] = shared_backoff
@@ -322,42 +323,42 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         self._bound_adapter: Final[BoundAdapter]
         self._read_output: Final[OutputReader[OutputT]]
         self._bound_adapter, self._read_output = _bound_adapter_and_reader(
-            adapter, binding, response_format
+            adapter, self._binding, response_format
         )
-        self._adapter_class: Final[type[Adapter]] = type(adapter)
-        self._adapter_model: Final[str] = adapter.model
-        self._adapter_provider_name: Final[str] = adapter.provider_name
-        self._adapter_config_fingerprint_data: Final[Mapping[str, object]] = (
-            adapter.config_fingerprint_data()
-        )
+        self._model: Final[str] = adapter.model
+        self._provider_name: Final[str] = adapter.provider_name
         self._response_format_fingerprint_data: Final[ResponseFormatFingerprintData] = (
             capture_response_format_fingerprint_data(response_format)
         )
 
+    @property
+    def binding(self) -> Binding:
+        """Return an independent copy of the settings that `bind()` inherits."""
+        return self._binding.snapshot()
+
+    @cached_property
+    def _config_fingerprint(self) -> str:
+        return llm_config_fingerprint(
+            adapter_class=type(self.adapter),
+            provider_name=self._provider_name,
+            prepared_config=self._bound_adapter.config_fingerprint_data(),
+            response_format_fingerprint_data=self._response_format_fingerprint_data,
+        )
+
     def config_fingerprint(self) -> str:
-        """Return a SHA-256 fingerprint of the current stored request configuration.
+        """Return a SHA-256 fingerprint of the bound provider configuration and response format.
 
-        `LLM` captures adapter and response-format configuration during binding.
-        Each call reads current `Binding` values.
-        It excludes per-input messages, retry and admission configuration, pricing, and credentials.
-        It also excludes SDK client state and tool functions.
-        It identifies stored configuration without establishing semantic or provider-wire equivalence.
+        It includes the adapter class, provider, and model.
+        It excludes per-input messages, retry and admission configuration, pricing, credentials, and tool functions.
 
-        Mapping insertion order does not affect the fingerprint. Sequence order and container types do.
+        Object key order does not affect the fingerprint. Array element order does.
         Class identity uses `__module__` and `__qualname__`.
         Dynamically created classes that reuse both values require distinct serialized configuration.
 
         Raises:
-            TypeError: A configuration value has no deterministic encoding or contains a cycle.
+            TypeError: The SDK cannot prepare the bound request, or a configuration value has no deterministic encoding.
         """
-        return llm_config_fingerprint(
-            adapter_class=self._adapter_class,
-            adapter_model=self._adapter_model,
-            adapter_provider_name=self._adapter_provider_name,
-            adapter_config_fingerprint_data=self._adapter_config_fingerprint_data,
-            binding=self.binding,
-            response_format_fingerprint_data=self._response_format_fingerprint_data,
-        )
+        return self._config_fingerprint
 
     @property
     def _splits_on_tool_calls(self) -> bool:
@@ -494,7 +495,8 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         A response with neither a text part nor an application tool call gives `GenerationError`.
         `max_completion_tokens=None` omits the limit when the provider permits it.
         `reasoning_level` accepts exact provider strings; `None` omits the setting.
-        `extra_body` supplies provider wire-body fields; `None` clears them.
+        Binding captures the current provider wire-body fields in `extra_body`, including nested values.
+        Pass a new `extra_body` to replace those fields. With `None`, Gemini uses the SDK client's HTTP defaults.
         Declare tools only through `tools`, because result types follow the configured tools.
         `max_requests` counts all requests per input, including retries.
 
@@ -508,6 +510,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
             ValueError: The binding breaks a rule of the adapter.
                 The adapter documents its binding constraints.
             TypeError: The adapter does not support `tool_choice`.
+            TypeError: A provider value does not support copying.
             TypeError: `response_format` is a proper subclass of `str`.
             pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
@@ -517,27 +520,27 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
             self.adapter,
             shared_backoff=self.shared_backoff,
             observer=self.observer,
-            system_prompt=_resolved_replacement(system_prompt, self.binding.system_prompt),
+            system_prompt=_resolved_replacement(system_prompt, self._binding.system_prompt),
             tools=_resolved_replacement(tools, self.tool_manager),
             provider_executed_tools=_resolved_replacement(
-                provider_executed_tools, self.binding.provider_executed_tools
+                provider_executed_tools, self._binding.provider_executed_tools
             ),
             response_format=_resolved_replacement(response_format, self.response_format),
             max_completion_tokens=_resolved_replacement(
-                max_completion_tokens, self.binding.max_completion_tokens
+                max_completion_tokens, self._binding.max_completion_tokens
             ),
-            reasoning_level=_resolved_replacement(reasoning_level, self.binding.reasoning_level),
-            temperature=_resolved_replacement(temperature, self.binding.temperature),
-            tool_choice=_resolved_replacement(tool_choice, self.binding.tool_choice),
+            reasoning_level=_resolved_replacement(reasoning_level, self._binding.reasoning_level),
+            temperature=_resolved_replacement(temperature, self._binding.temperature),
+            tool_choice=_resolved_replacement(tool_choice, self._binding.tool_choice),
             parallel_tool_calls=_resolved_replacement(
-                parallel_tool_calls, self.binding.parallel_tool_calls
+                parallel_tool_calls, self._binding.parallel_tool_calls
             ),
-            extra_body=_resolved_replacement(extra_body, self.binding.extra_body),
+            extra_body=_resolved_replacement(extra_body, self._binding.extra_body),
             max_requests=_resolved_replacement(max_requests, self.max_requests),
             automatic_cache_breakpoints=_resolved_replacement(
-                automatic_cache_breakpoints, self.binding.automatic_cache_breakpoints
+                automatic_cache_breakpoints, self._binding.automatic_cache_breakpoints
             ),
-            tool_schemas=self.binding.tool_schemas if isinstance(tools, Unchanged) else None,
+            tool_schemas=self._binding.tool_schemas if isinstance(tools, Unchanged) else None,
         )
 
     async def _settle_failed_request(
@@ -749,7 +752,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
     async def _generate_with_escapes_recorded(
         self, messages: Sequence[Message], *, deadline: Deadline
     ) -> Generation[OutputT]:
-        ledger = _RequestLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
+        ledger = _RequestLedger(model=self._model, provider_name=self._provider_name)
         timeout_scope = deadline.scope
         try:
             async with timeout_scope:
@@ -769,8 +772,8 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         if self.observer is None:
             return UNOBSERVED_OPERATION
         start = GenerationStart(
-            provider_name=self.adapter.provider_name,
-            model=self.adapter.model,
+            provider_name=self._provider_name,
+            model=self._model,
             binding=self.binding,
             response_format=self.response_format,
             messages=messages,
@@ -920,7 +923,7 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         Deleting an `input_ids` entry removes its saved record.
         Reusing an `input_ids` entry with a changed input generates that input again.
         Repeated equal inputs remain separate inputs by position or by distinct `input_ids` entries.
-        Changing the binding or switching whether `input_ids` is provided replaces a valid resume file.
+        A changed `config_fingerprint` or a switch between positions and `input_ids` replaces a valid resume file.
         The file's `config_fingerprint` is the value from `config_fingerprint()`.
         Changes excluded by `config_fingerprint()` do not replace the file.
         A malformed first line or unsupported format raises before any provider request.
@@ -1059,6 +1062,8 @@ class LLM[OutputT: str | BaseModel = str, ToolManagerT: ToolManager | None = Non
         return StreamHandle(
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,
+            provider_name=self._provider_name,
+            model=self._model,
             read_output=self._read_output,
             messages=messages,
             shared_backoff=self.shared_backoff,
@@ -1188,6 +1193,7 @@ def llm_from_adapter(
         ValueError: `tools` contains duplicate names.
         ValueError: `AllowedToolsChoice.tool_names` contains a name absent from the configured tools.
         ValueError: `system_prompt` is an empty sequence or `max_requests` is below one or boolean.
+        TypeError: A provider value does not support copying.
         TypeError: The adapter does not support the binding or `response_format` is a proper subclass of `str`.
         pydantic.ValidationError: The provider SDK rejects a provider-executed tool.
         pydantic.PydanticInvalidForJsonSchema: The output or tool model has no JSON schema.

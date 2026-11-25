@@ -1,6 +1,7 @@
 """Implement the OpenAI Responses API through the official openai SDK."""
 
 from collections.abc import AsyncIterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Literal, cast, override
 
@@ -59,6 +60,7 @@ from langchaint.adapter import (
     ToolChoice,
     _RejectedMessagesError,
     narrowed_request_params,
+    prepared_request_fields,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
     validated_provider_executed_tool_types,
@@ -93,6 +95,8 @@ from langchaint.openai.shared import (
     _image_data_uri,
     _OpenAIGenerationAdapterBase,
     _priced_tier,
+    _wire_extra_body,
+    _wire_json_object,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -160,7 +164,6 @@ class _OpenAIResponsesPrecomputedFields:
     """The structured binding's JSON schema, omitted by the text binding."""
 
     extra_body: Mapping[str, object] | None
-    charged_provider_executed_tools: bool
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
@@ -396,7 +399,7 @@ def _wire_function_tool(tool_schema: ToolSchema) -> FunctionToolParam:
     tool: FunctionToolParam = {
         "type": "function",
         "name": tool_schema.name,
-        "parameters": dict(tool_schema.args_schema),
+        "parameters": _wire_json_object(tool_schema.args_schema, sdk_type=dict[str, object]),
         "strict": None,
     }
     if tool_schema.description is not None:
@@ -412,7 +415,10 @@ def _wire_tools(
     tools: list[ToolParam] = [_wire_function_tool(tool_schema) for tool_schema in tool_schemas]
     # cast: the neutral Mapping type exceeds the SDK TypedDict union.
     # The adapter validated each mapping's type discriminator.
-    tools.extend(cast("ToolParam", tool) for tool in provider_executed_tools)
+    tools.extend(
+        cast("ToolParam", _wire_json_object(tool, sdk_type=ToolParam))
+        for tool in provider_executed_tools
+    )
     return tools
 
 
@@ -661,15 +667,6 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
         self.service_tier: OpenAIResponsesServiceTier | None = service_tier
 
-    @override
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return stored request configuration outside `Binding`."""
-        return {
-            "reasoning_summary": self.reasoning_summary,
-            "service_tier": self.service_tier,
-            "supports_prompt_cache_options": self.supports_prompt_cache_options,
-        }
-
     def _precompute_fields(self, binding: Binding) -> _OpenAIResponsesPrecomputedFields:
         """Precompute request fields from the binding.
 
@@ -683,6 +680,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             ValueError: A provider-executed tool type is unsupported or uses another provider.
             ValueError: A bound charged tool has no stated price.
         """
+        binding = binding.snapshot()
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
@@ -751,8 +749,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],
             text=omit,
-            extra_body=binding.extra_body,
-            charged_provider_executed_tools=bool(provider_executed_tool_types),
+            extra_body=_wire_extra_body(binding.extra_body),
         )
 
     @override
@@ -760,10 +757,13 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         """Bind for plain-text output without I/O.
 
         Raises:
+            TypeError: A provider value in `binding` cannot be copied.
             ValueError: `binding` contains unsupported values.
         """
         return _BoundOpenAIResponses(
-            adapter=self, precomputed_fields=self._precompute_fields(binding)
+            adapter=self,
+            precomputed_fields=self._precompute_fields(binding),
+            charged_provider_executed_tools=bool(binding.provider_executed_tools),
         )
 
     @override
@@ -771,6 +771,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         """Bind for structured output in response_format without I/O.
 
         Raises:
+            TypeError: A provider value in `binding` cannot be copied.
             ValueError: `binding` contains unsupported values.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
@@ -778,6 +779,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
         schema = without_schema_titles(response_format.model_json_schema())
         return _BoundOpenAIResponses(
             adapter=self,
+            charged_provider_executed_tools=bool(binding.provider_executed_tools),
             precomputed_fields=replace(
                 self._precompute_fields(binding),
                 text={
@@ -785,7 +787,10 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
                         "type": "json_schema",
                         "name": response_format.__name__,
                         "strict": True,
-                        "schema": _ensure_strict_json_schema(schema, path=(), root=schema),
+                        "schema": _wire_json_object(
+                            _ensure_strict_json_schema(schema, path=(), root=schema),
+                            sdk_type=dict[str, object],
+                        ),
                     }
                 },
             ),
@@ -959,9 +964,15 @@ class _BoundOpenAIResponses(BoundAdapter):
         *,
         adapter: OpenAIResponsesAdapter,
         precomputed_fields: _OpenAIResponsesPrecomputedFields,
+        charged_provider_executed_tools: bool,
     ) -> None:
         self._adapter = adapter
         self._precomputed_fields = precomputed_fields
+        self._charged_provider_executed_tools = charged_provider_executed_tools
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        return prepared_request_fields(self._precomputed_fields, omitted_class=Omit)
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -996,9 +1007,10 @@ class _BoundOpenAIResponses(BoundAdapter):
             wire_input = _wire_input(messages)
         except _RejectedMessagesError as rejected:
             return RejectedMessages(error_text=str(rejected))
+        precomputed = deepcopy(self._precomputed_fields, {id(omit): omit})
         return _OpenAIResponsesRequestParams(
-            precomputed=self._precomputed_fields,
-            input=[*self._precomputed_fields.input_prefix, *wire_input],
+            precomputed=precomputed,
+            input=[*precomputed.input_prefix, *wire_input],
         )
 
     @override
@@ -1034,7 +1046,7 @@ class _BoundOpenAIResponses(BoundAdapter):
         return _OpenAIResponsesStream(
             sdk_stream=await manager.__aenter__(),
             pricing=self._adapter.pricing,
-            charged_provider_executed_tools=precomputed.charged_provider_executed_tools,
+            charged_provider_executed_tools=self._charged_provider_executed_tools,
         )
 
     @override

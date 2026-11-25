@@ -18,7 +18,8 @@ Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, re
 import base64
 import json
 from collections import Counter
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import ClassVar, Literal, cast, override
 
@@ -27,10 +28,13 @@ from anthropic import (
     AsyncAnthropic,
     AsyncAnthropicBedrock,
     AsyncAnthropicBedrockMantle,
+    NotGiven,
     Omit,
     omit,
     transform_schema,
 )
+from anthropic._constants import ANTHROPIC_API_VERSION
+from anthropic._utils import prepare_request_data
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
     Base64ImageSourceParam,
@@ -42,7 +46,6 @@ from anthropic.types import (
     RedactedThinkingBlockParam,
     TextBlockParam,
     ThinkingBlockParam,
-    ThinkingConfigParam,
     ToolChoiceParam,
     ToolParam,
     ToolResultBlockParam,
@@ -71,6 +74,7 @@ from langchaint.adapter import (
     ToolChoice,
     _RejectedMessagesError,
     narrowed_request_params,
+    prepared_request_fields,
     record_request_failure_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     request_failure_from_response,
@@ -368,7 +372,7 @@ _NO_ANTHROPIC_PROVIDER_EXECUTED_TOOLS = _AnthropicProviderExecutedTools()
 def _provider_executed_tools(
     provider_executed_tools: tuple[Mapping[str, object], ...],
 ) -> _AnthropicProviderExecutedTools:
-    """Validate supported `type` values while preserving each mapping by reference.
+    """Validate the tool types and identify the categories their usage counters price.
 
     Raises:
         ValueError: a mapping lacks a supported string `type` value.
@@ -401,12 +405,10 @@ class _AnthropicPrecomputedFields:
 
     model: str
     max_tokens: int
-    temperature: float | Omit
     system: list[TextBlockParam] | Omit
     tools: list[ToolUnionParam] | Omit
     tool_choice: ToolChoiceParam | Omit
     output_config: OutputConfigParam | Omit
-    thinking: ThinkingConfigParam | Omit
     service_tier: AnthropicServiceTier | Omit
     inference_geo: str | Omit
     cache_control: CacheControlEphemeralParam | Omit
@@ -420,46 +422,6 @@ class _AnthropicPrecomputedFields:
     """
 
     extra_body: Mapping[str, object] | None
-    provider_executed_tools: _AnthropicProviderExecutedTools
-
-
-@dataclass(frozen=True)
-class _TemperatureExtraBody(Mapping[str, object]):
-    """Expose temperature with caller fields while retaining caller_fields by reference."""
-
-    temperature: float
-    caller_fields: Mapping[str, object]
-
-    @override
-    def __getitem__(self, key: str) -> object:
-        if key == "temperature":
-            return self.temperature
-        return self.caller_fields[key]
-
-    @override
-    def __iter__(self) -> Iterator[str]:
-        yield "temperature"
-        yield from (key for key in self.caller_fields if key != "temperature")
-
-    @override
-    def __len__(self) -> int:
-        caller_field_count = len(self.caller_fields)
-        if "temperature" in self.caller_fields:
-            return caller_field_count
-        return caller_field_count + 1
-
-
-def _extra_body_with_temperature(
-    precomputed: _AnthropicPrecomputedFields,
-) -> Mapping[str, object] | None:
-    if isinstance(precomputed.temperature, Omit):
-        return precomputed.extra_body
-    if precomputed.extra_body is None:
-        return {"temperature": precomputed.temperature}
-    return _TemperatureExtraBody(
-        temperature=precomputed.temperature,
-        caller_fields=precomputed.extra_body,
-    )
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
@@ -729,9 +691,21 @@ def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> 
     return {"type": "none"}
 
 
+def _prepared_mapping(mapping: Mapping[str, object]) -> dict[str, object]:
+    """Apply the SDK's request conversion to in-memory values.
+
+    Query conversion leaves file inputs for the SDK to read when it sends the request.
+    """
+    prepared: dict[str, object] = prepare_request_data(mapping, location="query")
+    return prepared
+
+
 def _wire_function_tool(tool_schema: ToolSchema) -> ToolParam:
     """Convert one tool schema. `description=None` omits the description key."""
-    tool: ToolParam = {"name": tool_schema.name, "input_schema": dict(tool_schema.args_schema)}
+    tool: ToolParam = {
+        "name": tool_schema.name,
+        "input_schema": _prepared_mapping(tool_schema.args_schema),
+    }
     if tool_schema.description is not None:
         tool["description"] = tool_schema.description
     return tool
@@ -754,13 +728,11 @@ def _wire_tools(
     ]
     # cast: the neutral Mapping type exceeds the SDK TypedDict union.
     # The adapter validated each mapping's type discriminator.
-    tools.extend(cast("ToolUnionParam", tool) for tool in provider_executed_tools)
+    tools.extend(
+        cast("ToolUnionParam", _prepared_mapping(tool)) for tool in provider_executed_tools
+    )
     if cache_breakpoint_on_last_tool and tools and "cache_control" not in tools[-1]:
-        # Copying preserves the caller's mapping.
-        last_tool = dict(tools[-1])
-        last_tool["cache_control"] = _cache_control_param(cache_ttl)
-        # cast: the copied mapping remains wider than the SDK TypedDict union.
-        tools[-1] = cast("ToolUnionParam", last_tool)
+        tools[-1]["cache_control"] = _cache_control_param(cache_ttl)
     return tools
 
 
@@ -1021,23 +993,12 @@ class AnthropicMessagesAdapter(Adapter):
         self.client: AnthropicClient = client_without_retries(client)
         self.pricing: AnthropicPricingTable = pricing
         self.cache_ttl: CacheTTL = cache_ttl
-        self._uses_top_level_cache_control: bool = not isinstance(
-            self.client, AsyncAnthropicBedrock
-        )
         self.service_tier: AnthropicServiceTier | None = service_tier
         self.inference_geo: str | None = inference_geo
 
-    @override
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return stored request configuration outside `Binding`."""
-        return {
-            "uses_top_level_cache_control": self._uses_top_level_cache_control,
-            "cache_ttl": self.cache_ttl,
-            "inference_geo": self.inference_geo,
-            "service_tier": self.service_tier,
-        }
-
-    def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
+    def _precompute_fields(
+        self, binding: Binding, *, response_format: type[BaseModel] | None = None
+    ) -> _AnthropicPrecomputedFields:
         """Precompute request fields and the remaining `message_cache_breakpoint_budget`.
 
         A string `system_prompt` becomes one system block.
@@ -1053,8 +1014,6 @@ class AnthropicMessagesAdapter(Adapter):
         Raises:
             ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
             ValueError: Binding cache breakpoints exceed four, `extra_body` conflicts, or `system_prompt` is empty.
-            ValueError: A provider-executed tool type is unsupported or code execution lacks a qualifying web tool.
-            ValueError: Provider-executed tools use another provider or web-search rates are invalid.
             TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
         """
         if binding.max_completion_tokens is None:
@@ -1064,14 +1023,6 @@ class AnthropicMessagesAdapter(Adapter):
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
-        provider_executed_tools = _provider_executed_tools(binding.provider_executed_tools)
-        if binding.provider_executed_tools and self.provider_name != "anthropic":
-            raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
-        if provider_executed_tools.web_search:
-            require_stated_rate(
-                rate_name="web_search_usd_per_invocation",
-                rate=self.pricing.web_search_usd_per_invocation,
-            )
         system: list[TextBlockParam] | Omit = omit
         bind_cache_breakpoint_count = 0
         if binding.system_prompt is not None:
@@ -1118,42 +1069,63 @@ class AnthropicMessagesAdapter(Adapter):
             raise ValueError(
                 f"the binding writes {bind_cache_breakpoint_count + automatic_cache_breakpoint_count} cache breakpoints, over the API's limit of {_MAX_CACHE_BREAKPOINTS_PER_REQUEST} per request; set cache_breakpoint=False on some system parts or remove cache_control from provider_executed_tools"
             )
-        output_config: OutputConfigParam | Omit = omit
-        thinking: ThinkingConfigParam | Omit = omit
+        output_config: OutputConfigParam = {}
+        extra_body = dict(binding.extra_body or {})
         if binding.reasoning_level is not None:
             # cast: `reasoning_level` deliberately exceeds the SDK effort literal.
             output_config = cast("OutputConfigParam", {"effort": binding.reasoning_level})
-            if binding.extra_body is None or "thinking" not in binding.extra_body:
-                thinking = {"type": "adaptive"}
+            _ = extra_body.setdefault("thinking", {"type": "adaptive"})
+        if response_format is not None:
+            output_format: JSONOutputFormatParam = {
+                "schema": transform_schema(
+                    without_schema_titles(TypeAdapter(response_format).json_schema())
+                ),
+                "type": "json_schema",
+            }
+            output_config["format"] = output_format
 
-        # Set the legacy Bedrock API version unless extra_body overrides it.
-        extra_body = (
-            {"anthropic_version": "bedrock-2023-05-31", **(binding.extra_body or {})}
-            if isinstance(self.client, AsyncAnthropicBedrock)
-            else binding.extra_body
-        )
+        legacy_bedrock = isinstance(self.client, AsyncAnthropicBedrock)
+        if legacy_bedrock:
+            version = extra_body.get("anthropic_version", "bedrock-2023-05-31")
+            extra_body["anthropic_version"] = (
+                ANTHROPIC_API_VERSION if isinstance(version, (Omit, NotGiven)) else version
+            )
+        if binding.temperature is not None:
+            extra_body["temperature"] = binding.temperature
         return _AnthropicPrecomputedFields(
             model=self.model,
             max_tokens=binding.max_completion_tokens,
-            temperature=(binding.temperature if binding.temperature is not None else omit),
             system=system,
             tools=tools,
             tool_choice=tool_choice,
-            output_config=output_config,
-            thinking=thinking,
+            output_config=output_config or omit,
             service_tier=self.service_tier if self.service_tier is not None else omit,
             inference_geo=self.inference_geo if self.inference_geo is not None else omit,
             cache_control=(
                 _cache_control_param(self.cache_ttl)
-                if binding.automatic_cache_breakpoints and self._uses_top_level_cache_control
+                if binding.automatic_cache_breakpoints and not legacy_bedrock
                 else omit
             ),
-            automatic_message_cache_breakpoint=(
-                binding.automatic_cache_breakpoints and not self._uses_top_level_cache_control
-            ),
+            automatic_message_cache_breakpoint=binding.automatic_cache_breakpoints
+            and legacy_bedrock,
             cache_ttl=self.cache_ttl,
             message_cache_breakpoint_budget=message_cache_breakpoint_budget,
-            extra_body=extra_body,
+            extra_body=_prepared_mapping(extra_body) or None,
+        )
+
+    def _bind(self, binding: Binding, *, response_format: type[BaseModel] | None) -> BoundAdapter:
+        binding = binding.snapshot()
+        provider_executed_tools = _provider_executed_tools(binding.provider_executed_tools)
+        if binding.provider_executed_tools and self.provider_name != "anthropic":
+            raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
+        if provider_executed_tools.web_search:
+            require_stated_rate(
+                rate_name="web_search_usd_per_invocation",
+                rate=self.pricing.web_search_usd_per_invocation,
+            )
+        return _BoundAnthropic(
+            adapter=self,
+            precomputed_fields=self._precompute_fields(binding, response_format=response_format),
             provider_executed_tools=provider_executed_tools,
         )
 
@@ -1163,9 +1135,9 @@ class AnthropicMessagesAdapter(Adapter):
 
         Raises:
             ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
-            TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
+            TypeError: `binding.tool_choice` is `AllowedToolsChoice` or a provider value cannot be copied.
         """
-        return _BoundAnthropic(adapter=self, precomputed_fields=self._precompute_fields(binding))
+        return self._bind(binding, response_format=None)
 
     @override
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
@@ -1178,27 +1150,11 @@ class AnthropicMessagesAdapter(Adapter):
 
         Raises:
             ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
-            TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
+            TypeError: `binding.tool_choice` is `AllowedToolsChoice` or a provider value cannot be copied.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """
-        precomputed_fields = self._precompute_fields(binding)
-        output_format: JSONOutputFormatParam = {
-            "schema": transform_schema(
-                without_schema_titles(TypeAdapter(response_format).json_schema())
-            ),
-            "type": "json_schema",
-        }
-        bound_output_config = precomputed_fields.output_config
-        output_config: OutputConfigParam = (
-            {"format": output_format}
-            if isinstance(bound_output_config, Omit)
-            else {**bound_output_config, "format": output_format}
-        )
-        return _BoundAnthropic(
-            adapter=self,
-            precomputed_fields=replace(precomputed_fields, output_config=output_config),
-        )
+        return self._bind(binding, response_format=response_format)
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:
@@ -1319,10 +1275,19 @@ class _BoundAnthropic(BoundAdapter):
     """An Anthropic Messages adapter bound to a frozen prefix."""
 
     def __init__(
-        self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
+        self,
+        *,
+        adapter: AnthropicMessagesAdapter,
+        precomputed_fields: _AnthropicPrecomputedFields,
+        provider_executed_tools: _AnthropicProviderExecutedTools,
     ) -> None:
         self._adapter = adapter
         self._precomputed_fields = precomputed_fields
+        self._provider_executed_tools = provider_executed_tools
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        return prepared_request_fields(self._precomputed_fields, omitted_class=Omit)
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1335,7 +1300,7 @@ class _BoundAnthropic(BoundAdapter):
         return _billing_from_sdk_usage(
             _as_message(raw).usage,
             pricing=self._adapter.pricing,
-            provider_executed_tools=self._precomputed_fields.provider_executed_tools,
+            provider_executed_tools=self._provider_executed_tools,
         )
 
     @override
@@ -1361,7 +1326,7 @@ class _BoundAnthropic(BoundAdapter):
         if isinstance(wire_messages, RejectedMessages):
             return wire_messages
         return _AnthropicRequestParams(
-            precomputed=self._precomputed_fields, messages=wire_messages
+            precomputed=deepcopy(self._precomputed_fields), messages=wire_messages
         )
 
     @override
@@ -1386,18 +1351,17 @@ class _BoundAnthropic(BoundAdapter):
             tools=precomputed.tools,
             tool_choice=precomputed.tool_choice,
             output_config=precomputed.output_config,
-            thinking=precomputed.thinking,
             service_tier=precomputed.service_tier,
             inference_geo=precomputed.inference_geo,
             cache_control=precomputed.cache_control,
             messages=params.messages,
-            extra_body=_extra_body_with_temperature(precomputed),
+            extra_body=precomputed.extra_body,
             extra_headers={"x-stainless-retry-count": str(request_count)},
         )
         return _AnthropicStream(
             sdk_stream=await manager.__aenter__(),
             pricing=self._adapter.pricing,
-            provider_executed_tools=precomputed.provider_executed_tools,
+            provider_executed_tools=self._provider_executed_tools,
         )
 
     @override

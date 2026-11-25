@@ -22,7 +22,6 @@ from langchaint import (
     AudioPart,
     Billing,
     ContentPart,
-    GenerationError,
     ImagePart,
     ImageUrlPart,
     LongContextPricing,
@@ -322,7 +321,9 @@ class _Answer(BaseModel):
 # --- bind ---
 
 
-_NO_SDK_RETRIES = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+_NO_SDK_RETRIES = types.HttpOptions(
+    retry_options=types.HttpRetryOptions(attempts=1), extra_body={}
+)
 """The http_options every binding sends, so max_requests counts every request."""
 
 
@@ -704,28 +705,55 @@ def test_structured_bind_sends_the_response_schema() -> None:
 
 
 def test_service_tier_is_sent_and_fingerprinted() -> None:
-    """Pricing is billing configuration, so the fingerprint excludes it."""
     adapter = _adapter(service_tier="flex")
-    assert adapter.config_fingerprint_data() == {"service_tier": "flex"}
     assert _request_config(_binding(), adapter) == types.GenerateContentConfig(
         automatic_continuation=False,
         service_tier=types.ServiceTier.FLEX,
         http_options=_NO_SDK_RETRIES,
+    )
+    assert (
+        llm_from_adapter(adapter).config_fingerprint()
+        != llm_from_adapter(_adapter()).config_fingerprint()
+    )
+
+
+def test_automatic_cache_breakpoints_has_no_effect_on_the_fingerprint() -> None:
+    llm = llm_from_adapter(_adapter())
+    assert (
+        llm.config_fingerprint() == llm.bind(automatic_cache_breakpoints=True).config_fingerprint()
     )
 
 
 # --- build_request_params ---
 
 
-def test_built_request_keeps_the_generation_config_it_validated() -> None:
+def test_build_request_params_isolates_the_bound_model_and_config() -> None:
     generation_config = {"topK": 5}
-    bound = _adapter().bind_text(_binding(extra_body={"generation_config": generation_config}))
+    binding = _binding(
+        extra_body={"generation_config": generation_config}, tool_schemas=(_echo_schema(),)
+    )
+    adapter = _adapter()
+    bound = adapter.bind_text(binding)
     messages = [UserMessage(content="hi")]
     request = bound.build_request_params(messages)
     assert isinstance(request, _GeminiRequestParams)
+    expected_request = request.as_json()
+    fingerprint_data = bound.config_fingerprint_data()
+
+    adapter.model = "another-model"
     generation_config["candidateCount"] = 2
-    assert json.loads(request.as_json())["extra_body"] == {"generation_config": {"topK": 5}}
-    assert isinstance(bound.build_request_params(messages), RejectedMessages)
+    assert request.config.tools is not None
+    request.config.tools.clear()
+    assert request.config.http_options is not None
+    assert request.config.http_options.extra_body is not None
+    request.config.http_options.extra_body.clear()
+
+    following_request = bound.build_request_params(messages)
+    assert isinstance(following_request, _GeminiRequestParams)
+    assert following_request.as_json() == expected_request
+    assert bound.config_fingerprint_data() == fingerprint_data
+    with pytest.raises(ValueError, match="candidateCount"):
+        _ = adapter.bind_text(binding)
 
 
 def test_user_message_forms() -> None:
@@ -1503,35 +1531,144 @@ _TWO_CHUNK_SSE_BODY = (
 """A streamGenerateContent server-sent-event body of two chunks, the second carrying finishReason STOP."""
 
 
-def test_gemini_sends_the_extra_body_its_fingerprint_identifies() -> None:
-    sent: list[str] = []
-
+def _recording_http_client(sent: list[dict[str, object]]) -> httpx2.AsyncClient:
     def serve(request: httpx2.Request) -> httpx2.Response:
-        sent.append(json.loads(request.content)["cachedContent"])
+        sent.append(json.loads(request.content))
         return httpx2.Response(
             200, content=_TWO_CHUNK_SSE_BODY, headers={"content-type": "text/event-stream"}
         )
 
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(serve))
+
+
+@pytest.mark.parametrize("vertexai", [False, True])
+def test_gemini_fingerprints_the_body_after_the_sdk_merges_extra_body(*, vertexai: bool) -> None:
+    sent: list[dict[str, object]] = []
+
     async def scenario() -> None:
-        async with httpx2.AsyncClient(transport=httpx2.MockTransport(serve)) as http_client:
+        async with _recording_http_client(sent) as http_client:
+            client = genai.Client(
+                api_key="offline",
+                vertexai=vertexai,
+                http_options=types.HttpOptions(httpx_async_client=http_client),
+            )
+            provider_name = "gcp.vertex_ai" if vertexai else "gcp.gemini"
+            llm = llm_from_adapter(
+                _adapter(client=client, provider_name=provider_name), temperature=0.1
+            )
+            aliases = {"generationConfig": {"topK": 2}, "generation_config": {"topK": 4}}
+            configurations = [
+                llm.bind(extra_body=aliases),
+                llm.bind(extra_body=dict(reversed(aliases.items()))),
+                llm.bind(extra_body={"generation_config": {"topK": 2}}),
+                llm.bind(extra_body={"generationConfig": {"topK": 2}}),
+                llm.bind(reasoning_level="HIGH"),
+                llm.bind(
+                    extra_body={
+                        "generationConfig": {
+                            "thinkingConfig": {"include_thoughts": True, "thinking_level": "HIGH"}
+                        }
+                    }
+                ),
+            ]
+            for configured in configurations:
+                assert (await configured.generate_one("hi")).output == "hey"
+            fingerprints = [configured.config_fingerprint() for configured in configurations]
+            assert sent[0]["generationConfig"] == {"temperature": 0.1, "topK": 4}
+            assert sent[1]["generationConfig"] == {"temperature": 0.1, "topK": 2}
+            assert fingerprints[0] != fingerprints[1]
+            assert sent[1] == sent[2] == sent[3]
+            assert fingerprints[1] == fingerprints[2] == fingerprints[3]
+            assert sent[4] == sent[5]
+            assert fingerprints[4] == fingerprints[5]
+
+    run_with_timeout(scenario())
+
+
+def test_gemini_binding_captures_or_replaces_client_extra_body() -> None:
+    sent: list[dict[str, object]] = []
+
+    async def scenario() -> None:
+        async with _recording_http_client(sent) as http_client:
+            options = types.HttpOptions(httpx_async_client=http_client, extra_body={})
+            client = genai.Client(api_key="offline", vertexai=False, http_options=options)
+            adapter = _adapter(client=client)
+            empty = llm_from_adapter(adapter)
+            assert options.extra_body is not None
+            generation_config = {"topK": 2}
+            options.extra_body.update({
+                "cachedContent": "A",
+                "generationConfig": generation_config,
+            })
+            inherited = llm_from_adapter(adapter)
+            cleared = inherited.bind(extra_body={})
+            options.extra_body["cachedContent"] = "B"
+            generation_config["topK"] = 4
+            changed = llm_from_adapter(adapter)
+            assert inherited.config_fingerprint() != changed.config_fingerprint()
+            assert empty.config_fingerprint() == cleared.config_fingerprint()
+            for configured in (empty, inherited, cleared, changed):
+                assert (await configured.generate_one("hi")).output == "hey"
+            assert sent[0] == sent[2]
+            assert "cachedContent" not in sent[0]
+            assert sent[1]["cachedContent"] == "A"
+            assert sent[1]["generationConfig"] == {"topK": 2}
+            assert sent[3]["cachedContent"] == "B"
+            assert sent[3]["generationConfig"] == {"topK": 4}
+            for fields, message in (
+                ({"contents": [{"role": "user"}]}, "contents"),
+                ({"generationConfig": {"candidateCount": 2}}, "candidateCount"),
+            ):
+                options.extra_body.update(fields)
+                with pytest.raises(ValueError, match=message):
+                    _ = llm_from_adapter(adapter)
+                options.extra_body.clear()
+
+    run_with_timeout(scenario())
+
+
+def test_gemini_sends_the_extra_body_and_tools_its_fingerprint_identifies() -> None:
+    sent: list[dict[str, object]] = []
+
+    async def scenario() -> None:
+        async with _recording_http_client(sent) as http_client:
             client = genai.Client(
                 api_key="offline",
                 vertexai=False,
                 http_options=types.HttpOptions(httpx_async_client=http_client),
             )
-            extra_body = {"cachedContent": "cachedContents/A"}
-            llm = llm_from_adapter(_adapter(client=client), extra_body=extra_body)
+            stop_sequences = ["END"]
+            extra_body = {"generationConfig": {"stopSequences": stop_sequences}}
+            store_names = ["fileSearchStores/A"]
+            provider_executed_tools = [{"file_search": {"file_search_store_names": store_names}}]
+            llm = llm_from_adapter(
+                _adapter(client=client),
+                extra_body=extra_body,
+                provider_executed_tools=provider_executed_tools,
+            )
             initial = llm.config_fingerprint()
-            extra_body["cachedContent"] = "cachedContents/B"
-            assert llm.config_fingerprint() != initial
-            assert (await llm.generate_one("hi")).output == "hey"
-            assert sent == ["cachedContents/B"]
+            stop_sequences.append("STOP")
+            store_names.append("fileSearchStores/B")
+            assert llm.config_fingerprint() == initial
+            assert llm.bind(extra_body=extra_body).config_fingerprint() != initial
+            assert (
+                llm.bind(provider_executed_tools=provider_executed_tools).config_fingerprint()
+                != initial
+            )
+            rebound = llm.bind(
+                extra_body=extra_body, provider_executed_tools=provider_executed_tools
+            )
 
-            extra_body["systemInstruction"] = "override"
-            with pytest.raises(GenerationError, match="systemInstruction") as caught:
-                _ = await llm.generate_one("hi")
-            assert caught.value.kind == "rejected_error"
-            assert len(sent) == 1
+            assert (await llm.generate_one("hi")).output == "hey"
+            assert (await rebound.generate_one("hi")).output == "hey"
+            assert [body["generationConfig"] for body in sent] == [
+                {"stopSequences": ["END"]},
+                {"stopSequences": ["END", "STOP"]},
+            ]
+            assert [body["tools"] for body in sent] == [
+                [{"fileSearch": {"file_search_store_names": ["fileSearchStores/A"]}}],
+                [{"fileSearch": {"file_search_store_names": store_names}}],
+            ]
 
     run_with_timeout(scenario())
 

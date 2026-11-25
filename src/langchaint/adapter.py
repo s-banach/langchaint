@@ -7,7 +7,8 @@ import time
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from typing import ClassVar, Literal, NamedTuple
 
 from pydantic import BaseModel
@@ -302,6 +303,38 @@ def validated_provider_executed_tool_types(
     return frozenset(tool_types)
 
 
+def _copy_binding_mapping(source: Mapping[str, object]) -> dict[str, object]:
+    """Materialize mappings, including read-only views, and detach nested provider values."""
+    memo: dict[int, object] = {}
+    # A Mapping can construct a temporary value on each lookup. Keep its id valid while copying.
+    sources: list[object] = []
+
+    def copy_mapping[KeyT](mapping: Mapping[KeyT, object]) -> dict[KeyT, object]:
+        result: dict[KeyT, object] = {}
+        memo[id(mapping)] = result
+        result.update((key, copy_value(value)) for key, value in mapping.items())
+        return result
+
+    def copy_value(value: object) -> object:
+        if id(value) in memo:
+            return memo[id(value)]
+        sources.append(value)
+        if isinstance(value, Mapping):
+            return copy_mapping(value)
+        if type(value) is list:
+            items: list[object] = []
+            memo[id(value)] = items
+            sequence: Sequence[object] = value
+            items.extend(copy_value(item) for item in sequence)
+            return items
+        if type(value) is tuple:
+            elements: Sequence[object] = value
+            return memo.setdefault(id(value), tuple(copy_value(item) for item in elements))
+        return deepcopy(value, memo)
+
+    return copy_mapping(source)
+
+
 @dataclass(frozen=True, kw_only=True)
 class Binding:
     """The frozen prefix of one LLM, in langchaint terms only.
@@ -341,9 +374,29 @@ class Binding:
     extra_body: Mapping[str, object] | None = None
     """Provider wire-body fields sent verbatim on every request.
 
-    Provider wire names map to values passed through by reference.
+    Binding a model captures the current values, including nested mappings and sequences.
     Each adapter rejects keys that it populates.
     """
+
+    def snapshot(self) -> "Binding":
+        """Return binding values that can be passed to an adapter or caller independently.
+
+        Raises:
+            TypeError: A provider value does not support copying.
+        """
+        return replace(
+            self,
+            tool_schemas=tuple(
+                replace(tool, args_schema=_copy_binding_mapping(tool.args_schema))
+                for tool in self.tool_schemas
+            ),
+            provider_executed_tools=tuple(
+                _copy_binding_mapping(tool) for tool in self.provider_executed_tools
+            ),
+            extra_body=_copy_binding_mapping(self.extra_body)
+            if self.extra_body is not None
+            else None,
+        )
 
     def __post_init__(self) -> None:
         """Reject `AllowedToolsChoice` names absent from `tool_schemas`.
@@ -578,6 +631,22 @@ def request_params_json(request_params: RequestParams, *, omitted_class: type) -
     )
 
 
+def prepared_request_fields(config: object, *, omitted_class: type) -> dict[str, object]:
+    """Return the bound request fields from a provider's configuration dataclass.
+
+    Raises:
+        TypeError: `config` is not a dataclass instance.
+    """
+    if not is_dataclass(config) or isinstance(config, type):
+        raise TypeError("config must be a dataclass instance")
+    prepared: dict[str, object] = {}
+    for field in fields(config):
+        value: object = getattr(config, field.name)
+        if not isinstance(value, omitted_class):
+            prepared[field.name] = value
+    return deepcopy(prepared)
+
+
 def _without_omitted(value: object, omitted_class: type) -> object:
     if isinstance(value, dict):
         mapping: Mapping[object, object] = value
@@ -679,6 +748,15 @@ class AdapterStream(ABC):
 
 class BoundAdapter(ABC):
     """One adapter bound to a frozen prefix."""
+
+    @abstractmethod
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return the prepared provider fields in their JSON representation, including the model.
+
+        Include settings that govern how input messages are converted.
+        Omit SDK transport options, credentials, pricing, and response-accounting fields.
+        """
+        ...
 
     @abstractmethod
     def build_request_params(
@@ -819,17 +897,6 @@ class Adapter(ABC):
         self.automatic_cache_breakpoints_default: bool = automatic_cache_breakpoints_default
 
     @abstractmethod
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return a snapshot of stored adapter configuration that can form provider requests.
-
-        Exclude the SDK client, credentials, pricing, and response-accounting configuration.
-        The configured model's `config_fingerprint` adds the adapter class, model, and provider.
-        It also adds the binding and response format.
-        An adapter may include a non-secret endpoint identity when its contract treats that identity as configuration.
-        """
-        ...
-
-    @abstractmethod
     def bind_text(self, binding: Binding) -> BoundAdapter:
         """Bind for plain-text output.
 
@@ -840,6 +907,7 @@ class Adapter(ABC):
 
         Raises:
             ValueError: `binding` contains unsupported values.
+            TypeError: A provider value does not support copying.
         """
         ...
 
@@ -855,6 +923,7 @@ class Adapter(ABC):
 
         Raises:
             ValueError: `binding` contains unsupported values.
+            TypeError: A provider value does not support copying.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
         """

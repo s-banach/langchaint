@@ -49,6 +49,7 @@ from langchaint import (
 )
 from langchaint.adapter import (
     AdapterStream,
+    Binding,
     FinishedResponse,
     Refusal,
     RejectedMessages,
@@ -212,8 +213,8 @@ def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
 
 
 class _CurrentSpanRecordingBoundAdapter(FakeBoundAdapter):
-    def __init__(self, adapter: FakeAdapter) -> None:
-        super().__init__(adapter)
+    def __init__(self, adapter: FakeAdapter, binding: Binding) -> None:
+        super().__init__(adapter, binding)
         self.spans_current_at_open: list[trace.Span] = []
 
     @override

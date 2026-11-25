@@ -2,9 +2,10 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, assert_type, override
 
 import pytest
@@ -467,9 +468,8 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         assert rejected_record.usage == ZERO_USAGE
         assert rejected.value.raw is None
         assert isinstance(rejected.value.__cause__, ValueError)
-        assert rejected.value.request_params == FakeRequestParams(
-            messages=(UserMessage(content="hi"),)
-        )
+        assert isinstance(rejected.value.request_params, FakeRequestParams)
+        assert rejected.value.request_params.messages == (UserMessage(content="hi"),)
 
     run_with_timeout(scenario())
 
@@ -816,7 +816,7 @@ def test_bind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     )
     assert tool.schema_calls == 1
     assert replacement_llm.tool_manager is llm.tool_manager
-    assert replacement_llm.binding.tool_schemas is llm.binding.tool_schemas
+    assert replacement_llm.binding.tool_schemas == llm.binding.tool_schemas
 
 
 def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
@@ -1081,15 +1081,38 @@ def test_bind_resolves_automatic_cache_breakpoints(*, default_value: bool) -> No
     )
 
 
-def test_construction_and_bind_carry_extra_body_by_reference() -> None:
-    adapter = FakeAdapter()
-    extra_body = {"safety_identifier": "user-7"}
-    llm = llm_from_adapter(adapter, extra_body=extra_body)
-    assert llm.binding.extra_body is extra_body
-    assert llm.bind(system_prompt="s").binding.extra_body is extra_body
-    replacement = {"safety_identifier": "user-8"}
-    assert llm.bind(extra_body=replacement).binding.extra_body is replacement
+def test_bind_inherits_its_own_copy_of_extra_body() -> None:
+    values = ["first"]
+    llm = llm_from_adapter(FakeAdapter(), extra_body={"values": values})
+    values.append("second")
+    exposed = llm.binding.extra_body
+    assert exposed is not None
+    assert isinstance(exposed["values"], list)
+    exposed["values"].clear()
+    assert llm.binding.extra_body == {"values": ["first"]}
+    assert llm.bind(system_prompt="s").binding.extra_body == {"values": ["first"]}
+    assert llm.bind(extra_body={"values": values}).binding.extra_body == {"values": values}
     assert llm.bind(extra_body=None).binding.extra_body is None
+
+
+def test_binding_captures_values_computed_by_a_mapping() -> None:
+    keys = tuple(str(index) for index in range(100))
+
+    class Fields(Mapping[str, object]):
+        @override
+        def __getitem__(self, key: str) -> object:
+            return MappingProxyType({"id": key})
+
+        @override
+        def __iter__(self) -> Iterator[str]:
+            return iter(keys)
+
+        @override
+        def __len__(self) -> int:
+            return len(keys)
+
+    llm = llm_from_adapter(FakeAdapter(), extra_body=Fields())
+    assert llm.binding.extra_body == {key: {"id": key} for key in keys}
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
@@ -1098,15 +1121,21 @@ def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
     assert first.config_fingerprint() == second.config_fingerprint()
 
 
-def test_config_fingerprint_preserves_sequence_order_and_container_types() -> None:
+def test_config_fingerprint_uses_json_object_keys() -> None:
+    objects = ({2: "a", 11: "b"}, {"2": "a", "11": "b"}, {2: "a", "11": "b"})
+    fingerprints = {
+        llm_from_adapter(FakeAdapter(), extra_body={"example": value}).config_fingerprint()
+        for value in objects
+    }
+    assert len(fingerprints) == 1
+
+
+def test_config_fingerprint_identifies_json_arrays_by_their_ordered_values() -> None:
     ordered = llm_from_adapter(FakeAdapter(), extra_body={"values": [1, 2]})
     reversed_order = llm_from_adapter(FakeAdapter(), extra_body={"values": [2, 1]})
     tuple_value = llm_from_adapter(FakeAdapter(), extra_body={"values": (1, 2)})
-    set_value = llm_from_adapter(FakeAdapter(), extra_body={"values": {1, 2}})
-    frozen_set_value = llm_from_adapter(FakeAdapter(), extra_body={"values": frozenset({1, 2})})
     assert ordered.config_fingerprint() != reversed_order.config_fingerprint()
-    assert ordered.config_fingerprint() != tuple_value.config_fingerprint()
-    assert set_value.config_fingerprint() != frozen_set_value.config_fingerprint()
+    assert ordered.config_fingerprint() == tuple_value.config_fingerprint()
 
 
 def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuration() -> None:
@@ -1116,8 +1145,6 @@ def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuratio
     changed_model_adapter.model = "other-model"
     changed_provider_adapter = FakeAdapter()
     changed_provider_adapter.provider_name = "other-provider"
-    changed_config_adapter = FakeAdapter()
-    changed_config_adapter.automatic_cache_breakpoints_default = True
     assert (
         baseline.config_fingerprint()
         != llm_from_adapter(changed_model_adapter).config_fingerprint()
@@ -1129,25 +1156,18 @@ def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuratio
     assert (
         baseline.config_fingerprint() != llm_from_adapter(_OtherFakeAdapter()).config_fingerprint()
     )
-    assert (
-        baseline.config_fingerprint()
-        != llm_from_adapter(changed_config_adapter).config_fingerprint()
-    )
 
 
-def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -> None:
+def test_config_fingerprint_uses_values_at_bind_time() -> None:
     extra_body: dict[str, object] = {"value": 1}
     adapter = FakeAdapter()
     llm = llm_from_adapter(adapter, extra_body=extra_body)
-    initial = llm.config_fingerprint()
+    initial = llm_from_adapter(FakeAdapter(), extra_body={"value": 1}).config_fingerprint()
     extra_body["value"] = 2
-    after_binding_mutation = llm.config_fingerprint()
     adapter.model = "changed-model"
     adapter.provider_name = "changed-provider"
-    adapter.automatic_cache_breakpoints_default = True
-    assert initial != after_binding_mutation
-    assert after_binding_mutation == llm.config_fingerprint()
-    assert after_binding_mutation != llm.bind().config_fingerprint()
+    assert llm.config_fingerprint() == initial
+    assert llm.bind().config_fingerprint() != initial
 
 
 def test_config_fingerprint_tracks_response_format_and_bind() -> None:
@@ -1158,10 +1178,6 @@ def test_config_fingerprint_tracks_response_format_and_bind() -> None:
     assert text.config_fingerprint() != answer.config_fingerprint()
     assert answer.config_fingerprint() != other_answer.config_fingerprint()
     assert answer.config_fingerprint() != replacement_llm.config_fingerprint()
-    assert (
-        text.config_fingerprint()
-        != text.bind(automatic_cache_breakpoints=True).config_fingerprint()
-    )
 
 
 def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> None:
@@ -1194,29 +1210,21 @@ def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> Non
 
 
 @pytest.mark.parametrize(
-    ("value", "message"),
-    [
-        (object(), "binding.extra_body['value'] has unsupported type builtins.object"),
-        (float("inf"), "binding.extra_body['value'] contains a non-finite float"),
-    ],
+    "value",
+    [object(), float("inf")],
 )
-def test_config_fingerprint_rejects_values_without_a_deterministic_encoding(
-    value: object, message: str
-) -> None:
+def test_config_fingerprint_rejects_non_json_provider_values(value: object) -> None:
     llm = llm_from_adapter(FakeAdapter(), extra_body={"value": value})
-    with pytest.raises(TypeError) as raised:
+    with pytest.raises(TypeError, match="prepared provider configuration"):
         _ = llm.config_fingerprint()
-    assert str(raised.value) == message
 
 
 def test_config_fingerprint_rejects_a_container_cycle() -> None:
     cyclic: dict[str, object] = {}
     cyclic["self"] = cyclic
     llm = llm_from_adapter(FakeAdapter(), extra_body=cyclic)
-    message = "binding.extra_body['self'] contains a cycle"
-    with pytest.raises(TypeError) as raised:
+    with pytest.raises(TypeError, match="Circular reference"):
         _ = llm.config_fingerprint()
-    assert str(raised.value) == message
 
 
 def test_config_fingerprint_encodes_an_unpaired_surrogate() -> None:

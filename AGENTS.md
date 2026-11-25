@@ -57,6 +57,7 @@ Document a public parameter exactly when its name and type leave its meaning or 
 - Create one `SharedBackoff` per rate-limit quota.
 - Gate every request start through its `admitted()` block.
 - Disable SDK retries so langchaint accounts for every request.
+- Capture provider request configuration at bind time. Fingerprint the same prepared fields that the bound adapter uses for requests.
 - Take each request's retry decision from the SDK's own retry rule where the SDK exposes one. Keep only pausing, failure names, mid-stream errors, and server-stated waits the SDK ignores.
 - Wrap official SDK clients.
 - Let the SDK assemble streams.
@@ -103,7 +104,7 @@ Document a public parameter exactly when its name and type leave its meaning or 
 - Represent a nonzero category with no configured rate as NaN.
 - Never fabricate prices or model catalogs.
 - Label provider-published list pricing as an estimate.
-- Pass provider values through by reference.
+- Pass raw provider responses and usage through by reference.
 - Construct a langchaint model only when its shape differs from the SDK object.
 
 ## Types and imports

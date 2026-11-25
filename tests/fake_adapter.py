@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import ClassVar, override
 
@@ -191,6 +192,7 @@ class ScriptedRequestStream(FakeStream):
 @dataclass(frozen=True, kw_only=True)
 class FakeRequestParams(RequestParams):
     messages: tuple[Message, ...]
+    config: Mapping[str, object]
 
     @override
     def as_json(self) -> str:
@@ -206,8 +208,15 @@ def as_fake_request_params(request_params: RequestParams) -> FakeRequestParams:
 class FakeBoundAdapter(BoundAdapter):
     """Consume scripts and count requests independently for each binding."""
 
-    def __init__(self, adapter: "FakeAdapter") -> None:
+    def __init__(self, adapter: "FakeAdapter", binding: Binding) -> None:
         self._adapter = adapter
+        self._config = {
+            "model": adapter.model,
+            "system_prompt": [part.model_dump(mode="json") for part in binding.system_prompt]
+            if isinstance(binding.system_prompt, tuple)
+            else binding.system_prompt,
+            "extra_body": binding.extra_body,
+        }
         self._scripted_requests = list(adapter.scripted_requests)
         self._rejected_messages = list(adapter.rejected_messages)
         self._scripted_by_raw_id: dict[str, ScriptedResponse] = {}
@@ -217,6 +226,10 @@ class FakeBoundAdapter(BoundAdapter):
         self.open_count: int = 0
         self.hang_reached: asyncio.Event = asyncio.Event()
         """Set when an open_stream call suspends because of the adapter's hang_from_open."""
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        return deepcopy(self._config)
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -242,7 +255,7 @@ class FakeBoundAdapter(BoundAdapter):
         if self._rejected_messages:
             return self._rejected_messages.pop(0)
         self.build_count += 1
-        return FakeRequestParams(messages=tuple(messages))
+        return FakeRequestParams(messages=tuple(messages), config=self.config_fingerprint_data())
 
     def _request_stream(
         self, scripted_response: ScriptedResponse, *, content: str | None
@@ -343,19 +356,15 @@ class FakeAdapter(Adapter):
         self.structured_bind_count: int = 0
 
     @override
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        return {"automatic_cache_breakpoints_default": self.automatic_cache_breakpoints_default}
-
-    @override
     def bind_text(self, binding: Binding) -> BoundAdapter:
-        bound_adapter = self._bound_adapter_class(self)
+        bound_adapter = self._bound_adapter_class(self, binding)
         self.bound_adapters.append(bound_adapter)
         return bound_adapter
 
     @override
     def bind_structured(self, binding: Binding, response_format: type[BaseModel]) -> BoundAdapter:
         self.structured_bind_count += 1
-        return self._bound_adapter_class(self)
+        return self._bound_adapter_class(self, binding)
 
     @override
     def request_failure(self, error: Exception) -> RequestFailure:

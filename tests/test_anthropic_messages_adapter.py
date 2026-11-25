@@ -5,6 +5,7 @@ import math
 import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import Literal, NamedTuple, TypeIs, override
 
 import anthropic
@@ -24,7 +25,7 @@ from anthropic.lib.streaming import (
 )
 from anthropic.types import ContentBlockParam, MessageParam, ParsedMessage
 from anthropic.types.parsed_message import ParsedTextBlock
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from langchaint import (
     LLM,
@@ -83,7 +84,7 @@ from langchaint.anthropic.messages_adapter import (
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
-    _extra_body_with_temperature,
+    _provider_executed_tools,
     _wire_messages,
     _wire_tool_choice,
 )
@@ -260,19 +261,8 @@ _UNSET_BINDING = Binding(
 """A binding that states only `max_completion_tokens`, which Anthropic requires."""
 
 
-def _precomputed_with_provider_executed_tools(*tool_types: str) -> _AnthropicProviderExecutedTools:
-    return (
-        _adapter()
-        ._precompute_fields(
-            _binding(
-                system_prompt=None,
-                tool_schemas=(),
-                provider_executed_tools=tuple({"type": tool_type} for tool_type in tool_types),
-                automatic_cache_breakpoints=False,
-            )
-        )
-        .provider_executed_tools
-    )
+def _tool_categories(*tool_types: str) -> _AnthropicProviderExecutedTools:
+    return _provider_executed_tools(tuple({"type": tool_type} for tool_type in tool_types))
 
 
 def test_billing_partitions_and_prices_complete_usage() -> None:
@@ -379,9 +369,7 @@ def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
     usage = _billing_from_sdk_usage(
         usage_raw,
         _PRICING,
-        provider_executed_tools=_precomputed_with_provider_executed_tools(
-            *case.provider_executed_tool_types
-        ),
+        provider_executed_tools=_tool_categories(*case.provider_executed_tool_types),
         billing_complete=case.billing_complete,
     ).usage
     assert usage.provider_executed_tool_cost_in_usd == pytest.approx(
@@ -392,7 +380,7 @@ def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
 def test_a_bound_anthropic_web_search_requires_its_price() -> None:
     adapter = _adapter(pricing=replace(_PRICING, web_search_usd_per_invocation=None))
     with pytest.raises(ValueError, match="is None"):
-        _ = adapter._precompute_fields(
+        _ = adapter.bind_text(
             _binding(
                 system_prompt="system",
                 tool_schemas=(),
@@ -934,7 +922,7 @@ def test_wire_tool_choice_none_forbids_calls_and_carries_no_parallel_flag(
     assert _wire_tool_choice("none", parallel_tool_calls=parallel_tool_calls) == {"type": "none"}
 
 
-def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
+def test_config_fingerprint_data_includes_prepared_fields_and_message_cache_settings() -> None:
     adapter = AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test"),
         model="m",
@@ -944,11 +932,15 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
         service_tier="standard_only",
         inference_geo="us",
     )
-    assert adapter.config_fingerprint_data() == {
-        "uses_top_level_cache_control": True,
+    assert adapter.bind_text(_UNSET_BINDING).config_fingerprint_data() == {
+        "model": "m",
+        "max_tokens": 4096,
+        "automatic_message_cache_breakpoint": False,
+        "message_cache_breakpoint_budget": 4,
         "cache_ttl": "1h",
         "inference_geo": "us",
         "service_tier": "standard_only",
+        "extra_body": None,
     }
 
 
@@ -959,8 +951,6 @@ def test_unset_binding_fields_stay_at_the_omit_sentinel() -> None:
         precomputed_fields.tools,
         precomputed_fields.tool_choice,
         precomputed_fields.output_config,
-        precomputed_fields.thinking,
-        precomputed_fields.temperature,
         precomputed_fields.service_tier,
         precomputed_fields.inference_geo,
         precomputed_fields.cache_control,
@@ -978,7 +968,7 @@ def test_request_passes_reasoning_level_through() -> None:
         replace(_UNSET_BINDING, reasoning_level="minimal")
     )
     assert precomputed_fields.output_config == {"effort": "minimal"}
-    assert precomputed_fields.thinking == {"type": "adaptive"}
+    assert precomputed_fields.extra_body == {"thinking": {"type": "adaptive"}}
 
 
 def test_open_stream_sends_the_built_request() -> None:
@@ -1033,29 +1023,134 @@ def test_open_stream_sends_the_built_request() -> None:
     ]
 
 
-def test_extra_body_keeps_caller_fields_by_reference_beside_a_temperature() -> None:
-    caller_fields: dict[str, object] = {"top_k": 5}
+def test_legacy_bedrock_requests_and_fingerprints_use_the_bound_extra_body() -> None:
+    sent: list[tuple[str, str, float]] = []
 
-    def extra_body_bound_with(temperature: float | None) -> Mapping[str, object] | None:
-        return _extra_body_with_temperature(
-            _adapter()._precompute_fields(
-                _binding(
-                    system_prompt=None,
-                    tool_schemas=(),
-                    automatic_cache_breakpoints=True,
-                    extra_body=caller_fields,
-                    temperature=temperature,
-                )
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        sent.append((body["anthropic_version"], body["metadata"]["user_id"], body["temperature"]))
+        return httpx2.Response(400, json={"message": "rejected"})
+
+    async def scenario() -> None:
+        async with AsyncAnthropicBedrock(
+            aws_region="us-east-1",
+            api_key="offline",
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
+        ) as client:
+            metadata = {"user_id": "initial"}
+            extra_body: dict[str, object] = {"metadata": metadata}
+            llm = llm_from_adapter(
+                _adapter(client=client, provider_name="aws.bedrock"),
+                max_completion_tokens=16,
+                temperature=0.2,
+                extra_body=extra_body,
             )
-        )
+            fingerprint = llm.config_fingerprint()
+            with pytest.raises(GenerationError) as caught:
+                await llm.generate_one("q")
+            request = caught.value.request_params
+            assert isinstance(request, _AnthropicRequestParams)
+            assert request.precomputed.extra_body is not None
+            request_metadata = request.precomputed.extra_body["metadata"]
+            assert isinstance(request_metadata, dict)
+            request_metadata.clear()
+            extra_body["anthropic_version"] = "custom"
+            metadata["user_id"] = "edited"
+            assert llm.config_fingerprint() == fingerprint
+            with pytest.raises(GenerationError):
+                await llm.generate_one("q")
+            rebound = llm.bind(extra_body=extra_body)
+            assert rebound.config_fingerprint() != fingerprint
+            with pytest.raises(GenerationError):
+                await rebound.generate_one("q")
+            sdk_default = llm.bind(
+                extra_body={"metadata": metadata, "anthropic_version": anthropic.omit}
+            )
+            with pytest.raises(GenerationError):
+                await sdk_default.generate_one("q")
+            assert (
+                sdk_default.config_fingerprint()
+                == llm.bind(
+                    extra_body={"metadata": metadata, "anthropic_version": sent[-1][0]}
+                ).config_fingerprint()
+            )
 
-    assert extra_body_bound_with(None) is caller_fields
-    with_temperature = extra_body_bound_with(0.2)
-    assert with_temperature is not None
-    assert dict(with_temperature) == {"temperature": 0.2, "top_k": 5}
-    caller_fields["top_k"] = 6
-    caller_fields["temperature"] = 0.7
-    assert dict(with_temperature) == {"temperature": 0.2, "top_k": 6}
+    run_with_timeout(scenario())
+    assert sent[:3] == [
+        ("bedrock-2023-05-31", "initial", 0.2),
+        ("bedrock-2023-05-31", "initial", 0.2),
+        ("custom", "edited", 0.2),
+    ]
+
+
+def test_fingerprints_match_anthropic_thinking_omissions_and_model_serialization() -> None:
+    class Metadata(BaseModel):
+        user: str = Field(default="A", serialization_alias="user_id")
+
+    sent: list[dict[str, object]] = []
+
+    def reject(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content))
+        return httpx2.Response(400, json={"message": "rejected"})
+
+    async def send(llm: LLM) -> tuple[dict[str, object], str]:
+        with pytest.raises(GenerationError):
+            await llm.generate_one("q")
+        return sent[-1], llm.config_fingerprint()
+
+    async def scenario() -> None:
+        async with AsyncAnthropic(
+            api_key="offline",
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject)),
+        ) as client:
+            tool = {"type": "web_search_20250305", "name": "web_search"}
+            llm = llm_from_adapter(
+                _adapter(client=client),
+                max_completion_tokens=16,
+                reasoning_level="high",
+                provider_executed_tools=(tool,),
+            )
+            baseline = await send(llm)
+            assert baseline[0]["thinking"] == {"type": "adaptive"}
+            assert baseline[0]["tools"] == [tool]
+            assert "metadata" not in baseline[0]
+            for omitted in (anthropic.omit, anthropic.not_given):
+                assert (
+                    await send(
+                        llm.bind(
+                            extra_body={"thinking": {"type": "adaptive"}, "metadata": omitted},
+                            provider_executed_tools=({**tool, "max_uses": omitted},),
+                        )
+                    )
+                    == baseline
+                )
+            default, default_fingerprint = await send(
+                llm.bind(extra_body={"metadata": Metadata()})
+            )
+            explicit, explicit_fingerprint = await send(
+                llm.bind(extra_body={"metadata": Metadata(user="A")})
+            )
+            assert default["metadata"] == {}
+            assert explicit["metadata"] == {"user_id": "A"}
+            assert default_fingerprint != explicit_fingerprint
+            assert await send(llm.bind(extra_body={"metadata": {"user_id": "A"}})) == (
+                explicit,
+                explicit_fingerprint,
+            )
+
+    run_with_timeout(scenario())
+
+
+def test_binding_defers_file_reads_and_fingerprinting_rejects_the_path(tmp_path: Path) -> None:
+    llm = llm_from_adapter(
+        _adapter(),
+        max_completion_tokens=16,
+        extra_body={"source": {"type": "base64", "data": tmp_path / "unread"}},
+    )
+    with pytest.raises(TypeError, match="Path"):
+        _ = llm.config_fingerprint()
 
 
 def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
@@ -1136,7 +1231,7 @@ def test_provider_executed_tool_binds_without_function_tools() -> None:
 )
 def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
     provider_executed_tool: dict[str, object] = {"type": tool_type}
-    precomputed = _adapter()._precompute_fields(
+    bound = _adapter().bind_text(
         _binding(
             system_prompt="system",
             tool_schemas=(),
@@ -1144,7 +1239,7 @@ def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
             automatic_cache_breakpoints=False,
         )
     )
-    assert _block_list(precomputed.tools) == [provider_executed_tool]
+    assert bound.config_fingerprint_data()["tools"] == [provider_executed_tool]
 
 
 @pytest.mark.parametrize(
@@ -1163,9 +1258,7 @@ def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
 def test_supported_code_execution_requires_a_qualifying_web_tool(
     code_execution_type: str, web_tool_type: str
 ) -> None:
-    provider_executed_tools = _precomputed_with_provider_executed_tools(
-        web_tool_type, code_execution_type
-    )
+    provider_executed_tools = _tool_categories(web_tool_type, code_execution_type)
     assert provider_executed_tools.code_execution_exempt
 
 
@@ -1194,7 +1287,7 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(
     provider_executed_tool: Mapping[str, object],
 ) -> None:
     with pytest.raises(ValueError, match="supported string type"):
-        _ = _adapter()._precompute_fields(
+        _ = _adapter().bind_text(
             _binding(
                 system_prompt="system",
                 tool_schemas=(),
@@ -1209,7 +1302,7 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(
 )
 def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: str) -> None:
     with pytest.raises(ValueError, match="qualifying web tool"):
-        _ = _precomputed_with_provider_executed_tools(code_execution_type)
+        _ = _tool_categories(code_execution_type)
 
 
 def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
@@ -1217,7 +1310,7 @@ def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
         client=AsyncAnthropicBedrock(aws_region="us-east-1"), provider_name="aws.bedrock"
     )
     with pytest.raises(ValueError, match="provider_name='anthropic'"):
-        _ = adapter._precompute_fields(
+        _ = adapter.bind_text(
             _binding(
                 system_prompt="system",
                 tool_schemas=(),
@@ -1602,10 +1695,8 @@ def test_automatic_cache_breakpoints_select_final_caching_by_api(
     ]
     if uses_top_level_cache_control:
         assert request.precomputed.cache_control == _CACHE_CONTROL_1H
-        assert request.precomputed.extra_body is None
     else:
         assert isinstance(request.precomputed.cache_control, anthropic.Omit)
-        assert request.precomputed.extra_body == {"anthropic_version": "bedrock-2023-05-31"}
 
 
 def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_id() -> None:
@@ -1668,8 +1759,7 @@ def test_extra_body_thinking_replaces_the_adaptive_thinking_of_reasoning_level()
         replace(_UNSET_BINDING, reasoning_level="low", extra_body=extra_body)
     )
     assert precomputed_fields.output_config == {"effort": "low"}
-    assert isinstance(precomputed_fields.thinking, anthropic.Omit)
-    assert precomputed_fields.extra_body is extra_body
+    assert precomputed_fields.extra_body == extra_body
 
 
 @pytest.mark.parametrize(
@@ -1948,7 +2038,7 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
     rendered = json.loads(request.as_json())
     assert rendered["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
     assert rendered["precomputed"]["model"] == "m"
-    assert "temperature" not in rendered["precomputed"]
+    assert "tools" not in rendered["precomputed"]
 
 
 def test_request_renders_system_part_cache_breakpoints_and_the_automatic_last_block_one() -> None:

@@ -12,9 +12,8 @@ from typing import TypeIs
 import pydantic
 from pydantic import BaseModel
 
-from langchaint.adapter import Adapter, AllowedToolsChoice, Binding, SpecificToolChoice
+from langchaint.adapter import Adapter
 from langchaint.common.messages import Message
-from langchaint.tools import ToolSchema
 
 type _CanonicalValue = None | bool | str | list[_CanonicalValue]
 type _ConfigContainer = (
@@ -44,38 +43,30 @@ def capture_response_format_fingerprint_data(
 def llm_config_fingerprint(
     *,
     adapter_class: type[Adapter],
-    adapter_model: str,
-    adapter_provider_name: str,
-    adapter_config_fingerprint_data: Mapping[str, object],
-    binding: Binding,
+    provider_name: str,
+    prepared_config: Mapping[str, object],
     response_format_fingerprint_data: ResponseFormatFingerprintData,
 ) -> str:
-    """Hash the stored configuration that can form provider requests.
+    """Hash the prepared provider configuration and the output type that reads its responses.
 
     Raises:
         TypeError: A configuration value has no deterministic encoding or contains a cycle.
     """
     if isinstance(response_format_fingerprint_data, _ResponseFormatFingerprintError):
         raise TypeError(response_format_fingerprint_data.message)
-    canonicalizer = _Canonicalizer()
-    payload: _CanonicalValue = [
-        [
-            "adapter",
-            _class_identity(adapter_class),
-            ["model", adapter_model],
-            ["provider_name", adapter_provider_name],
-            [
-                "config_fingerprint_data",
-                canonicalizer.value(
-                    adapter_config_fingerprint_data,
-                    path="adapter.config_fingerprint_data()",
-                ),
-            ],
-        ],
-        ["binding", canonicalizer.value(binding, path="binding")],
+    payload = [
+        ["adapter", _class_identity(adapter_class)],
+        ["provider_name", provider_name],
+        ["prepared_config", dict(prepared_config)],
         ["response_format", response_format_fingerprint_data],
     ]
-    digest = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+    try:
+        # JSON converts numeric object keys to strings before they can be sorted.
+        normalized: object = json.loads(json.dumps(payload, allow_nan=False))
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cannot encode prepared provider configuration as JSON: {exc}") from exc
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
     return f"sha256:{digest}"
 
 
@@ -135,18 +126,6 @@ class _Canonicalizer:
             return ["enum", _class_identity(type(value)), ["name", value.name]]
         if type(value) in (bool, int, float, str, bytes):
             return self._scalar(value, path=path)
-        if isinstance(value, Binding):
-            return self._binding(value, path=path)
-        if isinstance(value, ToolSchema):
-            return self._tool_schema(value, path=path)
-        if isinstance(value, SpecificToolChoice):
-            return ["SpecificToolChoice", ["tool_name", value.tool_name]]
-        if isinstance(value, AllowedToolsChoice):
-            return [
-                "AllowedToolsChoice",
-                self._field(path, "tool_names", value.tool_names),
-                ["mode", value.mode],
-            ]
         if isinstance(value, BaseModel):
             return self._pydantic_model(value, path=path)
         if _is_config_container(value):
@@ -155,9 +134,6 @@ class _Canonicalizer:
         raise TypeError(
             f"{path} has unsupported type {value_class.__module__}.{value_class.__qualname__}"
         )
-
-    def _field(self, path: str, name: str, value: object) -> _CanonicalValue:
-        return [name, self.value(value, path=f"{path}.{name}")]
 
     def _scalar(self, value: object, *, path: str) -> _CanonicalValue:
         if type(value) is bool:
@@ -173,33 +149,6 @@ class _Canonicalizer:
         if type(value) is bytes:
             return ["bytes", base64.b64encode(value).decode("ascii")]
         raise AssertionError("_scalar requires a supported scalar")
-
-    def _binding(self, binding: Binding, *, path: str) -> _CanonicalValue:
-        return [
-            "Binding",
-            self._field(path, "system_prompt", binding.system_prompt),
-            self._field(path, "tool_schemas", binding.tool_schemas),
-            self._field(path, "provider_executed_tools", binding.provider_executed_tools),
-            self._field(path, "tool_choice", binding.tool_choice),
-            self._field(path, "parallel_tool_calls", binding.parallel_tool_calls),
-            self._field(path, "max_completion_tokens", binding.max_completion_tokens),
-            self._field(path, "reasoning_level", binding.reasoning_level),
-            self._field(path, "temperature", binding.temperature),
-            self._field(
-                path,
-                "automatic_cache_breakpoints",
-                binding.automatic_cache_breakpoints,
-            ),
-            self._field(path, "extra_body", binding.extra_body),
-        ]
-
-    def _tool_schema(self, tool_schema: ToolSchema, *, path: str) -> _CanonicalValue:
-        return [
-            "ToolSchema",
-            ["name", tool_schema.name],
-            ["description", tool_schema.description],
-            self._field(path, "args_schema", tool_schema.args_schema),
-        ]
 
     def _pydantic_model(self, value: BaseModel, *, path: str) -> _CanonicalValue:
         try:

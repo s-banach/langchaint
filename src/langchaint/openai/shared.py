@@ -1,10 +1,7 @@
-"""Share openai clients, errors, and pricing.
-
-The Responses and Chat Completions adapters use the same clients, exceptions, and service tiers.
-This module imports neither adapter nor private SDK modules.
-"""
+"""Share OpenAI clients, request preparation, errors, and pricing."""
 
 import base64
+import json
 from abc import ABC
 from collections import Counter
 from collections.abc import Mapping
@@ -13,6 +10,8 @@ from typing import ClassVar, Literal, override
 
 import openai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI
+from openai._utils import transform
+from openai._utils._json import openapi_dumps
 
 from langchaint.adapter import (
     Adapter,
@@ -91,6 +90,32 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
 def _image_data_uri(image_part: ImagePart) -> str:
     encoded_data = base64.b64encode(image_part.data).decode("ascii")
     return f"data:{image_part.media_type};base64,{encoded_data}"
+
+
+def _wire_json_object(
+    fields: Mapping[str, object], *, sdk_type: object = object
+) -> dict[str, object]:
+    """Capture the JSON object the SDK sends, leaving encoding errors to the request."""
+    try:
+        encoded = openapi_dumps(transform(fields, sdk_type))
+    except (TypeError, ValueError, RecursionError):
+        return dict(fields)
+    decoded: dict[str, object] = json.loads(encoded)
+    return decoded
+
+
+def _wire_extra_body(extra_body: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Return the extra fields the SDK merges into the request body."""
+    if not extra_body:
+        return None
+    return (
+        _wire_json_object({
+            key: value
+            for key, value in extra_body.items()
+            if not isinstance(value, (openai.Omit, openai.NotGiven))
+        })
+        or None
+    )
 
 
 def _priced_tier(

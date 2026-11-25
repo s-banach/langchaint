@@ -8,6 +8,7 @@ Cache parameters match the Responses API values and follow `Binding.automatic_ca
 
 import base64
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Literal, cast, override
 
@@ -56,6 +57,7 @@ from langchaint.adapter import (
     ToolChoice,
     _RejectedMessagesError,
     narrowed_request_params,
+    prepared_request_fields,
     reject_extra_body_keys_the_adapter_populates,
     request_params_json,
 )
@@ -80,6 +82,8 @@ from langchaint.openai.shared import (
     _image_data_uri,
     _OpenAIGenerationAdapterBase,
     _priced_tier,
+    _wire_extra_body,
+    _wire_json_object,
     require_prompt_cache_options_support,
 )
 from langchaint.tools import ToolSchema
@@ -372,7 +376,7 @@ def _wire_function_definition(tool_schema: ToolSchema) -> FunctionDefinition:
     """Convert one tool schema. `description=None` omits the description key."""
     function: FunctionDefinition = {
         "name": tool_schema.name,
-        "parameters": dict(tool_schema.args_schema),
+        "parameters": _wire_json_object(tool_schema.args_schema, sdk_type=dict[str, object]),
     }
     if tool_schema.description is not None:
         function["description"] = tool_schema.description
@@ -523,7 +527,9 @@ def _wire_response_format(response_format: type[BaseModel]) -> ResponseFormatJSO
     """
     json_schema: JSONSchema = {
         "name": response_format.__name__,
-        "schema": without_schema_titles(response_format.model_json_schema()),
+        "schema": _wire_json_object(
+            without_schema_titles(response_format.model_json_schema()), sdk_type=dict[str, object]
+        ),
         "strict": False,
     }
     return {"type": "json_schema", "json_schema": json_schema}
@@ -586,14 +592,6 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         )
         self.service_tier: OpenAIServiceTier | None = service_tier
 
-    @override
-    def config_fingerprint_data(self) -> Mapping[str, object]:
-        """Return stored request configuration outside `Binding`."""
-        return {
-            "service_tier": self.service_tier,
-            "supports_prompt_cache_options": self.supports_prompt_cache_options,
-        }
-
     def _precompute_fields(self, binding: Binding) -> _OpenAIChatCompletionsPrecomputedFields:
         """Precompute request fields from the binding.
 
@@ -604,6 +602,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             ValueError: `extra_body` sets `n` to a value other than 1 or `None`, because the adapter reads one choice.
             ValueError: `provider_executed_tools` is nonempty.
         """
+        binding = binding.snapshot()
         if binding.provider_executed_tools:
             raise ValueError(
                 "OpenAIChatCompletionsAdapter cannot send provider_executed_tools. "
@@ -669,7 +668,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             ),
             service_tier=self.service_tier if self.service_tier is not None else omit,
             response_format=omit,
-            extra_body=binding.extra_body,
+            extra_body=_wire_extra_body(binding.extra_body),
         )
 
     @override
@@ -677,6 +676,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         """Bind for plain-text output without I/O.
 
         Raises:
+            TypeError: A provider value in `binding` cannot be copied.
             ValueError: `binding` contains unsupported values.
         """
         return _BoundOpenAIChatCompletions(
@@ -688,6 +688,7 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
         """Bind for structured output in response_format without I/O.
 
         Raises:
+            TypeError: A provider value in `binding` cannot be copied.
             ValueError: `binding` contains unsupported values.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.
@@ -898,6 +899,10 @@ class _BoundOpenAIChatCompletions(BoundAdapter):
         self._precomputed_fields = precomputed_fields
 
     @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        return prepared_request_fields(self._precomputed_fields, omitted_class=Omit)
+
+    @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price counters using the reported `service_tier`.
 
@@ -936,9 +941,10 @@ class _BoundOpenAIChatCompletions(BoundAdapter):
             wire_messages = _wire_messages(messages)
         except _RejectedMessagesError as rejected:
             return RejectedMessages(error_text=str(rejected))
+        precomputed = deepcopy(self._precomputed_fields, {id(omit): omit})
         return _OpenAIChatCompletionsRequestParams(
-            precomputed=self._precomputed_fields,
-            messages=[*self._precomputed_fields.messages_prefix, *wire_messages],
+            precomputed=precomputed,
+            messages=[*precomputed.messages_prefix, *wire_messages],
         )
 
     @override

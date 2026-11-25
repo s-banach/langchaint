@@ -7,8 +7,8 @@ import contextlib
 import json
 import logging
 import pathlib
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
-from typing import ClassVar, Literal, NamedTuple, TypeAliasType, get_args, override
+from collections.abc import AsyncIterator, Callable, Mapping
+from typing import ClassVar, Literal, NamedTuple, override
 
 import numpy as np
 import pytest
@@ -62,7 +62,6 @@ from langchaint.embedding_requests import EmbeddingRequestRecord
 from langchaint.span_parsing import (
     OtelToolCallResponsePart,
     generation_input_from_otel,
-    generation_record_from_otel,
     llm_from_otel,
     output_messages_from_otel,
     parse_otel_chat,
@@ -500,32 +499,19 @@ class _Answer(BaseModel):
     value: int
 
 
-def _literal_strings(annotation: object) -> Iterator[str]:
-    if isinstance(annotation, str):
-        yield annotation
-    elif isinstance(annotation, TypeAliasType):
-        yield from _literal_strings(annotation.__value__)
-    else:
-        for argument in get_args(annotation):
-            yield from _literal_strings(argument)
-
-
 @pytest.mark.parametrize("response_format", [str, _Answer])
-@pytest.mark.parametrize("stop_reason", tuple(_literal_strings(StopReason)))
 @pytest.mark.parametrize("path", GENERATION_PATHS)
-def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
-    path: GenerationPath, stop_reason: StopReason, response_format: type[str] | type[_Answer]
+def test_span_parsing_rebuilds_the_binding_and_messages_a_chat_span_records(
+    path: GenerationPath, response_format: type[str] | type[_Answer]
 ) -> None:
     """Use tuple content and compact `args_json` to match the forms returned by span parsing."""
-    tool_calls = (
-        (ToolCall(id="call2", name="echo", args_json='{"text":"y"}'),)
-        if stop_reason == "tool_call"
-        else ()
-    )
     assistant_message = AssistantMessage(
-        content=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
+        content=(
+            TextPart(text="checking"),
+            ToolCall(id="call2", name="echo", args_json='{"text":"y"}'),
+        )
         if response_format is str
-        else (TextPart(text='{"value":1}'), *tool_calls)
+        else (TextPart(text="Checking."), TextPart(text='{"value":1}'))
     )
     generation_input = (
         _MULTIMODAL_USER_MESSAGE,
@@ -544,7 +530,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
                 ScriptedResponse(
                     interpretation=FinishedResponse(
                         assistant_message=assistant_message,
-                        stop_reason=stop_reason,
+                        stop_reason="tool_call" if response_format is str else "stop",
                         cannot_continue=None,
                     ),
                     usage=USAGE,
@@ -552,20 +538,15 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
             ]
         )
         initial_llm, exporter = _traced(adapter, capture_message_content=True)
-        text_llm = initial_llm.bind(
+        llm = initial_llm.bind(
             system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
+            response_format=response_format,
             max_completion_tokens=123,
             reasoning_level="high",
             temperature=0.25,
         )
-        generation: Generation[str] | Generation[_Answer]
-        if response_format is str:
-            llm = text_llm
-            generation = await _generate_through(path, text_llm, generation_input)
-        else:
-            llm = text_llm.bind(response_format=_Answer)
-            generation = await _generate_through(path, llm, generation_input)
+        generation = await _generate_through(path, llm, generation_input)
         (span,) = exporter.get_finished_spans()
         parsed = parse_otel_chat(_exported_attributes(span))
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
@@ -580,19 +561,11 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         assert reconstructed.binding == llm.binding
         assert generation_input_from_otel(parsed) == generation_input
         assert output_messages_from_otel(parsed) == (generation.assistant_message,)
-        record = generation_record_from_otel(parsed)
-        assert record.kind == generation.kind
-        if record.kind == "plain" and generation.kind == "plain":
-            assert record.output == (
-                generation.output.model_dump(mode="json")
-                if isinstance(generation.output, BaseModel)
-                else generation.output
-            )
-        assert record.stop_reason == generation.stop_reason
-        assert record.assistant_message == generation.assistant_message
-        assert record.request_history.provider_name == generation.request_history.provider_name
-        assert record.request_history.model == generation.request_history.model
-        assert record.kept_request.model_served == generation.kept_request.model_served
+        assert parsed.response_finish_reasons == (generation.stop_reason,)
+        assert parsed.output_messages is not None
+        assert tuple(message.finish_reason for message in parsed.output_messages) == (
+            generation.stop_reason,
+        )
 
     run_with_timeout(scenario())
 

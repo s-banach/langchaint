@@ -1,8 +1,6 @@
 """Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
 import json
-from dataclasses import dataclass
-from functools import partial
 from importlib.resources import files
 from typing import Annotated, Literal
 
@@ -19,9 +17,6 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
-from langchaint.adapter import FinishedResponse
-from langchaint.billing.pricing import UNPRICED_TOKEN_RATES, Billing
-from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.common.messages import (
     AssistantMessage,
@@ -32,22 +27,13 @@ from langchaint.common.messages import (
     JsonValue,
     Message,
     MessageContent,
-    StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
     UserMessage,
     _is_object_dict,
-    final_text,
 )
 from langchaint.generation.llm import LLM, GenerationInput
-from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
-from langchaint.generation.response import (
-    GenerationRecord,
-    PlainGenerationRecord,
-    ToolCallGenerationRecord,
-    response_outcome,
-)
 from langchaint.tools import ToolManager, ToolSchema
 
 OPERATION_NAME = "gen_ai.operation.name"
@@ -708,100 +694,6 @@ def output_messages_from_otel(
     return tuple(_assistant_message_from_output(message) for message in output_messages)
 
 
-def generation_record_from_otel(
-    otel_chat_span: OtelChatSpan,
-) -> GenerationRecord[JsonValue]:
-    """Convert one parsed OTel chat span of a generation into a generation record.
-
-    The record follows `response_outcome` for the output message and selected finish reason, as for a live generation.
-    `ToolCallResponse` gives `ToolCallGenerationRecord`.
-    `PlainResponse` gives `PlainGenerationRecord`.
-    Under `gen_ai.output.type` `"json"`, the output is the final text part parsed as JSON.
-    Otherwise, the output is the final text part.
-    The record contains one synthetic request record.
-    `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
-    `first_item_after_seconds`, `error`, and `request_id` are `None`.
-    `Billing.usage` is `ZERO_USAGE`.
-    `Billing.service_tier` is `"unknown"`.
-    Every `Billing.usd_per_million_tokens` rate is NaN.
-    Trace usage, cost, retry, request count, timing, and provider service-tier attributes are ignored.
-    Failure detection uses `error.type` and the selected finish reason.
-    `OtelChatSpan` does not contain OTel span status.
-    A failed span without either failure signal cannot be detected.
-
-    Args:
-        otel_chat_span: The parsed OTel chat span attributes.
-
-    Raises:
-        OtelToLangchaintConversionError: The span reports failure.
-        OtelToLangchaintConversionError: The output message gives neither `PlainResponse` nor `ToolCallResponse`.
-            Examples include an empty message or a token-limit stop at a final tool call.
-            Under `gen_ai.output.type` `"json"`, final text that is not JSON also gives an unusable outcome.
-        OtelToLangchaintConversionError: A selected value cannot construct a generation record unchanged.
-        OtelToLangchaintConversionError: Output messages are available only by reference.
-    """
-    if otel_chat_span.error_type is not None:
-        raise _attribute_conversion_error("error.type", "reports a failed span")
-    output_messages = otel_chat_span.output_messages
-    _require_inline_content(OUTPUT_MESSAGES, output_messages, otel_chat_span.output_messages_ref)
-    if output_messages is None or len(output_messages) != 1:
-        raise _attribute_conversion_error(
-            OUTPUT_MESSAGES,
-            "must contain exactly one output message",
-        )
-    output_message = output_messages[0]
-    assistant_message = _assistant_message_from_output(output_message)
-    stop_reason = _stop_reason_from_otel(otel_chat_span, output_message.finish_reason)
-    output_type = _supported_output_type(otel_chat_span.output_type)
-    if not otel_chat_span.provider_name:
-        raise _attribute_conversion_error("gen_ai.provider.name", "is required")
-    if not otel_chat_span.request_model:
-        raise _attribute_conversion_error("gen_ai.request.model", "is required")
-    billing = Billing(
-        usage=ZERO_USAGE,
-        service_tier="unknown",
-        usd_per_million_tokens=UNPRICED_TOKEN_RATES,
-    )
-    request_record = SettledRequestRecord(
-        started_after_seconds=0.0,
-        elapsed_seconds=0.0,
-        first_item_after_seconds=None,
-        error=None,
-        billing=billing,
-        assistant_message=assistant_message,
-        model_served=otel_chat_span.response_model,
-        response_id=otel_chat_span.response_id,
-        request_id=None,
-    )
-    request_history = RequestHistory(
-        model=otel_chat_span.request_model,
-        provider_name=otel_chat_span.provider_name,
-        records=(request_record,),
-        elapsed_seconds=0.0,
-    )
-    outcome = response_outcome(
-        FinishedResponse(
-            assistant_message=assistant_message, stop_reason=stop_reason, cannot_continue=None
-        ),
-        partial(_span_output, output_type=output_type),
-    )
-    match outcome.kind:
-        case "plain_response":
-            return PlainGenerationRecord[JsonValue](
-                request_history=request_history,
-                output=outcome.output.value,
-                stop_reason=outcome.stop_reason,
-            )
-        case "tool_call_response":
-            return ToolCallGenerationRecord(
-                request_history=request_history, stop_reason=outcome.stop_reason
-            )
-        case _:
-            raise _attribute_conversion_error(
-                OUTPUT_MESSAGES, f"gives outcome {outcome.kind!r}, which is not a generation"
-            )
-
-
 def llm_from_otel[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     otel_chat_span: OtelChatSpan,
     *,
@@ -856,42 +748,6 @@ def llm_from_otel[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
     return llm
 
 
-def _stop_reason_from_otel(
-    otel_chat_span: OtelChatSpan, message_finish_reason: str | None
-) -> StopReason:
-    response_finish_reasons = otel_chat_span.response_finish_reasons
-    if response_finish_reasons is not None:
-        if len(response_finish_reasons) != 1:
-            raise _attribute_conversion_error(
-                "gen_ai.response.finish_reasons",
-                "must contain exactly one value",
-            )
-        selected_finish_reason = response_finish_reasons[0]
-        if message_finish_reason is not None and message_finish_reason != selected_finish_reason:
-            raise OtelToLangchaintConversionError(
-                f"gen_ai.response.finish_reasons {response_finish_reasons!r} differs from {OUTPUT_MESSAGES} finish_reason {message_finish_reason!r}"
-            )
-    else:
-        selected_finish_reason = message_finish_reason
-    if selected_finish_reason is None:
-        raise OtelToLangchaintConversionError(
-            f"gen_ai.response.finish_reasons {response_finish_reasons!r} and {OUTPUT_MESSAGES} finish_reason {message_finish_reason!r} contain no value"
-        )
-    match selected_finish_reason:
-        case "error":
-            raise OtelToLangchaintConversionError(
-                f"finish_reason {selected_finish_reason!r} reports a failed span"
-            )
-        case "length":
-            return "max_completion_tokens"
-        case "content_filter":
-            return "refusal"
-        case "stop" | "tool_call" | "refusal" | "context_window_exceeded":
-            return selected_finish_reason
-        case _:
-            return "other"
-
-
 def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
     """Return `output_type`, reading an absent value as `"text"`.
 
@@ -907,31 +763,6 @@ def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
             raise OtelToLangchaintConversionError(
                 f"gen_ai.output.type {output_type!r} is neither 'text' nor 'json'"
             )
-
-
-@dataclass(frozen=True)
-class _SpanOutput:
-    """Hold output read from a span.
-
-    Wrapping keeps JSON null distinct from `None`, which an `OutputReader` returns for a message without output.
-    """
-
-    value: JsonValue
-
-
-def _span_output(
-    assistant_message: AssistantMessage, *, output_type: Literal["text", "json"]
-) -> _SpanOutput | ValidationError | None:
-    """Read the final text part as an `OutputReader` for `response_outcome`, parsing it as JSON under `"json"`."""
-    text = final_text(assistant_message)
-    if text is None:
-        return None
-    if output_type == "text":
-        return _SpanOutput(text)
-    try:
-        return _SpanOutput(_JSON_VALUE_ADAPTER.validate_json(text))
-    except ValidationError as error:
-        return error
 
 
 def _require_matching_response_format(
@@ -1072,7 +903,6 @@ __all__ = [
     "OtelTranscriptionPart",
     "OtelUriPart",
     "generation_input_from_otel",
-    "generation_record_from_otel",
     "llm_from_otel",
     "output_messages_from_otel",
     "parse_otel_chat",

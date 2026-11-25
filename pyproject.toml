@@ -1,6 +1,6 @@
 [project]
 name = "langchaint"
-version = "0.38.4"
+version = "0.38.5"
 description = "A provider-neutral Python client for LLM applications."
 readme = "README.md"
 license = "MIT"
